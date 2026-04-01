@@ -7,11 +7,13 @@ Currently supports the **Mirax (.mrxs)** format from 3DHISTECH scanners, includi
 ## Features
 
 - **Pure Rust** -- no C dependencies, no libjpeg, no glib, no Cairo
-- **JPEG RGBA decoding** -- reads alpha from 4-component JPEGs (YCbCr+A); 3-component JPEGs get opaque alpha
-- **PNG and BMP24 decoding**
+- **Multi-channel fluorescence** -- reads individual filter channels (DAPI, FITC, TRITC, CY5, etc.) from packed JPEG tiles and separate filter level tile sets
+- **Per-channel access** -- `read_region(channel, ...)` returns a single grayscale channel
+- **RGBA compositing** -- `read_region_rgba(...)` maps any channels to R/G/B/A
+- **JPEG/PNG/BMP decoding** -- auto-detects format from magic bytes
 - **Multi-level pyramid** -- access any zoom level from full resolution down to thumbnail
-- **Tile caching** -- LRU cache avoids redundant decoding of shared image tiles
-- **Associated images** -- read macro, label, and thumbnail images
+- **Tile caching** -- LRU cache avoids redundant JPEG decoding across channel reads
+- **Associated images** -- macro, label, and thumbnail images
 - **Properties** -- all Slidedat.ini metadata exposed as key-value pairs
 - **CLI tool** -- `info` command shows all layers, filters, z-stacks, and tile formats
 - **Extensible** -- `SlideBackend` trait allows adding new format vendors
@@ -26,18 +28,19 @@ use openslide_rs::OpenSlide;
 let slide = OpenSlide::open("slide.mrxs")?;
 
 println!("Levels: {}", slide.level_count());
+println!("Channels: {}", slide.channel_count());
 let (w, h) = slide.level_dimensions(0).unwrap();
-println!("Full resolution: {}x{}", w, h);
 
-// Read a 512x512 region from the center at level 0
-let region = slide.read_region(
+// Read a single channel (e.g. DAPI = channel 0)
+let gray = slide.read_region(0, (w / 2) as i64, (h / 2) as i64, 0, 256, 256)?;
+// gray.data is Vec<u8>, 1 byte per pixel
+
+// Read all channels composited into RGBA
+let rgba = slide.read_region_rgba(
+    [Some(0), Some(1), Some(2), Some(3)],  // ch0→R, ch1→G, ch2→B, ch3→A
     (w / 2) as i64, (h / 2) as i64,
-    0,    // level
-    512, 512,
+    0, 256, 256,
 )?;
-
-// region.data is Vec<u8> in RGBA order, 4 bytes per pixel
-println!("Pixel (0,0): {:?}", region.pixel(0, 0));
 ```
 
 ### CLI
@@ -90,11 +93,14 @@ HIER_3: "Microscope focus level" (9 levels)
 |--------|-------------|
 | `OpenSlide::open(path)` | Open a slide file |
 | `OpenSlide::detect_vendor(path)` | Detect format without opening |
+| `slide.channel_count()` | Number of channels (e.g. 4 for DAPI/FITC/TRITC/CY5) |
+| `slide.channel_name(ch)` | Channel name (filter name for fluorescence) |
 | `slide.level_count()` | Number of zoom levels |
 | `slide.level_dimensions(level)` | (width, height) at a zoom level |
 | `slide.level_downsample(level)` | Downsample factor (1.0 at level 0) |
 | `slide.best_level_for_downsample(ds)` | Best level for a target downsample |
-| `slide.read_region(x, y, level, w, h)` | Read an RGBA region |
+| `slide.read_region(ch, x, y, level, w, h)` | Read a single channel as `GrayImage` |
+| `slide.read_region_rgba(chs, x, y, level, w, h)` | Composite channels into `RgbaImage` |
 | `slide.properties()` | All metadata as HashMap |
 | `slide.associated_image_names()` | List associated images |
 | `slide.read_associated_image(name)` | Read an associated image |

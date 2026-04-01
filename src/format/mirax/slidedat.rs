@@ -495,46 +495,14 @@ impl SlideDat {
         }
 
         // Parse filter channels from "Slide filter level" HIER layer.
-        //
-        // The index contains data in blocks of zoom_level_count consecutive
-        // records. Each FilterLevel gets its own block:
-        //   Block 0 (offsets 0..N-1):   FilterLevel_0 tile data
-        //   Block 1 (offsets N..2N-1):  Mask data
-        //   Block 2 (offsets 2N..3N-1): FilterLevel_1 tile data
-        //   etc.
-        // where N = zoom_level_count.
-        //
-        // Map FilterLevel names to block indices:
-        //   "FilterLevel_0" → block 0 → hier_offset = 0
-        //   "FilterLevel_1" → block 2 → hier_offset = 2 * zoom_level_count
-        //   (block 1 is mask data, skipped for tile reading)
+        // hier_offset is set to -1 here; it gets resolved in MiraxSlide::open()
+        // by probing the actual index to find which blocks contain tile data.
         let mut filter_channels = Vec::new();
 
-        // Collect unique FilterLevel names and assign block indices
-        let mut filter_level_to_block: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-        filter_level_to_block.insert("FilterLevel_0".into(), 0);
-
-        // Find "Slide filter level" layer and parse its channels
         for layer in &layers {
             if layer.name.trim() != "Slide filter level" {
                 continue;
             }
-            // Assign block indices to unique FilterLevel names
-            // FilterLevel_0 = block 0, FilterLevel_1 = block 2 (skip mask block 1)
-            let mut next_block = 2i32; // block 1 is mask
-            for level in &layer.levels {
-                if let Some(ref sec) = level.section {
-                    let fl_name = ini.get(sec.trim(), "DATA_IN_THIS_FILTER_LEVEL")
-                        .unwrap_or_default();
-                    let fl_name = fl_name.trim().to_string();
-                    if !filter_level_to_block.contains_key(&fl_name) {
-                        filter_level_to_block.insert(fl_name, next_block);
-                        next_block += 1;
-                    }
-                }
-            }
-
-            // Now parse each filter channel
             for level in &layer.levels {
                 if let Some(ref sec) = level.section {
                     let sec = sec.trim();
@@ -551,17 +519,11 @@ impl SlideDat {
                     let color_b = ini.get(sec, "COLOR_B")
                         .and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(255);
 
-                    let block = filter_level_to_block
-                        .get(filter_level_name.trim())
-                        .copied()
-                        .unwrap_or(0);
-                    let hier_offset = block * zoom_level_count;
-
                     filter_channels.push(FilterChannel {
                         name,
                         storing_channel: storing_ch,
                         filter_level_name,
-                        hier_offset,
+                        hier_offset: -1, // resolved later by probing index
                         color_r,
                         color_g,
                         color_b,

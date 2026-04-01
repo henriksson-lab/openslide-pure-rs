@@ -98,6 +98,37 @@ impl OpenSlide {
         self.backend.channel_name(channel)
     }
 
+    /// Read up to 4 channels and composite them into an RGBA image.
+    ///
+    /// `channels`: which logical channels map to R, G, B, A (use None to skip).
+    /// For a 3-channel brightfield slide: `[Some(0), Some(1), Some(2), None]`
+    /// For fluorescence: e.g. `[Some(0), Some(1), Some(2), Some(3)]` for DAPI→R, FITC→G, TRITC→B, CY5→A.
+    pub fn read_region_rgba(
+        &self,
+        channels: [Option<u32>; 4],
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<RgbaImage> {
+        let size = w as usize * h as usize;
+        let mut rgba = vec![0u8; size * 4];
+
+        for (out_idx, ch_opt) in channels.iter().enumerate() {
+            if let Some(ch) = ch_opt {
+                let gray = self.read_region(*ch, x, y, level, w, h)?;
+                for i in 0..size {
+                    if i < gray.data.len() {
+                        rgba[i * 4 + out_idx] = gray.data[i];
+                    }
+                }
+            }
+        }
+
+        RgbaImage::from_rgba(w, h, rgba)
+    }
+
     /// Debug: get the number of tiles in the grid for a given channel and level.
     pub fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize {
         self.backend.debug_grid_tile_count(channel, level)

@@ -185,11 +185,63 @@ impl MiraxSlide {
             &zoom_params,
         )?;
 
-        // Collect unique filter level hier offsets
-        // FilterLevel_0 is always at offset 0 (HIER_0).
-        // FilterLevel_1 (if present) is at offset from the slidedat filter metadata.
-        let mut filter_level_hier_offsets: Vec<i32> = vec![0]; // always have FL0 at offset 0
+        // Probe the index to find tile data blocks.
+        //
+        // The index contains blocks of zoom_level_count consecutive records.
+        // Some blocks are tile data (large entry counts), others are mask/metadata
+        // (small entries). We identify tile data blocks by checking if the first
+        // record has an entry count close to the expected number of tiles at
+        // zoom level 0.
+        //
+        // Then assign: first tile block = FilterLevel_0, second = FilterLevel_1, etc.
+        // Identify tile data blocks by checking average entry data length.
+        // Real tile data (JPEG/PNG) has entries with length > 500 bytes.
+        // Mask/metadata blocks have tiny entries (~100-140 bytes).
+        let mut tile_block_offsets: Vec<i32> = Vec::new();
+        let mut block_idx = 0i32;
+        loop {
+            let offset = block_idx * zoom_level_count;
+            match index.read_hier_record_at_offset(offset) {
+                Ok(entries) if !entries.is_empty() => {
+                    let avg_len: f64 = entries.iter()
+                        .map(|e| e.length as f64)
+                        .sum::<f64>() / entries.len() as f64;
+                    if avg_len > 500.0 {
+                        tile_block_offsets.push(offset);
+                    }
+                    block_idx += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Collect unique FilterLevel names in order, map to block offsets
+        let mut filter_level_names: Vec<String> = Vec::new();
         for fc in &sd.filter_channels {
+            let fl = fc.filter_level_name.trim().to_string();
+            if !filter_level_names.contains(&fl) {
+                filter_level_names.push(fl);
+            }
+        }
+
+        // Resolve hier_offset for each filter channel
+        let mut filter_level_to_offset: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+        for (i, name) in filter_level_names.iter().enumerate() {
+            let offset = tile_block_offsets.get(i).copied().unwrap_or(0);
+            filter_level_to_offset.insert(name.clone(), offset);
+        }
+
+        // Update filter_channels with resolved offsets
+        let mut filter_channels = sd.filter_channels.clone();
+        for fc in &mut filter_channels {
+            fc.hier_offset = filter_level_to_offset
+                .get(fc.filter_level_name.trim())
+                .copied()
+                .unwrap_or(0);
+        }
+
+        let mut filter_level_hier_offsets: Vec<i32> = vec![0];
+        for fc in &filter_channels {
             if fc.hier_offset >= 0 && !filter_level_hier_offsets.contains(&fc.hier_offset) {
                 filter_level_hier_offsets.push(fc.hier_offset);
             }
@@ -353,7 +405,7 @@ impl MiraxSlide {
         // The RGB channel for CY5 after YCbCr→RGB decoding is B (channel 2),
         // because a single-channel luminance JPEG maps to the blue component.
         // For FilterLevel_0 channels, storing_channel directly maps to R/G/B.
-        let channels: Vec<ChannelMapping> = if sd.filter_channels.is_empty() {
+        let channels: Vec<ChannelMapping> = if filter_channels.is_empty() {
             // Non-fluorescence slide: 3 channels = R, G, B
             vec![
                 ChannelMapping { name: "Red".into(), rgb_channel: 0, filter_level_idx: 0 },
@@ -361,7 +413,7 @@ impl MiraxSlide {
                 ChannelMapping { name: "Blue".into(), rgb_channel: 2, filter_level_idx: 0 },
             ]
         } else {
-            sd.filter_channels.iter().map(|fc| {
+            filter_channels.iter().map(|fc| {
                 let filter_level_idx = filter_level_hier_offsets.iter()
                     .position(|&o| o == fc.hier_offset)
                     .unwrap_or(0);
