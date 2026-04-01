@@ -10,23 +10,14 @@ fn main() {
         println!("  Ch {}: {}", ch, slide.channel_name(ch).unwrap_or("?"));
     }
 
-    println!("\nGrid tile counts:");
-    for ch in 0..slide.channel_count() {
-        let name = slide.channel_name(ch).unwrap_or("?");
-        print!("  Ch {} {:20}:", ch, name);
-        for level in 0..slide.level_count().min(4) {
-            print!(" L{}={}", level, slide.debug_grid_tile_count(ch, level));
-        }
-        println!(" ...");
-    }
-
-    // Read from center
+    let tile_size: u32 = 256;
     let cx = (w0 / 2) as i64;
     let cy = (h0 / 2) as i64;
-    println!("\nCenter ({},{}) 256x256 level 0:", cx, cy);
+
+    println!("\nCenter ({},{}) {}x{} level 0:", cx, cy, tile_size, tile_size);
     for ch in 0..slide.channel_count() {
         let name = slide.channel_name(ch).unwrap_or("?");
-        match slide.read_region(ch, cx, cy, 0, 256, 256) {
+        match slide.read_region(ch, cx, cy, 0, tile_size, tile_size) {
             Ok(img) => {
                 let sum: u64 = img.data.iter().map(|&v| v as u64).sum();
                 let avg = sum as f64 / img.data.len() as f64;

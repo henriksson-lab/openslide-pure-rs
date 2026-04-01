@@ -7,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::cache::{CachedTile, TileCache};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::SlideBackend;
@@ -63,6 +64,7 @@ struct MiraxSlide {
     properties: HashMap<String, String>,
     datafile_paths: Vec<PathBuf>,
     associated_images: HashMap<String, AssociatedImageInfo>,
+    cache: TileCache,
 }
 
 struct MiraxLevelData {
@@ -437,6 +439,7 @@ impl MiraxSlide {
             properties: props,
             datafile_paths: sd.datafile_paths,
             associated_images,
+            cache: TileCache::new(),
         })
     }
 
@@ -513,19 +516,44 @@ impl MiraxSlide {
     fn decode_tile_channel(
         &self,
         tile: &Tile,
-        _format_hint: ImageFormat,
+        filter_level_idx: usize,
+        level: u32,
         channel: u32,
     ) -> Result<GrayImage> {
-        let datafile_path = &self.datafile_paths[tile.image.fileno as usize];
-        let data = read_record_data(
-            datafile_path,
-            tile.image.offset as i64,
-            tile.image.length as i64,
-        )?;
-        // Auto-detect format from magic bytes (more reliable than INI metadata
-        // which may not match secondary filter levels)
-        let format = detect_image_format(&data);
-        decode::decode_channel(format, &data, channel)
+        // Check cache for the full RGB decode
+        let imageno = tile.image.imageno;
+        let cached = self.cache.get(filter_level_idx, level, imageno);
+
+        let rgb_tile = match cached {
+            Some(t) => t,
+            None => {
+                // Decode the full tile to RGB
+                let datafile_path = &self.datafile_paths[tile.image.fileno as usize];
+                let data = read_record_data(
+                    datafile_path,
+                    tile.image.offset as i64,
+                    tile.image.length as i64,
+                )?;
+                let format = detect_image_format(&data);
+                let (rgb, width, height) = decode::decode_rgb(format, &data)?;
+                let tile = CachedTile { width, height, rgb };
+                self.cache.put(filter_level_idx, level, imageno, tile.clone());
+                tile
+            }
+        };
+
+        // Extract the requested channel
+        let pixel_count = rgb_tile.width as usize * rgb_tile.height as usize;
+        let ch = channel.min(2) as usize;
+        let mut gray = Vec::with_capacity(pixel_count);
+        for pixel in rgb_tile.rgb.chunks_exact(3) {
+            gray.push(pixel[ch]);
+        }
+        Ok(GrayImage {
+            width: rgb_tile.width,
+            height: rgb_tile.height,
+            data: gray,
+        })
     }
 }
 
@@ -586,7 +614,8 @@ impl SlideBackend for MiraxSlide {
         for (col, row, entry) in tiles {
             let decoded = self.decode_tile_channel(
                 &entry.tile,
-                level_data.level.image_format,
+                mapping.filter_level_idx,
+                level,
                 mapping.rgb_channel,
             )?;
 

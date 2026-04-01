@@ -22,6 +22,24 @@ pub fn decode_to_rgba(format: ImageFormat, data: &[u8]) -> Result<RgbaImage> {
     }
 }
 
+/// Decode image data to RGB, returning (rgb_bytes, width, height).
+pub fn decode_rgb(format: ImageFormat, data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    match format {
+        ImageFormat::Jpeg => jpeg::decode_jpeg_rgb(data),
+        _ => {
+            // Fallback: decode to RGBA, then strip alpha
+            let rgba = decode_to_rgba(format, data)?;
+            let mut rgb = Vec::with_capacity(rgba.width as usize * rgba.height as usize * 3);
+            for pixel in rgba.data.chunks_exact(4) {
+                rgb.push(pixel[0]);
+                rgb.push(pixel[1]);
+                rgb.push(pixel[2]);
+            }
+            Ok((rgb, rgba.width, rgba.height))
+        }
+    }
+}
+
 /// Decode image data and extract a single channel (0=R, 1=G, 2=B).
 pub fn decode_channel(format: ImageFormat, data: &[u8], channel: u32) -> Result<GrayImage> {
     match format {
