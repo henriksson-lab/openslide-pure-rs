@@ -8,6 +8,8 @@ Contact me if you wish for me to add more of the file formats from the original 
 
 **Note that this version fixes a problem in the original OpenSlide, namely, it can read all 4 channels. The file format has been reverse engineered**
 
+More testing may be needed
+
 ## Features
 
 - **Pure Rust** -- no C dependencies, no libjpeg, no glib, no Cairo
