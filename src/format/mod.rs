@@ -18,6 +18,7 @@ pub(crate) trait SlideBackend {
     fn properties(&self) -> &HashMap<String, String>;
     fn associated_image_names(&self) -> Vec<&str>;
     fn read_associated_image(&self, name: &str) -> Result<RgbaImage>;
+    fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize;
 }
 
 /// Try to detect and open a slide file, returning the appropriate backend.

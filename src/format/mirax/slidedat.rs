@@ -494,23 +494,47 @@ impl SlideDat {
             });
         }
 
-        // Parse filter channels from "Slide filter level" HIER layer
+        // Parse filter channels from "Slide filter level" HIER layer.
+        //
+        // The index contains data in blocks of zoom_level_count consecutive
+        // records. Each FilterLevel gets its own block:
+        //   Block 0 (offsets 0..N-1):   FilterLevel_0 tile data
+        //   Block 1 (offsets N..2N-1):  Mask data
+        //   Block 2 (offsets 2N..3N-1): FilterLevel_1 tile data
+        //   etc.
+        // where N = zoom_level_count.
+        //
+        // Map FilterLevel names to block indices:
+        //   "FilterLevel_0" → block 0 → hier_offset = 0
+        //   "FilterLevel_1" → block 2 → hier_offset = 2 * zoom_level_count
+        //   (block 1 is mask data, skipped for tile reading)
         let mut filter_channels = Vec::new();
-        // Compute hier offsets for each layer
-        let mut hier_offsets: Vec<i32> = Vec::new(); // start offset for each HIER layer
-        {
-            let mut off = 0i32;
-            for layer in &layers {
-                hier_offsets.push(off);
-                off += layer.levels.len() as i32;
-            }
-        }
+
+        // Collect unique FilterLevel names and assign block indices
+        let mut filter_level_to_block: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+        filter_level_to_block.insert("FilterLevel_0".into(), 0);
 
         // Find "Slide filter level" layer and parse its channels
-        for (layer_idx, layer) in layers.iter().enumerate() {
+        for layer in &layers {
             if layer.name.trim() != "Slide filter level" {
                 continue;
             }
+            // Assign block indices to unique FilterLevel names
+            // FilterLevel_0 = block 0, FilterLevel_1 = block 2 (skip mask block 1)
+            let mut next_block = 2i32; // block 1 is mask
+            for level in &layer.levels {
+                if let Some(ref sec) = level.section {
+                    let fl_name = ini.get(sec.trim(), "DATA_IN_THIS_FILTER_LEVEL")
+                        .unwrap_or_default();
+                    let fl_name = fl_name.trim().to_string();
+                    if !filter_level_to_block.contains_key(&fl_name) {
+                        filter_level_to_block.insert(fl_name, next_block);
+                        next_block += 1;
+                    }
+                }
+            }
+
+            // Now parse each filter channel
             for level in &layer.levels {
                 if let Some(ref sec) = level.section {
                     let sec = sec.trim();
@@ -527,38 +551,11 @@ impl SlideDat {
                     let color_b = ini.get(sec, "COLOR_B")
                         .and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(255);
 
-                    // Find the hier offset for the filter level's data.
-                    // FilterLevel_0 data is at HIER_0 (offset 0).
-                    // FilterLevel_1 data: look for it at other HIER layers.
-                    let hier_offset = if filter_level_name.trim() == "FilterLevel_0" {
-                        0 // HIER_0 zoom level 0
-                    } else {
-                        // Look for this filter level name in the "Slide filter level"
-                        // HIER's own values. The actual tile data for FilterLevel_1
-                        // seems to be at the corresponding HIER_3 "ExtFocusLevel" offset.
-                        // For now: find which HIER_2 level matches this name, and
-                        // use the corresponding z-stack offset.
-                        // The pattern observed: HIER_3 ExtFocusLevel (offset = sum of
-                        // HIER_0+HIER_1+HIER_2 levels) contains FilterLevel_1 tiles.
-                        let mut found = -1i32;
-                        // Find which level in HIER_2 this filter_level_name matches
-                        for (li, ll) in layer.levels.iter().enumerate() {
-                            if ll.name.trim() == filter_level_name.trim() {
-                                // FilterLevel_1 is at HIER_2 level li.
-                                // But its actual tile data is at the HIER_3 ExtFocusLevel
-                                // offset, which is hier_offsets[3] (for HIER_3 layer index 3).
-                                // Specifically: offset = hier_offsets[HIER_3_index]
-                                if layers.len() > layer_idx + 1 {
-                                    // Next HIER layer (typically HIER_3 "Microscope focus level")
-                                    // The ExtFocusLevel at offset 0 of that layer has the data
-                                    found = hier_offsets.get(layer_idx + 1).copied().unwrap_or(-1);
-                                }
-                                let _ = li;
-                                break;
-                            }
-                        }
-                        found
-                    };
+                    let block = filter_level_to_block
+                        .get(filter_level_name.trim())
+                        .copied()
+                        .unwrap_or(0);
+                    let hier_offset = block * zoom_level_count;
 
                     filter_channels.push(FilterChannel {
                         name,

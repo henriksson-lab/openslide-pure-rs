@@ -97,4 +97,9 @@ impl OpenSlide {
     pub fn channel_name(&self, channel: u32) -> Option<&str> {
         self.backend.channel_name(channel)
     }
+
+    /// Debug: get the number of tiles in the grid for a given channel and level.
+    pub fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize {
+        self.backend.debug_grid_tile_count(channel, level)
+    }
 }

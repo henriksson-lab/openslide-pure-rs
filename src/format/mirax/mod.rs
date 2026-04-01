@@ -235,6 +235,8 @@ impl MiraxSlide {
 
                 let lp = &zoom_params[zoom_level];
 
+                let is_primary = hier_base_offset == 0;
+
                 for entry in &entries {
                     let x = entry.image_index % images_x;
                     let y = entry.image_index / images_x;
@@ -270,42 +272,57 @@ impl MiraxSlide {
                             let yp = yy / image_divisions;
                             let cp = yp * (images_x / image_divisions) + xp;
 
-                            if zoom_level == 0 {
-                                if slide_positions[(cp * 2) as usize] == 0
-                                    && slide_positions[(cp * 2 + 1) as usize] == 0
-                                    && (xp != 0 || yp != 0)
-                                {
-                                    continue;
-                                }
-                                active_positions.insert(cp);
-                            } else {
-                                let mut found = false;
-                                for ypp in yp..yp + lp.positions_per_tile {
-                                    for xpp in xp..xp + lp.positions_per_tile {
-                                        let cpp = ypp * (images_x / image_divisions) + xpp;
-                                        if active_positions.contains(&cpp) {
-                                            found = true;
+                            // For the primary filter level, use the position
+                            // buffer and active_positions filtering.
+                            // For secondary filter levels, place tiles directly
+                            // on a simple grid (the position buffer may not
+                            // cover these tiles).
+                            if is_primary {
+                                if zoom_level == 0 {
+                                    if slide_positions[(cp * 2) as usize] == 0
+                                        && slide_positions[(cp * 2 + 1) as usize] == 0
+                                        && (xp != 0 || yp != 0)
+                                    {
+                                        continue;
+                                    }
+                                    active_positions.insert(cp);
+                                } else {
+                                    let mut found = false;
+                                    for ypp in yp..yp + lp.positions_per_tile {
+                                        for xpp in xp..xp + lp.positions_per_tile {
+                                            let cpp = ypp * (images_x / image_divisions) + xpp;
+                                            if active_positions.contains(&cpp) {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if found {
                                             break;
                                         }
                                     }
-                                    if found {
-                                        break;
+                                    if !found {
+                                        continue;
                                     }
-                                }
-                                if !found {
-                                    continue;
                                 }
                             }
 
-                            let image0_w = levels[0].level.image_width;
-                            let image0_h = levels[0].level.image_height;
-                            let pos0_x = slide_positions[(cp * 2) as usize]
-                                + image0_w * (xx - xp * image_divisions);
-                            let pos0_y = slide_positions[(cp * 2 + 1) as usize]
-                                + image0_h * (yy - yp * image_divisions);
-
-                            let pos_x = pos0_x as f64 / lp.image_concat as f64;
-                            let pos_y = pos0_y as f64 / lp.image_concat as f64;
+                            let (pos_x, pos_y) = if is_primary && (cp * 2 + 1) < slide_positions.len() as i32 {
+                                let image0_w = levels[0].level.image_width;
+                                let image0_h = levels[0].level.image_height;
+                                let pos0_x = slide_positions[(cp * 2) as usize]
+                                    + image0_w * (xx - xp * image_divisions);
+                                let pos0_y = slide_positions[(cp * 2 + 1) as usize]
+                                    + image0_h * (yy - yp * image_divisions);
+                                (pos0_x as f64 / lp.image_concat as f64,
+                                 pos0_y as f64 / lp.image_concat as f64)
+                            } else {
+                                // Simple grid placement: tile position from
+                                // image coordinates × tile advance
+                                let tile_col = (x / lp.tile_count_divisor + xi) as f64;
+                                let tile_row = (y / lp.tile_count_divisor + yi) as f64;
+                                (tile_col * lp.tile_advance_x,
+                                 tile_row * lp.tile_advance_y)
+                            };
 
                             let tile_col = (x / lp.tile_count_divisor + xi) as i64;
                             let tile_row = (y / lp.tile_count_divisor + yi) as i64;
@@ -496,7 +513,7 @@ impl MiraxSlide {
     fn decode_tile_channel(
         &self,
         tile: &Tile,
-        format: ImageFormat,
+        _format_hint: ImageFormat,
         channel: u32,
     ) -> Result<GrayImage> {
         let datafile_path = &self.datafile_paths[tile.image.fileno as usize];
@@ -505,6 +522,9 @@ impl MiraxSlide {
             tile.image.offset as i64,
             tile.image.length as i64,
         )?;
+        // Auto-detect format from magic bytes (more reliable than INI metadata
+        // which may not match secondary filter levels)
+        let format = detect_image_format(&data);
         decode::decode_channel(format, &data, channel)
     }
 }
@@ -607,9 +627,34 @@ impl SlideBackend for MiraxSlide {
         let data = read_record_data(path, info.offset as i64, info.size as i64)?;
         decode::decode_to_rgba(ImageFormat::Jpeg, &data)
     }
+
+    fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize {
+        let mapping = match self.channels.get(channel as usize) {
+            Some(m) => m,
+            None => return 0,
+        };
+        let levels = match self.filter_level_grids.get(mapping.filter_level_idx) {
+            Some(l) => l,
+            None => return 0,
+        };
+        levels.get(level as usize).map_or(0, |l| l.grid.tile_count())
+    }
 }
 
 /// Blit (copy) a sub-rectangle of a grayscale source tile into the destination image.
+/// Detect image format from magic bytes.
+fn detect_image_format(data: &[u8]) -> ImageFormat {
+    if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
+        ImageFormat::Jpeg
+    } else if data.len() >= 4 && &data[0..4] == b"\x89PNG" {
+        ImageFormat::Png
+    } else if data.len() >= 2 && data[0] == b'B' && data[1] == b'M' {
+        ImageFormat::Bmp
+    } else {
+        ImageFormat::Jpeg // fallback
+    }
+}
+
 fn blit_gray(
     src: &GrayImage,
     src_x: f64,
