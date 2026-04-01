@@ -87,4 +87,14 @@ impl OpenSlide {
     pub fn vendor(&self) -> &'static str {
         self.backend.vendor()
     }
+
+    /// Get the number of channels in the slide.
+    pub fn channel_count(&self) -> u32 {
+        self.backend.channel_count()
+    }
+
+    /// Get the name of a channel (e.g. filter name for fluorescence).
+    pub fn channel_name(&self, channel: u32) -> Option<&str> {
+        self.backend.channel_name(channel)
+    }
 }

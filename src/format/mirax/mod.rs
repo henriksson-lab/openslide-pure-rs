@@ -43,9 +43,23 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     Ok(Box::new(slide))
 }
 
+/// Describes how to read a single logical filter channel.
+#[derive(Debug, Clone)]
+struct ChannelMapping {
+    /// Filter name (e.g. "DAPI-5060C-ZHE-ZERO")
+    name: String,
+    /// Which RGB channel to extract after decoding the tile JPEG (0=R, 1=G, 2=B)
+    rgb_channel: u32,
+    /// Index into `filter_level_grids` for this channel's tile data.
+    filter_level_idx: usize,
+}
+
 /// The Mirax slide backend.
 struct MiraxSlide {
-    levels: Vec<MiraxLevelData>,
+    /// Zoom level data for each filter level. Index 0 = FilterLevel_0, etc.
+    filter_level_grids: Vec<Vec<MiraxLevelData>>,
+    /// Mapping from logical channel index to filter level + RGB channel.
+    channels: Vec<ChannelMapping>,
     properties: HashMap<String, String>,
     datafile_paths: Vec<PathBuf>,
     associated_images: HashMap<String, AssociatedImageInfo>,
@@ -169,132 +183,186 @@ impl MiraxSlide {
             &zoom_params,
         )?;
 
-        // Build levels
-        let mut levels = Vec::with_capacity(zoom_level_count as usize);
-        for i in 0..zoom_level_count as usize {
-            let zs = &sd.zoom_levels[i];
-            let lp = &zoom_params[i];
-
-            let level = MiraxLevel {
-                width: base_w / lp.image_concat as i64,
-                height: base_h / lp.image_concat as i64,
-                downsample: lp.image_concat as f64 / zoom_params[0].image_concat as f64,
-                image_width: zs.image_w,
-                image_height: zs.image_h,
-                tile_w: zs.image_w as f64 / lp.tiles_per_image as f64,
-                tile_h: zs.image_h as f64 / lp.tiles_per_image as f64,
-                image_format: zs.image_format,
-                params: lp.clone(),
-            };
-
-            let grid = TileGrid::new(lp.tile_advance_x, lp.tile_advance_y);
-            levels.push(MiraxLevelData { level, grid });
+        // Collect unique filter level hier offsets
+        // FilterLevel_0 is always at offset 0 (HIER_0).
+        // FilterLevel_1 (if present) is at offset from the slidedat filter metadata.
+        let mut filter_level_hier_offsets: Vec<i32> = vec![0]; // always have FL0 at offset 0
+        for fc in &sd.filter_channels {
+            if fc.hier_offset >= 0 && !filter_level_hier_offsets.contains(&fc.hier_offset) {
+                filter_level_hier_offsets.push(fc.hier_offset);
+            }
         }
 
-        // Read hierarchical entries and populate grids
-        let hier_entries = index.read_hier_data_pages(zoom_level_count, images_x, images_y)?;
+        // Build tile grids for each filter level
+        let mut filter_level_grids: Vec<Vec<MiraxLevelData>> = Vec::new();
 
-        let mut image_number: i32 = 0;
-        let mut active_positions: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        for &hier_base_offset in &filter_level_hier_offsets {
+            // Build empty levels
+            let mut levels = Vec::with_capacity(zoom_level_count as usize);
+            for i in 0..zoom_level_count as usize {
+                let zs = &sd.zoom_levels[i];
+                let lp = &zoom_params[i];
 
-        for (zoom_level, entries) in hier_entries.iter().enumerate() {
-            let lp = &zoom_params[zoom_level];
-            let images_down = images_y;
+                let level = MiraxLevel {
+                    width: base_w / lp.image_concat as i64,
+                    height: base_h / lp.image_concat as i64,
+                    downsample: lp.image_concat as f64 / zoom_params[0].image_concat as f64,
+                    image_width: zs.image_w,
+                    image_height: zs.image_h,
+                    tile_w: zs.image_w as f64 / lp.tiles_per_image as f64,
+                    tile_h: zs.image_h as f64 / lp.tiles_per_image as f64,
+                    image_format: zs.image_format,
+                    params: lp.clone(),
+                };
 
-            for entry in entries {
-                let x = entry.image_index % images_x;
-                let y = entry.image_index / images_x;
+                let grid = TileGrid::new(lp.tile_advance_x, lp.tile_advance_y);
+                levels.push(MiraxLevelData { level, grid });
+            }
 
-                if y >= images_down {
-                    continue;
-                }
+            // Read hierarchical entries for this filter level's zoom levels.
+            // For FilterLevel_0 (offset 0), read records 0..zoom_level_count.
+            // For FilterLevel_1 (e.g. offset 20), read records 20..20+zoom_level_count.
+            // Only read as many zoom levels as we have entries for.
+            let mut image_number: i32 = 0;
+            let mut active_positions: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
-                let image = Arc::new(Image {
-                    fileno: entry.fileno,
-                    offset: entry.offset,
-                    length: entry.length,
-                    imageno: image_number,
-                });
-                image_number += 1;
+            for zoom_level in 0..zoom_level_count as usize {
+                let record_offset = hier_base_offset + zoom_level as i32;
+                let entries = match index.read_hier_record_at_offset(record_offset) {
+                    Ok(e) => e,
+                    Err(_) => break, // no more zoom levels at this filter level
+                };
 
-                let tile_w = levels[zoom_level].level.tile_w;
-                let tile_h = levels[zoom_level].level.tile_h;
+                let lp = &zoom_params[zoom_level];
 
-                // Split image into tiles_per_image^2 tiles
-                for yi in 0..lp.tiles_per_image {
-                    let yy = y + yi * image_divisions;
-                    if yy >= images_y {
-                        break;
+                for entry in &entries {
+                    let x = entry.image_index % images_x;
+                    let y = entry.image_index / images_x;
+
+                    if y >= images_y {
+                        continue;
                     }
 
-                    for xi in 0..lp.tiles_per_image {
-                        let xx = x + xi * image_divisions;
-                        if xx >= images_x {
+                    let image = Arc::new(Image {
+                        fileno: entry.fileno,
+                        offset: entry.offset,
+                        length: entry.length,
+                        imageno: image_number,
+                    });
+                    image_number += 1;
+
+                    let tile_w = levels[zoom_level].level.tile_w;
+                    let tile_h = levels[zoom_level].level.tile_h;
+
+                    for yi in 0..lp.tiles_per_image {
+                        let yy = y + yi * image_divisions;
+                        if yy >= images_y {
                             break;
                         }
 
-                        // Compute tile position
-                        let xp = xx / image_divisions;
-                        let yp = yy / image_divisions;
-                        let cp = yp * (images_x / image_divisions) + xp;
-
-                        // Check/update active positions
-                        if zoom_level == 0 {
-                            if slide_positions[(cp * 2) as usize] == 0
-                                && slide_positions[(cp * 2 + 1) as usize] == 0
-                                && (xp != 0 || yp != 0)
-                            {
-                                continue;
+                        for xi in 0..lp.tiles_per_image {
+                            let xx = x + xi * image_divisions;
+                            if xx >= images_x {
+                                break;
                             }
-                            active_positions.insert(cp);
-                        } else {
-                            let mut found = false;
-                            for ypp in yp..yp + lp.positions_per_tile {
-                                for xpp in xp..xp + lp.positions_per_tile {
-                                    let cpp = ypp * (images_x / image_divisions) + xpp;
-                                    if active_positions.contains(&cpp) {
-                                        found = true;
+
+                            let xp = xx / image_divisions;
+                            let yp = yy / image_divisions;
+                            let cp = yp * (images_x / image_divisions) + xp;
+
+                            if zoom_level == 0 {
+                                if slide_positions[(cp * 2) as usize] == 0
+                                    && slide_positions[(cp * 2 + 1) as usize] == 0
+                                    && (xp != 0 || yp != 0)
+                                {
+                                    continue;
+                                }
+                                active_positions.insert(cp);
+                            } else {
+                                let mut found = false;
+                                for ypp in yp..yp + lp.positions_per_tile {
+                                    for xpp in xp..xp + lp.positions_per_tile {
+                                        let cpp = ypp * (images_x / image_divisions) + xpp;
+                                        if active_positions.contains(&cpp) {
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    if found {
                                         break;
                                     }
                                 }
-                                if found {
-                                    break;
+                                if !found {
+                                    continue;
                                 }
                             }
-                            if !found {
-                                continue;
-                            }
+
+                            let image0_w = levels[0].level.image_width;
+                            let image0_h = levels[0].level.image_height;
+                            let pos0_x = slide_positions[(cp * 2) as usize]
+                                + image0_w * (xx - xp * image_divisions);
+                            let pos0_y = slide_positions[(cp * 2 + 1) as usize]
+                                + image0_h * (yy - yp * image_divisions);
+
+                            let pos_x = pos0_x as f64 / lp.image_concat as f64;
+                            let pos_y = pos0_y as f64 / lp.image_concat as f64;
+
+                            let tile_col = (x / lp.tile_count_divisor + xi) as i64;
+                            let tile_row = (y / lp.tile_count_divisor + yi) as i64;
+
+                            let offset_x = pos_x - (tile_col as f64 * lp.tile_advance_x);
+                            let offset_y = pos_y - (tile_row as f64 * lp.tile_advance_y);
+
+                            let tile = Tile {
+                                image: Arc::clone(&image),
+                                src_x: tile_w * xi as f64,
+                                src_y: tile_h * yi as f64,
+                            };
+
+                            levels[zoom_level].grid.add_tile(
+                                tile_col, tile_row, offset_x, offset_y, tile_w, tile_h, tile,
+                            );
                         }
-
-                        let image0_w = levels[0].level.image_width;
-                        let image0_h = levels[0].level.image_height;
-                        let pos0_x = slide_positions[(cp * 2) as usize]
-                            + image0_w * (xx - xp * image_divisions);
-                        let pos0_y = slide_positions[(cp * 2 + 1) as usize]
-                            + image0_h * (yy - yp * image_divisions);
-
-                        let pos_x = pos0_x as f64 / lp.image_concat as f64;
-                        let pos_y = pos0_y as f64 / lp.image_concat as f64;
-
-                        let tile_col = (x / lp.tile_count_divisor + xi) as i64;
-                        let tile_row = (y / lp.tile_count_divisor + yi) as i64;
-
-                        let offset_x = pos_x - (tile_col as f64 * lp.tile_advance_x);
-                        let offset_y = pos_y - (tile_row as f64 * lp.tile_advance_y);
-
-                        let tile = Tile {
-                            image: Arc::clone(&image),
-                            src_x: tile_w * xi as f64,
-                            src_y: tile_h * yi as f64,
-                        };
-
-                        levels[zoom_level].grid.add_tile(
-                            tile_col, tile_row, offset_x, offset_y, tile_w, tile_h, tile,
-                        );
                     }
                 }
             }
+
+            filter_level_grids.push(levels);
         }
+
+        // Build channel mappings from filter_channels metadata.
+        // The RGB channel for CY5 after YCbCr→RGB decoding is B (channel 2),
+        // because a single-channel luminance JPEG maps to the blue component.
+        // For FilterLevel_0 channels, storing_channel directly maps to R/G/B.
+        let channels: Vec<ChannelMapping> = if sd.filter_channels.is_empty() {
+            // Non-fluorescence slide: 3 channels = R, G, B
+            vec![
+                ChannelMapping { name: "Red".into(), rgb_channel: 0, filter_level_idx: 0 },
+                ChannelMapping { name: "Green".into(), rgb_channel: 1, filter_level_idx: 0 },
+                ChannelMapping { name: "Blue".into(), rgb_channel: 2, filter_level_idx: 0 },
+            ]
+        } else {
+            sd.filter_channels.iter().map(|fc| {
+                let filter_level_idx = filter_level_hier_offsets.iter()
+                    .position(|&o| o == fc.hier_offset)
+                    .unwrap_or(0);
+
+                // For FilterLevel_0, storing_channel maps directly to RGB position.
+                // For other filter levels with a single channel, the data appears in
+                // B (channel 2) after YCbCr→RGB conversion of a single-channel JPEG.
+                let rgb_channel = if fc.hier_offset == 0 {
+                    fc.storing_channel as u32
+                } else {
+                    2 // Single-channel luminance maps to B after YCbCr→RGB
+                };
+
+                ChannelMapping {
+                    name: fc.name.clone(),
+                    rgb_channel,
+                    filter_level_idx,
+                }
+            }).collect()
+        };
 
         // Build properties
         let mut props = sd.raw_properties;
@@ -347,7 +415,8 @@ impl MiraxSlide {
         }
 
         Ok(MiraxSlide {
-            levels,
+            filter_level_grids,
+            channels,
             properties: props,
             datafile_paths: sd.datafile_paths,
             associated_images,
@@ -445,22 +514,44 @@ impl SlideBackend for MiraxSlide {
         "mirax"
     }
 
+    fn channel_count(&self) -> u32 {
+        self.channels.len() as u32
+    }
+
+    fn channel_name(&self, channel: u32) -> Option<&str> {
+        self.channels.get(channel as usize).map(|c| c.name.as_str())
+    }
+
     fn level_count(&self) -> u32 {
-        self.levels.len() as u32
+        // Use the first filter level's grid count (all filter levels share the same zoom structure)
+        self.filter_level_grids.first().map_or(0, |g| g.len() as u32)
     }
 
     fn level_dimensions(&self, level: u32) -> Option<(u64, u64)> {
-        self.levels.get(level as usize).map(|l| {
+        self.filter_level_grids.first()?.get(level as usize).map(|l| {
             (l.level.width as u64, l.level.height as u64)
         })
     }
 
     fn level_downsample(&self, level: u32) -> Option<f64> {
-        self.levels.get(level as usize).map(|l| l.level.downsample)
+        self.filter_level_grids.first()?.get(level as usize).map(|l| l.level.downsample)
     }
 
     fn read_region(&self, channel: u32, x: i64, y: i64, level: u32, w: u32, h: u32) -> Result<GrayImage> {
-        let level_data = self.levels.get(level as usize).ok_or_else(|| {
+        // Map logical channel to filter level + RGB channel
+        let mapping = self.channels.get(channel as usize).ok_or_else(|| {
+            OpenSlideError::InvalidArgument(format!(
+                "Invalid channel {} (slide has {} channels)", channel, self.channels.len()
+            ))
+        })?;
+
+        let levels = self.filter_level_grids.get(mapping.filter_level_idx).ok_or_else(|| {
+            OpenSlideError::Format(format!(
+                "Filter level {} not found for channel {}", mapping.filter_level_idx, channel
+            ))
+        })?;
+
+        let level_data = levels.get(level as usize).ok_or_else(|| {
             OpenSlideError::InvalidArgument(format!("Invalid level {}", level))
         })?;
 
@@ -476,7 +567,7 @@ impl SlideBackend for MiraxSlide {
             let decoded = self.decode_tile_channel(
                 &entry.tile,
                 level_data.level.image_format,
-                channel,
+                mapping.rgb_channel,
             )?;
 
             let tile_origin_x =

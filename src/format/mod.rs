@@ -9,6 +9,8 @@ use crate::pixel::{GrayImage, RgbaImage};
 /// Trait implemented by each slide format backend.
 pub(crate) trait SlideBackend {
     fn vendor(&self) -> &'static str;
+    fn channel_count(&self) -> u32;
+    fn channel_name(&self, channel: u32) -> Option<&str>;
     fn level_count(&self) -> u32;
     fn level_dimensions(&self, level: u32) -> Option<(u64, u64)>;
     fn level_downsample(&self, level: u32) -> Option<f64>;

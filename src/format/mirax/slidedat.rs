@@ -17,10 +17,31 @@ pub struct SlideDat {
     pub layers: Vec<HierLayer>,
     /// All non-hierarchical layers.
     pub nonhier_layers: Vec<NonhierLayer>,
+    /// Parsed filter channel info (from "Slide filter level" HIER layer).
+    pub filter_channels: Vec<FilterChannel>,
     /// All raw key-value pairs for properties export.
     pub raw_properties: HashMap<String, String>,
     /// The raw Ini handle for looking up arbitrary section keys.
     ini: Ini,
+}
+
+/// A fluorescence filter channel descriptor.
+#[derive(Debug, Clone)]
+pub struct FilterChannel {
+    /// Filter name, e.g. "DAPI-5060C-ZHE-ZERO"
+    pub name: String,
+    /// Which RGB channel stores this filter's data (0=R, 1=G, 2=B).
+    pub storing_channel: i32,
+    /// Which FilterLevel this channel's tiles belong to (e.g. "FilterLevel_0").
+    pub filter_level_name: String,
+    /// The hier record offset where this filter level's zoom level 0 tiles start.
+    /// For FilterLevel_0 this is 0 (same as HIER_0), for FilterLevel_1 it's
+    /// the offset of "ExtFocusLevel" in HIER_3 (or wherever the data lives).
+    pub hier_offset: i32,
+    /// Display color.
+    pub color_r: u8,
+    pub color_g: u8,
+    pub color_b: u8,
 }
 
 #[derive(Debug)]
@@ -473,6 +494,85 @@ impl SlideDat {
             });
         }
 
+        // Parse filter channels from "Slide filter level" HIER layer
+        let mut filter_channels = Vec::new();
+        // Compute hier offsets for each layer
+        let mut hier_offsets: Vec<i32> = Vec::new(); // start offset for each HIER layer
+        {
+            let mut off = 0i32;
+            for layer in &layers {
+                hier_offsets.push(off);
+                off += layer.levels.len() as i32;
+            }
+        }
+
+        // Find "Slide filter level" layer and parse its channels
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            if layer.name.trim() != "Slide filter level" {
+                continue;
+            }
+            for level in &layer.levels {
+                if let Some(ref sec) = level.section {
+                    let sec = sec.trim();
+                    let name = ini.get(sec, "FILTER_NAME").unwrap_or_default();
+                    let storing_ch = ini.get(sec, "STORING_CHANNEL_NUMBER")
+                        .and_then(|v| parse_int(&v).ok())
+                        .unwrap_or(0);
+                    let filter_level_name = ini.get(sec, "DATA_IN_THIS_FILTER_LEVEL")
+                        .unwrap_or_default();
+                    let color_r = ini.get(sec, "COLOR_R")
+                        .and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(255);
+                    let color_g = ini.get(sec, "COLOR_G")
+                        .and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(255);
+                    let color_b = ini.get(sec, "COLOR_B")
+                        .and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(255);
+
+                    // Find the hier offset for the filter level's data.
+                    // FilterLevel_0 data is at HIER_0 (offset 0).
+                    // FilterLevel_1 data: look for it at other HIER layers.
+                    let hier_offset = if filter_level_name.trim() == "FilterLevel_0" {
+                        0 // HIER_0 zoom level 0
+                    } else {
+                        // Look for this filter level name in the "Slide filter level"
+                        // HIER's own values. The actual tile data for FilterLevel_1
+                        // seems to be at the corresponding HIER_3 "ExtFocusLevel" offset.
+                        // For now: find which HIER_2 level matches this name, and
+                        // use the corresponding z-stack offset.
+                        // The pattern observed: HIER_3 ExtFocusLevel (offset = sum of
+                        // HIER_0+HIER_1+HIER_2 levels) contains FilterLevel_1 tiles.
+                        let mut found = -1i32;
+                        // Find which level in HIER_2 this filter_level_name matches
+                        for (li, ll) in layer.levels.iter().enumerate() {
+                            if ll.name.trim() == filter_level_name.trim() {
+                                // FilterLevel_1 is at HIER_2 level li.
+                                // But its actual tile data is at the HIER_3 ExtFocusLevel
+                                // offset, which is hier_offsets[3] (for HIER_3 layer index 3).
+                                // Specifically: offset = hier_offsets[HIER_3_index]
+                                if layers.len() > layer_idx + 1 {
+                                    // Next HIER layer (typically HIER_3 "Microscope focus level")
+                                    // The ExtFocusLevel at offset 0 of that layer has the data
+                                    found = hier_offsets.get(layer_idx + 1).copied().unwrap_or(-1);
+                                }
+                                let _ = li;
+                                break;
+                            }
+                        }
+                        found
+                    };
+
+                    filter_channels.push(FilterChannel {
+                        name,
+                        storing_channel: storing_ch,
+                        filter_level_name,
+                        hier_offset,
+                        color_r,
+                        color_g,
+                        color_b,
+                    });
+                }
+            }
+        }
+
         Ok(SlideDat {
             general: GeneralSection {
                 slide_id,
@@ -503,6 +603,7 @@ impl SlideDat {
             zoom_levels,
             layers,
             nonhier_layers,
+            filter_channels,
             raw_properties,
             ini,
         })

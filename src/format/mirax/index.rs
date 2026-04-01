@@ -275,6 +275,79 @@ impl IndexFile {
 
         Ok(all_entries)
     }
+
+    /// Read tile entries from a single hier record at a given offset in the
+    /// pointer table. The offset is the sequential index across all HIER layers
+    /// (e.g. offset 0 = first HIER_0 level, offset 10 = first HIER_1 level, etc.)
+    ///
+    /// Returns Ok(entries) if the record contains tile data, or Err if it doesn't
+    /// match the expected tile data page structure.
+    pub fn read_hier_record_at_offset(&mut self, record_offset: i32) -> Result<Vec<HierEntry>> {
+        self.seek(self.hier_root)?;
+        let root_ptr = self.read_i32()?;
+        if root_ptr < 0 {
+            return Err(OpenSlideError::Format("Can't read initial hier pointer".into()));
+        }
+
+        let seek_location = root_ptr as i64 + record_offset as i64 * 4;
+        self.seek(seek_location)?;
+        let level_ptr = self.read_i32()?;
+        if level_ptr < 0 {
+            return Err(OpenSlideError::Format(format!(
+                "Can't read hier record pointer at offset {}", record_offset
+            )));
+        }
+
+        self.seek(level_ptr as i64)?;
+
+        let initial = self.read_i32()?;
+        if initial != 0 {
+            return Err(OpenSlideError::Format(format!(
+                "Expected 0 at beginning of data page at offset {}, got {}",
+                record_offset, initial
+            )));
+        }
+
+        let first_page = self.read_i32()?;
+        if first_page < 0 {
+            return Err(OpenSlideError::Format(
+                "Can't read initial data page pointer".into(),
+            ));
+        }
+
+        self.seek(first_page as i64)?;
+
+        let mut entries = Vec::new();
+        loop {
+            let page_len = self.read_i32()?;
+            if page_len < 0 {
+                return Err(OpenSlideError::Format("Can't read page length".into()));
+            }
+
+            let next_ptr = self.read_i32()?;
+
+            for _ in 0..page_len {
+                let image_index = self.read_i32()?;
+                let offset = self.read_i32()?;
+                let length = self.read_i32()?;
+                let fileno = self.read_i32()?;
+
+                entries.push(HierEntry {
+                    image_index,
+                    offset,
+                    length,
+                    fileno,
+                });
+            }
+
+            if next_ptr <= 0 {
+                break;
+            }
+            self.seek(next_ptr as i64)?;
+        }
+
+        Ok(entries)
+    }
 }
 
 #[cfg(test)]
