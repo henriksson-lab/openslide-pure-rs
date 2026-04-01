@@ -1,4 +1,4 @@
-# openslide-rs
+# openslide-pure-rs
 
 A pure Rust library for reading whole-slide images (digital pathology), inspired by [OpenSlide](https://openslide.org/).
 
@@ -54,7 +54,7 @@ let rgba = slide.read_region_rgba(
 #### Slide info
 
 ```
-$ openslide-rs info slide.mrxs
+$ openslide-pure-rs info slide.mrxs
 
 === Slide Info ===
 Slide ID:       0A6E096C19BC4977A324C3AE7EFD105F
@@ -89,20 +89,20 @@ HIER_2: "Slide filter level" (4 levels)
 
 ```sh
 # DAPI channel at full resolution, 256x256 tile from the center
-openslide-rs read slide.mrxs 33024 78720 256 256 --channel 0 --out dapi.png
+openslide-pure-rs read slide.mrxs 33024 78720 256 256 --channel 0 --out dapi.png
 
 # CY5 channel (4th filter)
-openslide-rs read slide.mrxs 33024 78720 256 256 --channel 3 --out cy5.png
+openslide-pure-rs read slide.mrxs 33024 78720 256 256 --channel 3 --out cy5.png
 
 # Read from a lower zoom level (level 9 = 512x downsample)
-openslide-rs read slide.mrxs 0 0 129 307 --level 9 --channel 0 --out thumb.png
+openslide-pure-rs read slide.mrxs 0 0 129 307 --level 9 --channel 0 --out thumb.png
 ```
 
 #### All channels side by side
 
 ```sh
 # Horizontally concatenate all channels into one image
-openslide-rs read slide.mrxs 0 0 129 307 --level 9 --all --out all_channels.png
+openslide-pure-rs read slide.mrxs 0 0 129 307 --level 9 --all --out all_channels.png
 # → Wrote 516x307 (4 channels: DAPI | FITC | TRITC | CY5) to all_channels.png
 ```
 
@@ -110,7 +110,7 @@ openslide-rs read slide.mrxs 0 0 129 307 --level 9 --all --out all_channels.png
 
 ```sh
 # Map channels to RGB (e.g. DAPI→Red, FITC→Green, TRITC→Blue)
-openslide-rs read slide.mrxs 33024 78720 256 256 --rgb 0,1,2 --out composite.png
+openslide-pure-rs read slide.mrxs 33024 78720 256 256 --rgb 0,1,2 --out composite.png
 ```
 
 ## API

@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use openslide_rs::format::mirax::slidedat::SlideDat;
-use openslide_rs::OpenSlide;
+use openslide_pure_rs::format::mirax::slidedat::SlideDat;
+use openslide_pure_rs::OpenSlide;
 
 fn print_usage() {
-    eprintln!("Usage: openslide-rs <command> <file.mrxs> [options]");
+    eprintln!("Usage: openslide-pure-rs <command> <file.mrxs> [options]");
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  info                          Show all layers, formats, and slide metadata");
@@ -135,9 +135,9 @@ fn cmd_info(path: &str) {
              "Level", "Format", "Tile W", "Tile H", "MPP X", "MPP Y", "Concat");
     for (i, zl) in sd.zoom_levels.iter().enumerate() {
         let format_name = match zl.image_format {
-            openslide_rs::decode::ImageFormat::Jpeg => "JPEG",
-            openslide_rs::decode::ImageFormat::Png => "PNG",
-            openslide_rs::decode::ImageFormat::Bmp => "BMP24",
+            openslide_pure_rs::decode::ImageFormat::Jpeg => "JPEG",
+            openslide_pure_rs::decode::ImageFormat::Png => "PNG",
+            openslide_pure_rs::decode::ImageFormat::Bmp => "BMP24",
         };
         println!("{:<6} {:>6} {:>12} {:>12} {:>8.4} {:>8.4} {:>10}",
                  i, format_name, zl.image_w, zl.image_h,
@@ -188,7 +188,7 @@ fn cmd_info(path: &str) {
 
 fn cmd_read(path: &str, args: &[String]) {
     if args.len() < 4 {
-        eprintln!("Usage: openslide-rs read <file> <x> <y> <w> <h> [options]");
+        eprintln!("Usage: openslide-pure-rs read <file> <x> <y> <w> <h> [options]");
         std::process::exit(1);
     }
 
@@ -233,7 +233,7 @@ fn cmd_read(path: &str, args: &[String]) {
     if mode == "all" {
         // Read all channels and concatenate horizontally
         let n = slide.channel_count();
-        let mut tiles: Vec<openslide_rs::GrayImage> = Vec::new();
+        let mut tiles: Vec<openslide_pure_rs::GrayImage> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
         for ch in 0..n {
             let name = slide.channel_name(ch).unwrap_or("?").to_string();

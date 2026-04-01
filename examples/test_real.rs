@@ -1,4 +1,4 @@
-use openslide_rs::OpenSlide;
+use openslide_pure_rs::OpenSlide;
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
