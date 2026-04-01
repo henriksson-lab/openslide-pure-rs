@@ -1,0 +1,154 @@
+use std::collections::HashMap;
+
+use crate::format::mirax::tile::Tile;
+
+/// A tile grid that maps (col, row) to tile entries.
+///
+/// This is a tilemap-style grid where tiles may have offsets from their
+/// nominal positions and can be sub-regions of larger images.
+#[derive(Debug)]
+pub struct TileGrid {
+    pub tile_advance_x: f64,
+    pub tile_advance_y: f64,
+    tiles: HashMap<(i64, i64), TileEntry>,
+}
+
+#[derive(Debug)]
+pub struct TileEntry {
+    pub tile: Tile,
+    /// Offset from nominal grid position.
+    pub offset_x: f64,
+    pub offset_y: f64,
+    /// Tile dimensions.
+    pub w: f64,
+    pub h: f64,
+}
+
+impl TileGrid {
+    pub fn new(tile_advance_x: f64, tile_advance_y: f64) -> Self {
+        Self {
+            tile_advance_x,
+            tile_advance_y,
+            tiles: HashMap::new(),
+        }
+    }
+
+    /// Add a tile at the given grid position.
+    pub fn add_tile(
+        &mut self,
+        col: i64,
+        row: i64,
+        offset_x: f64,
+        offset_y: f64,
+        w: f64,
+        h: f64,
+        tile: Tile,
+    ) {
+        self.tiles.insert(
+            (col, row),
+            TileEntry {
+                tile,
+                offset_x,
+                offset_y,
+                w,
+                h,
+            },
+        );
+    }
+
+    /// Get the tile entry at (col, row), if any.
+    pub fn get_tile(&self, col: i64, row: i64) -> Option<&TileEntry> {
+        self.tiles.get(&(col, row))
+    }
+
+    /// Find all tiles that overlap the given pixel region.
+    ///
+    /// The region is specified in this level's coordinate space.
+    /// Returns (col, row, entry) for each overlapping tile.
+    pub fn tiles_in_region(
+        &self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    ) -> Vec<(i64, i64, &TileEntry)> {
+        if self.tile_advance_x <= 0.0 || self.tile_advance_y <= 0.0 {
+            return Vec::new();
+        }
+
+        let col_start = (x / self.tile_advance_x).floor() as i64;
+        let col_end = ((x + w) / self.tile_advance_x).ceil() as i64;
+        let row_start = (y / self.tile_advance_y).floor() as i64;
+        let row_end = ((y + h) / self.tile_advance_y).ceil() as i64;
+
+        let mut result = Vec::new();
+        for row in row_start..row_end {
+            for col in col_start..col_end {
+                if let Some(entry) = self.tiles.get(&(col, row)) {
+                    result.push((col, row, entry));
+                }
+            }
+        }
+        result
+    }
+
+    pub fn tile_count(&self) -> usize {
+        self.tiles.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::mirax::tile::{Image, Tile};
+    use std::sync::Arc;
+
+    fn make_tile(imageno: i32) -> Tile {
+        Tile {
+            image: Arc::new(Image {
+                fileno: 0,
+                offset: 0,
+                length: 0,
+                imageno,
+            }),
+            src_x: 0.0,
+            src_y: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_grid_add_and_get() {
+        let mut grid = TileGrid::new(256.0, 256.0);
+        grid.add_tile(0, 0, 0.0, 0.0, 256.0, 256.0, make_tile(0));
+        grid.add_tile(1, 0, 0.0, 0.0, 256.0, 256.0, make_tile(1));
+
+        assert_eq!(grid.tile_count(), 2);
+        assert!(grid.get_tile(0, 0).is_some());
+        assert!(grid.get_tile(1, 0).is_some());
+        assert!(grid.get_tile(2, 0).is_none());
+    }
+
+    #[test]
+    fn test_tiles_in_region() {
+        let mut grid = TileGrid::new(256.0, 256.0);
+        for row in 0..4 {
+            for col in 0..4 {
+                grid.add_tile(col, row, 0.0, 0.0, 256.0, 256.0, make_tile((row * 4 + col) as i32));
+            }
+        }
+
+        // Region covering (100, 100) to (400, 400) should hit tiles at
+        // cols 0..2, rows 0..2
+        let tiles = grid.tiles_in_region(100.0, 100.0, 300.0, 300.0);
+        // cols: floor(100/256)=0, ceil(400/256)=2 -> cols 0,1
+        // rows: floor(100/256)=0, ceil(400/256)=2 -> rows 0,1
+        assert_eq!(tiles.len(), 4); // 2x2 = 4 tiles
+    }
+
+    #[test]
+    fn test_tiles_in_region_empty() {
+        let grid = TileGrid::new(256.0, 256.0);
+        let tiles = grid.tiles_in_region(0.0, 0.0, 512.0, 512.0);
+        assert_eq!(tiles.len(), 0);
+    }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "openslide-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust library for reading whole slide images"
+license = "LGPL-2.1"
+
+[dependencies]
+thiserror = "2"
+configparser = "3"
+zune-jpeg = "0.5"
+png = "0.17"
+byteorder = "1"
+flate2 = "1"
+lru = "0.12"
+
+[dev-dependencies]

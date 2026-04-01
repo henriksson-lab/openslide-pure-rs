@@ -1,0 +1,87 @@
+pub mod error;
+pub mod pixel;
+pub mod properties;
+pub mod decode;
+pub mod grid;
+pub mod cache;
+pub mod format;
+
+use std::collections::HashMap;
+use std::path::Path;
+
+pub use error::{OpenSlideError, Result};
+pub use pixel::RgbaImage;
+
+/// The main OpenSlide handle for reading whole slide images.
+pub struct OpenSlide {
+    backend: Box<dyn format::SlideBackend>,
+}
+
+impl OpenSlide {
+    /// Open a whole slide image file.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let backend = format::open_slide(path.as_ref())?;
+        Ok(Self { backend })
+    }
+
+    /// Detect the vendor of a slide file without fully opening it.
+    pub fn detect_vendor(path: impl AsRef<Path>) -> Option<&'static str> {
+        format::detect_vendor(path.as_ref())
+    }
+
+    /// Get the number of zoom levels.
+    pub fn level_count(&self) -> u32 {
+        self.backend.level_count()
+    }
+
+    /// Get the dimensions (width, height) of a zoom level.
+    pub fn level_dimensions(&self, level: u32) -> Option<(u64, u64)> {
+        self.backend.level_dimensions(level)
+    }
+
+    /// Get the downsample factor of a zoom level.
+    pub fn level_downsample(&self, level: u32) -> Option<f64> {
+        self.backend.level_downsample(level)
+    }
+
+    /// Get the best level for the given downsample factor.
+    pub fn best_level_for_downsample(&self, downsample: f64) -> u32 {
+        let count = self.level_count();
+        for level in (0..count).rev() {
+            if let Some(ds) = self.level_downsample(level) {
+                if ds <= downsample {
+                    return level;
+                }
+            }
+        }
+        0
+    }
+
+    /// Read a region from the slide at the given level.
+    ///
+    /// Coordinates (x, y) are in the level 0 reference frame.
+    /// Returns an RGBA image of size (w, h).
+    pub fn read_region(&self, x: i64, y: i64, level: u32, w: u32, h: u32) -> Result<RgbaImage> {
+        self.backend.read_region(x, y, level, w, h)
+    }
+
+    /// Get all properties as key-value pairs.
+    pub fn properties(&self) -> &HashMap<String, String> {
+        self.backend.properties()
+    }
+
+    /// Get the names of available associated images.
+    pub fn associated_image_names(&self) -> Vec<&str> {
+        self.backend.associated_image_names()
+    }
+
+    /// Read an associated image by name.
+    pub fn read_associated_image(&self, name: &str) -> Result<RgbaImage> {
+        self.backend.read_associated_image(name)
+    }
+
+    /// Get the vendor name for this slide.
+    pub fn vendor(&self) -> &'static str {
+        self.backend.vendor()
+    }
+}
