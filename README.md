@@ -4,6 +4,10 @@ A pure Rust library for reading whole-slide images (digital pathology), inspired
 
 Currently supports the **Mirax (.mrxs)** format from 3DHISTECH scanners, including fluorescence slides with multiple filter channels and z-stacks.
 
+Contact me if you wish for me to add more of the file formats from the original OpenSlide. However, I will need example data to ensure that the read functions are working.
+
+**Note that this version fixes a problem in the original OpenSlide, namely, it can read all 4 channels. The file format has been reverse engineered**
+
 ## Features
 
 - **Pure Rust** -- no C dependencies, no libjpeg, no glib, no Cairo
@@ -45,6 +49,8 @@ let rgba = slide.read_region_rgba(
 
 ### CLI
 
+#### Slide info
+
 ```
 $ openslide-rs info slide.mrxs
 
@@ -53,16 +59,11 @@ Slide ID:       0A6E096C19BC4977A324C3AE7EFD105F
 Slide type:     SLIDE_TYPE_FLUORESCENCE
 Magnification:  20x
 Image grid:     258 x 615
-Slide bitdepth: 8
-Camera bitdepth:16
-Data files:     204
 
 === Hierarchical Layers (4) ===
 
 HIER_0: "Slide zoom level" (10 levels)
-  Level 0: "ZoomLevel_0" [...]  format=JPEG, tile=256x256, mpp=0.325, concat=0
-  Level 1: "ZoomLevel_1" [...]  format=JPEG, tile=256x256, mpp=0.65, concat=1
-  ...
+  Level 0: "ZoomLevel_0" [...]  format=JPEG, tile=256x256, mpp=0.325
 
 HIER_2: "Slide filter level" (4 levels)
   Level 0: "FilterLevel_0" [...]  filter="DAPI-5060C-ZHE-ZERO", z_steps=8
@@ -70,21 +71,44 @@ HIER_2: "Slide filter level" (4 levels)
   Level 2: "FilterLevel_2" [...]  filter="LED-TRITC-ZERO", z_steps=8
   Level 3: "FilterLevel_3" [...]  filter="CY5-4040C", z_steps=8
 
-HIER_3: "Microscope focus level" (9 levels)
-  Level 0: "ExtFocusLevel" [...]  z_offset=0um
-  Level 1: "ZStackLevel_(-3)" [...]  z_offset=-3um
-  ...
+=== Channels (4) ===
+  Ch 0: DAPI-5060C-ZHE-ZERO
+  Ch 1: LED-FITC-A-ZHE-ZERO
+  Ch 2: LED-TRITC-ZERO
+  Ch 3: CY5-4040C
 
 === Computed Dimensions ===
   Level  0:  66048 x 157440  (downsample 1)
-  Level  1:  33024 x 78720   (downsample 2)
   ...
   Level  9:    129 x 307     (downsample 512)
+```
 
-=== Associated Images ===
-  label: 1725x1299
-  macro: 1405x3313
-  thumbnail: 1032x2460
+#### Read a single channel
+
+```sh
+# DAPI channel at full resolution, 256x256 tile from the center
+openslide-rs read slide.mrxs 33024 78720 256 256 --channel 0 --out dapi.png
+
+# CY5 channel (4th filter)
+openslide-rs read slide.mrxs 33024 78720 256 256 --channel 3 --out cy5.png
+
+# Read from a lower zoom level (level 9 = 512x downsample)
+openslide-rs read slide.mrxs 0 0 129 307 --level 9 --channel 0 --out thumb.png
+```
+
+#### All channels side by side
+
+```sh
+# Horizontally concatenate all channels into one image
+openslide-rs read slide.mrxs 0 0 129 307 --level 9 --all --out all_channels.png
+# → Wrote 516x307 (4 channels: DAPI | FITC | TRITC | CY5) to all_channels.png
+```
+
+#### RGB composite
+
+```sh
+# Map channels to RGB (e.g. DAPI→Red, FITC→Green, TRITC→Blue)
+openslide-rs read slide.mrxs 33024 78720 256 256 --rgb 0,1,2 --out composite.png
 ```
 
 ## API

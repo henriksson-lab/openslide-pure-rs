@@ -4,10 +4,18 @@ use openslide_rs::format::mirax::slidedat::SlideDat;
 use openslide_rs::OpenSlide;
 
 fn print_usage() {
-    eprintln!("Usage: openslide-rs <command> <file.mrxs>");
+    eprintln!("Usage: openslide-rs <command> <file.mrxs> [options]");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  info    Show all layers, formats, and slide metadata");
+    eprintln!("  info                          Show all layers, formats, and slide metadata");
+    eprintln!("  read <x> <y> <w> <h> [opts]   Read a region and write to PNG");
+    eprintln!();
+    eprintln!("Read options:");
+    eprintln!("  --level N        Zoom level (default: 0)");
+    eprintln!("  --channel N      Single channel to read (default: 0)");
+    eprintln!("  --rgb R,G,B      Map channels to RGB (e.g. --rgb 0,1,2)");
+    eprintln!("  --all            Concatenate all channels horizontally");
+    eprintln!("  --out FILE       Output filename (default: out.png)");
 }
 
 fn cmd_info(path: &str) {
@@ -178,6 +186,127 @@ fn cmd_info(path: &str) {
     }
 }
 
+fn cmd_read(path: &str, args: &[String]) {
+    if args.len() < 4 {
+        eprintln!("Usage: openslide-rs read <file> <x> <y> <w> <h> [options]");
+        std::process::exit(1);
+    }
+
+    let x: i64 = args[0].parse().unwrap_or_else(|_| { eprintln!("Invalid x"); std::process::exit(1); });
+    let y: i64 = args[1].parse().unwrap_or_else(|_| { eprintln!("Invalid y"); std::process::exit(1); });
+    let w: u32 = args[2].parse().unwrap_or_else(|_| { eprintln!("Invalid w"); std::process::exit(1); });
+    let h: u32 = args[3].parse().unwrap_or_else(|_| { eprintln!("Invalid h"); std::process::exit(1); });
+
+    let mut level: u32 = 0;
+    let mut out = "out.png".to_string();
+    let mut rgb_channels: Option<[u32; 3]> = None;
+    let mut single_channel: u32 = 0;
+    let mut mode = "single"; // "single", "rgb", "all"
+
+    let mut i = 4;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--level" => { i += 1; level = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0); }
+            "--channel" => { i += 1; single_channel = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0); mode = "single"; }
+            "--rgb" => {
+                i += 1;
+                if let Some(val) = args.get(i) {
+                    let parts: Vec<u32> = val.split(',').filter_map(|s| s.parse().ok()).collect();
+                    if parts.len() == 3 {
+                        rgb_channels = Some([parts[0], parts[1], parts[2]]);
+                        mode = "rgb";
+                    }
+                }
+            }
+            "--all" => { mode = "all"; }
+            "--out" => { i += 1; if let Some(v) = args.get(i) { out = v.clone(); } }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let slide = match OpenSlide::open(path) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Error opening slide: {}", e); std::process::exit(1); }
+    };
+
+    if mode == "all" {
+        // Read all channels and concatenate horizontally
+        let n = slide.channel_count();
+        let mut tiles: Vec<openslide_rs::GrayImage> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        for ch in 0..n {
+            let name = slide.channel_name(ch).unwrap_or("?").to_string();
+            match slide.read_region(ch, x, y, level, w, h) {
+                Ok(img) => { tiles.push(img); labels.push(name); }
+                Err(e) => { eprintln!("Error reading ch{} {}: {}", ch, name, e); std::process::exit(1); }
+            }
+        }
+
+        // Build concatenated grayscale image
+        let total_w = w * n;
+        let mut concat = vec![0u8; total_w as usize * h as usize];
+        for (ci, tile) in tiles.iter().enumerate() {
+            let x_off = ci as u32 * w;
+            for row in 0..h.min(tile.height) {
+                for col in 0..w.min(tile.width) {
+                    let src = row as usize * tile.width as usize + col as usize;
+                    let dst = row as usize * total_w as usize + (x_off + col) as usize;
+                    if src < tile.data.len() {
+                        concat[dst] = tile.data[src];
+                    }
+                }
+            }
+        }
+
+        write_png_gray(&out, &concat, total_w, h);
+        println!("Wrote {}x{} ({} channels: {}) to {}",
+                 total_w, h, n, labels.join(" | "), out);
+    } else if mode == "rgb" {
+        let chs = rgb_channels.unwrap();
+        let rgba = match slide.read_region_rgba(
+            [Some(chs[0]), Some(chs[1]), Some(chs[2]), None],
+            x, y, level, w, h,
+        ) {
+            Ok(img) => img,
+            Err(e) => { eprintln!("Error reading region: {}", e); std::process::exit(1); }
+        };
+
+        write_png_rgba(&out, &rgba.data, rgba.width, rgba.height);
+        println!("Wrote {}x{} RGB image to {}", rgba.width, rgba.height, out);
+    } else {
+        // Single channel mode: write as grayscale PNG
+        let gray = match slide.read_region(single_channel, x, y, level, w, h) {
+            Ok(img) => img,
+            Err(e) => { eprintln!("Error reading region: {}", e); std::process::exit(1); }
+        };
+
+        write_png_gray(&out, &gray.data, gray.width, gray.height);
+        let name = slide.channel_name(single_channel).unwrap_or("?");
+        println!("Wrote {}x{} grayscale (ch{} {}) to {}", gray.width, gray.height, single_channel, name, out);
+    }
+}
+
+fn write_png_gray(path: &str, data: &[u8], width: u32, height: u32) {
+    let file = std::fs::File::create(path).unwrap();
+    let w = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(w, width, height);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(data).unwrap();
+}
+
+fn write_png_rgba(path: &str, data: &[u8], width: u32, height: u32) {
+    let file = std::fs::File::create(path).unwrap();
+    let w = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(w, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(data).unwrap();
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -188,9 +317,11 @@ fn main() {
 
     let command = &args[1];
     let path = &args[2];
+    let rest = &args[3..];
 
     match command.as_str() {
         "info" => cmd_info(path),
+        "read" => cmd_read(path, rest),
         _ => {
             eprintln!("Unknown command: {}", command);
             print_usage();

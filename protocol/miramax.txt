@@ -1,0 +1,273 @@
+MIRAX (.mrxs) Format Specification (Partial, Reverse-Engineered)
+================================================================
+
+Based on OpenSlide C source, Python parser, and investigation of a real
+fluorescence slide (2079_R1.mrxs, 3DHISTECH scanner, SLIDE_VERSION 01.03).
+
+
+1. FILE STRUCTURE
+-----------------
+
+A Mirax slide consists of:
+
+  slide.mrxs              Plain text file (identifies the slide, not parsed)
+  slide/                  Companion directory (same name minus .mrxs)
+    Slidedat.ini          INI-format metadata (UTF-8, may have BOM EF BB BF)
+    Index.dat             Binary tile index
+    Data0000.dat          }
+    Data0001.dat          } Compressed tile data (JPEG/PNG/BMP)
+    ...                   }
+
+
+2. SLIDEDAT.INI
+---------------
+
+INI format with sections and key=value pairs. Case-sensitive keys.
+Float values may use ',' or '.' as decimal separator.
+
+### [GENERAL]
+  SLIDE_ID                          UUID string (e.g. "0A6E096C19BC4977A324C3AE7EFD105F")
+  SLIDE_VERSION                     Format version (e.g. "01.03")
+  SLIDE_TYPE                        e.g. "SLIDE_TYPE_FLUORESCENCE"
+  IMAGENUMBER_X                     Number of camera images horizontally (258)
+  IMAGENUMBER_Y                     Number of camera images vertically (615)
+  OBJECTIVE_MAGNIFICATION           e.g. 20
+  CameraImageDivisionsPerSide       How many sub-tiles per camera image (1 or 2)
+  VIMSLIDE_SLIDE_BITDEPTH           Output bit depth (e.g. 8)
+  VIMSLIDE_CAMERA_REAL_BITDEPTH     Camera sensor bit depth (e.g. 16)
+
+### [HIERARCHICAL]
+  HIER_COUNT                        Number of hierarchical layers (e.g. 4)
+  NONHIER_COUNT                     Number of non-hierarchical layers (e.g. 5)
+  INDEXFILE                         Index filename (always "Index.dat")
+  PAGEELEMENTCOUNT                  128 (index page parameter)
+  PAGELENGTH                        2048 (index page parameter)
+
+  For each HIER layer i (0..HIER_COUNT-1):
+    HIER_i_NAME                     Layer name (see below)
+    HIER_i_COUNT                    Number of levels in this layer
+    HIER_i_SECTION                  Section name for layer-level metadata
+    HIER_i_VAL_j                    Name of level j
+    HIER_i_VAL_j_SECTION            Section name for level j's metadata
+
+  For each NONHIER layer i:
+    NONHIER_i_NAME                  Layer name
+    NONHIER_i_COUNT                 Number of entries
+    NONHIER_i_VAL_j                 Entry name
+    NONHIER_i_VAL_j_SECTION         Section name
+
+### Hierarchical layer types observed:
+  "Slide zoom level"            HIER_0 — the image pyramid (10 zoom levels)
+  "Slide zoom mask level2"      HIER_1 — mask/segmentation data (2 levels)
+  "Slide filter level"          HIER_2 — fluorescence filter channels (4 filters)
+  "Microscope focus level"      HIER_3 — z-stack focus planes (9 levels)
+
+### [DATAFILE]
+  FILE_COUNT                        Number of data files (e.g. 204)
+  FILE_i                            Filename relative to companion dir (e.g. "Data0001.dat")
+
+### Zoom level sections (e.g. [LAYER_0_LEVEL_0_SECTION])
+  IMAGE_FORMAT                      "JPEG", "PNG", or "BMP24"
+  DIGITIZER_WIDTH                   Tile width in pixels (e.g. 256)
+  DIGITIZER_HEIGHT                  Tile height in pixels (e.g. 256)
+  IMAGE_CONCAT_FACTOR               Concatenation exponent (0 at level 0, 1 at others)
+  OVERLAP_X / OVERLAP_Y             Pixel overlap between camera images
+  MICROMETER_PER_PIXEL_X/Y          Resolution
+  IMAGE_FILL_COLOR_BGR              Background fill color in BGR format
+  IMAGE_COMPRESSION_FACTOR          JPEG quality (e.g. 80)
+
+### Filter level sections (e.g. [LAYER_2_LEVEL_0_SECTION])
+  FILTER_NAME                       e.g. "DAPI-5060C-ZHE-ZERO"
+  STORING_CHANNEL_NUMBER            Which RGB channel stores this filter (0=R, 1=G, 2=B)
+  DATA_IN_THIS_FILTER_LEVEL         Which FilterLevel name holds the tile data
+  COLOR_R / COLOR_G / COLOR_B       Display pseudocolor
+  IS_MASTER_FILTER                  True/False
+  ZSTACK_STEP_COUNT                 Number of z-stack steps (e.g. 8)
+  ZSTACK_FIRST_LEVEL                First z-stack offset (e.g. -3)
+  EXCITATION_FILTER_WAVELENGTH_NM   Excitation wavelength
+  EMISSION_FILTER_WAVELENGTH_NM     Emission wavelength
+
+### Focus level sections (e.g. [LAYER_3_LEVEL_0_SECTION])
+  OFFSET_IN_MICROMETERS             Z offset (e.g. -3, -2, -1, 0, 1, 2, 3, 4)
+
+### Non-hierarchical layer types observed:
+  "StitchingLayerForHWCoord"        Stitching coordinates
+  "Scan data layer"                 Contains:
+    ScanDataLayer_SlideThumbnail    Macro image (JPEG)
+    ScanDataLayer_SlideBarcode      Label image (JPEG)
+    ScanDataLayer_SlidePreview      Thumbnail image (JPEG)
+    ScanDataLayer_StagePositionMap  Stage positions
+    ScanDataLayer_XMLInfoHeader     XML metadata
+    ProfileXMLHeader / ProfileXML   Scanner profile
+    ScannedFOVsMap                  Scanned fields of view
+  "StitchingLayer"                  Stitching data
+  "VIMSLIDE_HISTOGRAM_DATA"         Histogram
+  "ScanInfoLayer"                   Scan metadata
+
+
+3. INDEX.DAT (BINARY)
+---------------------
+
+All integers are 32-bit little-endian (i32).
+
+### Header
+  Bytes 0-4:      Version string "01.02" (5 ASCII bytes, NOT null-terminated)
+  Bytes 5-N:      SLIDE_ID string (length = len(SLIDE_ID from Slidedat.ini))
+  Byte N+0..N+3:  hier_root_ptr    → points to hierarchical pointer table base
+  Byte N+4..N+7:  nonhier_root_ptr → points to non-hierarchical pointer table base
+
+### Hierarchical pointer table
+
+  At hier_root_ptr:
+    i32 table_base_ptr → points to start of pointer array
+
+  At table_base_ptr + record * 4:
+    i32 list_head_ptr → points to list head for this record
+
+  Records are organized in BLOCKS of zoom_level_count (N) records each.
+  The HIER layer counts from Slidedat.ini do NOT directly correspond to
+  the block layout. Instead:
+
+    Block 0: records 0..N-1     = FilterLevel_0 tile data (zoom levels 0..N-1)
+    Block 1: records N..2N-1    = Mask/metadata (small entries, ~100-140 bytes)
+    Block 2: records 2N..3N-1   = FilterLevel_1 tile data (zoom levels 0..N-1)
+    Block 3: records 3N..4N-1   = FilterLevel_2 tile data (if present)
+    ...
+
+  where N = HIER_0_COUNT (number of zoom levels, e.g. 10).
+
+  IMPORTANT: The HIER_COUNT and individual HIER_i_COUNT values in Slidedat.ini
+  do NOT correspond to block sizes. The index uses fixed blocks of N records
+  regardless of what the INI declares. For a 4-HIER slide with 10 zoom levels,
+  the total record count is 3*10 = 30 (not HIER_0+HIER_1+HIER_2+HIER_3 =
+  10+2+4+9 = 25 as the INI would suggest).
+
+### List head structure (at list_head_ptr)
+  i32 initial     Must be 0 (or 0x302e3130 for empty section)
+  i32 data_page_ptr → points to first data page
+
+### Data page (linked list)
+  i32 entry_count
+  i32 next_page_ptr   (0 = no more pages)
+  Then entry_count × 16 bytes, each:
+    i32 image_index   Tile position: x = image_index % IMAGENUMBER_X, y = image_index / IMAGENUMBER_X
+    i32 offset        Byte offset in data file
+    i32 length        Byte length of compressed tile
+    i32 fileno        Index into DATAFILE FILE_i
+
+### Non-hierarchical pointer table
+  Same structure as hierarchical, but at nonhier_root_ptr.
+  Non-hier records have a different page structure:
+    i32 page_size (should be >= 1)
+    i32 next_ptr (sometimes nonzero)
+    i32 zero
+    i32 zero
+    i32 offset
+    i32 size
+    i32 fileno
+
+### Slide position buffer
+  Located via non-hier record (either "VIMSLIDE_POSITION_BUFFER" or
+  "StitchingIntensityLayer", the latter zlib-compressed).
+  Each record is 9 bytes:
+    u8  flag      Must be 0 or 1
+    i32 x         Camera position X (little-endian)
+    i32 y         Camera position Y (little-endian)
+  Final positions are multiplied by level_0_image_concat.
+
+
+4. FLUORESCENCE CHANNEL STORAGE
+-------------------------------
+
+For fluorescence slides, multiple filter channels are packed into the RGB
+channels of JPEG tiles to save space.
+
+### FilterLevel_0 (standard zoom level tiles at HIER_0)
+  Up to 3 channels packed into R, G, B of each JPEG tile:
+    STORING_CHANNEL_NUMBER=0 → R channel  (e.g. DAPI)
+    STORING_CHANNEL_NUMBER=1 → G channel  (e.g. FITC)
+    STORING_CHANNEL_NUMBER=2 → B channel  (e.g. TRITC)
+
+### FilterLevel_1 (additional channels, separate tile set)
+  When there are more than 3 filters, additional FilterLevels are used.
+  DATA_IN_THIS_FILTER_LEVEL = "FilterLevel_1" indicates the channel's
+  tiles are in a separate tile set.
+
+  Observed tile data location for FilterLevel_1:
+    HIER_3 level 0 "ExtFocusLevel" (the extended focus composite)
+    Index record offset = sum of (HIER_0_COUNT + HIER_1_COUNT + HIER_2_COUNT)
+
+  The JPEG tiles contain single-channel luminance data. After standard
+  YCbCr→RGB decoding, the signal appears in the B channel (channel 2),
+  with R=0 and G=0.
+
+### Important: STORING_CHANNEL_NUMBER semantics
+  For FilterLevel_0: STORING_CHANNEL_NUMBER directly maps to R(0)/G(1)/B(2).
+  For FilterLevel_1+: The value refers to the channel allocation within that
+  filter level, NOT the RGB position after JPEG decoding. A single-channel
+  JPEG luminance maps to B after YCbCr→RGB conversion.
+
+
+5. TILE POSITION COMPUTATION
+-----------------------------
+
+Camera photos may overlap. CameraImageDivisionsPerSide controls sub-tiling.
+IMAGE_CONCAT_FACTOR controls how many original tiles are merged at each
+zoom level (always a power of 2).
+
+For zoom level i:
+  total_concat_exponent = sum of concat_exponents[0..i]
+  image_concat = 2^total_concat_exponent
+  tile_w = DIGITIZER_WIDTH / tiles_per_image
+  tile_h = DIGITIZER_HEIGHT / tiles_per_image
+  tile_advance_x = tile_w - (OVERLAP_X / images_per_position)
+  tile_advance_y = tile_h - (OVERLAP_Y / images_per_position)
+
+Tile grid coordinates:
+  tile_col = (image_x / tile_count_divisor) + sub_tile_xi
+  tile_row = (image_y / tile_count_divisor) + sub_tile_yi
+
+Level pixel dimensions:
+  level_width  = base_width  / image_concat
+  level_height = base_height / image_concat
+
+
+6. BLOCK DETECTION
+------------------
+
+  The HIER_COUNT and individual HIER_i_COUNT values in Slidedat.ini do NOT
+  directly map to index record layout. Tile data blocks must be identified
+  by probing:
+
+  - Scan blocks of zoom_level_count consecutive records
+  - Compute average entry data length per block
+  - Blocks with avg entry length > 500 bytes are tile data (JPEG/PNG)
+  - Blocks with avg entry length < 200 bytes are mask/metadata
+  - Assign tile data blocks to FilterLevels in order of appearance
+
+  For non-primary filter levels (FilterLevel_1+), the active RGB channel
+  after YCbCr→RGB decoding is auto-detected by decoding a sample tile and
+  checking which channel (R/G/B) has the highest signal sum.
+
+
+7. NOTES
+--------
+
+### JPEG colorspace detection
+  The JPEG tiles are detected by zune-jpeg as CMYK colorspace despite being
+  3-component YCbCr. This is a misdetection (the encoder likely sets unusual
+  markers). RGB output works correctly despite the wrong detection. Format
+  is auto-detected from magic bytes (FF D8 = JPEG, 89 50 = PNG, 42 4D = BMP)
+  rather than relying on the INI IMAGE_FORMAT field.
+
+### Single-channel JPEG luminance mapping
+  When a JPEG tile contains only one meaningful channel (e.g. CY5 alone in
+  FilterLevel_1), the luminance data ends up in the B channel after
+  YCbCr→RGB conversion (R=0, G=0, B=signal). This is auto-detected during
+  slide open by sampling a tile.
+
+### Z-stack data
+  HIER_3 "Microscope focus level" contains z-stack data with offsets from
+  -3um to +4um. Level 0 "ExtFocusLevel" is the extended focus composite.
+  Currently only ExtFocusLevel is used for FilterLevel_1 tile data.
+  Full z-stack access is not yet implemented.
