@@ -138,10 +138,20 @@ fn cmd_info(path: &str) {
 
     println!();
 
-    // Try opening to get computed dimensions and associated images
-    println!("=== Computed Dimensions ===");
+    // Open slide for computed info
     match OpenSlide::open(path) {
         Ok(slide) => {
+            // Channel info
+            if slide.channel_count() > 0 {
+                println!("=== Channels ({}) ===", slide.channel_count());
+                for ch in 0..slide.channel_count() {
+                    println!("  Ch {}: {}", ch, slide.channel_name(ch).unwrap_or("?"));
+                }
+                println!();
+            }
+
+            // Computed dimensions
+            println!("=== Computed Dimensions ===");
             for i in 0..slide.level_count() {
                 if let Some((w, h)) = slide.level_dimensions(i) {
                     let ds = slide.level_downsample(i).unwrap_or(0.0);
@@ -150,6 +160,7 @@ fn cmd_info(path: &str) {
             }
             println!();
 
+            // Associated images
             let names = slide.associated_image_names();
             if !names.is_empty() {
                 println!("=== Associated Images ===");
@@ -162,7 +173,7 @@ fn cmd_info(path: &str) {
             }
         }
         Err(e) => {
-            eprintln!("  (Could not open slide for dimensions: {})", e);
+            eprintln!("  (Could not open slide: {})", e);
         }
     }
 }

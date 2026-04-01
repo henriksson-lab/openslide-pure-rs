@@ -405,6 +405,43 @@ impl MiraxSlide {
         // The RGB channel for CY5 after YCbCr→RGB decoding is B (channel 2),
         // because a single-channel luminance JPEG maps to the blue component.
         // For FilterLevel_0 channels, storing_channel directly maps to R/G/B.
+        // For non-primary filter levels, auto-detect which RGB channel
+        // carries the signal by decoding a sample tile and checking sums.
+        let mut detected_rgb_channel: HashMap<i32, u32> = HashMap::new();
+        for &offset in &filter_level_hier_offsets {
+            if offset == 0 {
+                continue; // primary filter level uses storing_channel directly
+            }
+            if let Ok(entries) = index.read_hier_record_at_offset(offset) {
+                // Pick the entry with the largest data (likely most signal)
+                if let Some(entry) = entries.iter().max_by_key(|e| e.length) {
+                    if let Ok(path) = sd.datafile_paths.get(entry.fileno as usize)
+                        .ok_or_else(|| OpenSlideError::Format("bad fileno".into()))
+                    {
+                        if let Ok(data) = read_record_data(path, entry.offset as i64, entry.length as i64) {
+                            let format = detect_image_format(&data);
+                            if let Ok((rgb, _, _)) = decode::decode_rgb(format, &data) {
+                                // Sum each channel
+                                let mut sums = [0u64; 3];
+                                for pixel in rgb.chunks_exact(3) {
+                                    sums[0] += pixel[0] as u64;
+                                    sums[1] += pixel[1] as u64;
+                                    sums[2] += pixel[2] as u64;
+                                }
+                                let best = if sums[0] == 0 && sums[1] == 0 && sums[2] == 0 {
+                                    eprintln!("Warning: all RGB channels zero in sample tile for filter level at offset {}; defaulting to B channel", offset);
+                                    2 // All zeros: default to B (YCbCr luminance mapping)
+                                } else if sums[0] >= sums[1] && sums[0] >= sums[2] { 0 }
+                                    else if sums[1] >= sums[2] { 1 }
+                                    else { 2 };
+                                detected_rgb_channel.insert(offset, best);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let channels: Vec<ChannelMapping> = if filter_channels.is_empty() {
             // Non-fluorescence slide: 3 channels = R, G, B
             vec![
@@ -418,13 +455,12 @@ impl MiraxSlide {
                     .position(|&o| o == fc.hier_offset)
                     .unwrap_or(0);
 
-                // For FilterLevel_0, storing_channel maps directly to RGB position.
-                // For other filter levels with a single channel, the data appears in
-                // B (channel 2) after YCbCr→RGB conversion of a single-channel JPEG.
                 let rgb_channel = if fc.hier_offset == 0 {
+                    // Primary filter level: storing_channel maps to RGB directly
                     fc.storing_channel as u32
                 } else {
-                    2 // Single-channel luminance maps to B after YCbCr→RGB
+                    // Non-primary: use auto-detected channel
+                    detected_rgb_channel.get(&fc.hier_offset).copied().unwrap_or(2)
                 };
 
                 ChannelMapping {
