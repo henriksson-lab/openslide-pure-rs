@@ -106,6 +106,24 @@ pub fn decode_jpeg_rgb(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
     Ok((pixels, info.width as u32, info.height as u32))
 }
 
+/// Decode JPEG data and extract a single RGB channel as a grayscale image.
+///
+/// `channel`: 0=R, 1=G, 2=B.
+pub fn decode_jpeg_channel(data: &[u8], channel: u32) -> Result<crate::pixel::GrayImage> {
+    if channel > 2 {
+        return Err(OpenSlideError::InvalidArgument(format!(
+            "Channel {} out of range (0-2)", channel
+        )));
+    }
+    let (rgb, width, height) = decode_jpeg_rgb(data)?;
+    let pixel_count = width as usize * height as usize;
+    let mut gray = Vec::with_capacity(pixel_count);
+    for pixel in rgb.chunks_exact(3) {
+        gray.push(pixel[channel as usize]);
+    }
+    Ok(crate::pixel::GrayImage { width, height, data: gray })
+}
+
 /// Convert YCbCrA (4 bytes/pixel) to RGBA.
 ///
 /// Applies standard YCbCr→RGB conversion on the first 3 components

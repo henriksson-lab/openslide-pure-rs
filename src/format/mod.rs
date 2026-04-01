@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::Result;
-use crate::pixel::RgbaImage;
+use crate::pixel::{GrayImage, RgbaImage};
 
 /// Trait implemented by each slide format backend.
 pub(crate) trait SlideBackend {
@@ -12,7 +12,7 @@ pub(crate) trait SlideBackend {
     fn level_count(&self) -> u32;
     fn level_dimensions(&self, level: u32) -> Option<(u64, u64)>;
     fn level_downsample(&self, level: u32) -> Option<f64>;
-    fn read_region(&self, x: i64, y: i64, level: u32, w: u32, h: u32) -> Result<RgbaImage>;
+    fn read_region(&self, channel: u32, x: i64, y: i64, level: u32, w: u32, h: u32) -> Result<GrayImage>;
     fn properties(&self) -> &HashMap<String, String>;
     fn associated_image_names(&self) -> Vec<&str>;
     fn read_associated_image(&self, name: &str) -> Result<RgbaImage>;

@@ -7,12 +7,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::cache::TileCache;
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::SlideBackend;
 use crate::grid::TileGrid;
-use crate::pixel::RgbaImage;
+use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
 
 use self::index::IndexFile;
@@ -50,7 +49,6 @@ struct MiraxSlide {
     properties: HashMap<String, String>,
     datafile_paths: Vec<PathBuf>,
     associated_images: HashMap<String, AssociatedImageInfo>,
-    cache: TileCache,
 }
 
 struct MiraxLevelData {
@@ -353,7 +351,6 @@ impl MiraxSlide {
             properties: props,
             datafile_paths: sd.datafile_paths,
             associated_images,
-            cache: TileCache::new(),
         })
     }
 
@@ -427,18 +424,19 @@ impl MiraxSlide {
         }
     }
 
-    fn decode_tile(
+    fn decode_tile_channel(
         &self,
         tile: &Tile,
         format: ImageFormat,
-    ) -> Result<RgbaImage> {
+        channel: u32,
+    ) -> Result<GrayImage> {
         let datafile_path = &self.datafile_paths[tile.image.fileno as usize];
         let data = read_record_data(
             datafile_path,
             tile.image.offset as i64,
             tile.image.length as i64,
         )?;
-        decode::decode_to_rgba(format, &data)
+        decode::decode_channel(format, &data, channel)
     }
 }
 
@@ -461,7 +459,7 @@ impl SlideBackend for MiraxSlide {
         self.levels.get(level as usize).map(|l| l.level.downsample)
     }
 
-    fn read_region(&self, x: i64, y: i64, level: u32, w: u32, h: u32) -> Result<RgbaImage> {
+    fn read_region(&self, channel: u32, x: i64, y: i64, level: u32, w: u32, h: u32) -> Result<GrayImage> {
         let level_data = self.levels.get(level as usize).ok_or_else(|| {
             OpenSlideError::InvalidArgument(format!("Invalid level {}", level))
         })?;
@@ -470,53 +468,28 @@ impl SlideBackend for MiraxSlide {
         let lx = x as f64 / downsample;
         let ly = y as f64 / downsample;
 
-        let mut output = RgbaImage::new(w, h);
-
-        // Fill with background (from level 0)
-        // Default: white opaque
-        for pixel in output.data.chunks_exact_mut(4) {
-            pixel[0] = 0xFF;
-            pixel[1] = 0xFF;
-            pixel[2] = 0xFF;
-            pixel[3] = 0xFF;
-        }
+        let mut output = GrayImage::new(w, h);
 
         let tiles = level_data.grid.tiles_in_region(lx, ly, w as f64, h as f64);
 
         for (col, row, entry) in tiles {
-            // Look up or decode the full image for this tile
-            let imageno = entry.tile.image.imageno;
-            let decoded = match self.cache.get(level, imageno) {
-                Some(cached) => cached,
-                None => {
-                    let img = self.decode_tile(
-                        &entry.tile,
-                        level_data.level.image_format,
-                    )?;
-                    self.cache.put(level, imageno, img.clone());
-                    img
-                }
-            };
+            let decoded = self.decode_tile_channel(
+                &entry.tile,
+                level_data.level.image_format,
+                channel,
+            )?;
 
-            // Compute where this tile sits in the output
             let tile_origin_x =
                 col as f64 * level_data.grid.tile_advance_x + entry.offset_x;
             let tile_origin_y =
                 row as f64 * level_data.grid.tile_advance_y + entry.offset_y;
 
-            // Source sub-region within the decoded image
-            let src_x = entry.tile.src_x;
-            let src_y = entry.tile.src_y;
-            let src_w = entry.w;
-            let src_h = entry.h;
-
-            // Copy pixels from decoded tile to output
-            blit_tile(
+            blit_gray(
                 &decoded,
-                src_x,
-                src_y,
-                src_w,
-                src_h,
+                entry.tile.src_x,
+                entry.tile.src_y,
+                entry.w,
+                entry.h,
                 &mut output,
                 tile_origin_x - lx,
                 tile_origin_y - ly,
@@ -545,14 +518,14 @@ impl SlideBackend for MiraxSlide {
     }
 }
 
-/// Blit (copy) a sub-rectangle of a source tile into the destination image.
-fn blit_tile(
-    src: &RgbaImage,
+/// Blit (copy) a sub-rectangle of a grayscale source tile into the destination image.
+fn blit_gray(
+    src: &GrayImage,
     src_x: f64,
     src_y: f64,
     src_w: f64,
     src_h: f64,
-    dst: &mut RgbaImage,
+    dst: &mut GrayImage,
     dst_x: f64,
     dst_y: f64,
 ) {
@@ -579,10 +552,10 @@ fn blit_tile(
                 continue;
             }
 
-            let src_idx = (sy as usize * src.width as usize + sx as usize) * 4;
-            let dst_idx = (dy as usize * dst.width as usize + dx as usize) * 4;
+            let src_idx = sy as usize * src.width as usize + sx as usize;
+            let dst_idx = dy as usize * dst.width as usize + dx as usize;
 
-            dst.data[dst_idx..dst_idx + 4].copy_from_slice(&src.data[src_idx..src_idx + 4]);
+            dst.data[dst_idx] = src.data[src_idx];
         }
     }
 }

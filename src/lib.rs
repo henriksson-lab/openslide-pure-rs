@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub use error::{OpenSlideError, Result};
-pub use pixel::RgbaImage;
+pub use pixel::{GrayImage, RgbaImage};
 
 /// The main OpenSlide handle for reading whole slide images.
 pub struct OpenSlide {
@@ -57,12 +57,15 @@ impl OpenSlide {
         0
     }
 
-    /// Read a region from the slide at the given level.
+    /// Read a single channel from a region of the slide.
+    ///
+    /// `channel`: color channel index (0=R, 1=G, 2=B for standard tiles).
+    /// For fluorescence slides, each channel corresponds to a filter
+    /// (e.g. 0=DAPI, 1=FITC, 2=TRITC packed into R/G/B of the same JPEG).
     ///
     /// Coordinates (x, y) are in the level 0 reference frame.
-    /// Returns an RGBA image of size (w, h).
-    pub fn read_region(&self, x: i64, y: i64, level: u32, w: u32, h: u32) -> Result<RgbaImage> {
-        self.backend.read_region(x, y, level, w, h)
+    pub fn read_region(&self, channel: u32, x: i64, y: i64, level: u32, w: u32, h: u32) -> Result<GrayImage> {
+        self.backend.read_region(channel, x, y, level, w, h)
     }
 
     /// Get all properties as key-value pairs.
