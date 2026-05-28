@@ -1,0 +1,1592 @@
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
+use crate::decode::{self, ImageFormat};
+use crate::error::{OpenSlideError, Result};
+use crate::format::{tiff, SlideBackend};
+use crate::pixel::{GrayImage, RgbaImage};
+use crate::properties;
+
+const PHILIPS_SOFTWARE: &str = "Philips";
+const XML_ROOT: &str = "DataObject";
+const XML_ROOT_TYPE_ATTR: &str = "ObjectType";
+const XML_ROOT_TYPE_VALUE: &str = "DPUfsImport";
+const XML_NAME_ATTR: &str = "Name";
+const XML_SCANNED_IMAGES_NAME: &str = "PIM_DP_SCANNED_IMAGES";
+const XML_DATA_REPRESENTATION_NAME: &str = "PIIM_PIXEL_DATA_REPRESENTATION_SEQUENCE";
+
+const TIFF_MAGIC_CLASSIC: u16 = 42;
+const TIFF_MAGIC_BIG: u16 = 43;
+
+const TYPE_ASCII: u16 = 2;
+const TYPE_SHORT: u16 = 3;
+const TYPE_LONG: u16 = 4;
+const TYPE_LONG8: u16 = 16;
+const TYPE_IFD8: u16 = 18;
+
+const TAG_IMAGEDESCRIPTION: u16 = 270;
+const TAG_SOFTWARE: u16 = 305;
+
+#[derive(Debug, Clone, Copy)]
+enum Endian {
+    Little,
+    Big,
+}
+
+impl Endian {
+    fn read_u16(self, bytes: &[u8]) -> u16 {
+        match self {
+            Endian::Little => u16::from_le_bytes([bytes[0], bytes[1]]),
+            Endian::Big => u16::from_be_bytes([bytes[0], bytes[1]]),
+        }
+    }
+
+    fn read_u32(self, bytes: &[u8]) -> u32 {
+        match self {
+            Endian::Little => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            Endian::Big => u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        }
+    }
+
+    fn read_u64(self, bytes: &[u8]) -> u64 {
+        match self {
+            Endian::Little => u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]),
+            Endian::Big => u64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FirstIfd {
+    entries: HashMap<u16, TiffEntry>,
+}
+
+#[derive(Debug)]
+struct TiffEntry {
+    value_type: u16,
+    raw: Vec<u8>,
+}
+
+impl FirstIfd {
+    fn open(path: &Path) -> Result<Self> {
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        let mut header = [0u8; 16];
+        file.read_exact(&mut header[..8])?;
+
+        let endian = match &header[0..2] {
+            b"II" => Endian::Little,
+            b"MM" => Endian::Big,
+            _ => return Err(OpenSlideError::UnsupportedFormat("Not a TIFF file".into())),
+        };
+
+        let magic = endian.read_u16(&header[2..4]);
+        let (bigtiff, first_ifd_offset) = match magic {
+            TIFF_MAGIC_CLASSIC => (false, endian.read_u32(&header[4..8]) as u64),
+            TIFF_MAGIC_BIG => {
+                file.read_exact(&mut header[8..16])?;
+                if endian.read_u16(&header[4..6]) != 8 || endian.read_u16(&header[6..8]) != 0 {
+                    return Err(OpenSlideError::Format(
+                        "Unsupported BigTIFF offset header".into(),
+                    ));
+                }
+                (true, endian.read_u64(&header[8..16]))
+            }
+            _ => return Err(OpenSlideError::UnsupportedFormat("Not a TIFF file".into())),
+        };
+
+        if first_ifd_offset >= file_len {
+            return Err(OpenSlideError::Format(
+                "TIFF first directory is outside file".into(),
+            ));
+        }
+
+        file.seek(SeekFrom::Start(first_ifd_offset))?;
+        let entry_count = if bigtiff {
+            let mut buf = [0u8; 8];
+            file.read_exact(&mut buf)?;
+            endian.read_u64(&buf)
+        } else {
+            let mut buf = [0u8; 2];
+            file.read_exact(&mut buf)?;
+            endian.read_u16(&buf) as u64
+        };
+        if entry_count > 100_000 {
+            return Err(OpenSlideError::Format(format!(
+                "Unreasonable TIFF directory entry count: {entry_count}"
+            )));
+        }
+
+        let entry_size = if bigtiff { 20usize } else { 12usize };
+        let inline_size = if bigtiff { 8usize } else { 4usize };
+        let mut entries = HashMap::new();
+
+        for _ in 0..entry_count {
+            let mut entry_buf = vec![0u8; entry_size];
+            file.read_exact(&mut entry_buf)?;
+
+            let tag = endian.read_u16(&entry_buf[0..2]);
+            let value_type = endian.read_u16(&entry_buf[2..4]);
+            let count = if bigtiff {
+                endian.read_u64(&entry_buf[4..12])
+            } else {
+                endian.read_u32(&entry_buf[4..8]) as u64
+            };
+            let value_field = if bigtiff {
+                &entry_buf[12..20]
+            } else {
+                &entry_buf[8..12]
+            };
+            let Some(value_size) =
+                value_type_size(value_type).and_then(|size| size.checked_mul(count))
+            else {
+                continue;
+            };
+            if value_size > 128 * 1024 * 1024 {
+                return Err(OpenSlideError::Format(format!(
+                    "Refusing to allocate {value_size} bytes for TIFF tag {tag}"
+                )));
+            }
+
+            let raw = if value_size <= inline_size as u64 {
+                value_field[..value_size as usize].to_vec()
+            } else {
+                let value_offset = if bigtiff {
+                    endian.read_u64(value_field)
+                } else {
+                    endian.read_u32(value_field) as u64
+                };
+                let value_end = value_offset.checked_add(value_size).ok_or_else(|| {
+                    OpenSlideError::Format(format!("TIFF tag {tag} value offset overflow"))
+                })?;
+                if value_end > file_len {
+                    return Err(OpenSlideError::Format(format!(
+                        "TIFF tag {tag} value extends outside file"
+                    )));
+                }
+
+                let return_pos = file.stream_position()?;
+                file.seek(SeekFrom::Start(value_offset))?;
+                let mut data = vec![0u8; value_size as usize];
+                file.read_exact(&mut data)?;
+                file.seek(SeekFrom::Start(return_pos))?;
+                data
+            };
+
+            entries.insert(tag, TiffEntry { value_type, raw });
+        }
+
+        Ok(Self { entries })
+    }
+
+    fn ascii(&self, tag: u16) -> Option<String> {
+        let entry = self.entries.get(&tag)?;
+        if entry.value_type != TYPE_ASCII {
+            return None;
+        }
+        let nul = entry
+            .raw
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(entry.raw.len());
+        std::str::from_utf8(&entry.raw[..nul])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+fn value_type_size(value_type: u16) -> Option<u64> {
+    match value_type {
+        1 | TYPE_ASCII => Some(1),
+        TYPE_SHORT => Some(2),
+        TYPE_LONG => Some(4),
+        5 | TYPE_LONG8 | TYPE_IFD8 => Some(8),
+        _ => None,
+    }
+}
+
+struct PhilipsTiffSlide {
+    inner: Box<dyn SlideBackend>,
+    properties: HashMap<String, String>,
+    level_dimensions: Vec<(u64, u64)>,
+    level_downsamples: Vec<f64>,
+    inner_downsamples: Vec<f64>,
+    associated_images: HashMap<String, Vec<u8>>,
+}
+
+pub fn detect(path: &Path) -> bool {
+    read_philips_description(path).is_ok()
+}
+
+pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
+    let description = read_philips_description(path)?;
+    let root = parse_xml(&description)?;
+    verify_philips_root(&root)?;
+    verify_main_image_count(&root)?;
+
+    let inner = tiff::open(path)?;
+    let mut properties = inner.properties().clone();
+    properties.insert(properties::PROPERTY_VENDOR.into(), "philips".into());
+    properties.remove("tiff.ImageDescription");
+    add_xml_properties(&root, &mut properties);
+    add_openslide_properties(&mut properties);
+
+    let (level_dimensions, level_downsamples, inner_downsamples) =
+        build_level_metadata(inner.as_ref(), &root)?;
+    add_level_properties(&mut properties, &level_dimensions, &level_downsamples);
+
+    let associated_images = read_xml_associated_images(&root);
+    for (name, data) in &associated_images {
+        if let Ok(format) = detect_associated_image_format(data) {
+            properties.insert(
+                format!("philips.associated.{name}.format"),
+                associated_format_name(format).into(),
+            );
+            if let Ok(image) = decode::decode_to_rgba(format, data) {
+                properties.insert(
+                    format!("openslide.associated.{name}.width"),
+                    image.width.to_string(),
+                );
+                properties.insert(
+                    format!("openslide.associated.{name}.height"),
+                    image.height.to_string(),
+                );
+            }
+        }
+    }
+
+    Ok(Box::new(PhilipsTiffSlide {
+        inner,
+        properties,
+        level_dimensions,
+        level_downsamples,
+        inner_downsamples,
+        associated_images,
+    }))
+}
+
+fn read_philips_description(path: &Path) -> Result<String> {
+    let first_ifd = FirstIfd::open(path)?;
+    let software = first_ifd
+        .ascii(TAG_SOFTWARE)
+        .ok_or_else(|| OpenSlideError::UnsupportedFormat("Missing TIFF Software tag".into()))?;
+    if !software.starts_with(PHILIPS_SOFTWARE) {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Not a Philips TIFF slide".into(),
+        ));
+    }
+    let description = first_ifd.ascii(TAG_IMAGEDESCRIPTION).ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat("Missing TIFF ImageDescription tag".into())
+    })?;
+    let root = parse_xml(&description)?;
+    verify_philips_root(&root)?;
+    Ok(description)
+}
+
+fn build_level_metadata(
+    inner: &dyn SlideBackend,
+    root: &XmlNode,
+) -> Result<(Vec<(u64, u64)>, Vec<f64>, Vec<f64>)> {
+    let level_count = inner.level_count();
+    let mut dimensions = Vec::with_capacity(level_count as usize);
+    let mut inner_downsamples = Vec::with_capacity(level_count as usize);
+    for level in 0..level_count {
+        dimensions.push(inner.level_dimensions(level).ok_or_else(|| {
+            OpenSlideError::Format(format!("Missing generic TIFF dimensions for level {level}"))
+        })?);
+        inner_downsamples.push(inner.level_downsample(level).ok_or_else(|| {
+            OpenSlideError::Format(format!("Missing generic TIFF downsample for level {level}"))
+        })?);
+    }
+
+    let spacings = pixel_spacings(root);
+    if spacings.is_empty() {
+        return Ok((dimensions, inner_downsamples.clone(), inner_downsamples));
+    }
+    if spacings.len() != level_count as usize {
+        return Err(OpenSlideError::Format(format!(
+            "Philips XML has {} level spacings, but TIFF has {} levels",
+            spacings.len(),
+            level_count
+        )));
+    }
+
+    let parsed = spacings
+        .iter()
+        .enumerate()
+        .map(|(i, spacing)| {
+            parse_pixel_spacing(spacing).ok_or_else(|| {
+                OpenSlideError::Format(format!("Couldn't parse level {i} pixel spacing"))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (l0_w, l0_h) = parsed[0];
+    if l0_w <= 0.0 || l0_h <= 0.0 {
+        return Err(OpenSlideError::Format(
+            "Invalid Philips level 0 pixel spacing".into(),
+        ));
+    }
+
+    let mut downsamples = vec![1.0; level_count as usize];
+    for (i, &(spacing_w, spacing_h)) in parsed.iter().enumerate().skip(1) {
+        let downsample = ((spacing_w / l0_w) + (spacing_h / l0_h)) / 2.0;
+        if !downsample.is_finite() || downsample <= 0.0 {
+            return Err(OpenSlideError::Format(format!(
+                "Invalid Philips downsample for level {i}"
+            )));
+        }
+        let downsample = downsample.round().max(1.0);
+        downsamples[i] = downsample;
+        dimensions[i] = (
+            (dimensions[0].0 as f64 / downsample).floor() as u64,
+            (dimensions[0].1 as f64 / downsample).floor() as u64,
+        );
+    }
+
+    Ok((dimensions, downsamples, inner_downsamples))
+}
+
+impl SlideBackend for PhilipsTiffSlide {
+    fn vendor(&self) -> &'static str {
+        "philips"
+    }
+
+    fn channel_count(&self) -> u32 {
+        self.inner.channel_count()
+    }
+
+    fn channel_name(&self, channel: u32) -> Option<&str> {
+        self.inner.channel_name(channel)
+    }
+
+    fn level_count(&self) -> u32 {
+        self.level_dimensions.len() as u32
+    }
+
+    fn level_dimensions(&self, level: u32) -> Option<(u64, u64)> {
+        self.level_dimensions.get(level as usize).copied()
+    }
+
+    fn level_downsample(&self, level: u32) -> Option<f64> {
+        self.level_downsamples.get(level as usize).copied()
+    }
+
+    fn read_region(
+        &self,
+        channel: u32,
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<GrayImage> {
+        let idx = level as usize;
+        let philips_downsample = *self
+            .level_downsamples
+            .get(idx)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {level}")))?;
+        let inner_downsample = *self
+            .inner_downsamples
+            .get(idx)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {level}")))?;
+        let scale = inner_downsample / philips_downsample;
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(OpenSlideError::Format(format!(
+                "Invalid Philips downsample scale for level {level}"
+            )));
+        }
+
+        self.inner.read_region(
+            channel,
+            (x as f64 * scale).round() as i64,
+            (y as f64 * scale).round() as i64,
+            level,
+            w,
+            h,
+        )
+    }
+
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.properties
+    }
+
+    fn associated_image_names(&self) -> Vec<&str> {
+        let mut names = self
+            .associated_images
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    fn read_associated_image(&self, name: &str) -> Result<RgbaImage> {
+        let data = self.associated_images.get(name).ok_or_else(|| {
+            OpenSlideError::InvalidArgument(format!("No associated image '{name}'"))
+        })?;
+        decode::decode_to_rgba(detect_associated_image_format(data)?, data)
+    }
+
+    fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize {
+        self.inner.debug_grid_tile_count(channel, level)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct XmlNode {
+    name: String,
+    attrs: HashMap<String, String>,
+    children: Vec<XmlNode>,
+    text: String,
+}
+
+impl XmlNode {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn has_element_child(&self) -> bool {
+        !self.children.is_empty()
+    }
+
+    fn text_content(&self) -> String {
+        let mut out = self.text.clone();
+        for child in &self.children {
+            out.push_str(&child.text_content());
+        }
+        out
+    }
+
+    fn child_attributes(&self) -> impl Iterator<Item = &XmlNode> {
+        self.children
+            .iter()
+            .filter(|child| child.name.eq_ignore_ascii_case("Attribute"))
+    }
+}
+
+fn parse_xml(xml: &str) -> Result<XmlNode> {
+    let mut stack = vec![XmlNode {
+        name: String::new(),
+        attrs: HashMap::new(),
+        children: Vec::new(),
+        text: String::new(),
+    }];
+    let mut pos = 0;
+    while pos < xml.len() {
+        let rest = &xml[pos..];
+        if let Some(text_end) = rest.find('<') {
+            let text = &rest[..text_end];
+            if !text.trim().is_empty() {
+                stack.last_mut().unwrap().text.push_str(&unescape_xml(text));
+            }
+            pos += text_end;
+        } else {
+            let text = rest;
+            if !text.trim().is_empty() {
+                stack.last_mut().unwrap().text.push_str(&unescape_xml(text));
+            }
+            break;
+        }
+
+        let rest = &xml[pos..];
+        if rest.starts_with("<!--") {
+            let end = rest
+                .find("-->")
+                .ok_or_else(|| OpenSlideError::Format("Unterminated XML comment".into()))?;
+            pos += end + 3;
+        } else if rest.starts_with("<![CDATA[") {
+            let end = rest
+                .find("]]>")
+                .ok_or_else(|| OpenSlideError::Format("Unterminated XML CDATA".into()))?;
+            stack.last_mut().unwrap().text.push_str(&rest[9..end]);
+            pos += end + 3;
+        } else if rest.starts_with("<?") {
+            let end = rest.find("?>").ok_or_else(|| {
+                OpenSlideError::Format("Unterminated XML processing instruction".into())
+            })?;
+            pos += end + 2;
+        } else if rest.starts_with("</") {
+            let end = rest
+                .find('>')
+                .ok_or_else(|| OpenSlideError::Format("Unterminated XML end tag".into()))?;
+            let name = rest[2..end].trim();
+            let node = stack
+                .pop()
+                .ok_or_else(|| OpenSlideError::Format("Unexpected XML end tag".into()))?;
+            if !node.name.eq_ignore_ascii_case(name) {
+                return Err(OpenSlideError::Format(format!(
+                    "Mismatched XML end tag: expected {}, got {name}",
+                    node.name
+                )));
+            }
+            stack.last_mut().unwrap().children.push(node);
+            pos += end + 1;
+        } else if rest.starts_with("<!") {
+            let end = rest
+                .find('>')
+                .ok_or_else(|| OpenSlideError::Format("Unterminated XML declaration".into()))?;
+            pos += end + 1;
+        } else if rest.starts_with('<') {
+            let end = find_tag_end(rest)
+                .ok_or_else(|| OpenSlideError::Format("Unterminated XML start tag".into()))?;
+            let mut tag = rest[1..end].trim();
+            let self_closing = tag.ends_with('/');
+            if self_closing {
+                tag = tag[..tag.len() - 1].trim_end();
+            }
+            let node = parse_start_tag(tag)?;
+            if self_closing {
+                stack.last_mut().unwrap().children.push(node);
+            } else {
+                stack.push(node);
+            }
+            pos += end + 1;
+        }
+    }
+
+    if stack.len() != 1 {
+        return Err(OpenSlideError::Format("Unclosed XML element".into()));
+    }
+    let mut root = stack.pop().unwrap();
+    if root.children.len() != 1 {
+        return Err(OpenSlideError::Format(
+            "XML document has no single root".into(),
+        ));
+    }
+    Ok(root.children.remove(0))
+}
+
+fn find_tag_end(s: &str) -> Option<usize> {
+    let mut quote = None;
+    for (idx, ch) in s.char_indices() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, '>') => return Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_start_tag(tag: &str) -> Result<XmlNode> {
+    let mut pos = 0;
+    skip_ws(tag, &mut pos);
+    let name = parse_xml_name(tag, &mut pos)
+        .ok_or_else(|| OpenSlideError::Format("XML start tag has no name".into()))?;
+    let mut attrs = HashMap::new();
+    loop {
+        skip_ws(tag, &mut pos);
+        if pos >= tag.len() {
+            break;
+        }
+        let attr_name = parse_xml_name(tag, &mut pos)
+            .ok_or_else(|| OpenSlideError::Format("XML attribute has no name".into()))?;
+        skip_ws(tag, &mut pos);
+        if tag.as_bytes().get(pos) != Some(&b'=') {
+            return Err(OpenSlideError::Format(format!(
+                "XML attribute {attr_name} has no value"
+            )));
+        }
+        pos += 1;
+        skip_ws(tag, &mut pos);
+        let quote = *tag
+            .as_bytes()
+            .get(pos)
+            .ok_or_else(|| OpenSlideError::Format("XML attribute value is missing".into()))?;
+        if quote != b'"' && quote != b'\'' {
+            return Err(OpenSlideError::Format(
+                "XML attribute value is not quoted".into(),
+            ));
+        }
+        pos += 1;
+        let start = pos;
+        while tag.as_bytes().get(pos).copied().is_some_and(|b| b != quote) {
+            pos += 1;
+        }
+        if pos >= tag.len() {
+            return Err(OpenSlideError::Format(
+                "Unterminated XML attribute value".into(),
+            ));
+        }
+        attrs.insert(attr_name, unescape_xml(&tag[start..pos]));
+        pos += 1;
+    }
+
+    Ok(XmlNode {
+        name,
+        attrs,
+        children: Vec::new(),
+        text: String::new(),
+    })
+}
+
+fn skip_ws(s: &str, pos: &mut usize) {
+    while s.as_bytes().get(*pos).is_some_and(u8::is_ascii_whitespace) {
+        *pos += 1;
+    }
+}
+
+fn parse_xml_name(s: &str, pos: &mut usize) -> Option<String> {
+    let start = *pos;
+    while let Some(&b) = s.as_bytes().get(*pos) {
+        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':' | b'.') {
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+    (*pos > start).then(|| s[start..*pos].to_string())
+}
+
+fn unescape_xml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let entity = &rest[pos..];
+        let Some(end) = entity.find(';') else {
+            out.push_str(entity);
+            return out;
+        };
+        let token = &entity[1..end];
+        match decode_xml_entity(token) {
+            Some(ch) => out.push(ch),
+            None => out.push_str(&entity[..=end]),
+        }
+        rest = &entity[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_xml_entity(token: &str) -> Option<char> {
+    match token {
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "amp" => Some('&'),
+        _ => {
+            let code = token
+                .strip_prefix("#x")
+                .or_else(|| token.strip_prefix("#X"))
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .or_else(|| {
+                    token
+                        .strip_prefix('#')
+                        .and_then(|decimal| decimal.parse::<u32>().ok())
+                })?;
+            char::from_u32(code)
+        }
+    }
+}
+
+fn verify_philips_root(root: &XmlNode) -> Result<()> {
+    if !root.name.eq_ignore_ascii_case(XML_ROOT) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Root tag not {XML_ROOT}"
+        )));
+    }
+    if !root
+        .attr(XML_ROOT_TYPE_ATTR)
+        .is_some_and(|value| value.eq_ignore_ascii_case(XML_ROOT_TYPE_VALUE))
+    {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Root {XML_ROOT_TYPE_ATTR} not {XML_ROOT_TYPE_VALUE}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_main_image_count(root: &XmlNode) -> Result<()> {
+    let count = scanned_images(root, "WSI").len();
+    if count != 1 {
+        return Err(OpenSlideError::Format(format!(
+            "Expected one Philips WSI image, found {count}"
+        )));
+    }
+    Ok(())
+}
+
+fn add_xml_properties(root: &XmlNode, properties: &mut HashMap<String, String>) {
+    add_properties(root.child_attributes(), "philips", properties, root);
+}
+
+fn add_properties<'a>(
+    attributes: impl Iterator<Item = &'a XmlNode>,
+    prefix: &str,
+    properties: &mut HashMap<String, String>,
+    root: &XmlNode,
+) {
+    for attr in attributes {
+        let Some(name) = attr.attr(XML_NAME_ATTR) else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case(XML_SCANNED_IMAGES_NAME) {
+            if let Some(wsi) = scanned_images(root, "WSI").into_iter().next() {
+                add_properties(wsi.child_attributes(), prefix, properties, root);
+            }
+        } else if name.eq_ignore_ascii_case(XML_DATA_REPRESENTATION_NAME) {
+            for (i, object) in array_data_objects(attr).into_iter().enumerate() {
+                let sub_prefix = format!("{prefix}.{name}[{i}]");
+                add_properties(object.child_attributes(), &sub_prefix, properties, root);
+            }
+        } else if !attr.has_element_child() {
+            properties.insert(
+                format!("{prefix}.{name}"),
+                attr.text_content().trim().to_string(),
+            );
+        }
+    }
+}
+
+fn add_openslide_properties(properties: &mut HashMap<String, String>) {
+    let spacing = properties
+        .get("philips.DICOM_PIXEL_SPACING")
+        .or_else(|| {
+            properties.get("philips.PIIM_PIXEL_DATA_REPRESENTATION_SEQUENCE[0].DICOM_PIXEL_SPACING")
+        })
+        .cloned();
+    if let Some(spacing) = spacing.and_then(|spacing| parse_pixel_spacing(&spacing)) {
+        properties.insert(
+            properties::PROPERTY_MPP_X.into(),
+            format_float(1e3 * spacing.0),
+        );
+        properties.insert(
+            properties::PROPERTY_MPP_Y.into(),
+            format_float(1e3 * spacing.1),
+        );
+    }
+
+    if let Some(derivation) = properties
+        .get("philips.DICOM_DERIVATION_DESCRIPTION")
+        .cloned()
+    {
+        if let Some(objective_power) = parse_objective_power(&derivation) {
+            properties.insert(
+                properties::PROPERTY_OBJECTIVE_POWER.into(),
+                objective_power.to_string(),
+            );
+        }
+    }
+}
+
+fn add_level_properties(
+    properties: &mut HashMap<String, String>,
+    dimensions: &[(u64, u64)],
+    downsamples: &[f64],
+) {
+    properties.insert("openslide.level-count".into(), dimensions.len().to_string());
+    for (i, ((w, h), downsample)) in dimensions.iter().zip(downsamples.iter()).enumerate() {
+        properties.insert(format!("openslide.level[{i}].width"), w.to_string());
+        properties.insert(format!("openslide.level[{i}].height"), h.to_string());
+        properties.insert(
+            format!("openslide.level[{i}].downsample"),
+            format_float(*downsample),
+        );
+    }
+}
+
+fn scanned_images<'a>(root: &'a XmlNode, image_type: &str) -> Vec<&'a XmlNode> {
+    let image_type = normalize_xml_token(image_type);
+    let Some(scanned_attr) = root.child_attributes().find(|attr| {
+        attr.attr(XML_NAME_ATTR)
+            .is_some_and(|name| name.eq_ignore_ascii_case(XML_SCANNED_IMAGES_NAME))
+    }) else {
+        return Vec::new();
+    };
+    array_data_objects(scanned_attr)
+        .into_iter()
+        .filter(|object| {
+            philips_image_type_text(object)
+                .as_deref()
+                .is_some_and(|value| {
+                    let value = normalize_xml_token(value);
+                    value == image_type || (image_type == "wsi" && is_main_wsi_image_type(&value))
+                })
+        })
+        .collect()
+}
+
+fn philips_image_type_text(node: &XmlNode) -> Option<String> {
+    [
+        "PIM_DP_IMAGE_TYPE",
+        "DICOM_IMAGE_TYPE",
+        "PIIM_IMAGE_TYPE",
+        "PIM_DP_IMAGE_NAME",
+        "DICOM_SERIES_DESCRIPTION",
+    ]
+    .into_iter()
+    .find_map(|name| child_attribute_text(node, name))
+}
+
+fn is_main_wsi_image_type(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "wsi"
+            | "wsiimage"
+            | "wholeslide"
+            | "wholeslideimage"
+            | "wholeimageslide"
+            | "volumeimage"
+            | "imagevolume"
+    ) || normalized.contains("volumelocalization") && normalized.contains("wsi")
+        || normalized.contains("whole") && normalized.contains("slide")
+}
+
+fn pixel_spacings(root: &XmlNode) -> Vec<String> {
+    let Some(wsi) = scanned_images(root, "WSI").into_iter().next() else {
+        return Vec::new();
+    };
+    let Some(sequence) = wsi.child_attributes().find(|attr| {
+        attr.attr(XML_NAME_ATTR)
+            .is_some_and(|name| name.eq_ignore_ascii_case(XML_DATA_REPRESENTATION_NAME))
+    }) else {
+        return Vec::new();
+    };
+    array_data_objects(sequence)
+        .into_iter()
+        .filter(|object| {
+            object.attr(XML_ROOT_TYPE_ATTR).is_none()
+                || object
+                    .attr(XML_ROOT_TYPE_ATTR)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("PixelDataRepresentation"))
+        })
+        .filter_map(|object| child_attribute_text(object, "DICOM_PIXEL_SPACING"))
+        .collect()
+}
+
+fn child_attribute_text(node: &XmlNode, name: &str) -> Option<String> {
+    let normalized_name = normalize_xml_token(name);
+    node.child_attributes()
+        .find(|attr| {
+            attr.attr(XML_NAME_ATTR)
+                .is_some_and(|value| normalize_xml_token(value) == normalized_name)
+        })
+        .map(|attr| attr.text_content().trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn array_data_objects(attr: &XmlNode) -> Vec<&XmlNode> {
+    attr.children
+        .iter()
+        .find(|child| child.name.eq_ignore_ascii_case("Array"))
+        .map(|array| {
+            array
+                .children
+                .iter()
+                .filter(|child| child.name.eq_ignore_ascii_case("DataObject"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn read_xml_associated_images(root: &XmlNode) -> HashMap<String, Vec<u8>> {
+    let mut images = HashMap::new();
+    for image in scanned_images_with_embedded_data(root) {
+        let Some(image_type) = philips_image_type_text(image) else {
+            continue;
+        };
+        let Some(name) = associated_name_from_image_type(&image_type) else {
+            continue;
+        };
+        for attr_name in [
+            "PIM_DP_IMAGE_DATA",
+            "PIM_DP_IMAGE_DATA_BASE64",
+            "PIM_DP_IMAGE_DATA_URI",
+            "PIM_DP_IMAGE_DATA_BINARY",
+            "PIM_DP_IMAGE_CONTENT",
+            "PIM_DP_IMAGE",
+            "PIIM_IMAGE_DATA",
+            "PIIM_IMAGE_DATA_BASE64",
+            "PIIM_IMAGE",
+            "DICOM_PIXEL_DATA",
+            "DICOM_IMAGE",
+            "DICOM_ICON_IMAGE_SEQUENCE",
+            "DICOM_ENCAPSULATED_DOCUMENT",
+            "DICOM_ENCAPSULATED_DOCUMENT_DATA",
+            "IMAGE_DATA",
+            "IMAGE_CONTENT",
+            "ENCODED_IMAGE",
+            "BASE64_IMAGE",
+            "BASE64_ENCODED_IMAGE",
+            "BASE64",
+        ] {
+            let Some(b64) = child_attribute_text(image, attr_name) else {
+                continue;
+            };
+            if let Ok(data) = decode_base64(strip_base64_data_uri(&b64)) {
+                if detect_associated_image_format(&data).is_ok() {
+                    images.entry(name.clone()).or_insert(data);
+                }
+            }
+        }
+    }
+    images
+}
+
+fn scanned_images_with_embedded_data(root: &XmlNode) -> Vec<&XmlNode> {
+    let Some(scanned_attr) = root.child_attributes().find(|attr| {
+        attr.attr(XML_NAME_ATTR).is_some_and(|name| {
+            normalize_xml_token(name) == normalize_xml_token(XML_SCANNED_IMAGES_NAME)
+        })
+    }) else {
+        return Vec::new();
+    };
+    array_data_objects(scanned_attr)
+}
+
+fn associated_name_from_image_type(image_type: &str) -> Option<String> {
+    let value = normalize_xml_token(image_type);
+    if value.contains("label")
+        || value.contains("barcode")
+        || value.contains("slideid")
+        || value.contains("slideidentifier")
+    {
+        Some("label".into())
+    } else if value.contains("macro")
+        || value.contains("localization")
+        || value.contains("localisation")
+        || value.contains("localizer")
+        || value.contains("localiser")
+        || value.contains("reference")
+        || value.contains("map")
+        || value.contains("navigator")
+        || value.contains("navigation")
+        || value.contains("navimage")
+    {
+        Some("macro".into())
+    } else if value.contains("thumbnail") || value.contains("thumb") || value.contains("icon") {
+        Some("thumbnail".into())
+    } else if value.contains("overview")
+        || value.contains("preview")
+        || value.contains("slidepreview")
+    {
+        Some("overview".into())
+    } else {
+        None
+    }
+}
+
+fn strip_base64_data_uri(value: &str) -> &str {
+    let trimmed = value.trim();
+    if let Some((prefix, payload)) = trimmed.split_once(',') {
+        let prefix = prefix.to_ascii_lowercase();
+        if prefix.starts_with("data:") && prefix.contains(";base64") {
+            return payload.trim();
+        }
+    }
+    trimmed
+}
+
+fn detect_associated_image_format(data: &[u8]) -> Result<ImageFormat> {
+    if data.starts_with(&[0xff, 0xd8]) {
+        Ok(ImageFormat::Jpeg)
+    } else if data.starts_with(b"\x89PNG") {
+        Ok(ImageFormat::Png)
+    } else if data.starts_with(b"BM") {
+        Ok(ImageFormat::Bmp)
+    } else {
+        Err(OpenSlideError::UnsupportedFormat(
+            "Philips associated image is not JPEG, PNG, or BMP".into(),
+        ))
+    }
+}
+
+fn associated_format_name(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Jpeg => "jpeg",
+        ImageFormat::Png => "png",
+        ImageFormat::Bmp => "bmp",
+    }
+}
+
+fn normalize_xml_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+// Philips stores row spacing followed by column spacing, in millimeters.
+fn parse_pixel_spacing(spacing: &str) -> Option<(f64, f64)> {
+    let parts = spacing
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == '\\' || ch == ',')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.trim_matches('"'))
+        .collect::<Vec<_>>();
+    if parts.len() != 2 {
+        return None;
+    }
+    let row_spacing = parts[0].parse::<f64>().ok()?;
+    let col_spacing = parts[1].parse::<f64>().ok()?;
+    Some((col_spacing, row_spacing))
+}
+
+fn parse_objective_power(derivation: &str) -> Option<u32> {
+    for item in derivation.split(['-', ';']) {
+        let mut kv = item.splitn(2, '=');
+        let key = kv.next()?.trim();
+        let value = kv.next().unwrap_or("").trim();
+        if key.eq_ignore_ascii_case("sourceFilename") {
+            break;
+        }
+        if key.eq_ignore_ascii_case("levels") || key.eq_ignore_ascii_case("objectivePower") {
+            let first_level = parse_objective_power_value(value.split(',').next()?)?;
+            if (1..=200).contains(&first_level) {
+                return Some(first_level);
+            }
+            break;
+        }
+    }
+    None
+}
+
+fn parse_objective_power_value(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    trimmed
+        .strip_suffix(['x', 'X'])
+        .unwrap_or(trimmed)
+        .parse()
+        .ok()
+}
+
+fn format_float(value: f64) -> String {
+    let s = format!("{value:.12}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn decode_base64(data: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len() * 3 / 4);
+    let mut buf = [0u8; 4];
+    let mut len = 0;
+    let mut seen_padding = false;
+    for b in data.bytes().filter(|b| !b.is_ascii_whitespace()) {
+        let value = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                seen_padding = true;
+                64
+            }
+            _ => {
+                return Err(OpenSlideError::Format(format!(
+                    "Invalid Philips base64 byte {b}"
+                )))
+            }
+        };
+        if seen_padding && b != b'=' {
+            return Err(OpenSlideError::Format(
+                "Invalid Philips base64 padding".into(),
+            ));
+        }
+        buf[len] = value;
+        len += 1;
+        if len == 4 {
+            if buf[0] == 64 || buf[1] == 64 {
+                return Err(OpenSlideError::Format(
+                    "Invalid Philips base64 padding".into(),
+                ));
+            }
+            out.push((buf[0] << 2) | (buf[1] >> 4));
+            if buf[2] != 64 {
+                out.push((buf[1] << 4) | (buf[2] >> 2));
+            }
+            if buf[3] != 64 {
+                out.push((buf[2] << 6) | buf[3]);
+            }
+            len = 0;
+        }
+    }
+    if len != 0 {
+        return Err(OpenSlideError::Format(
+            "Truncated Philips base64 data".into(),
+        ));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::OpenSlide;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TAG_SUBFILETYPE: u16 = 254;
+    const TAG_IMAGEWIDTH: u16 = 256;
+    const TAG_IMAGELENGTH: u16 = 257;
+    const TAG_BITSPERSAMPLE: u16 = 258;
+    const TAG_COMPRESSION: u16 = 259;
+    const TAG_PHOTOMETRIC: u16 = 262;
+    const TAG_SAMPLESPERPIXEL: u16 = 277;
+    const TAG_PLANARCONFIG: u16 = 284;
+    const TAG_TILEWIDTH: u16 = 322;
+    const TAG_TILELENGTH: u16 = 323;
+    const TAG_TILEOFFSETS: u16 = 324;
+    const TAG_TILEBYTECOUNTS: u16 = 325;
+
+    #[test]
+    fn detects_philips_tiff() {
+        let path = temp_path("philips-detect.tif");
+        fs::write(&path, make_philips_tiff()).unwrap();
+
+        assert!(detect(&path));
+        assert_eq!(OpenSlide::detect_vendor(&path), Some("philips"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_non_philips_tiff() {
+        let path = temp_path("philips-reject.tif");
+        let mut data = make_philips_tiff();
+        let needle = b"Philips";
+        let pos = data
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap();
+        data[pos..pos + needle.len()].copy_from_slice(b"Generic");
+        fs::write(&path, data).unwrap();
+
+        assert!(!detect(&path));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn opens_properties_levels_and_reads_tiles() {
+        let path = temp_path("philips-open.tif");
+        fs::write(&path, make_philips_tiff()).unwrap();
+
+        let slide = OpenSlide::open(&path).unwrap();
+        assert_eq!(slide.vendor(), "philips");
+        assert_eq!(slide.channel_count(), 3);
+        assert_eq!(slide.level_count(), 2);
+        assert_eq!(slide.level_dimensions(0), Some((4, 4)));
+        assert_eq!(slide.level_dimensions(1), Some((2, 2)));
+        assert_eq!(slide.level_downsample(1), Some(2.0));
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_MPP_X),
+            Some(&"0.5".to_string())
+        );
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_OBJECTIVE_POWER),
+            Some(&"40".to_string())
+        );
+        assert_eq!(
+            slide
+                .properties()
+                .get("philips.PIIM_PIXEL_DATA_REPRESENTATION_SEQUENCE[0].DICOM_PIXEL_SPACING"),
+            Some(&"\"0.0005\" \"0.0005\"".to_string())
+        );
+        assert!(slide.properties().get("tiff.ImageDescription").is_none());
+
+        let red = slide.read_region(0, 0, 0, 0, 4, 2).unwrap();
+        assert_eq!(red.data, vec![10, 40, 70, 100, 1, 4, 7, 10]);
+
+        let level1_red = slide.read_region(0, 2, 0, 1, 1, 1).unwrap();
+        assert_eq!(level1_red.data, vec![220]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_philips_xml_properties() {
+        let root = parse_xml(&philips_xml()).unwrap();
+        let mut properties = HashMap::new();
+        add_xml_properties(&root, &mut properties);
+        add_openslide_properties(&mut properties);
+
+        assert_eq!(
+            properties.get("philips.DICOM_DERIVATION_DESCRIPTION"),
+            Some(&"levels=40,20-sourceFilename=ignored".to_string())
+        );
+        let entity_root = parse_xml(
+            r#"<DataObject ObjectType="DPUfsImport"><Attribute Name="A&#x20;B">&#65;&amp;&#x42;</Attribute></DataObject>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            child_attribute_text(&entity_root, "A B"),
+            Some("A&B".to_string())
+        );
+        assert_eq!(
+            properties
+                .get("philips.PIIM_PIXEL_DATA_REPRESENTATION_SEQUENCE[1].DICOM_PIXEL_SPACING"),
+            Some(&"\"0.001\" \"0.001\"".to_string())
+        );
+        assert_eq!(
+            properties.get(properties::PROPERTY_MPP_Y),
+            Some(&"0.5".to_string())
+        );
+    }
+
+    #[test]
+    fn detects_associated_images_from_xml_types_and_formats() {
+        let xml = r#"<DataObject ObjectType="DPUfsImport">
+  <Attribute Name="PIM_DP_SCANNED_IMAGES">
+    <Array>
+      <DataObject ObjectType="DPScannedImage">
+        <Attribute Name="PIM_DP_IMAGE_TYPE">labelimage</Attribute>
+        <Attribute Name="PIM_DP_IMAGE_DATA">/9j/</Attribute>
+      </DataObject>
+      <DataObject ObjectType="DPScannedImage">
+        <Attribute Name="PIM_DP_IMAGE_TYPE">THUMBNAILIMAGE</Attribute>
+        <Attribute Name="PIM_DP_IMAGE_DATA">Qk0=</Attribute>
+      </DataObject>
+      <DataObject ObjectType="DPScannedImage">
+        <Attribute Name="PIM_DP_IMAGE_NAME">Barcode</Attribute>
+        <Attribute Name="PIM_DP_IMAGE_DATA_BASE64">data:image/png;base64,iVBORw0KGgo=</Attribute>
+      </DataObject>
+      <DataObject ObjectType="DPScannedImage">
+        <Attribute Name="DICOM_IMAGE_TYPE">Localization Image</Attribute>
+        <Attribute Name="PIM_DP_IMAGE_DATA_URI">data:image/bmp;base64,Qk0=</Attribute>
+      </DataObject>
+      <DataObject ObjectType="DPScannedImage">
+        <Attribute Name="pim_dp_image_type">Reference Map</Attribute>
+        <Attribute Name="pim_dp_image_content">Qk0=</Attribute>
+      </DataObject>
+      <dataobject objecttype="DPScannedImage">
+        <attribute name="dicom_series_description">Navigation image</attribute>
+        <attribute name="base64_encoded_image">Qk0=</attribute>
+      </dataobject>
+      <DataObject ObjectType="DPScannedImage">
+        <Attribute Name="PIM_DP_IMAGE_TYPE">DICOM icon image</Attribute>
+        <Attribute Name="PIM_DP_IMAGE_DATA_URI">data:application/octet-stream;base64,iVBORw0KGgo=</Attribute>
+      </DataObject>
+    </Array>
+  </Attribute>
+</DataObject>"#;
+        let root = parse_xml(xml).unwrap();
+        let images = read_xml_associated_images(&root);
+
+        assert!(images["label"].starts_with(&[0xff, 0xd8]));
+        assert!(images["thumbnail"].starts_with(b"BM"));
+        assert_eq!(
+            associated_name_from_image_type("macro image").as_deref(),
+            Some("macro")
+        );
+        assert_eq!(
+            associated_name_from_image_type("Slide Preview").as_deref(),
+            Some("overview")
+        );
+        assert_eq!(
+            associated_name_from_image_type("Localization Image").as_deref(),
+            Some("macro")
+        );
+        assert_eq!(
+            associated_name_from_image_type("Reference Map").as_deref(),
+            Some("macro")
+        );
+        assert_eq!(
+            associated_name_from_image_type("Navigator").as_deref(),
+            Some("macro")
+        );
+        assert_eq!(
+            associated_name_from_image_type("Localizer Image").as_deref(),
+            Some("macro")
+        );
+        assert_eq!(
+            associated_name_from_image_type("Slide ID").as_deref(),
+            Some("label")
+        );
+        assert_eq!(
+            associated_name_from_image_type("Slide Identifier Image").as_deref(),
+            Some("label")
+        );
+        assert_eq!(
+            associated_name_from_image_type("DICOM icon image").as_deref(),
+            Some("thumbnail")
+        );
+        assert!(images["macro"].starts_with(b"BM"));
+        assert_eq!(
+            strip_base64_data_uri(" data:image/png;base64,iVBORw0KGgo= "),
+            "iVBORw0KGgo="
+        );
+        assert_eq!(
+            strip_base64_data_uri("data:application/octet-stream;base64,iVBORw0KGgo="),
+            "iVBORw0KGgo="
+        );
+        assert_eq!(decode_base64("QUJD").unwrap(), b"ABC");
+        assert!(decode_base64("QU=JD").is_err());
+        assert_eq!(
+            associated_format_name(detect_associated_image_format(&images["thumbnail"]).unwrap()),
+            "bmp"
+        );
+        assert!(is_main_wsi_image_type("wholeslideimage"));
+        assert!(is_main_wsi_image_type("wsiimage"));
+        assert!(is_main_wsi_image_type("whole slide volume"));
+        assert_eq!(
+            parse_pixel_spacing("\"0.0005\"\\\"0.0006\""),
+            Some((0.0006, 0.0005))
+        );
+        assert_eq!(parse_pixel_spacing("0.0005,0.0006"), Some((0.0006, 0.0005)));
+        assert_eq!(
+            parse_objective_power("ObjectivePower=20;sourceFilename=ignored"),
+            Some(20)
+        );
+        assert_eq!(parse_objective_power("ObjectivePower=20X"), Some(20));
+        assert_eq!(parse_objective_power("levels=40x,20x,10x"), Some(40));
+        assert_eq!(parse_objective_power("ObjectivePower=Plan Apo 20X"), None);
+
+        let mixed_case_xml = r#"<dataobject objecttype="DPUfsImport">
+  <attribute name="pim_dp_scanned_images">
+    <array>
+      <dataobject objecttype="DPScannedImage">
+        <attribute name="pim_dp_image_type">WSI image</attribute>
+      </dataobject>
+    </array>
+  </attribute>
+</dataobject>"#;
+        let mixed_case_root = parse_xml(mixed_case_xml).unwrap();
+        verify_philips_root(&mixed_case_root).unwrap();
+        assert_eq!(scanned_images(&mixed_case_root, "WSI").len(), 1);
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!(
+            "openslide-rs-philips-test-{}-{nanos}-{name}",
+            std::process::id()
+        ));
+        path
+    }
+
+    fn philips_xml() -> String {
+        r#"<DataObject ObjectType="DPUfsImport">
+  <Attribute Name="PIM_DP_SCANNED_IMAGES">
+    <Array>
+      <DataObject ObjectType="DPScannedImage">
+        <Attribute Name="PIM_DP_IMAGE_TYPE">WSI</Attribute>
+        <Attribute Name="DICOM_DERIVATION_DESCRIPTION">levels=40,20-sourceFilename=ignored</Attribute>
+        <Attribute Name="PIIM_PIXEL_DATA_REPRESENTATION_SEQUENCE">
+          <Array>
+            <DataObject ObjectType="PixelDataRepresentation">
+              <Attribute Name="DICOM_PIXEL_SPACING">"0.0005" "0.0005"</Attribute>
+            </DataObject>
+            <DataObject ObjectType="PixelDataRepresentation">
+              <Attribute Name="DICOM_PIXEL_SPACING">"0.001" "0.001"</Attribute>
+            </DataObject>
+          </Array>
+        </Attribute>
+      </DataObject>
+    </Array>
+  </Attribute>
+</DataObject>"#
+            .to_string()
+    }
+
+    fn make_philips_tiff() -> Vec<u8> {
+        let xml = philips_xml();
+        let software = b"Philips Digital Pathology\0";
+
+        let level0_tiles = vec![
+            vec![10, 20, 30, 40, 50, 60, 1, 2, 3, 4, 5, 6],
+            vec![70, 80, 90, 100, 110, 120, 7, 8, 9, 10, 11, 12],
+            vec![13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24],
+            vec![25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36],
+        ];
+        let level1_tiles = vec![
+            vec![210, 0, 0, 220, 0, 0, 230, 0, 0, 240, 0, 0],
+            vec![0; 12],
+            vec![0; 12],
+            vec![0; 12],
+        ];
+
+        let entries0 = directory_entries(true);
+        let entries1 = directory_entries(false);
+        let dir0_offset = 8usize;
+        let dir0_len = 2 + entries0.len() * 12 + 4;
+        let dir1_offset = dir0_offset + dir0_len;
+        let dir1_len = 2 + entries1.len() * 12 + 4;
+        let data_base = dir1_offset + dir1_len;
+        let mut extra = Vec::new();
+
+        let bits_offset = add(&mut extra, data_base, &[8, 0, 8, 0, 8, 0]);
+        let desc_offset = add(&mut extra, data_base, format!("{xml}\0").as_bytes());
+        let software_offset = add(&mut extra, data_base, software);
+
+        let level0_tile_offsets = level0_tiles
+            .iter()
+            .map(|tile| add(&mut extra, data_base, tile))
+            .collect::<Vec<_>>();
+        let level1_tile_offsets = level1_tiles
+            .iter()
+            .map(|tile| add(&mut extra, data_base, tile))
+            .collect::<Vec<_>>();
+
+        let level0_tile_offsets_offset = add_u32_array(&mut extra, data_base, &level0_tile_offsets);
+        let level1_tile_offsets_offset = add_u32_array(&mut extra, data_base, &level1_tile_offsets);
+        let byte_counts = vec![12u32; 4];
+        let level0_byte_counts_offset = add_u32_array(&mut extra, data_base, &byte_counts);
+        let level1_byte_counts_offset = add_u32_array(&mut extra, data_base, &byte_counts);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"II");
+        out.extend_from_slice(&42u16.to_le_bytes());
+        out.extend_from_slice(&(dir0_offset as u32).to_le_bytes());
+        write_directory(
+            &mut out,
+            entries0,
+            dir1_offset as u32,
+            DirectoryValues {
+                subfiletype: 0,
+                width: 4,
+                height: 4,
+                bits_offset,
+                desc_offset,
+                desc_len: (xml.len() + 1) as u32,
+                software_offset,
+                software_len: software.len() as u32,
+                tile_offsets_offset: level0_tile_offsets_offset,
+                tile_byte_counts_offset: level0_byte_counts_offset,
+            },
+        );
+        write_directory(
+            &mut out,
+            entries1,
+            0,
+            DirectoryValues {
+                subfiletype: 1,
+                width: 3,
+                height: 3,
+                bits_offset,
+                desc_offset,
+                desc_len: (xml.len() + 1) as u32,
+                software_offset,
+                software_len: software.len() as u32,
+                tile_offsets_offset: level1_tile_offsets_offset,
+                tile_byte_counts_offset: level1_byte_counts_offset,
+            },
+        );
+        out.extend_from_slice(&extra);
+        out
+    }
+
+    #[derive(Clone, Copy)]
+    struct DirectoryValues {
+        subfiletype: u32,
+        width: u32,
+        height: u32,
+        bits_offset: u32,
+        desc_offset: u32,
+        desc_len: u32,
+        software_offset: u32,
+        software_len: u32,
+        tile_offsets_offset: u32,
+        tile_byte_counts_offset: u32,
+    }
+
+    fn directory_entries(first: bool) -> Vec<u16> {
+        let mut tags = vec![
+            TAG_SUBFILETYPE,
+            TAG_IMAGEWIDTH,
+            TAG_IMAGELENGTH,
+            TAG_BITSPERSAMPLE,
+            TAG_COMPRESSION,
+            TAG_PHOTOMETRIC,
+            TAG_IMAGEDESCRIPTION,
+            TAG_SOFTWARE,
+            TAG_SAMPLESPERPIXEL,
+            TAG_PLANARCONFIG,
+            TAG_TILEWIDTH,
+            TAG_TILELENGTH,
+            TAG_TILEOFFSETS,
+            TAG_TILEBYTECOUNTS,
+        ];
+        if !first {
+            tags.retain(|tag| *tag != TAG_SOFTWARE);
+        }
+        tags.sort_unstable();
+        tags
+    }
+
+    fn write_directory(
+        out: &mut Vec<u8>,
+        tags: Vec<u16>,
+        next_offset: u32,
+        values: DirectoryValues,
+    ) {
+        out.extend_from_slice(&(tags.len() as u16).to_le_bytes());
+        for tag in tags {
+            match tag {
+                TAG_SUBFILETYPE => push_entry(out, tag, TYPE_LONG, 1, values.subfiletype),
+                TAG_IMAGEWIDTH => push_entry(out, tag, TYPE_LONG, 1, values.width),
+                TAG_IMAGELENGTH => push_entry(out, tag, TYPE_LONG, 1, values.height),
+                TAG_BITSPERSAMPLE => push_entry(out, tag, TYPE_SHORT, 3, values.bits_offset),
+                TAG_COMPRESSION => push_entry(out, tag, TYPE_SHORT, 1, 1),
+                TAG_PHOTOMETRIC => push_entry(out, tag, TYPE_SHORT, 1, 2),
+                TAG_IMAGEDESCRIPTION => {
+                    push_entry(out, tag, TYPE_ASCII, values.desc_len, values.desc_offset)
+                }
+                TAG_SOFTWARE => push_entry(
+                    out,
+                    tag,
+                    TYPE_ASCII,
+                    values.software_len,
+                    values.software_offset,
+                ),
+                TAG_SAMPLESPERPIXEL => push_entry(out, tag, TYPE_SHORT, 1, 3),
+                TAG_PLANARCONFIG => push_entry(out, tag, TYPE_SHORT, 1, 1),
+                TAG_TILEWIDTH => push_entry(out, tag, TYPE_LONG, 1, 2),
+                TAG_TILELENGTH => push_entry(out, tag, TYPE_LONG, 1, 2),
+                TAG_TILEOFFSETS => push_entry(out, tag, TYPE_LONG, 4, values.tile_offsets_offset),
+                TAG_TILEBYTECOUNTS => {
+                    push_entry(out, tag, TYPE_LONG, 4, values.tile_byte_counts_offset)
+                }
+                _ => unreachable!(),
+            }
+        }
+        out.extend_from_slice(&next_offset.to_le_bytes());
+    }
+
+    fn add(extra: &mut Vec<u8>, base: usize, bytes: &[u8]) -> u32 {
+        let offset = (base + extra.len()) as u32;
+        extra.extend_from_slice(bytes);
+        if extra.len() % 2 != 0 {
+            extra.push(0);
+        }
+        offset
+    }
+
+    fn add_u32_array(extra: &mut Vec<u8>, base: usize, values: &[u32]) -> u32 {
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        add(extra, base, &bytes)
+    }
+
+    fn push_entry(out: &mut Vec<u8>, tag: u16, ty: u16, count: u32, value: u32) {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&ty.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        match ty {
+            TYPE_SHORT if count == 1 => {
+                out.extend_from_slice(&(value as u16).to_le_bytes());
+                out.extend_from_slice(&[0, 0]);
+            }
+            _ => out.extend_from_slice(&value.to_le_bytes()),
+        }
+    }
+}

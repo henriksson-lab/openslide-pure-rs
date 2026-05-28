@@ -120,6 +120,13 @@ fn read_slide_position_buffer(data: &[u8], level_0_image_concat: i32) -> Result<
 
 /// Read raw data from a data file at a given offset.
 fn read_record_data(path: &Path, offset: i64, size: i64) -> Result<Vec<u8>> {
+    if offset < 0 || size < 0 {
+        return Err(OpenSlideError::Format(format!(
+            "Negative record offset/size: offset={}, size={}",
+            offset, size
+        )));
+    }
+
     let mut f = std::fs::File::open(path)?;
     f.seek(SeekFrom::Start(offset as u64))?;
     let mut buf = vec![0u8; size as usize];
@@ -648,7 +655,14 @@ impl MiraxSlide {
             Some(t) => t,
             None => {
                 // Decode the full tile to RGB
-                let datafile_path = &self.datafile_paths[tile.image.fileno as usize];
+                let fileno = tile.image.fileno;
+                if fileno < 0 || fileno as usize >= self.datafile_paths.len() {
+                    return Err(OpenSlideError::Format(format!(
+                        "Invalid data file number {}",
+                        fileno
+                    )));
+                }
+                let datafile_path = &self.datafile_paths[fileno as usize];
                 let data = read_record_data(
                     datafile_path,
                     tile.image.offset as i64,
@@ -791,9 +805,16 @@ impl SlideBackend for MiraxSlide {
             OpenSlideError::InvalidArgument(format!("No associated image '{}'", name))
         })?;
 
+        if info.fileno < 0 || info.fileno as usize >= self.datafile_paths.len() {
+            return Err(OpenSlideError::Format(format!(
+                "Invalid data file number {}",
+                info.fileno
+            )));
+        }
         let path = &self.datafile_paths[info.fileno as usize];
         let data = read_record_data(path, info.offset as i64, info.size as i64)?;
-        decode::decode_to_rgba(ImageFormat::Jpeg, &data)
+        let format = detect_image_format(&data);
+        decode::decode_to_rgba(format, &data)
     }
 
     fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize {

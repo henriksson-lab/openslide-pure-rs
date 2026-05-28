@@ -1,4 +1,16 @@
+pub mod aperio;
+pub mod dicom;
+pub mod hamamatsu;
+pub mod leica;
 pub mod mirax;
+pub mod philips;
+pub mod sakura;
+pub(crate) mod tiff;
+pub(crate) mod tiff_alias;
+pub mod trestle;
+pub(crate) mod unsupported;
+pub mod ventana;
+pub mod zeiss;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -31,9 +43,47 @@ pub(crate) trait SlideBackend: Send + Sync {
 
 /// Try to detect and open a slide file, returning the appropriate backend.
 pub(crate) fn open_slide(path: &Path) -> Result<Box<dyn SlideBackend>> {
-    // Try each format in order
-    let formats: &[fn(&Path) -> Result<Box<dyn SlideBackend>>] = &[mirax::open];
+    if hamamatsu::detect(path) {
+        return hamamatsu::open(path);
+    }
+    if aperio::detect(path) {
+        return aperio::open(path);
+    }
+    if leica::detect(path) {
+        return leica::open(path);
+    }
+    if trestle::detect(path) {
+        return trestle::open(path);
+    }
+    if ventana::detect(path) {
+        return ventana::open(path);
+    }
+    if dicom::detect(path) {
+        return dicom::open(path);
+    }
+    if philips::detect(path) {
+        return philips::open(path);
+    }
+    if let Some(vendor) = tiff_alias::detect_vendor(path) {
+        return tiff_alias::open(path, vendor);
+    }
+    if tiff::detect(path) {
+        return tiff::open(path);
+    }
 
+    // Try each non-TIFF format in order
+    let formats: &[fn(&Path) -> Result<Box<dyn SlideBackend>>] = &[
+        aperio::open,
+        hamamatsu::open,
+        leica::open,
+        trestle::open,
+        ventana::open,
+        mirax::open,
+        philips::open,
+        dicom::open,
+        sakura::open,
+        zeiss::open,
+    ];
     let mut last_err = None;
     for open_fn in formats {
         match open_fn(path) {
@@ -46,6 +96,10 @@ pub(crate) fn open_slide(path: &Path) -> Result<Box<dyn SlideBackend>> {
         }
     }
 
+    if let Some(vendor) = unsupported::detect_vendor(path) {
+        return unsupported::open(path, vendor);
+    }
+
     Err(last_err.unwrap_or_else(|| {
         crate::error::OpenSlideError::UnsupportedFormat(format!(
             "No format handler recognized: {}",
@@ -56,8 +110,44 @@ pub(crate) fn open_slide(path: &Path) -> Result<Box<dyn SlideBackend>> {
 
 /// Detect the vendor for a slide file without fully opening it.
 pub(crate) fn detect_vendor(path: &Path) -> Option<&'static str> {
+    if hamamatsu::detect(path) {
+        return Some("hamamatsu");
+    }
+    if aperio::detect(path) {
+        return Some("aperio");
+    }
+    if leica::detect(path) {
+        return Some("leica");
+    }
     if mirax::detect(path) {
         return Some("mirax");
+    }
+    if trestle::detect(path) {
+        return Some("trestle");
+    }
+    if ventana::detect(path) {
+        return Some("ventana");
+    }
+    if dicom::detect(path) {
+        return Some("dicom");
+    }
+    if philips::detect(path) {
+        return Some("philips");
+    }
+    if sakura::detect(path) {
+        return Some("sakura");
+    }
+    if zeiss::detect(path) {
+        return Some("zeiss");
+    }
+    if let Some(vendor) = tiff_alias::detect_vendor(path) {
+        return Some(vendor);
+    }
+    if tiff::detect(path) {
+        return Some("generic-tiff");
+    }
+    if let Some(vendor) = unsupported::detect_vendor(path) {
+        return Some(vendor);
     }
     None
 }

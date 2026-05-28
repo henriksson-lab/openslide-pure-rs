@@ -4,7 +4,7 @@ use openslide_pure_rs::format::mirax::slidedat::SlideDat;
 use openslide_pure_rs::OpenSlide;
 
 fn print_usage() {
-    eprintln!("Usage: openslide-pure-rs <command> <file.mrxs> [options]");
+    eprintln!("Usage: openslide-pure-rs <command> <slide> [options]");
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  info                          Show all layers, formats, and slide metadata");
@@ -19,21 +19,67 @@ fn print_usage() {
 }
 
 fn cmd_info(path: &str) {
-    let mrxs_path = Path::new(path);
-
-    // Check extension
-    if mrxs_path.extension().and_then(|e| e.to_str()) != Some("mrxs") {
-        eprintln!("Error: expected .mrxs file");
-        std::process::exit(1);
+    if Path::new(path).extension().and_then(|e| e.to_str()) == Some("mrxs") {
+        print_mirax_info(path);
     }
 
+    // Open slide for computed info
+    match OpenSlide::open(path) {
+        Ok(slide) => {
+            println!("=== OpenSlide Info ===");
+            println!("Vendor: {}", slide.vendor());
+            println!("Levels: {}", slide.level_count());
+            println!("Channels: {}", slide.channel_count());
+            println!();
+
+            // Channel info
+            if slide.channel_count() > 0 {
+                println!("=== Channels ({}) ===", slide.channel_count());
+                for ch in 0..slide.channel_count() {
+                    println!("  Ch {}: {}", ch, slide.channel_name(ch).unwrap_or("?"));
+                }
+                println!();
+            }
+
+            // Computed dimensions
+            println!("=== Computed Dimensions ===");
+            for i in 0..slide.level_count() {
+                if let Some((w, h)) = slide.level_dimensions(i) {
+                    let ds = slide.level_downsample(i).unwrap_or(0.0);
+                    println!(
+                        "  Level {:>2}: {:>6} x {:<6}  (downsample {:.0})",
+                        i, w, h, ds
+                    );
+                }
+            }
+            println!();
+
+            // Associated images
+            let names = slide.associated_image_names();
+            if !names.is_empty() {
+                println!("=== Associated Images ===");
+                for name in names {
+                    match slide.read_associated_image(name) {
+                        Ok(img) => println!("  {}: {}x{}", name, img.width, img.height),
+                        Err(e) => println!("  {}: Error: {}", name, e),
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("  (Could not open slide: {})", e);
+        }
+    }
+}
+
+fn print_mirax_info(path: &str) {
+    let mrxs_path = Path::new(path);
     let dirname = mrxs_path.with_extension("");
     if !dirname.join("Slidedat.ini").is_file() {
         eprintln!("Error: Slidedat.ini not found in {}", dirname.display());
         std::process::exit(1);
     }
 
-    // Parse Slidedat.ini for full layer info
     let sd = match SlideDat::parse(&dirname) {
         Ok(sd) => sd,
         Err(e) => {
@@ -42,7 +88,6 @@ fn cmd_info(path: &str) {
         }
     };
 
-    // General info
     println!("=== Slide Info ===");
     println!("Slide ID:       {}", sd.general.slide_id);
     if let Some(ref st) = sd.general.slide_type {
@@ -64,7 +109,6 @@ fn cmd_info(path: &str) {
     println!("Index file:     {}", sd.hierarchical.index_filename);
     println!();
 
-    // Hierarchical layers
     println!("=== Hierarchical Layers ({}) ===", sd.layers.len());
     for layer in &sd.layers {
         println!();
@@ -79,7 +123,6 @@ fn cmd_info(path: &str) {
             let section = level.section.as_deref().unwrap_or("(none)");
             print!("  Level {}: \"{}\" [{}]", j, level.name, section);
 
-            // Try to read format info from the level's section
             if let Some(ref sec) = level.section {
                 let sec = sec.trim();
                 let mut details = Vec::new();
@@ -124,8 +167,6 @@ fn cmd_info(path: &str) {
     }
 
     println!();
-
-    // Non-hierarchical layers
     println!(
         "=== Non-Hierarchical Layers ({}) ===",
         sd.nonhier_layers.len()
@@ -144,8 +185,6 @@ fn cmd_info(path: &str) {
     }
 
     println!();
-
-    // Zoom level summary (from the slide zoom layer)
     println!("=== Zoom Levels (Slide zoom level) ===");
     println!(
         "{:<6} {:>6} {:>12} {:>12} {:>8} {:>8} {:>10}",
@@ -164,48 +203,6 @@ fn cmd_info(path: &str) {
     }
 
     println!();
-
-    // Open slide for computed info
-    match OpenSlide::open(path) {
-        Ok(slide) => {
-            // Channel info
-            if slide.channel_count() > 0 {
-                println!("=== Channels ({}) ===", slide.channel_count());
-                for ch in 0..slide.channel_count() {
-                    println!("  Ch {}: {}", ch, slide.channel_name(ch).unwrap_or("?"));
-                }
-                println!();
-            }
-
-            // Computed dimensions
-            println!("=== Computed Dimensions ===");
-            for i in 0..slide.level_count() {
-                if let Some((w, h)) = slide.level_dimensions(i) {
-                    let ds = slide.level_downsample(i).unwrap_or(0.0);
-                    println!(
-                        "  Level {:>2}: {:>6} x {:<6}  (downsample {:.0})",
-                        i, w, h, ds
-                    );
-                }
-            }
-            println!();
-
-            // Associated images
-            let names = slide.associated_image_names();
-            if !names.is_empty() {
-                println!("=== Associated Images ===");
-                for name in names {
-                    match slide.read_associated_image(name) {
-                        Ok(img) => println!("  {}: {}x{}", name, img.width, img.height),
-                        Err(e) => println!("  {}: Error: {}", name, e),
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("  (Could not open slide: {})", e);
-        }
-    }
 }
 
 fn cmd_read(path: &str, args: &[String]) {

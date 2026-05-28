@@ -122,6 +122,11 @@ impl OpenSlide {
     ) -> Result<RgbaImage> {
         let size = w as usize * h as usize;
         let mut rgba = vec![0u8; size * 4];
+        if channels[3].is_none() {
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+        }
 
         for (out_idx, ch_opt) in channels.iter().enumerate() {
             if let Some(ch) = ch_opt {
@@ -140,5 +145,98 @@ impl OpenSlide {
     /// Debug: get the number of tiles in the grid for a given channel and level.
     pub fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize {
         self.backend.debug_grid_tile_count(channel, level)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::SlideBackend;
+
+    struct DummyBackend;
+
+    impl SlideBackend for DummyBackend {
+        fn vendor(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn channel_count(&self) -> u32 {
+            4
+        }
+
+        fn channel_name(&self, _channel: u32) -> Option<&str> {
+            None
+        }
+
+        fn level_count(&self) -> u32 {
+            1
+        }
+
+        fn level_dimensions(&self, _level: u32) -> Option<(u64, u64)> {
+            Some((1, 1))
+        }
+
+        fn level_downsample(&self, _level: u32) -> Option<f64> {
+            Some(1.0)
+        }
+
+        fn read_region(
+            &self,
+            channel: u32,
+            _x: i64,
+            _y: i64,
+            _level: u32,
+            w: u32,
+            h: u32,
+        ) -> Result<GrayImage> {
+            Ok(GrayImage {
+                width: w,
+                height: h,
+                data: vec![10 + channel as u8; w as usize * h as usize],
+            })
+        }
+
+        fn properties(&self) -> &HashMap<String, String> {
+            static PROPS: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+            PROPS.get_or_init(HashMap::new)
+        }
+
+        fn associated_image_names(&self) -> Vec<&str> {
+            Vec::new()
+        }
+
+        fn read_associated_image(&self, _name: &str) -> Result<RgbaImage> {
+            Err(OpenSlideError::InvalidArgument("no image".into()))
+        }
+
+        fn debug_grid_tile_count(&self, _channel: u32, _level: u32) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn rgba_composite_defaults_alpha_to_opaque() {
+        let slide = OpenSlide {
+            backend: Box::new(DummyBackend),
+        };
+
+        let image = slide
+            .read_region_rgba([Some(0), Some(1), Some(2), None], 0, 0, 0, 1, 1)
+            .unwrap();
+
+        assert_eq!(image.pixel(0, 0), [10, 11, 12, 255]);
+    }
+
+    #[test]
+    fn rgba_composite_uses_requested_alpha_channel() {
+        let slide = OpenSlide {
+            backend: Box::new(DummyBackend),
+        };
+
+        let image = slide
+            .read_region_rgba([Some(0), Some(1), Some(2), Some(3)], 0, 0, 0, 1, 1)
+            .unwrap();
+
+        assert_eq!(image.pixel(0, 0), [10, 11, 12, 13]);
     }
 }

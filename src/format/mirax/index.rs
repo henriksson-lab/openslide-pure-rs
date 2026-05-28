@@ -331,6 +331,12 @@ impl IndexFile {
                 let length = self.read_i32()?;
                 let fileno = self.read_i32()?;
 
+                if image_index < 0 || offset < 0 || length < 0 || fileno < 0 {
+                    return Err(OpenSlideError::Format(
+                        "Negative value in hier entry".into(),
+                    ));
+                }
+
                 entries.push(HierEntry {
                     image_index,
                     offset,
