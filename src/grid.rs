@@ -65,13 +65,7 @@ impl TileGrid {
     ///
     /// The region is specified in this level's coordinate space.
     /// Returns (col, row, entry) for each overlapping tile.
-    pub fn tiles_in_region(
-        &self,
-        x: f64,
-        y: f64,
-        w: f64,
-        h: f64,
-    ) -> Vec<(i64, i64, &TileEntry)> {
+    pub fn tiles_in_region(&self, x: f64, y: f64, w: f64, h: f64) -> Vec<(i64, i64, &TileEntry)> {
         if self.tile_advance_x <= 0.0 || self.tile_advance_y <= 0.0 {
             return Vec::new();
         }
@@ -133,7 +127,15 @@ mod tests {
         let mut grid = TileGrid::new(256.0, 256.0);
         for row in 0..4 {
             for col in 0..4 {
-                grid.add_tile(col, row, 0.0, 0.0, 256.0, 256.0, make_tile((row * 4 + col) as i32));
+                grid.add_tile(
+                    col,
+                    row,
+                    0.0,
+                    0.0,
+                    256.0,
+                    256.0,
+                    make_tile((row * 4 + col) as i32),
+                );
             }
         }
 

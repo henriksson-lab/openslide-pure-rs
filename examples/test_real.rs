@@ -23,7 +23,10 @@ fn main() {
     let cx = (w0 / 2) as i64;
     let cy = (h0 / 2) as i64;
 
-    println!("\nCenter ({},{}) {}x{} level 0:", cx, cy, tile_size, tile_size);
+    println!(
+        "\nCenter ({},{}) {}x{} level 0:",
+        cx, cy, tile_size, tile_size
+    );
     for ch in 0..slide.channel_count() {
         let name = slide.channel_name(ch).unwrap_or("?");
         match slide.read_region(ch, cx, cy, 0, tile_size, tile_size) {
@@ -49,7 +52,10 @@ fn main() {
     match slide.read_region_rgba(rgba_channels, cx, cy, 0, tile_size, tile_size) {
         Ok(img) => {
             let p = img.pixel(tile_size / 2, tile_size / 2);
-            println!("  Center pixel: R={} G={} B={} A={}", p[0], p[1], p[2], p[3]);
+            println!(
+                "  Center pixel: R={} G={} B={} A={}",
+                p[0], p[1], p[2], p[3]
+            );
         }
         Err(e) => println!("  Error: {}", e),
     }

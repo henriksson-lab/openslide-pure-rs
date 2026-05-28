@@ -1,6 +1,6 @@
+pub mod bmp;
 pub mod jpeg;
 pub mod png;
-pub mod bmp;
 
 /// Image formats that can appear in slide tiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +52,11 @@ pub fn decode_channel(format: ImageFormat, data: &[u8], channel: u32) -> Result<
             for pixel in rgba.data.chunks_exact(4) {
                 gray.push(pixel[channel.min(3) as usize]);
             }
-            Ok(GrayImage { width: rgba.width, height: rgba.height, data: gray })
+            Ok(GrayImage {
+                width: rgba.width,
+                height: rgba.height,
+                data: gray,
+            })
         }
     }
 }

@@ -49,7 +49,10 @@ fn cmd_info(path: &str) {
         println!("Slide type:     {}", st);
     }
     println!("Magnification:  {}x", sd.general.objective_magnification);
-    println!("Image grid:     {} x {}", sd.general.images_x, sd.general.images_y);
+    println!(
+        "Image grid:     {} x {}",
+        sd.general.images_x, sd.general.images_y
+    );
     println!("Divisions/side: {}", sd.general.image_divisions);
     if let Some(bd) = sd.general.slide_bitdepth {
         println!("Slide bitdepth: {}", bd);
@@ -65,7 +68,12 @@ fn cmd_info(path: &str) {
     println!("=== Hierarchical Layers ({}) ===", sd.layers.len());
     for layer in &sd.layers {
         println!();
-        println!("HIER_{}: \"{}\" ({} levels)", layer.index, layer.name, layer.levels.len());
+        println!(
+            "HIER_{}: \"{}\" ({} levels)",
+            layer.index,
+            layer.name,
+            layer.levels.len()
+        );
 
         for (j, level) in layer.levels.iter().enumerate() {
             let section = level.section.as_deref().unwrap_or("(none)");
@@ -118,10 +126,18 @@ fn cmd_info(path: &str) {
     println!();
 
     // Non-hierarchical layers
-    println!("=== Non-Hierarchical Layers ({}) ===", sd.nonhier_layers.len());
+    println!(
+        "=== Non-Hierarchical Layers ({}) ===",
+        sd.nonhier_layers.len()
+    );
     for layer in &sd.nonhier_layers {
         println!();
-        println!("NONHIER_{}: \"{}\" ({} entries)", layer.index, layer.name, layer.levels.len());
+        println!(
+            "NONHIER_{}: \"{}\" ({} entries)",
+            layer.index,
+            layer.name,
+            layer.levels.len()
+        );
         for (j, level) in layer.levels.iter().enumerate() {
             println!("  {}: \"{}\"", j, level.name);
         }
@@ -131,17 +147,20 @@ fn cmd_info(path: &str) {
 
     // Zoom level summary (from the slide zoom layer)
     println!("=== Zoom Levels (Slide zoom level) ===");
-    println!("{:<6} {:>6} {:>12} {:>12} {:>8} {:>8} {:>10}",
-             "Level", "Format", "Tile W", "Tile H", "MPP X", "MPP Y", "Concat");
+    println!(
+        "{:<6} {:>6} {:>12} {:>12} {:>8} {:>8} {:>10}",
+        "Level", "Format", "Tile W", "Tile H", "MPP X", "MPP Y", "Concat"
+    );
     for (i, zl) in sd.zoom_levels.iter().enumerate() {
         let format_name = match zl.image_format {
             openslide_pure_rs::decode::ImageFormat::Jpeg => "JPEG",
             openslide_pure_rs::decode::ImageFormat::Png => "PNG",
             openslide_pure_rs::decode::ImageFormat::Bmp => "BMP24",
         };
-        println!("{:<6} {:>6} {:>12} {:>12} {:>8.4} {:>8.4} {:>10}",
-                 i, format_name, zl.image_w, zl.image_h,
-                 zl.mpp_x, zl.mpp_y, zl.concat_exponent);
+        println!(
+            "{:<6} {:>6} {:>12} {:>12} {:>8.4} {:>8.4} {:>10}",
+            i, format_name, zl.image_w, zl.image_h, zl.mpp_x, zl.mpp_y, zl.concat_exponent
+        );
     }
 
     println!();
@@ -163,7 +182,10 @@ fn cmd_info(path: &str) {
             for i in 0..slide.level_count() {
                 if let Some((w, h)) = slide.level_dimensions(i) {
                     let ds = slide.level_downsample(i).unwrap_or(0.0);
-                    println!("  Level {:>2}: {:>6} x {:<6}  (downsample {:.0})", i, w, h, ds);
+                    println!(
+                        "  Level {:>2}: {:>6} x {:<6}  (downsample {:.0})",
+                        i, w, h, ds
+                    );
                 }
             }
             println!();
@@ -192,10 +214,22 @@ fn cmd_read(path: &str, args: &[String]) {
         std::process::exit(1);
     }
 
-    let x: i64 = args[0].parse().unwrap_or_else(|_| { eprintln!("Invalid x"); std::process::exit(1); });
-    let y: i64 = args[1].parse().unwrap_or_else(|_| { eprintln!("Invalid y"); std::process::exit(1); });
-    let w: u32 = args[2].parse().unwrap_or_else(|_| { eprintln!("Invalid w"); std::process::exit(1); });
-    let h: u32 = args[3].parse().unwrap_or_else(|_| { eprintln!("Invalid h"); std::process::exit(1); });
+    let x: i64 = args[0].parse().unwrap_or_else(|_| {
+        eprintln!("Invalid x");
+        std::process::exit(1);
+    });
+    let y: i64 = args[1].parse().unwrap_or_else(|_| {
+        eprintln!("Invalid y");
+        std::process::exit(1);
+    });
+    let w: u32 = args[2].parse().unwrap_or_else(|_| {
+        eprintln!("Invalid w");
+        std::process::exit(1);
+    });
+    let h: u32 = args[3].parse().unwrap_or_else(|_| {
+        eprintln!("Invalid h");
+        std::process::exit(1);
+    });
 
     let mut level: u32 = 0;
     let mut out = "out.png".to_string();
@@ -206,8 +240,15 @@ fn cmd_read(path: &str, args: &[String]) {
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
-            "--level" => { i += 1; level = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0); }
-            "--channel" => { i += 1; single_channel = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0); mode = "single"; }
+            "--level" => {
+                i += 1;
+                level = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            "--channel" => {
+                i += 1;
+                single_channel = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+                mode = "single";
+            }
             "--rgb" => {
                 i += 1;
                 if let Some(val) = args.get(i) {
@@ -218,8 +259,15 @@ fn cmd_read(path: &str, args: &[String]) {
                     }
                 }
             }
-            "--all" => { mode = "all"; }
-            "--out" => { i += 1; if let Some(v) = args.get(i) { out = v.clone(); } }
+            "--all" => {
+                mode = "all";
+            }
+            "--out" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    out = v.clone();
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -227,7 +275,10 @@ fn cmd_read(path: &str, args: &[String]) {
 
     let slide = match OpenSlide::open(path) {
         Ok(s) => s,
-        Err(e) => { eprintln!("Error opening slide: {}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error opening slide: {}", e);
+            std::process::exit(1);
+        }
     };
 
     if mode == "all" {
@@ -238,8 +289,14 @@ fn cmd_read(path: &str, args: &[String]) {
         for ch in 0..n {
             let name = slide.channel_name(ch).unwrap_or("?").to_string();
             match slide.read_region(ch, x, y, level, w, h) {
-                Ok(img) => { tiles.push(img); labels.push(name); }
-                Err(e) => { eprintln!("Error reading ch{} {}: {}", ch, name, e); std::process::exit(1); }
+                Ok(img) => {
+                    tiles.push(img);
+                    labels.push(name);
+                }
+                Err(e) => {
+                    eprintln!("Error reading ch{} {}: {}", ch, name, e);
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -260,16 +317,29 @@ fn cmd_read(path: &str, args: &[String]) {
         }
 
         write_png_gray(&out, &concat, total_w, h);
-        println!("Wrote {}x{} ({} channels: {}) to {}",
-                 total_w, h, n, labels.join(" | "), out);
+        println!(
+            "Wrote {}x{} ({} channels: {}) to {}",
+            total_w,
+            h,
+            n,
+            labels.join(" | "),
+            out
+        );
     } else if mode == "rgb" {
         let chs = rgb_channels.unwrap();
         let rgba = match slide.read_region_rgba(
             [Some(chs[0]), Some(chs[1]), Some(chs[2]), None],
-            x, y, level, w, h,
+            x,
+            y,
+            level,
+            w,
+            h,
         ) {
             Ok(img) => img,
-            Err(e) => { eprintln!("Error reading region: {}", e); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("Error reading region: {}", e);
+                std::process::exit(1);
+            }
         };
 
         write_png_rgba(&out, &rgba.data, rgba.width, rgba.height);
@@ -278,12 +348,18 @@ fn cmd_read(path: &str, args: &[String]) {
         // Single channel mode: write as grayscale PNG
         let gray = match slide.read_region(single_channel, x, y, level, w, h) {
             Ok(img) => img,
-            Err(e) => { eprintln!("Error reading region: {}", e); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("Error reading region: {}", e);
+                std::process::exit(1);
+            }
         };
 
         write_png_gray(&out, &gray.data, gray.width, gray.height);
         let name = slide.channel_name(single_channel).unwrap_or("?");
-        println!("Wrote {}x{} grayscale (ch{} {}) to {}", gray.width, gray.height, single_channel, name, out);
+        println!(
+            "Wrote {}x{} grayscale (ch{} {}) to {}",
+            gray.width, gray.height, single_channel, name, out
+        );
     }
 }
 

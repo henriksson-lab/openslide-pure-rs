@@ -1,10 +1,10 @@
+pub mod cache;
+pub mod decode;
 pub mod error;
+pub mod format;
+pub mod grid;
 pub mod pixel;
 pub mod properties;
-pub mod decode;
-pub mod grid;
-pub mod cache;
-pub mod format;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -64,7 +64,15 @@ impl OpenSlide {
     /// (e.g. 0=DAPI, 1=FITC, 2=TRITC packed into R/G/B of the same JPEG).
     ///
     /// Coordinates (x, y) are in the level 0 reference frame.
-    pub fn read_region(&self, channel: u32, x: i64, y: i64, level: u32, w: u32, h: u32) -> Result<GrayImage> {
+    pub fn read_region(
+        &self,
+        channel: u32,
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<GrayImage> {
         self.backend.read_region(channel, x, y, level, w, h)
     }
 

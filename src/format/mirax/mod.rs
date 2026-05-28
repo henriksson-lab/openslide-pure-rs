@@ -1,5 +1,5 @@
-pub mod slidedat;
 pub mod index;
+pub mod slidedat;
 pub mod tile;
 
 use std::collections::HashMap;
@@ -17,9 +17,7 @@ use crate::properties;
 
 use self::index::IndexFile;
 use self::slidedat::SlideDat;
-use self::tile::{
-    compute_base_dimensions, compute_zoom_level_params, Image, MiraxLevel, Tile,
-};
+use self::tile::{compute_base_dimensions, compute_zoom_level_params, Image, MiraxLevel, Tile};
 
 /// Check whether a path looks like a Mirax .mrxs slide.
 pub fn detect(path: &Path) -> bool {
@@ -34,9 +32,7 @@ pub fn detect(path: &Path) -> bool {
 /// Try to open a Mirax slide, returning a SlideBackend.
 pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     if !detect(path) {
-        return Err(OpenSlideError::UnsupportedFormat(
-            "Not a Mirax file".into(),
-        ));
+        return Err(OpenSlideError::UnsupportedFormat("Not a Mirax file".into()));
     }
 
     let dirname = path.with_extension("");
@@ -81,10 +77,7 @@ struct AssociatedImageInfo {
 /// Read the slide position buffer from raw data.
 ///
 /// Each record is 9 bytes: 1 byte flag + 4 byte x + 4 byte y (little-endian).
-fn read_slide_position_buffer(
-    data: &[u8],
-    level_0_image_concat: i32,
-) -> Result<Vec<i32>> {
+fn read_slide_position_buffer(data: &[u8], level_0_image_concat: i32) -> Result<Vec<i32>> {
     const RECORD_SIZE: usize = 9;
     if !data.len().is_multiple_of(RECORD_SIZE) {
         return Err(OpenSlideError::Format(
@@ -105,8 +98,18 @@ fn read_slide_position_buffer(
             )));
         }
 
-        let x = i32::from_le_bytes([data[base + 1], data[base + 2], data[base + 3], data[base + 4]]);
-        let y = i32::from_le_bytes([data[base + 5], data[base + 6], data[base + 7], data[base + 8]]);
+        let x = i32::from_le_bytes([
+            data[base + 1],
+            data[base + 2],
+            data[base + 3],
+            data[base + 4],
+        ]);
+        let y = i32::from_le_bytes([
+            data[base + 5],
+            data[base + 6],
+            data[base + 7],
+            data[base + 8],
+        ]);
 
         positions.push(x * level_0_image_concat);
         positions.push(y * level_0_image_concat);
@@ -147,8 +150,7 @@ impl MiraxSlide {
 
         let has_position_data = sd.hierarchical.nonhier_offsets.vimslide_position != -1
             || sd.hierarchical.nonhier_offsets.stitching_position != -1;
-        let has_overlaps =
-            sd.zoom_levels[0].overlap_x != 0.0 || sd.zoom_levels[0].overlap_y != 0.0;
+        let has_overlaps = sd.zoom_levels[0].overlap_x != 0.0 || sd.zoom_levels[0].overlap_y != 0.0;
 
         let zoom_params = compute_zoom_level_params(
             &concat_exponents,
@@ -173,8 +175,7 @@ impl MiraxSlide {
         );
 
         // Read slide positions
-        let npositions =
-            (images_x / image_divisions) * (images_y / image_divisions);
+        let npositions = (images_x / image_divisions) * (images_y / image_divisions);
 
         let slide_positions = Self::load_slide_positions(
             &sd,
@@ -203,9 +204,8 @@ impl MiraxSlide {
             let offset = block_idx * zoom_level_count;
             match index.read_hier_record_at_offset(offset) {
                 Ok(entries) if !entries.is_empty() => {
-                    let avg_len: f64 = entries.iter()
-                        .map(|e| e.length as f64)
-                        .sum::<f64>() / entries.len() as f64;
+                    let avg_len: f64 =
+                        entries.iter().map(|e| e.length as f64).sum::<f64>() / entries.len() as f64;
                     if avg_len > 500.0 {
                         tile_block_offsets.push(offset);
                     }
@@ -225,7 +225,8 @@ impl MiraxSlide {
         }
 
         // Resolve hier_offset for each filter channel
-        let mut filter_level_to_offset: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+        let mut filter_level_to_offset: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
         for (i, name) in filter_level_names.iter().enumerate() {
             let offset = tile_block_offsets.get(i).copied().unwrap_or(0);
             filter_level_to_offset.insert(name.clone(), offset);
@@ -278,7 +279,8 @@ impl MiraxSlide {
             // For FilterLevel_1 (e.g. offset 20), read records 20..20+zoom_level_count.
             // Only read as many zoom levels as we have entries for.
             let mut image_number: i32 = 0;
-            let mut active_positions: std::collections::HashSet<i32> = std::collections::HashSet::new();
+            let mut active_positions: std::collections::HashSet<i32> =
+                std::collections::HashSet::new();
 
             for zoom_level in 0..zoom_level_count as usize {
                 let record_offset = hier_base_offset + zoom_level as i32;
@@ -360,23 +362,25 @@ impl MiraxSlide {
                                 }
                             }
 
-                            let (pos_x, pos_y) = if is_primary && (cp * 2 + 1) < slide_positions.len() as i32 {
-                                let image0_w = levels[0].level.image_width;
-                                let image0_h = levels[0].level.image_height;
-                                let pos0_x = slide_positions[(cp * 2) as usize]
-                                    + image0_w * (xx - xp * image_divisions);
-                                let pos0_y = slide_positions[(cp * 2 + 1) as usize]
-                                    + image0_h * (yy - yp * image_divisions);
-                                (pos0_x as f64 / lp.image_concat as f64,
-                                 pos0_y as f64 / lp.image_concat as f64)
-                            } else {
-                                // Simple grid placement: tile position from
-                                // image coordinates × tile advance
-                                let tile_col = (x / lp.tile_count_divisor + xi) as f64;
-                                let tile_row = (y / lp.tile_count_divisor + yi) as f64;
-                                (tile_col * lp.tile_advance_x,
-                                 tile_row * lp.tile_advance_y)
-                            };
+                            let (pos_x, pos_y) =
+                                if is_primary && (cp * 2 + 1) < slide_positions.len() as i32 {
+                                    let image0_w = levels[0].level.image_width;
+                                    let image0_h = levels[0].level.image_height;
+                                    let pos0_x = slide_positions[(cp * 2) as usize]
+                                        + image0_w * (xx - xp * image_divisions);
+                                    let pos0_y = slide_positions[(cp * 2 + 1) as usize]
+                                        + image0_h * (yy - yp * image_divisions);
+                                    (
+                                        pos0_x as f64 / lp.image_concat as f64,
+                                        pos0_y as f64 / lp.image_concat as f64,
+                                    )
+                                } else {
+                                    // Simple grid placement: tile position from
+                                    // image coordinates × tile advance
+                                    let tile_col = (x / lp.tile_count_divisor + xi) as f64;
+                                    let tile_row = (y / lp.tile_count_divisor + yi) as f64;
+                                    (tile_col * lp.tile_advance_x, tile_row * lp.tile_advance_y)
+                                };
 
                             let tile_col = (x / lp.tile_count_divisor + xi) as i64;
                             let tile_row = (y / lp.tile_count_divisor + yi) as i64;
@@ -415,10 +419,14 @@ impl MiraxSlide {
             if let Ok(entries) = index.read_hier_record_at_offset(offset) {
                 // Pick the entry with the largest data (likely most signal)
                 if let Some(entry) = entries.iter().max_by_key(|e| e.length) {
-                    if let Ok(path) = sd.datafile_paths.get(entry.fileno as usize)
+                    if let Ok(path) = sd
+                        .datafile_paths
+                        .get(entry.fileno as usize)
                         .ok_or_else(|| OpenSlideError::Format("bad fileno".into()))
                     {
-                        if let Ok(data) = read_record_data(path, entry.offset as i64, entry.length as i64) {
+                        if let Ok(data) =
+                            read_record_data(path, entry.offset as i64, entry.length as i64)
+                        {
                             let format = detect_image_format(&data);
                             if let Ok((rgb, _, _)) = decode::decode_rgb(format, &data) {
                                 // Sum each channel
@@ -431,9 +439,13 @@ impl MiraxSlide {
                                 let best = if sums[0] == 0 && sums[1] == 0 && sums[2] == 0 {
                                     eprintln!("Warning: all RGB channels zero in sample tile for filter level at offset {}; defaulting to B channel", offset);
                                     2 // All zeros: default to B (YCbCr luminance mapping)
-                                } else if sums[0] >= sums[1] && sums[0] >= sums[2] { 0 }
-                                    else if sums[1] >= sums[2] { 1 }
-                                    else { 2 };
+                                } else if sums[0] >= sums[1] && sums[0] >= sums[2] {
+                                    0
+                                } else if sums[1] >= sums[2] {
+                                    1
+                                } else {
+                                    2
+                                };
                                 detected_rgb_channel.insert(offset, best);
                             }
                         }
@@ -445,38 +457,54 @@ impl MiraxSlide {
         let channels: Vec<ChannelMapping> = if filter_channels.is_empty() {
             // Non-fluorescence slide: 3 channels = R, G, B
             vec![
-                ChannelMapping { name: "Red".into(), rgb_channel: 0, filter_level_idx: 0 },
-                ChannelMapping { name: "Green".into(), rgb_channel: 1, filter_level_idx: 0 },
-                ChannelMapping { name: "Blue".into(), rgb_channel: 2, filter_level_idx: 0 },
+                ChannelMapping {
+                    name: "Red".into(),
+                    rgb_channel: 0,
+                    filter_level_idx: 0,
+                },
+                ChannelMapping {
+                    name: "Green".into(),
+                    rgb_channel: 1,
+                    filter_level_idx: 0,
+                },
+                ChannelMapping {
+                    name: "Blue".into(),
+                    rgb_channel: 2,
+                    filter_level_idx: 0,
+                },
             ]
         } else {
-            filter_channels.iter().map(|fc| {
-                let filter_level_idx = filter_level_hier_offsets.iter()
-                    .position(|&o| o == fc.hier_offset)
-                    .unwrap_or(0);
+            filter_channels
+                .iter()
+                .map(|fc| {
+                    let filter_level_idx = filter_level_hier_offsets
+                        .iter()
+                        .position(|&o| o == fc.hier_offset)
+                        .unwrap_or(0);
 
-                let rgb_channel = if fc.hier_offset == 0 {
-                    // Primary filter level: storing_channel maps to RGB directly
-                    fc.storing_channel as u32
-                } else {
-                    // Non-primary: use auto-detected channel
-                    detected_rgb_channel.get(&fc.hier_offset).copied().unwrap_or(2)
-                };
+                    let rgb_channel = if fc.hier_offset == 0 {
+                        // Primary filter level: storing_channel maps to RGB directly
+                        fc.storing_channel as u32
+                    } else {
+                        // Non-primary: use auto-detected channel
+                        detected_rgb_channel
+                            .get(&fc.hier_offset)
+                            .copied()
+                            .unwrap_or(2)
+                    };
 
-                ChannelMapping {
-                    name: fc.name.clone(),
-                    rgb_channel,
-                    filter_level_idx,
-                }
-            }).collect()
+                    ChannelMapping {
+                        name: fc.name.clone(),
+                        rgb_channel,
+                        filter_level_idx,
+                    }
+                })
+                .collect()
         };
 
         // Build properties
         let mut props = sd.raw_properties;
-        props.insert(
-            properties::PROPERTY_VENDOR.into(),
-            "mirax".into(),
-        );
+        props.insert(properties::PROPERTY_VENDOR.into(), "mirax".into());
         if sd.zoom_levels[0].mpp_x > 0.0 {
             props.insert(
                 properties::PROPERTY_MPP_X.into(),
@@ -552,7 +580,9 @@ impl MiraxSlide {
             let record = index.read_nonhier_record(record_no)?;
 
             if record.fileno < 0 || record.fileno as usize >= sd.datafile_paths.len() {
-                return Err(OpenSlideError::Format("Invalid fileno in position record".into()));
+                return Err(OpenSlideError::Format(
+                    "Invalid fileno in position record".into(),
+                ));
             }
 
             let raw_data = read_record_data(
@@ -561,7 +591,9 @@ impl MiraxSlide {
                 record.size as i64,
             )?;
 
-            let data = if offsets.stitching_position != -1 && record_no == offsets.stitching_position {
+            let data = if offsets.stitching_position != -1
+                && record_no == offsets.stitching_position
+            {
                 // Decompress zlib
                 use flate2::read::ZlibDecoder;
                 let mut decoder = ZlibDecoder::new(&raw_data[..]);
@@ -625,7 +657,8 @@ impl MiraxSlide {
                 let format = detect_image_format(&data);
                 let (rgb, width, height) = decode::decode_rgb(format, &data)?;
                 let tile = CachedTile { width, height, rgb };
-                self.cache.put(filter_level_idx, level, imageno, tile.clone());
+                self.cache
+                    .put(filter_level_idx, level, imageno, tile.clone());
                 tile
             }
         };
@@ -660,36 +693,56 @@ impl SlideBackend for MiraxSlide {
 
     fn level_count(&self) -> u32 {
         // Use the first filter level's grid count (all filter levels share the same zoom structure)
-        self.filter_level_grids.first().map_or(0, |g| g.len() as u32)
+        self.filter_level_grids
+            .first()
+            .map_or(0, |g| g.len() as u32)
     }
 
     fn level_dimensions(&self, level: u32) -> Option<(u64, u64)> {
-        self.filter_level_grids.first()?.get(level as usize).map(|l| {
-            (l.level.width as u64, l.level.height as u64)
-        })
+        self.filter_level_grids
+            .first()?
+            .get(level as usize)
+            .map(|l| (l.level.width as u64, l.level.height as u64))
     }
 
     fn level_downsample(&self, level: u32) -> Option<f64> {
-        self.filter_level_grids.first()?.get(level as usize).map(|l| l.level.downsample)
+        self.filter_level_grids
+            .first()?
+            .get(level as usize)
+            .map(|l| l.level.downsample)
     }
 
-    fn read_region(&self, channel: u32, x: i64, y: i64, level: u32, w: u32, h: u32) -> Result<GrayImage> {
+    fn read_region(
+        &self,
+        channel: u32,
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<GrayImage> {
         // Map logical channel to filter level + RGB channel
         let mapping = self.channels.get(channel as usize).ok_or_else(|| {
             OpenSlideError::InvalidArgument(format!(
-                "Invalid channel {} (slide has {} channels)", channel, self.channels.len()
+                "Invalid channel {} (slide has {} channels)",
+                channel,
+                self.channels.len()
             ))
         })?;
 
-        let levels = self.filter_level_grids.get(mapping.filter_level_idx).ok_or_else(|| {
-            OpenSlideError::Format(format!(
-                "Filter level {} not found for channel {}", mapping.filter_level_idx, channel
-            ))
-        })?;
+        let levels = self
+            .filter_level_grids
+            .get(mapping.filter_level_idx)
+            .ok_or_else(|| {
+                OpenSlideError::Format(format!(
+                    "Filter level {} not found for channel {}",
+                    mapping.filter_level_idx, channel
+                ))
+            })?;
 
-        let level_data = levels.get(level as usize).ok_or_else(|| {
-            OpenSlideError::InvalidArgument(format!("Invalid level {}", level))
-        })?;
+        let level_data = levels
+            .get(level as usize)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {}", level)))?;
 
         let downsample = level_data.level.downsample;
         let lx = x as f64 / downsample;
@@ -707,10 +760,8 @@ impl SlideBackend for MiraxSlide {
                 mapping.rgb_channel,
             )?;
 
-            let tile_origin_x =
-                col as f64 * level_data.grid.tile_advance_x + entry.offset_x;
-            let tile_origin_y =
-                row as f64 * level_data.grid.tile_advance_y + entry.offset_y;
+            let tile_origin_x = col as f64 * level_data.grid.tile_advance_x + entry.offset_x;
+            let tile_origin_y = row as f64 * level_data.grid.tile_advance_y + entry.offset_y;
 
             blit_gray(
                 &decoded,
@@ -754,7 +805,9 @@ impl SlideBackend for MiraxSlide {
             Some(l) => l,
             None => return 0,
         };
-        levels.get(level as usize).map_or(0, |l| l.grid.tile_count())
+        levels
+            .get(level as usize)
+            .map_or(0, |l| l.grid.tile_count())
     }
 }
 

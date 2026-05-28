@@ -27,7 +27,10 @@ pub fn decode_bmp_rgba(data: &[u8]) -> Result<RgbaImage> {
     let compression = u32::from_le_bytes([data[30], data[31], data[32], data[33]]);
 
     if width <= 0 {
-        return Err(OpenSlideError::Decode(format!("Invalid BMP width: {}", width)));
+        return Err(OpenSlideError::Decode(format!(
+            "Invalid BMP width: {}",
+            width
+        )));
     }
     if bpp != 24 {
         return Err(OpenSlideError::Decode(format!(
@@ -62,7 +65,11 @@ pub fn decode_bmp_rgba(data: &[u8]) -> Result<RgbaImage> {
     let mut rgba = vec![0u8; w as usize * h as usize * 4];
 
     for row in 0..h as usize {
-        let src_row = if bottom_up { (h as usize - 1) - row } else { row };
+        let src_row = if bottom_up {
+            (h as usize - 1) - row
+        } else {
+            row
+        };
         let src_offset = src_row * row_stride;
         let dst_offset = row * w as usize * 4;
 
@@ -70,10 +77,10 @@ pub fn decode_bmp_rgba(data: &[u8]) -> Result<RgbaImage> {
             let si = src_offset + col * 3;
             let di = dst_offset + col * 4;
             // BMP stores BGR, convert to RGBA
-            rgba[di] = pixel_data[si + 2];     // R
+            rgba[di] = pixel_data[si + 2]; // R
             rgba[di + 1] = pixel_data[si + 1]; // G
-            rgba[di + 2] = pixel_data[si];     // B
-            rgba[di + 3] = 0xFF;               // A (BMP24 has no alpha)
+            rgba[di + 2] = pixel_data[si]; // B
+            rgba[di + 3] = 0xFF; // A (BMP24 has no alpha)
         }
     }
 
@@ -103,7 +110,7 @@ mod tests {
         data[22..26].copy_from_slice(&height.to_le_bytes());
         data[26..28].copy_from_slice(&1u16.to_le_bytes()); // planes
         data[28..30].copy_from_slice(&24u16.to_le_bytes()); // bpp
-        // compression = 0 (BI_RGB), already zeroed
+                                                            // compression = 0 (BI_RGB), already zeroed
 
         // Fill pixel rows (with padding)
         for row in 0..h as usize {
@@ -136,8 +143,8 @@ mod tests {
         // File order (BGR): row0=[red, green], row1=[blue, white]
         // bottom-up means: display row 0 = file row 1, display row 1 = file row 0
         let pixels = vec![
-            0x00, 0x00, 0xFF,  0x00, 0xFF, 0x00,  // file row 0 (bottom): red, green
-            0xFF, 0x00, 0x00,  0xFF, 0xFF, 0xFF,  // file row 1 (top): blue, white
+            0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, // file row 0 (bottom): red, green
+            0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, // file row 1 (top): blue, white
         ];
         let bmp = make_bmp24(2, 2, &pixels);
         let img = decode_bmp_rgba(&bmp).unwrap();
@@ -145,7 +152,7 @@ mod tests {
         // Display row 0 = file row 1 (top): blue, white
         assert_eq!(img.pixel(0, 0), [0x00, 0x00, 0xFF, 0xFF]); // blue
         assert_eq!(img.pixel(1, 0), [0xFF, 0xFF, 0xFF, 0xFF]); // white
-        // Display row 1 = file row 0 (bottom): red, green
+                                                               // Display row 1 = file row 0 (bottom): red, green
         assert_eq!(img.pixel(0, 1), [0xFF, 0x00, 0x00, 0xFF]); // red
         assert_eq!(img.pixel(1, 1), [0x00, 0xFF, 0x00, 0xFF]); // green
     }
@@ -154,7 +161,7 @@ mod tests {
     fn test_decode_bmp24_top_down() {
         // Negative height = top-down
         let pixels = vec![
-            0xFF, 0x00, 0x00,  // blue (BGR)
+            0xFF, 0x00, 0x00, // blue (BGR)
         ];
         let bmp = make_bmp24(1, -1, &pixels);
         let img = decode_bmp_rgba(&bmp).unwrap();

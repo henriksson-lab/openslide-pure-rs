@@ -44,12 +44,11 @@ impl IndexFile {
 
         // Read and verify version
         let mut version_buf = [0u8; 5];
-        reader.read_exact(&mut version_buf).map_err(|e| {
-            OpenSlideError::Format(format!("Cannot read index version: {}", e))
-        })?;
-        let version = std::str::from_utf8(&version_buf).map_err(|_| {
-            OpenSlideError::Format("Index version is not valid UTF-8".into())
-        })?;
+        reader
+            .read_exact(&mut version_buf)
+            .map_err(|e| OpenSlideError::Format(format!("Cannot read index version: {}", e)))?;
+        let version = std::str::from_utf8(&version_buf)
+            .map_err(|_| OpenSlideError::Format("Index version is not valid UTF-8".into()))?;
         if version != INDEX_VERSION {
             return Err(OpenSlideError::Format(format!(
                 "Index.dat has unexpected version '{}', expected '{}'",
@@ -63,9 +62,8 @@ impl IndexFile {
         reader.read_exact(&mut id_buf).map_err(|e| {
             OpenSlideError::Format(format!("Cannot read slide ID from index: {}", e))
         })?;
-        let found_id = std::str::from_utf8(&id_buf).map_err(|_| {
-            OpenSlideError::Format("Index slide ID is not valid UTF-8".into())
-        })?;
+        let found_id = std::str::from_utf8(&id_buf)
+            .map_err(|_| OpenSlideError::Format("Index slide ID is not valid UTF-8".into()))?;
         if found_id != expected_slide_id {
             return Err(OpenSlideError::Format(format!(
                 "Index.dat slide ID '{}' doesn't match expected '{}'",
@@ -85,17 +83,15 @@ impl IndexFile {
     }
 
     fn read_i32(&mut self) -> Result<i32> {
-        self.reader.read_i32::<LittleEndian>().map_err(|e| {
-            OpenSlideError::Format(format!("Cannot read i32 from index: {}", e))
-        })
+        self.reader
+            .read_i32::<LittleEndian>()
+            .map_err(|e| OpenSlideError::Format(format!("Cannot read i32 from index: {}", e)))
     }
 
     fn seek(&mut self, pos: i64) -> Result<()> {
-        self.reader
-            .seek(SeekFrom::Start(pos as u64))
-            .map_err(|e| {
-                OpenSlideError::Format(format!("Cannot seek in index to {}: {}", pos, e))
-            })?;
+        self.reader.seek(SeekFrom::Start(pos as u64)).map_err(|e| {
+            OpenSlideError::Format(format!("Cannot seek in index to {}: {}", pos, e))
+        })?;
         Ok(())
     }
 
@@ -121,9 +117,7 @@ impl IndexFile {
         let initial = self.read_i32()?;
         if initial == 0x302e3130 {
             // Magic constant = empty section
-            return Err(OpenSlideError::Format(
-                "Nonhier record is empty".into(),
-            ));
+            return Err(OpenSlideError::Format("Nonhier record is empty".into()));
         }
         if initial != 0 {
             return Err(OpenSlideError::Format(format!(
@@ -184,7 +178,9 @@ impl IndexFile {
         self.seek(self.hier_root)?;
         let root_ptr = self.read_i32()?;
         if root_ptr < 0 {
-            return Err(OpenSlideError::Format("Can't read initial hier pointer".into()));
+            return Err(OpenSlideError::Format(
+                "Can't read initial hier pointer".into(),
+            ));
         }
 
         let mut all_entries = Vec::with_capacity(zoom_levels as usize);
@@ -286,7 +282,9 @@ impl IndexFile {
         self.seek(self.hier_root)?;
         let root_ptr = self.read_i32()?;
         if root_ptr < 0 {
-            return Err(OpenSlideError::Format("Can't read initial hier pointer".into()));
+            return Err(OpenSlideError::Format(
+                "Can't read initial hier pointer".into(),
+            ));
         }
 
         let seek_location = root_ptr as i64 + record_offset as i64 * 4;
@@ -294,7 +292,8 @@ impl IndexFile {
         let level_ptr = self.read_i32()?;
         if level_ptr < 0 {
             return Err(OpenSlideError::Format(format!(
-                "Can't read hier record pointer at offset {}", record_offset
+                "Can't read hier record pointer at offset {}",
+                record_offset
             )));
         }
 
@@ -419,8 +418,7 @@ mod tests {
 
         // hier_root -> zoom_table_pos
         let hier_ptr_pos = hier_root_pos;
-        buf[hier_ptr_pos..hier_ptr_pos + 4]
-            .copy_from_slice(&(zoom_table_pos as i32).to_le_bytes());
+        buf[hier_ptr_pos..hier_ptr_pos + 4].copy_from_slice(&(zoom_table_pos as i32).to_le_bytes());
 
         // zoom_table[0] -> list_head_pos
         buf[zoom_table_pos..zoom_table_pos + 4]

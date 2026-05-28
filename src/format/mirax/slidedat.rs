@@ -137,9 +137,8 @@ fn parse_int(s: &str) -> Result<i32> {
 }
 
 fn get_value(ini: &Ini, section: &str, key: &str) -> Result<String> {
-    ini.get(section, key).ok_or_else(|| {
-        OpenSlideError::Format(format!("Missing key [{}].{}", section, key))
-    })
+    ini.get(section, key)
+        .ok_or_else(|| OpenSlideError::Format(format!("Missing key [{}].{}", section, key)))
 }
 
 fn get_int(ini: &Ini, section: &str, key: &str) -> Result<i32> {
@@ -270,23 +269,23 @@ impl SlideDat {
         ini.set_default_section("");
 
         // Read file content and strip UTF-8 BOM if present
-        let content = std::fs::read_to_string(&slidedat_path).map_err(|e| {
-            OpenSlideError::Format(format!("Can't read Slidedat.ini: {}", e))
-        })?;
+        let content = std::fs::read_to_string(&slidedat_path)
+            .map_err(|e| OpenSlideError::Format(format!("Can't read Slidedat.ini: {}", e)))?;
         let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
 
-        ini.read(content.to_string()).map_err(|e| {
-            OpenSlideError::Format(format!("Can't parse Slidedat.ini: {}", e))
-        })?;
+        ini.read(content.to_string())
+            .map_err(|e| OpenSlideError::Format(format!("Can't parse Slidedat.ini: {}", e)))?;
 
         let raw_properties = extract_raw_properties(&ini);
 
         // [GENERAL]
         let slide_id = get_value(&ini, "GENERAL", "SLIDE_ID")?;
         let slide_type = ini.get("GENERAL", "SLIDE_TYPE");
-        let slide_bitdepth = ini.get("GENERAL", "VIMSLIDE_SLIDE_BITDEPTH")
+        let slide_bitdepth = ini
+            .get("GENERAL", "VIMSLIDE_SLIDE_BITDEPTH")
             .and_then(|v| parse_int(&v).ok());
-        let camera_bitdepth = ini.get("GENERAL", "VIMSLIDE_CAMERA_REAL_BITDEPTH")
+        let camera_bitdepth = ini
+            .get("GENERAL", "VIMSLIDE_CAMERA_REAL_BITDEPTH")
             .and_then(|v| parse_int(&v).ok());
         let images_x = get_int(&ini, "GENERAL", "IMAGENUMBER_X")?;
         let images_y = get_int(&ini, "GENERAL", "IMAGENUMBER_Y")?;
@@ -329,7 +328,9 @@ impl SlideDat {
         let zoom_level_count_key = format!("HIER_{}_COUNT", slide_zoom_level_value);
         let zoom_level_count = get_int(&ini, "HIERARCHICAL", &zoom_level_count_key)?;
         if zoom_level_count <= 0 {
-            return Err(OpenSlideError::Format("Zoom level count must be positive".into()));
+            return Err(OpenSlideError::Format(
+                "Zoom level count must be positive".into(),
+            ));
         }
 
         let mut zoom_level_section_names = Vec::with_capacity(zoom_level_count as usize);
@@ -349,8 +350,7 @@ impl SlideDat {
             let mut levels = Vec::with_capacity(level_count as usize);
             for j in 0..level_count {
                 let level_name_key = format!("HIER_{}_VAL_{}", i, j);
-                let level_name = ini.get("HIERARCHICAL", &level_name_key)
-                    .unwrap_or_default();
+                let level_name = ini.get("HIERARCHICAL", &level_name_key).unwrap_or_default();
                 let level_section_key = format!("HIER_{}_VAL_{}_SECTION", i, j);
                 let level_section = ini.get("HIERARCHICAL", &level_section_key);
                 levels.push(HierLevel {
@@ -377,8 +377,7 @@ impl SlideDat {
             let mut levels = Vec::with_capacity(level_count as usize);
             for j in 0..level_count {
                 let level_name_key = format!("NONHIER_{}_VAL_{}", i, j);
-                let level_name = ini.get("HIERARCHICAL", &level_name_key)
-                    .unwrap_or_default();
+                let level_name = ini.get("HIERARCHICAL", &level_name_key).unwrap_or_default();
                 let level_section_key = format!("NONHIER_{}_VAL_{}_SECTION", i, j);
                 let level_section = ini.get("HIERARCHICAL", &level_section_key);
                 levels.push(NonhierLevel {
@@ -458,7 +457,9 @@ impl SlideDat {
 
             if i == 0 {
                 if concat_exponent < 0 {
-                    return Err(OpenSlideError::Format("concat_exponent < 0 at level 0".into()));
+                    return Err(OpenSlideError::Format(
+                        "concat_exponent < 0 at level 0".into(),
+                    ));
                 }
             } else if concat_exponent <= 0 {
                 return Err(OpenSlideError::Format(format!(
@@ -474,9 +475,8 @@ impl SlideDat {
             }
 
             // Convert BGR to RGB
-            let fill_rgb = ((bgr << 16) & 0x00FF0000)
-                | (bgr & 0x0000FF00)
-                | ((bgr >> 16) & 0x000000FF);
+            let fill_rgb =
+                ((bgr << 16) & 0x00FF0000) | (bgr & 0x0000FF00) | ((bgr >> 16) & 0x000000FF);
 
             let format_str = get_value(&ini, section, "IMAGE_FORMAT")?;
             let image_format = parse_image_format(&format_str)?;
@@ -507,17 +507,25 @@ impl SlideDat {
                 if let Some(ref sec) = level.section {
                     let sec = sec.trim();
                     let name = ini.get(sec, "FILTER_NAME").unwrap_or_default();
-                    let storing_ch = ini.get(sec, "STORING_CHANNEL_NUMBER")
+                    let storing_ch = ini
+                        .get(sec, "STORING_CHANNEL_NUMBER")
                         .and_then(|v| parse_int(&v).ok())
                         .unwrap_or(0);
-                    let filter_level_name = ini.get(sec, "DATA_IN_THIS_FILTER_LEVEL")
+                    let filter_level_name = ini
+                        .get(sec, "DATA_IN_THIS_FILTER_LEVEL")
                         .unwrap_or_default();
-                    let color_r = ini.get(sec, "COLOR_R")
-                        .and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(255);
-                    let color_g = ini.get(sec, "COLOR_G")
-                        .and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(255);
-                    let color_b = ini.get(sec, "COLOR_B")
-                        .and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(255);
+                    let color_r = ini
+                        .get(sec, "COLOR_R")
+                        .and_then(|v| v.trim().parse::<u8>().ok())
+                        .unwrap_or(255);
+                    let color_g = ini
+                        .get(sec, "COLOR_G")
+                        .and_then(|v| v.trim().parse::<u8>().ok())
+                        .unwrap_or(255);
+                    let color_b = ini
+                        .get(sec, "COLOR_B")
+                        .and_then(|v| v.trim().parse::<u8>().ok())
+                        .unwrap_or(255);
 
                     filter_channels.push(FilterChannel {
                         name,
