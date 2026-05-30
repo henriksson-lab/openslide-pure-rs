@@ -9,6 +9,35 @@ use crate::format::SlideBackend;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
 
+/// Decompress a complete Zstandard frame into a freshly allocated buffer.
+///
+/// Uses the pure-Rust `zstd-pure-rs` decoder. The frame must declare its
+/// content size (CZI Zstd subblocks always do); frames with an unknown size
+/// are rejected rather than streamed.
+fn zstd_decode_all(src: &[u8]) -> Result<Vec<u8>> {
+    use zstd_pure_rs::prelude::{
+        ZSTD_decompress, ZSTD_getFrameContentSize, ZSTD_isError, ZSTD_CONTENTSIZE_ERROR,
+        ZSTD_CONTENTSIZE_UNKNOWN,
+    };
+
+    let content_size = ZSTD_getFrameContentSize(src);
+    if content_size == ZSTD_CONTENTSIZE_ERROR || content_size == ZSTD_CONTENTSIZE_UNKNOWN {
+        return Err(OpenSlideError::Decode(
+            "Failed to decode Zeiss CZI Zstd subblock: missing frame content size".to_string(),
+        ));
+    }
+
+    let mut decoded = vec![0u8; content_size as usize];
+    let written = ZSTD_decompress(&mut decoded, src);
+    if ZSTD_isError(written) {
+        return Err(OpenSlideError::Decode(format!(
+            "Failed to decode Zeiss CZI Zstd subblock: decode error code {written}"
+        )));
+    }
+    decoded.truncate(written);
+    Ok(decoded)
+}
+
 const SID_ZISRAWATTDIR: &[u8] = b"ZISRAWATTDIR";
 const SID_ZISRAWDIRECTORY: &[u8] = b"ZISRAWDIRECTORY";
 const SID_ZISRAWFILE: &[u8] = b"ZISRAWFILE";
@@ -292,11 +321,7 @@ impl ZeissSlide {
                 )
             }
             CZI_COMPRESSION_ZSTD0 | CZI_COMPRESSION_ZSTD1 => {
-                let decoded = zstd::stream::decode_all(raw.as_slice()).map_err(|err| {
-                    OpenSlideError::Decode(format!(
-                        "Failed to decode Zeiss CZI Zstd subblock: {err}"
-                    ))
-                })?;
+                let decoded = zstd_decode_all(&raw)?;
                 decode_uncompressed_subblock_channel(block, &decoded, channel)
             }
             other => Err(OpenSlideError::UnsupportedFormat(format!(
@@ -1940,7 +1965,14 @@ mod tests {
             std::process::id()
         ));
         let pixels = vec![3, 2, 1, 6, 5, 4];
-        let compressed = zstd::stream::encode_all(pixels.as_slice(), 0).unwrap();
+        let compressed = {
+            use zstd_pure_rs::prelude::{ZSTD_compress, ZSTD_compressBound, ZSTD_isError};
+            let mut buf = vec![0u8; ZSTD_compressBound(pixels.len())];
+            let written = ZSTD_compress(&mut buf, &pixels, 0);
+            assert!(!ZSTD_isError(written), "zstd compression failed: {written}");
+            buf.truncate(written);
+            buf
+        };
         fs::write(
             &path,
             make_test_czi(2, 1, CZI_PIXEL_BGR24, CZI_COMPRESSION_ZSTD0, &compressed),

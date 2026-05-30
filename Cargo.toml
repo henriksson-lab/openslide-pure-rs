@@ -1,11 +1,11 @@
 [package]
 name = "openslide-pure-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Pure Rust library for reading whole slide images"
 license = "LGPL-2.1"
 homepage = "https://github.com/henriksson-lab/openslide-pure-rs"
-exclude = ["openslide/", "examples/"]
+include = ["/src/**/*.rs", "/README.md", "/Cargo.toml"]
 
 [dependencies]
 thiserror = "2"
@@ -16,6 +16,6 @@ byteorder = "1"
 flate2 = "1"
 lru = "0.12"
 tiff = "0.11"
-zstd = { version = "0.13", default-features = false }
+zstd-pure-rs = "0.1.1"
 
 [dev-dependencies]

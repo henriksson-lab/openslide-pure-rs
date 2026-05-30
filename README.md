@@ -1,11 +1,12 @@
 # openslide-pure-rs
 
-A Rust translation of [OpenSlide](https://openslide.org/), alibrary for reading whole-slide images (digital pathology).
+A Rust translation of [OpenSlide](https://openslide.org/), a library for reading whole-slide images (digital pathology).
 
 Includes full **Mirax (.mrxs)** support from 3DHISTECH scanners; format reverse engineered to support 4th channel,
 trying to [address long-standing problems with this format](https://www.openmicroscopy.org/2016/01/06/format-support.html).
 Fix yet to be contributed upstream (more testing needed)
 
+* 2026-05-30: Further audits. **This crate is still experimental**
 * 2026-05-28: Blind-translated a large number of non-MRXS formats. **These need real data to be tested**; please provide files if you find bugs and I will make them work!
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code! 
