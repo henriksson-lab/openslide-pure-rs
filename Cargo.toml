@@ -2,9 +2,13 @@
 name = "openslide-pure-rs"
 version = "0.1.1"
 edition = "2021"
-description = "Pure Rust library for reading whole slide images"
-license = "LGPL-2.1"
-homepage = "https://github.com/henriksson-lab/openslide-pure-rs"
+description = "Pure Rust library for reading whole slide images (digital pathology), including Mirax (.mrxs)"
+license = "LGPL-2.1-only"
+homepage = "https://github.com/henriksson-lab/openslide-rs"
+repository = "https://github.com/henriksson-lab/openslide-rs"
+readme = "README.md"
+keywords = ["openslide", "pathology", "microscopy", "wsi", "mirax"]
+categories = ["multimedia::images", "science", "parsing"]
 include = ["/src/**/*.rs", "/README.md", "/Cargo.toml"]
 
 [dependencies]
@@ -16,6 +20,4 @@ byteorder = "1"
 flate2 = "1"
 lru = "0.12"
 tiff = "0.11"
-zstd-pure-rs = "0.1.1"
-
-[dev-dependencies]
+zstd-pure-rs = "0.1"
