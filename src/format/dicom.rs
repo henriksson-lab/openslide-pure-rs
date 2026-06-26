@@ -118,6 +118,8 @@ const TS_JPEG_2000: &str = "1.2.840.10008.1.2.4.91";
 const ITEM_TAG: Tag = Tag(0xfffe, 0xe000);
 const ITEM_DELIMITATION_ITEM_TAG: Tag = Tag(0xfffe, 0xe00d);
 const SEQUENCE_DELIMITATION_ITEM_TAG: Tag = Tag(0xfffe, 0xe0dd);
+const MAX_DEFLATED_DATASET_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CAPTURED_DEFLATED_PIXEL_DATA_BYTES: u32 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Tag(u16, u16);
@@ -336,13 +338,6 @@ struct TotalPixelMatrixOrigin {
 }
 
 pub fn detect(path: &Path) -> bool {
-    if matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some(ext) if ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff")
-    ) {
-        return false;
-    }
-
     let Ok((meta, _dataset_offset)) = read_file_meta(path) else {
         return false;
     };
@@ -1647,14 +1642,18 @@ fn read_dataset(
 fn read_deflated_dataset(path: &Path, offset: u64) -> Result<ParsedDataset> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
-    let mut deflated = Vec::new();
-    file.read_to_end(&mut deflated)?;
     let mut inflated = Vec::new();
-    DeflateDecoder::new(&deflated[..])
+    DeflateDecoder::new(file)
+        .take(MAX_DEFLATED_DATASET_BYTES + 1)
         .read_to_end(&mut inflated)
         .map_err(|err| {
             OpenSlideError::Decode(format!("DICOM deflated dataset decode failed: {err}"))
         })?;
+    if inflated.len() as u64 > MAX_DEFLATED_DATASET_BYTES {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Deflated DICOM dataset exceeds {MAX_DEFLATED_DATASET_BYTES} bytes after inflation"
+        )));
+    }
     let mut cursor = Cursor::new(inflated);
     read_dataset_from_reader(&mut cursor, true, Endian::Little, true)
 }
@@ -1686,6 +1685,12 @@ fn read_dataset_from_reader(
                     return Err(OpenSlideError::UnsupportedFormat(
                         "Deflated native DICOM PixelData has undefined length".into(),
                     ));
+                }
+                if header.len > MAX_CAPTURED_DEFLATED_PIXEL_DATA_BYTES {
+                    return Err(OpenSlideError::UnsupportedFormat(format!(
+                        "Deflated native DICOM PixelData is {len} bytes, exceeding the {MAX_CAPTURED_DEFLATED_PIXEL_DATA_BYTES} byte in-memory limit",
+                        len = header.len
+                    )));
                 }
                 let mut value = vec![0; header.len as usize];
                 file.read_exact(&mut value)?;
@@ -3773,6 +3778,23 @@ mod tests {
     }
 
     #[test]
+    fn detects_dicom_wsi_file_meta_with_tiff_extension() {
+        let path = test_path("detects_dicom_wsi_file_meta_with_tiff_extension.tif");
+        let mut data = vec![0; DICM_OFFSET as usize];
+        data.extend_from_slice(DICM_MAGIC);
+        write_explicit_element(
+            &mut data,
+            TAG_MEDIA_STORAGE_SOP_CLASS_UID,
+            b"UI",
+            VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE.as_bytes(),
+        );
+        fs::write(&path, data).unwrap();
+
+        assert!(detect(&path));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn reads_native_rgb_frames_as_row_major_tiles() {
         let path = test_path("reads_native_rgb_frames_as_row_major_tiles.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
@@ -5312,6 +5334,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_deflated_dataset_exceeding_inflated_cap() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+
+        let path = test_path("rejects_deflated_dataset_exceeding_inflated_cap.dcm");
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        let chunk = [0u8; 1024];
+        for _ in 0..=(MAX_DEFLATED_DATASET_BYTES / chunk.len() as u64) {
+            encoder.write_all(&chunk).unwrap();
+        }
+        let deflated = encoder.finish().unwrap();
+
+        let mut data = dicom_preamble(TS_DEFLATED_EXPLICIT_VR_LE);
+        let dataset_offset = data.len() as u64;
+        data.extend_from_slice(&deflated);
+        fs::write(&path, data).unwrap();
+
+        let err = read_deflated_dataset(&path, dataset_offset).unwrap_err();
+        assert!(format!("{err}").contains("exceeds"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_deflated_pixel_data_exceeding_capture_cap_before_allocation() {
+        let mut dataset = Vec::new();
+        write_common_wsi_dataset(&mut dataset, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
+        write_explicit_element_header(
+            &mut dataset,
+            TAG_PIXEL_DATA,
+            b"OB",
+            MAX_CAPTURED_DEFLATED_PIXEL_DATA_BYTES + 1,
+            Endian::Little,
+        );
+        let mut cursor = Cursor::new(dataset);
+
+        let err = read_dataset_from_reader(&mut cursor, true, Endian::Little, true).unwrap_err();
+        assert!(format!("{err}").contains("in-memory limit"));
+    }
+
+    #[test]
     fn reads_native_palette_color_frames() {
         let path = test_path("reads_native_palette_color_frames.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
@@ -5805,6 +5867,39 @@ mod tests {
 
     fn write_explicit_element(data: &mut Vec<u8>, tag: Tag, vr: &[u8; 2], value: &[u8]) {
         write_explicit_element_endian(data, tag, vr, value, Endian::Little);
+    }
+
+    fn write_explicit_element_header(
+        data: &mut Vec<u8>,
+        tag: Tag,
+        vr: &[u8; 2],
+        len: u32,
+        endian: Endian,
+    ) {
+        match endian {
+            Endian::Little => {
+                data.extend_from_slice(&tag.0.to_le_bytes());
+                data.extend_from_slice(&tag.1.to_le_bytes());
+            }
+            Endian::Big => {
+                data.extend_from_slice(&tag.0.to_be_bytes());
+                data.extend_from_slice(&tag.1.to_be_bytes());
+            }
+        }
+        data.extend_from_slice(vr);
+        if uses_32_bit_explicit_vr_length(vr) {
+            data.extend_from_slice(&[0, 0]);
+            match endian {
+                Endian::Little => data.extend_from_slice(&len.to_le_bytes()),
+                Endian::Big => data.extend_from_slice(&len.to_be_bytes()),
+            }
+        } else {
+            let len = u16::try_from(len).unwrap();
+            match endian {
+                Endian::Little => data.extend_from_slice(&len.to_le_bytes()),
+                Endian::Big => data.extend_from_slice(&len.to_be_bytes()),
+            }
+        }
     }
 
     fn write_explicit_element_endian(

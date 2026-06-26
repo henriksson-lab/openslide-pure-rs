@@ -76,15 +76,15 @@ const NDPI_PROPERTY_MAP: u16 = 65449;
 
 /// Check whether a path looks like a Hamamatsu VMS, VMU, or NDPI slide.
 pub fn detect(path: &Path) -> bool {
-    detect_vms_vmu(path) || detect_ndpi(path)
+    hamamatsu_vms_vmu_detect(path) || hamamatsu_ndpi_detect(path)
 }
 
 /// Try to open a Hamamatsu slide, returning a metadata-capable backend.
 pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
-    if detect_vms_vmu(path) {
+    if hamamatsu_vms_vmu_detect(path) {
         return Ok(Box::new(HamamatsuSlide::open_vms_vmu(path)?));
     }
-    if detect_ndpi(path) {
+    if hamamatsu_ndpi_detect(path) {
         return Ok(Box::new(HamamatsuSlide::open_ndpi(path)?));
     }
     Err(OpenSlideError::UnsupportedFormat(
@@ -480,7 +480,7 @@ impl SlideBackend for HamamatsuSlide {
     }
 }
 
-fn detect_vms_vmu(path: &Path) -> bool {
+fn hamamatsu_vms_vmu_detect(path: &Path) -> bool {
     let Ok(ini) = read_key_file(path) else {
         return false;
     };
@@ -493,13 +493,57 @@ fn detect_vms_vmu(path: &Path) -> bool {
     }
 }
 
-fn detect_ndpi(path: &Path) -> bool {
-    let Ok(tiff) = TiffFile::open(path) else {
-        return false;
-    };
-    tiff.dirs
-        .first()
-        .is_some_and(|dir| dir.contains(NDPI_FORMAT_FLAG))
+fn hamamatsu_ndpi_detect(path: &Path) -> bool {
+    let result = (|| -> Result<bool> {
+        let mut file = fs::File::open(path)?;
+        let mut header = [0u8; 16];
+        file.read_exact(&mut header[..8])?;
+
+        let endian = match &header[0..2] {
+            b"II" => Endian::Little,
+            b"MM" => Endian::Big,
+            _ => return Err(OpenSlideError::Format("Not a TIFF file".into())),
+        };
+        let magic = read_u16_from_chunk(&header[2..4], endian);
+        let (bigtiff, first_ifd) = match magic {
+            42 => (false, read_u32_from_chunk(&header[4..8], endian) as u64),
+            43 => {
+                file.read_exact(&mut header[8..16])?;
+                if read_u16_from_chunk(&header[4..6], endian) != 8 {
+                    return Err(OpenSlideError::Format("Unsupported BigTIFF header".into()));
+                }
+                (true, read_u64_from_chunk(&header[8..16], endian))
+            }
+            _ => return Err(OpenSlideError::Format("Not a TIFF file".into())),
+        };
+
+        file.seek(SeekFrom::Start(first_ifd))?;
+
+        let count = if bigtiff {
+            let mut bytes = [0u8; 8];
+            file.read_exact(&mut bytes)?;
+            read_u64_from_chunk(&bytes, endian)
+        } else {
+            let mut bytes = [0u8; 2];
+            file.read_exact(&mut bytes)?;
+            u64::from(read_u16_from_chunk(&bytes, endian))
+        };
+        let count_usize = usize::try_from(count)
+            .map_err(|_| OpenSlideError::Format("BigTIFF entry count overflow".into()))?;
+        let entry_size = if bigtiff { 20usize } else { 12usize };
+
+        for _ in 0..count_usize {
+            let mut entry = vec![0u8; entry_size];
+            file.read_exact(&mut entry)?;
+            let tag = read_u16_from_chunk(&entry[0..2], endian);
+            if tag == NDPI_FORMAT_FLAG {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    })();
+    result.unwrap_or(false)
 }
 
 fn read_key_file(path: &Path) -> Result<Ini> {
@@ -986,8 +1030,10 @@ struct NgrHeader {
 }
 
 fn read_ngr_header(path: &Path) -> Result<NgrHeader> {
-    let data = fs::read(path)?;
-    if data.len() < 28 || &data[0..2] != b"GN" {
+    let mut file = fs::File::open(path)?;
+    let mut data = [0; 28];
+    file.read_exact(&mut data)?;
+    if &data[0..2] != b"GN" {
         return Err(OpenSlideError::Format(format!(
             "Bad NGR header in {}",
             path.display()
@@ -1216,10 +1262,9 @@ fn read_vmu_region(
             file.seek(SeekFrom::Start(offset))?;
             let mut bytes = [0u8; 2];
             file.read_exact(&mut bytes)?;
-            let sample = u16::from_le_bytes(bytes) >> 4;
             let dst_x = (src_x as i64 - x) as u32;
             let dst_y = (src_y as i64 - y) as u32;
-            output.data[(dst_y * w + dst_x) as usize] = (sample >> 4) as u8;
+            output.data[(dst_y * w + dst_x) as usize] = (u16::from_le_bytes(bytes) >> 4) as u8;
         }
     }
     Ok(output)
@@ -2409,7 +2454,7 @@ mod tests {
         );
         assert!(slide.associated_image_names().contains(&"label"));
         let green = slide.read_region(1, 0, 0, 0, 1, 1).unwrap();
-        assert_eq!(green.pixel(0, 0), 22);
+        assert_eq!(green.pixel(0, 0), 96);
     }
 
     #[test]
@@ -2433,7 +2478,7 @@ mod tests {
 
         let slide = OpenSlide::open(&vmu).unwrap();
         let red = slide.read_region(0, 0, 0, 0, 4, 1).unwrap();
-        assert_eq!(red.data, vec![1, 1, 4, 4]);
+        assert_eq!(red.data, vec![16, 16, 64, 64]);
     }
 
     #[test]
@@ -2669,6 +2714,30 @@ mod tests {
             slide.properties().get("hamamatsu.CustomThree"),
             Some(&"gamma".to_string())
         );
+    }
+
+    #[test]
+    fn ndpi_detect_ignores_malformed_later_ifd_after_flag() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-detect-malformed");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("slide.ndpi");
+        fs::write(&path, ndpi_flag_with_bad_entry()).unwrap();
+
+        assert!(hamamatsu_ndpi_detect(&path));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ndpi_detect_preserves_bigtiff_reserved_byte_tolerance() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-detect-bigtiff-reserved");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("slide.ndpi");
+        fs::write(&path, bigtiff_ndpi_with_nonzero_reserved()).unwrap();
+
+        assert!(hamamatsu_ndpi_detect(&path));
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2910,6 +2979,47 @@ mod tests {
 
     fn minimal_ndpi() -> Vec<u8> {
         minimal_ndpi_with_image(COMPRESSION_NONE, &ndpi_pixel_data())
+    }
+
+    fn ndpi_flag_with_bad_entry() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&42u16.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        write_classic_tiff_entry(&mut data, NDPI_FORMAT_FLAG, 4, 1, 1);
+        write_classic_tiff_entry(&mut data, 65000, 99, 1, 0);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data
+    }
+
+    fn bigtiff_ndpi_with_nonzero_reserved() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&43u16.to_le_bytes());
+        data.extend_from_slice(&8u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&16u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&NDPI_FORMAT_FLAG.to_le_bytes());
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data
+    }
+
+    fn write_classic_tiff_entry(
+        data: &mut Vec<u8>,
+        tag: u16,
+        field_type: u16,
+        count: u32,
+        value: u32,
+    ) {
+        data.extend_from_slice(&tag.to_le_bytes());
+        data.extend_from_slice(&field_type.to_le_bytes());
+        data.extend_from_slice(&count.to_le_bytes());
+        data.extend_from_slice(&value.to_le_bytes());
     }
 
     fn minimal_ndpi_with_image(compression: u16, image_data: &[u8]) -> Vec<u8> {

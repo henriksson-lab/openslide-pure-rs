@@ -1,3 +1,30 @@
+//! Mirax (.mrxs) backend.
+//!
+//! This is a translation of the reference C driver
+//! `openslide/src/openslide-vendor-mirax.c`. When auditing for translation
+//! fidelity, that C file is the source of truth — EXCEPT for the parts marked
+//! below.
+//!
+//! ## Auditing convention: `EXTENSION` markers
+//!
+//! Blocks tagged `EXTENSION (not in C OpenSlide)` are intentional additions
+//! that have NO counterpart in the C driver and must NOT be "corrected" to
+//! match it. The C driver exposes a Mirax slide as a single pre-composited
+//! RGBA image; this crate additionally exposes the slide as separate logical
+//! **channels** (`channel_count` / `channel_name` / `read_region(channel, ..)`)
+//! so that fluorescence slides — whose filters are stored in distinct Mirax
+//! "filter levels" — can be read one filter at a time. Grep `EXTENSION` to see
+//! every such site.
+//!
+//! Everything NOT marked `EXTENSION` is meant to mirror the C driver exactly
+//! (including its integer-truncation quirks — see `tile::compute_base_dimensions`),
+//! and a divergence there is a bug to fix, not a feature to keep.
+//!
+//! Key invariant the extension preserves: for an ordinary brightfield slide
+//! (no filter levels) the channels are simply `[R, G, B]` drawn from filter
+//! level 0, and the level/dimension math is shared and untouched — so the
+//! channel feature does not alter geometry parity with the C driver.
+
 pub mod index;
 pub mod slidedat;
 pub mod tile;
@@ -40,7 +67,9 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     Ok(Box::new(slide))
 }
 
-/// Describes how to read a single logical filter channel.
+/// EXTENSION (not in C OpenSlide): describes how to read a single logical
+/// filter channel. The C driver has no channel concept; this maps each exposed
+/// channel to (a Mirax filter level, an RGB plane within that level's tiles).
 #[derive(Debug, Clone)]
 struct ChannelMapping {
     /// Filter name (e.g. "DAPI-5060C-ZHE-ZERO")
@@ -53,9 +82,16 @@ struct ChannelMapping {
 
 /// The Mirax slide backend.
 struct MiraxSlide {
-    /// Zoom level data for each filter level. Index 0 = FilterLevel_0, etc.
+    /// Zoom level data, indexed by filter level then zoom level.
+    ///
+    /// EXTENSION (not in C OpenSlide): the C driver keeps a single stack of
+    /// levels. Here the outer Vec holds one stack PER Mirax filter level
+    /// (index 0 = FilterLevel_0 = the primary/brightfield data), so fluorescence
+    /// filters can be addressed separately. For a brightfield slide this Vec has
+    /// length 1 and behaves exactly like the C driver.
     filter_level_grids: Vec<Vec<MiraxLevelData>>,
-    /// Mapping from logical channel index to filter level + RGB channel.
+    /// EXTENSION (not in C OpenSlide): mapping from logical channel index to
+    /// filter level + RGB channel. See [`ChannelMapping`].
     channels: Vec<ChannelMapping>,
     properties: HashMap<String, String>,
     datafile_paths: Vec<PathBuf>,
@@ -222,6 +258,13 @@ impl MiraxSlide {
             }
         }
 
+        // --- EXTENSION (not in C OpenSlide): filter-level discovery ---
+        // The C driver reads only the primary "Slide zoom level" hierarchy.
+        // Here we additionally enumerate the Mirax "Slide filter level"
+        // hierarchies so each fluorescence filter's tile blocks can be located.
+        // `filter_level_hier_offsets` always starts with 0 (the primary level),
+        // so a brightfield slide ends up with exactly one entry and the loops
+        // below collapse to the C behaviour.
         // Collect unique FilterLevel names in order, map to block offsets
         let mut filter_level_names: Vec<String> = Vec::new();
         for fc in &sd.filter_channels {
@@ -254,8 +297,13 @@ impl MiraxSlide {
                 filter_level_hier_offsets.push(fc.hier_offset);
             }
         }
+        // --- end EXTENSION ---
 
-        // Build tile grids for each filter level
+        // Build tile grids for each filter level.
+        // EXTENSION (not in C OpenSlide): the outer loop runs once per filter
+        // level. For a brightfield slide `filter_level_hier_offsets == [0]`, so
+        // this builds the single level stack the C driver builds. The tile
+        // placement inside the loop mirrors the C driver.
         let mut filter_level_grids: Vec<Vec<MiraxLevelData>> = Vec::new();
 
         for &hier_base_offset in &filter_level_hier_offsets {
@@ -412,6 +460,11 @@ impl MiraxSlide {
             filter_level_grids.push(levels);
         }
 
+        // ===================== EXTENSION (not in C OpenSlide) =====================
+        // Everything from here to "end EXTENSION: channel mapping" builds the
+        // logical-channel table. The C driver has no equivalent — it always
+        // composites tiles to RGBA. Do not delete this to match the C source.
+        //
         // Build channel mappings from filter_channels metadata.
         // The RGB channel for CY5 after YCbCr→RGB decoding is B (channel 2),
         // because a single-channel luminance JPEG maps to the blue component.
@@ -508,6 +561,7 @@ impl MiraxSlide {
                 })
                 .collect()
         };
+        // =================== end EXTENSION: channel mapping ===================
 
         // Build properties
         let mut props = sd.raw_properties;
@@ -533,6 +587,33 @@ impl MiraxSlide {
             properties::PROPERTY_BACKGROUND_COLOR.into(),
             format!("{:06x}", fill),
         );
+
+        // Bounds of the scanned (non-background) region, derived from the
+        // populated tiles of the primary filter level's level 0. Matches the
+        // reference OpenSlide `_openslide_set_bounds_props_from_grid`:
+        //   x = floor(left), width = ceil(left + w) - floor(left), etc.
+        if let Some((bx, by, bw, bh)) = filter_level_grids
+            .first()
+            .and_then(|levels| levels.first())
+            .and_then(|l0| l0.grid.bounds())
+        {
+            props.insert(
+                properties::PROPERTY_BOUNDS_X.into(),
+                (bx.floor() as i64).to_string(),
+            );
+            props.insert(
+                properties::PROPERTY_BOUNDS_Y.into(),
+                (by.floor() as i64).to_string(),
+            );
+            props.insert(
+                properties::PROPERTY_BOUNDS_WIDTH.into(),
+                (((bx + bw).ceil() - bx.floor()) as i64).to_string(),
+            );
+            props.insert(
+                properties::PROPERTY_BOUNDS_HEIGHT.into(),
+                (((by + bh).ceil() - by.floor()) as i64).to_string(),
+            );
+        }
 
         // Associated images info
         let mut associated_images = HashMap::new();
@@ -640,6 +721,10 @@ impl MiraxSlide {
         }
     }
 
+    /// EXTENSION (not in C OpenSlide): decode a tile and return a single RGB
+    /// plane as grayscale. The C driver decodes tiles straight into the RGBA
+    /// output buffer; here we decode to RGB (cached) and pick `channel`'s plane
+    /// so callers can read one filter/channel at a time.
     fn decode_tile_channel(
         &self,
         tile: &Tile,
@@ -697,6 +782,8 @@ impl SlideBackend for MiraxSlide {
         "mirax"
     }
 
+    // EXTENSION (not in C OpenSlide): per-channel query API. The C driver has
+    // no notion of channels (a Mirax slide is one RGBA image).
     fn channel_count(&self) -> u32 {
         self.channels.len() as u32
     }
@@ -735,7 +822,11 @@ impl SlideBackend for MiraxSlide {
         w: u32,
         h: u32,
     ) -> Result<GrayImage> {
-        // Map logical channel to filter level + RGB channel
+        // EXTENSION (not in C OpenSlide): the `channel` parameter and the
+        // channel→(filter level, RGB plane) resolution below are additions. The
+        // C driver's read_region has no channel argument and always returns
+        // composited RGBA. Once `levels`/`level_data` are resolved, the geometry
+        // (downsample, tiles_in_region, per-tile blit) mirrors the C driver.
         let mapping = self.channels.get(channel as usize).ok_or_else(|| {
             OpenSlideError::InvalidArgument(format!(
                 "Invalid channel {} (slide has {} channels)",

@@ -47,6 +47,18 @@ PROFILES = {
         "Ventana/Ventana-1.bif",
         "Zeiss/Zeiss-5-JXR.czi",
     ],
+    "nonmirax-coverage": [
+        "Aperio/CMU-1-Small-Region.svs",
+        "DICOM/Leica-4.zip",
+        "Generic-TIFF/CMU-1.tiff",
+        "Hamamatsu/CMU-1.ndpi",
+        "Hamamatsu-vms/CMU-1.zip",
+        "Leica/Leica-Fluorescence-1.scn",
+        "Philips-TIFF/Philips-1.tiff",
+        "Trestle/CMU-1.zip",
+        "Ventana/Ventana-1.bif",
+        "Zeiss/Zeiss-5-JXR.czi",
+    ],
 }
 
 

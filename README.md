@@ -6,6 +6,8 @@ Includes full **Mirax (.mrxs)** support from 3DHISTECH scanners; format reverse 
 trying to [address long-standing problems with this format](https://www.openmicroscopy.org/2016/01/06/format-support.html).
 Fix yet to be contributed upstream (more testing needed)
 
+* todo use test data from https://openslide.cs.cmu.edu/download/openslide-testdata/
+
 * 2026-05-30: Further audits. **This crate is still experimental**
 * 2026-05-28: Blind-translated a large number of non-MRXS formats. **These need real data to be tested**; please provide files if you find bugs and I will make them work!
 

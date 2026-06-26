@@ -17,7 +17,10 @@ pub struct SlideDat {
     pub layers: Vec<HierLayer>,
     /// All non-hierarchical layers.
     pub nonhier_layers: Vec<NonhierLayer>,
-    /// Parsed filter channel info (from "Slide filter level" HIER layer).
+    /// EXTENSION (not in C OpenSlide): parsed filter channel info (from the
+    /// "Slide filter level" HIER layer). The C driver ignores filter levels;
+    /// this drives the multi-channel fluorescence support. See the module-level
+    /// `EXTENSION` note in `mirax/mod.rs`.
     pub filter_channels: Vec<FilterChannel>,
     /// All raw key-value pairs for properties export.
     pub raw_properties: HashMap<String, String>,
@@ -25,7 +28,7 @@ pub struct SlideDat {
     ini: Ini,
 }
 
-/// A fluorescence filter channel descriptor.
+/// EXTENSION (not in C OpenSlide): a fluorescence filter channel descriptor.
 #[derive(Debug, Clone)]
 pub struct FilterChannel {
     /// Filter name, e.g. "DAPI-5060C-ZHE-ZERO"
@@ -494,7 +497,11 @@ impl SlideDat {
             });
         }
 
-        // Parse filter channels from "Slide filter level" HIER layer.
+        // --- EXTENSION (not in C OpenSlide): parse filter channels ---
+        // Parse filter channels from the "Slide filter level" HIER layer, which
+        // the C driver does not read at all. This is the metadata source for the
+        // multi-channel fluorescence feature; if `filter_channels` is empty the
+        // slide is treated as ordinary brightfield RGB.
         // hier_offset is set to -1 here; it gets resolved in MiraxSlide::open()
         // by probing the actual index to find which blocks contain tile data.
         let mut filter_channels = Vec::new();
@@ -539,6 +546,7 @@ impl SlideDat {
                 }
             }
         }
+        // --- end EXTENSION: parse filter channels ---
 
         Ok(SlideDat {
             general: GeneralSection {

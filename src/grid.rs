@@ -61,6 +61,31 @@ impl TileGrid {
         self.tiles.get(&(col, row))
     }
 
+    /// Bounding box of the actually-populated tiles, in this level's pixel
+    /// coordinates, as `(x, y, w, h)`. Returns `None` if the grid is empty.
+    ///
+    /// Mirrors the reference OpenSlide `tilemap_get_bounds`: each tile spans
+    /// `[col*advance + offset_x, col*advance + offset_x + w]` horizontally
+    /// (and likewise vertically), and the bounds are the min/max envelope.
+    pub fn bounds(&self) -> Option<(f64, f64, f64, f64)> {
+        let mut left = f64::INFINITY;
+        let mut top = f64::INFINITY;
+        let mut right = f64::NEG_INFINITY;
+        let mut bottom = f64::NEG_INFINITY;
+        for (&(col, row), e) in &self.tiles {
+            let x = col as f64 * self.tile_advance_x + e.offset_x;
+            let y = row as f64 * self.tile_advance_y + e.offset_y;
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x + e.w);
+            bottom = bottom.max(y + e.h);
+        }
+        if left.is_infinite() {
+            return None;
+        }
+        Some((left, top, right - left, bottom - top))
+    }
+
     /// Find all tiles that overlap the given pixel region.
     ///
     /// The region is specified in this level's coordinate space.

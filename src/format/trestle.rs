@@ -755,7 +755,7 @@ fn required_uints(tiff: &TiffFile, dir: &TiffDirectory, tag: u16) -> Result<Vec<
 }
 
 struct TrestleSlide {
-    tiff: TiffFile,
+    tiff_path: PathBuf,
     levels: Vec<TrestleLevel>,
     properties: HashMap<String, String>,
     cache: TileCache,
@@ -835,9 +835,10 @@ impl TrestleSlide {
         let channel_count = levels[0].channel_count();
         add_level_properties(&mut properties, &levels);
         let macro_path = associated_path(&tiff.path).filter(|path| path.exists());
+        let tiff_path = tiff.path;
 
         Ok(Self {
-            tiff,
+            tiff_path,
             levels,
             properties,
             cache: TileCache::new(),
@@ -861,7 +862,7 @@ impl TrestleSlide {
         }
 
         let tile = if level.planar_config == PLANARCONFIG_SEPARATE {
-            decode_separate_tile(&self.tiff.path, level, tile_no)?
+            decode_separate_tile(&self.tiff_path, level, tile_no)?
         } else {
             let byte_count = level.tile_byte_counts[tile_no as usize];
             if byte_count == 0 {
@@ -872,7 +873,7 @@ impl TrestleSlide {
                 });
             }
             let offset = level.tile_offsets[tile_no as usize];
-            let raw = read_file_range(&self.tiff.path, offset, byte_count)?;
+            let raw = read_file_range(&self.tiff_path, offset, byte_count)?;
             match level.compression {
                 COMPRESSION_JPEG => {
                     let jpeg = merge_jpeg_tables(&raw, level.jpeg_tables.as_deref());

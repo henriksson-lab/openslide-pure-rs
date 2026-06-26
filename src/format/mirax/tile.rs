@@ -122,12 +122,19 @@ pub fn compute_base_dimensions(
     overlap_x: f64,
     overlap_y: f64,
 ) -> (i64, i64) {
+    // Overlaps are fractional (e.g. 7.5). The reference C driver accumulates
+    // `base += image - overlap` in floating point into an int64, which truncates
+    // the *running sum*: because every other addend is an integer, the fractional
+    // part of the overlap is dropped each seam (so a 7.5 overlap removes 8 px, not
+    // 7). Truncating each per-seam term `(image - overlap) as i64` reproduces that
+    // exactly. Truncating the overlap on its own (`overlap as i64`) would round the
+    // wrong way and leave the level a few pixels too large.
     let mut base_w: i64 = 0;
     for i in 0..images_x {
         if (i % image_divisions) != (image_divisions - 1) || i == images_x - 1 {
             base_w += image_w as i64;
         } else {
-            base_w += image_w as i64 - overlap_x as i64;
+            base_w += (image_w as f64 - overlap_x) as i64;
         }
     }
 
@@ -136,7 +143,7 @@ pub fn compute_base_dimensions(
         if (i % image_divisions) != (image_divisions - 1) || i == images_y - 1 {
             base_h += image_h as i64;
         } else {
-            base_h += image_h as i64 - overlap_y as i64;
+            base_h += (image_h as f64 - overlap_y) as i64;
         }
     }
 
@@ -163,6 +170,24 @@ mod tests {
         let (w, _h) = compute_base_dimensions(4, 1, 2, 100, 100, 10.0, 0.0);
         // i=0: full (100), i=1: minus overlap (90), i=2: full (100), i=3: full (last, 100)
         assert_eq!(w, 100 + 90 + 100 + 100);
+    }
+
+    #[test]
+    fn test_compute_base_dimensions_fractional_overlap_cmu1() {
+        // Parameters from the public CMU-1-Saved-1_16 Mirax slide:
+        // IMAGENUMBER_X=352, IMAGENUMBER_Y=976, CameraImageDivisionsPerSide=4,
+        // DIGITIZER_WIDTH=340, DIGITIZER_HEIGHT=256, OVERLAP_X=OVERLAP_Y=7.5.
+        // The reference C driver drops the fractional overlap from the running
+        // integer sum, so each of the (divisions-1) seams removes 8 px, not 7.
+        let (w, h) = compute_base_dimensions(352, 976, 4, 340, 256, 7.5, 7.5);
+        // 87 width seams (i%4==3, excluding the last image): 265*340 + 87*332.
+        assert_eq!(w, 118984);
+        // 243 height seams: 733*256 + 243*248.
+        assert_eq!(h, 247912);
+        // Level 0 = base / image_concat(=16) via integer division must match the
+        // reference OpenSlide dimensions exactly (7436 x 15494).
+        assert_eq!(w / 16, 7436);
+        assert_eq!(h / 16, 15494);
     }
 
     #[test]

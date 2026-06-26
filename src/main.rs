@@ -8,6 +8,9 @@ fn print_usage() {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  info                          Show all layers, formats, and slide metadata");
+    eprintln!(
+        "  meta                          Print machine-readable JSON metadata (for parity checks)"
+    );
     eprintln!("  read <x> <y> <w> <h> [opts]   Read a region and write to PNG");
     eprintln!();
     eprintln!("Read options:");
@@ -205,6 +208,112 @@ fn print_mirax_info(path: &str) {
     println!();
 }
 
+/// Escape a string for inclusion in JSON.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Print machine-readable JSON metadata for parity checking against the
+/// reference C OpenSlide. Kept deliberately flat and dependency-free.
+fn cmd_meta(path: &str) {
+    let slide = match OpenSlide::open(path) {
+        Ok(s) => s,
+        Err(e) => {
+            // Emit a JSON object describing the failure so the harness can
+            // distinguish "could not open" from "wrong metadata".
+            println!(
+                "{{\"path\":\"{}\",\"ok\":false,\"error\":\"{}\"}}",
+                json_escape(path),
+                json_escape(&e.to_string())
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str(&format!("  \"path\": \"{}\",\n", json_escape(path)));
+    out.push_str("  \"ok\": true,\n");
+    out.push_str(&format!(
+        "  \"vendor\": \"{}\",\n",
+        json_escape(slide.vendor())
+    ));
+    out.push_str(&format!("  \"level_count\": {},\n", slide.level_count()));
+    out.push_str(&format!(
+        "  \"channel_count\": {},\n",
+        slide.channel_count()
+    ));
+
+    // Channels
+    out.push_str("  \"channels\": [");
+    for ch in 0..slide.channel_count() {
+        if ch > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!(
+            "\"{}\"",
+            json_escape(slide.channel_name(ch).unwrap_or("?"))
+        ));
+    }
+    out.push_str("],\n");
+
+    // Levels
+    out.push_str("  \"levels\": [\n");
+    for i in 0..slide.level_count() {
+        let (w, h) = slide.level_dimensions(i).unwrap_or((0, 0));
+        let ds = slide.level_downsample(i).unwrap_or(0.0);
+        out.push_str(&format!(
+            "    {{\"level\": {}, \"width\": {}, \"height\": {}, \"downsample\": {}}}{}\n",
+            i,
+            w,
+            h,
+            ds,
+            if i + 1 < slide.level_count() { "," } else { "" }
+        ));
+    }
+    out.push_str("  ],\n");
+
+    // Associated images
+    out.push_str("  \"associated\": [");
+    let names = slide.associated_image_names();
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("\"{}\"", json_escape(name)));
+    }
+    out.push_str("],\n");
+
+    // Properties (sorted for stable output)
+    out.push_str("  \"properties\": {\n");
+    let mut props: Vec<(&String, &String)> = slide.properties().iter().collect();
+    props.sort_by(|a, b| a.0.cmp(b.0));
+    for (i, (k, v)) in props.iter().enumerate() {
+        out.push_str(&format!(
+            "    \"{}\": \"{}\"{}\n",
+            json_escape(k),
+            json_escape(v),
+            if i + 1 < props.len() { "," } else { "" }
+        ));
+    }
+    out.push_str("  }\n");
+    out.push_str("}\n");
+
+    print!("{}", out);
+}
+
 fn cmd_read(path: &str, args: &[String]) {
     if args.len() < 4 {
         eprintln!("Usage: openslide-pure-rs read <file> <x> <y> <w> <h> [options]");
@@ -394,6 +503,7 @@ fn main() {
 
     match command.as_str() {
         "info" => cmd_info(path),
+        "meta" => cmd_meta(path),
         "read" => cmd_read(path, rest),
         _ => {
             eprintln!("Unknown command: {}", command);

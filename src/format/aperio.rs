@@ -419,17 +419,6 @@ impl SlideBackend for AperioSlide {
         }
         let lx = x as f64 / level.downsample;
         let ly = y as f64 / level.downsample;
-        if level.compression == COMPRESSION_LZW {
-            return read_tiff_crate_region(
-                &self.path,
-                level.dir_index,
-                channel,
-                lx.round() as i64,
-                ly.round() as i64,
-                w,
-                h,
-            );
-        }
         let start_col = floor_div(lx, level.tile_w as f64).max(0) as u64;
         let start_row = floor_div(ly, level.tile_h as f64).max(0) as u64;
         let end_col = ceil_div(lx + w as f64, level.tile_w as f64)
@@ -475,7 +464,7 @@ impl SlideBackend for AperioSlide {
             .value_u64(TIFFTAG_COMPRESSION, self.endian)
             .unwrap_or(COMPRESSION_NONE as u64) as u16;
         if compression == COMPRESSION_LZW {
-            return read_associated_with_tiff_crate(&self.path, image.dir_index);
+            return get_associated_image_data(&self.path, image.dir_index);
         }
         let mut file = File::open(&self.path)?;
         read_directory_rgba(&mut file, dir, self.endian)
@@ -504,7 +493,10 @@ impl AperioSlide {
         let tile_index = usize::try_from(tile_index)
             .map_err(|_| OpenSlideError::Format("Tile index too large".into()))?;
         if level.planar_config == PLANARCONFIG_SEPARATE
-            && !matches!(level.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG)
+            && !matches!(
+                level.compression,
+                COMPRESSION_JPEG | COMPRESSION_OLD_JPEG | COMPRESSION_LZW
+            )
         {
             let data = self.read_planar_tile(file, level, tile_index)?;
             return decode_raw_channel_with_photometric(
@@ -518,6 +510,33 @@ impl AperioSlide {
                 level.endian,
                 channel,
             );
+        }
+
+        if level.compression == COMPRESSION_LZW {
+            let byte_count_index = if level.planar_config == PLANARCONFIG_SEPARATE {
+                let tiles_per_plane = usize::try_from(level.tiles_across * level.tiles_down)
+                    .map_err(|_| {
+                        OpenSlideError::Format("Aperio planar tile count too large".into())
+                    })?;
+                (channel as usize)
+                    .checked_mul(tiles_per_plane)
+                    .and_then(|base| base.checked_add(tile_index))
+                    .ok_or_else(|| {
+                        OpenSlideError::Format("Aperio planar tile index overflow".into())
+                    })?
+            } else {
+                tile_index
+            };
+            if level
+                .tile_byte_counts
+                .get(byte_count_index)
+                .copied()
+                .unwrap_or(0)
+                == 0
+            {
+                return Ok(GrayImage::new(level.tile_w, level.tile_h));
+            }
+            return openslide_tiff_read_tile_channel(&self.path, level, tile_index, channel);
         }
 
         let data = self.read_tile_payload(file, level, tile_index)?;
@@ -1350,7 +1369,7 @@ fn has_jpeg_marker(data: &[u8], wanted: u8) -> bool {
     false
 }
 
-fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<RgbaImage> {
+fn get_associated_image_data(path: &Path, dir_index: usize) -> Result<RgbaImage> {
     let file = File::open(path)?;
     let mut decoder = ::tiff::decoder::Decoder::new(file)
         .map_err(|err| OpenSlideError::Decode(format!("TIFF decoder setup failed: {err}")))?;
@@ -1475,65 +1494,96 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
     RgbaImage::from_rgba(width, height, rgba)
 }
 
-fn read_tiff_crate_region(
+fn openslide_tiff_read_tile_channel(
     path: &Path,
-    dir_index: usize,
+    level: &AperioLevel,
+    tile_index: usize,
     channel: u32,
-    x: i64,
-    y: i64,
-    w: u32,
-    h: u32,
 ) -> Result<GrayImage> {
     let file = File::open(path)?;
     let mut decoder = ::tiff::decoder::Decoder::new(file)
         .map_err(|err| OpenSlideError::Decode(format!("TIFF decoder setup failed: {err}")))?;
     decoder
-        .seek_to_image(dir_index)
+        .seek_to_image(level.dir_index)
         .map_err(|err| OpenSlideError::Decode(format!("TIFF directory seek failed: {err}")))?;
-    let (decoded_width, decoded_height) = decoder
-        .dimensions()
-        .map_err(|err| OpenSlideError::Decode(format!("TIFF dimensions read failed: {err}")))?;
-    let color_type = decoder
-        .colortype()
-        .map_err(|err| OpenSlideError::Decode(format!("TIFF color type read failed: {err}")))?;
-    let image = decoder
-        .read_image()
-        .map_err(|err| OpenSlideError::Decode(format!("TIFF image decode failed: {err}")))?;
-    let (stride, channel_count) = match color_type {
-        ::tiff::ColorType::Gray(8) | ::tiff::ColorType::Gray(16) => (1usize, 1usize),
-        ::tiff::ColorType::GrayA(8) | ::tiff::ColorType::GrayA(16) => (2, 1),
-        ::tiff::ColorType::RGB(8) | ::tiff::ColorType::RGB(16) | ::tiff::ColorType::YCbCr(8) => {
-            (3, 3)
-        }
-        ::tiff::ColorType::RGBA(8) | ::tiff::ColorType::RGBA(16) => (4, 3),
-        other => {
-            return Err(OpenSlideError::Decode(format!(
-                "Unsupported TIFF color type from tiff crate: {:?}",
-                other
-            )))
-        }
-    };
-    if channel as usize >= channel_count {
-        return Err(OpenSlideError::InvalidArgument(format!(
-            "Invalid channel {} for decoded TIFF channel count {}",
-            channel, channel_count
-        )));
-    }
 
-    let pixel_count = decoded_width as usize * decoded_height as usize;
+    let chunk_index = if level.planar_config == PLANARCONFIG_SEPARATE {
+        let tiles_per_plane = level
+            .tiles_across
+            .checked_mul(level.tiles_down)
+            .ok_or_else(|| OpenSlideError::Format("Aperio planar tile count overflow".into()))?;
+        u32::try_from(
+            u64::from(channel)
+                .checked_mul(tiles_per_plane)
+                .and_then(|base| base.checked_add(tile_index as u64))
+                .ok_or_else(|| {
+                    OpenSlideError::Format("Aperio planar tile index overflow".into())
+                })?,
+        )
+        .map_err(|_| OpenSlideError::Format("Aperio planar tile index too large".into()))?
+    } else {
+        u32::try_from(tile_index)
+            .map_err(|_| OpenSlideError::Format("Aperio tile index too large".into()))?
+    };
+    let image = decoder
+        .read_chunk(chunk_index)
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF LZW chunk decode failed: {err}")))?;
+
+    let (width, height) = if level.planar_config == PLANARCONFIG_SEPARATE {
+        (level.tile_w, level.tile_h)
+    } else {
+        decoder.chunk_data_dimensions(chunk_index)
+    };
+    let (stride, sample_offset) = if level.planar_config == PLANARCONFIG_SEPARATE {
+        (1usize, 0usize)
+    } else {
+        let color_type = decoder
+            .colortype()
+            .map_err(|err| OpenSlideError::Decode(format!("TIFF color type read failed: {err}")))?;
+        let (stride, channel_count) = match color_type {
+            ::tiff::ColorType::Gray(8) | ::tiff::ColorType::Gray(16) => (1usize, 1usize),
+            ::tiff::ColorType::GrayA(8) | ::tiff::ColorType::GrayA(16) => (2, 1),
+            ::tiff::ColorType::RGB(8)
+            | ::tiff::ColorType::RGB(16)
+            | ::tiff::ColorType::YCbCr(8) => (3, 3),
+            ::tiff::ColorType::RGBA(8) | ::tiff::ColorType::RGBA(16) => (4, 3),
+            other => {
+                return Err(OpenSlideError::Decode(format!(
+                    "Unsupported TIFF color type from tiff crate: {:?}",
+                    other
+                )))
+            }
+        };
+        if channel as usize >= channel_count {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid channel {} for decoded TIFF channel count {}",
+                channel, channel_count
+            )));
+        }
+        (
+            stride,
+            if channel_count == 1 {
+                0
+            } else {
+                channel as usize
+            },
+        )
+    };
+
+    let pixel_count = width as usize * height as usize;
     match &image {
         ::tiff::decoder::DecodingResult::U8(data)
             if data.len() < pixel_count.saturating_mul(stride) =>
         {
             return Err(OpenSlideError::Decode(
-                "Decoded TIFF image is truncated".into(),
+                "Decoded TIFF chunk is truncated".into(),
             ));
         }
         ::tiff::decoder::DecodingResult::U16(data)
             if data.len() < pixel_count.saturating_mul(stride) =>
         {
             return Err(OpenSlideError::Decode(
-                "Decoded TIFF image is truncated".into(),
+                "Decoded TIFF chunk is truncated".into(),
             ));
         }
         ::tiff::decoder::DecodingResult::U8(_) | ::tiff::decoder::DecodingResult::U16(_) => {}
@@ -1545,32 +1595,15 @@ fn read_tiff_crate_region(
         }
     }
 
-    let mut output = GrayImage::new(w, h);
-    for out_y in 0..h {
-        let src_y = y + i64::from(out_y);
-        if src_y < 0 || src_y >= i64::from(decoded_height) {
-            continue;
-        }
-        for out_x in 0..w {
-            let src_x = x + i64::from(out_x);
-            if src_x < 0 || src_x >= i64::from(decoded_width) {
-                continue;
-            }
-            let src = (src_y as usize * decoded_width as usize + src_x as usize) * stride;
-            let sample = match color_type {
-                ::tiff::ColorType::Gray(8)
-                | ::tiff::ColorType::Gray(16)
-                | ::tiff::ColorType::GrayA(8)
-                | ::tiff::ColorType::GrayA(16) => src,
-                _ => src + channel as usize,
-            };
-            let value = match &image {
-                ::tiff::decoder::DecodingResult::U8(data) => data[sample],
-                ::tiff::decoder::DecodingResult::U16(data) => downscale_u16_to_u8(data[sample]),
-                _ => unreachable!(),
-            };
-            output.data[out_y as usize * w as usize + out_x as usize] = value;
-        }
+    let mut output = GrayImage::new(width, height);
+    for pixel in 0..pixel_count {
+        let sample = pixel * stride + sample_offset;
+        let value = match &image {
+            ::tiff::decoder::DecodingResult::U8(data) => data[sample],
+            ::tiff::decoder::DecodingResult::U16(data) => downscale_u16_to_u8(data[sample]),
+            _ => unreachable!(),
+        };
+        output.data[pixel] = value;
     }
     Ok(output)
 }
@@ -2560,7 +2593,7 @@ mod tests {
             image.write_data(&[10, 20, 30, 40, 50, 60]).unwrap();
         }
 
-        let rgba = read_associated_with_tiff_crate(&path, 0).unwrap();
+        let rgba = get_associated_image_data(&path, 0).unwrap();
         assert_eq!(rgba.width, 2);
         assert_eq!(rgba.height, 1);
         assert_eq!(rgba.data, vec![10, 20, 30, 0xff, 40, 50, 60, 0xff]);
@@ -2586,9 +2619,10 @@ mod tests {
                 .unwrap();
         }
 
-        let red = read_tiff_crate_region(&path, 0, 0, 1, 0, 2, 2).unwrap();
+        let slide = lzw_test_slide(path.clone(), 3, 2, vec![8, 8, 8]);
+        let red = slide.read_region(0, 1, 0, 0, 2, 2).unwrap();
         assert_eq!(red.data, vec![40, 70, 41, 71]);
-        let blue = read_tiff_crate_region(&path, 0, 2, 0, 1, 3, 1).unwrap();
+        let blue = slide.read_region(2, 0, 1, 0, 3, 1).unwrap();
         assert_eq!(blue.data, vec![31, 61, 91]);
 
         let _ = fs::remove_file(path);
@@ -2610,7 +2644,7 @@ mod tests {
                 .unwrap();
         }
 
-        let rgba = read_associated_with_tiff_crate(&path, 0).unwrap();
+        let rgba = get_associated_image_data(&path, 0).unwrap();
         assert_eq!(rgba.data, vec![10, 20, 30, 128, 40, 50, 60, 255]);
 
         let _ = fs::remove_file(path);
@@ -2632,7 +2666,7 @@ mod tests {
                 .unwrap();
         }
 
-        let rgba = read_associated_with_tiff_crate(&path, 0).unwrap();
+        let rgba = get_associated_image_data(&path, 0).unwrap();
         assert_eq!(
             rgba.data,
             vec![0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff]
@@ -2660,12 +2694,47 @@ mod tests {
                 .unwrap();
         }
 
-        let red = read_tiff_crate_region(&path, 0, 0, 0, 0, 2, 2).unwrap();
+        let slide = lzw_test_slide(path.clone(), 2, 2, vec![16, 16, 16]);
+        let red = slide.read_region(0, 0, 0, 0, 2, 2).unwrap();
         assert_eq!(red.data, vec![0x10, 0x40, 0x70, 0xa0]);
-        let blue = read_tiff_crate_region(&path, 0, 2, 0, 1, 2, 1).unwrap();
+        let blue = slide.read_region(2, 0, 1, 0, 2, 1).unwrap();
         assert_eq!(blue.data, vec![0x90, 0xc0]);
 
         let _ = fs::remove_file(path);
+    }
+
+    fn lzw_test_slide(
+        path: PathBuf,
+        width: u64,
+        height: u64,
+        bits_per_sample: Vec<u16>,
+    ) -> AperioSlide {
+        AperioSlide {
+            path,
+            endian: Endian::Little,
+            levels: vec![AperioLevel {
+                dir_index: 0,
+                width,
+                height,
+                downsample: 1.0,
+                tile_w: width as u32,
+                tile_h: height as u32,
+                tiles_across: 1,
+                tiles_down: 1,
+                compression: COMPRESSION_LZW,
+                photometric: PHOTOMETRIC_RGB,
+                samples_per_pixel: 3,
+                planar_config: 1,
+                endian: Endian::Little,
+                bits_per_sample,
+                tile_offsets: vec![0],
+                tile_byte_counts: vec![1],
+                jpeg_tables: None,
+            }],
+            directories: Vec::new(),
+            properties: HashMap::new(),
+            associated_images: HashMap::new(),
+        }
     }
 
     #[test]

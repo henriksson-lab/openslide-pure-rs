@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -112,32 +112,33 @@ struct TiffEntry {
 }
 
 impl TiffFile {
+    #[cfg(test)]
     fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, None, None)
+    }
+
+    fn open_first_directory(path: &Path) -> Result<Self> {
+        let selected_dirs = BTreeSet::from([0]);
+        Self::open_with(path, Some(&selected_dirs), Some(&[TAG_IMAGEDESCRIPTION]))
+    }
+
+    fn open_selected(path: &Path, selected_dirs: &BTreeSet<usize>) -> Result<Self> {
+        Self::open_with(path, Some(selected_dirs), None)
+    }
+
+    fn open_with(
+        path: &Path,
+        selected_dirs: Option<&BTreeSet<usize>>,
+        external_value_tags: Option<&[u16]>,
+    ) -> Result<Self> {
         let mut file = File::open(path)?;
-        let file_len = file.metadata()?.len();
-        let mut header = [0u8; 16];
-        file.read_exact(&mut header[..8])?;
-
-        let endian = match &header[0..2] {
-            b"II" => Endian::Little,
-            b"MM" => Endian::Big,
-            _ => return Err(OpenSlideError::UnsupportedFormat("Not a TIFF file".into())),
-        };
-
-        let magic = endian.read_u16(&header[2..4]);
-        let (bigtiff, mut next_offset) = match magic {
-            TIFF_MAGIC_CLASSIC => (false, endian.read_u32(&header[4..8]) as u64),
-            TIFF_MAGIC_BIG => {
-                file.read_exact(&mut header[8..16])?;
-                if endian.read_u16(&header[4..6]) != 8 || endian.read_u16(&header[6..8]) != 0 {
-                    return Err(OpenSlideError::Format(
-                        "Unsupported BigTIFF offset header".into(),
-                    ));
-                }
-                (true, endian.read_u64(&header[8..16]))
-            }
-            _ => return Err(OpenSlideError::UnsupportedFormat("Not a TIFF file".into())),
-        };
+        let TiffHeader {
+            endian,
+            bigtiff,
+            mut next_offset,
+            file_len,
+        } = read_tiff_header(&mut file)?;
+        let last_selected_dir = selected_dirs.and_then(|dirs| dirs.iter().next_back().copied());
 
         let mut directories = Vec::new();
         while next_offset != 0 {
@@ -153,15 +154,25 @@ impl TiffFile {
                 ));
             }
 
-            let (directory, following_offset) = read_directory(
-                &mut file,
-                endian,
-                bigtiff,
-                directories.len(),
-                next_offset,
-                file_len,
-            )?;
+            let index = directories.len();
+            let read_entries = selected_dirs.is_none_or(|dirs| dirs.contains(&index));
+            let (directory, following_offset) = if read_entries {
+                read_directory(
+                    &mut file,
+                    endian,
+                    bigtiff,
+                    index,
+                    next_offset,
+                    file_len,
+                    external_value_tags,
+                )?
+            } else {
+                skip_directory(&mut file, endian, bigtiff, index, next_offset, file_len)?
+            };
             directories.push(directory);
+            if last_selected_dir.is_some_and(|last| index >= last) {
+                break;
+            }
             next_offset = following_offset;
         }
 
@@ -242,6 +253,47 @@ impl TiffEntry {
     }
 }
 
+struct TiffHeader {
+    endian: Endian,
+    bigtiff: bool,
+    next_offset: u64,
+    file_len: u64,
+}
+
+fn read_tiff_header(file: &mut File) -> Result<TiffHeader> {
+    let file_len = file.metadata()?.len();
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header[..8])?;
+
+    let endian = match &header[0..2] {
+        b"II" => Endian::Little,
+        b"MM" => Endian::Big,
+        _ => return Err(OpenSlideError::UnsupportedFormat("Not a TIFF file".into())),
+    };
+
+    let magic = endian.read_u16(&header[2..4]);
+    let (bigtiff, next_offset) = match magic {
+        TIFF_MAGIC_CLASSIC => (false, endian.read_u32(&header[4..8]) as u64),
+        TIFF_MAGIC_BIG => {
+            file.read_exact(&mut header[8..16])?;
+            if endian.read_u16(&header[4..6]) != 8 || endian.read_u16(&header[6..8]) != 0 {
+                return Err(OpenSlideError::Format(
+                    "Unsupported BigTIFF offset header".into(),
+                ));
+            }
+            (true, endian.read_u64(&header[8..16]))
+        }
+        _ => return Err(OpenSlideError::UnsupportedFormat("Not a TIFF file".into())),
+    };
+
+    Ok(TiffHeader {
+        endian,
+        bigtiff,
+        next_offset,
+        file_len,
+    })
+}
+
 fn read_directory(
     file: &mut File,
     endian: Endian,
@@ -249,6 +301,7 @@ fn read_directory(
     index: usize,
     offset: u64,
     file_len: u64,
+    external_value_tags: Option<&[u16]>,
 ) -> Result<(TiffDirectory, u64)> {
     file.seek(SeekFrom::Start(offset))?;
 
@@ -288,6 +341,19 @@ fn read_directory(
         } else {
             &entry_buf[8..12]
         };
+        let should_read_value = external_value_tags.is_none_or(|tags| tags.contains(&tag));
+        if !should_read_value {
+            entries.insert(
+                tag,
+                TiffEntry {
+                    value_type,
+                    count,
+                    raw: Vec::new(),
+                },
+            );
+            continue;
+        }
+
         let value_size = value_type_size(value_type)
             .and_then(|size| size.checked_mul(count))
             .ok_or_else(|| {
@@ -340,6 +406,73 @@ fn read_directory(
     };
 
     Ok((TiffDirectory { index, entries }, following_offset))
+}
+
+fn skip_directory(
+    file: &mut File,
+    endian: Endian,
+    bigtiff: bool,
+    index: usize,
+    offset: u64,
+    file_len: u64,
+) -> Result<(TiffDirectory, u64)> {
+    file.seek(SeekFrom::Start(offset))?;
+
+    let entry_count = if bigtiff {
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf)?;
+        endian.read_u64(&buf)
+    } else {
+        let mut buf = [0u8; 2];
+        file.read_exact(&mut buf)?;
+        endian.read_u16(&buf) as u64
+    };
+    if entry_count > 100_000 {
+        return Err(OpenSlideError::Format(format!(
+            "Unreasonable TIFF directory entry count: {}",
+            entry_count
+        )));
+    }
+
+    let entry_size = if bigtiff { 20u64 } else { 12u64 };
+    let next_offset_size = if bigtiff { 8u64 } else { 4u64 };
+    let entries_size = entry_count
+        .checked_mul(entry_size)
+        .ok_or_else(|| OpenSlideError::Format("TIFF directory entry table size overflow".into()))?;
+    let next_offset_pos = file
+        .stream_position()?
+        .checked_add(entries_size)
+        .ok_or_else(|| {
+            OpenSlideError::Format("TIFF directory next offset position overflow".into())
+        })?;
+    if next_offset_pos
+        .checked_add(next_offset_size)
+        .is_none_or(|end| end > file_len)
+    {
+        return Err(OpenSlideError::Format(format!(
+            "TIFF directory {} extends outside file",
+            index
+        )));
+    }
+    file.seek(SeekFrom::Start(next_offset_pos))?;
+
+    let following_offset = if bigtiff {
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf)?;
+        endian.read_u64(&buf)
+    } else {
+        let mut buf = [0u8; 4];
+        file.read_exact(&mut buf)?;
+        endian.read_u32(&buf) as u64
+    };
+
+    Ok((
+        TiffDirectory {
+            index,
+            entries: HashMap::new(),
+        },
+        following_offset,
+    ))
 }
 
 fn read_chunks<T>(
@@ -455,7 +588,11 @@ pub(crate) struct LeicaSlide {
 }
 
 pub(crate) fn detect(path: &Path) -> bool {
-    let Ok(tiff) = TiffFile::open(path) else {
+    leica_detect(path)
+}
+
+fn leica_detect(path: &Path) -> bool {
+    let Ok(tiff) = TiffFile::open_first_directory(path) else {
         return false;
     };
     let Some(first) = tiff.directory(0) else {
@@ -468,8 +605,12 @@ pub(crate) fn detect(path: &Path) -> bool {
 }
 
 pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
-    let tiff = TiffFile::open(path)?;
-    let first = tiff
+    leica_open(path)
+}
+
+fn leica_open(path: &Path) -> Result<Box<dyn SlideBackend>> {
+    let first_tiff = TiffFile::open_first_directory(path)?;
+    let first = first_tiff
         .directory(0)
         .ok_or_else(|| OpenSlideError::UnsupportedFormat("TIFF has no directories".into()))?;
     let description = first
@@ -482,6 +623,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     }
 
     let collection = parse_xml_description(&description)?;
+    let tiff = TiffFile::open_selected(path, &referenced_directories(&collection))?;
     let (levels, mut properties, associated_images) = create_levels(&tiff, &collection)?;
     add_tiff_properties(&mut properties, &tiff, &levels);
     add_level_properties(&mut properties, &levels);
@@ -493,6 +635,14 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
         properties,
         associated_images,
     }))
+}
+
+fn referenced_directories(collection: &Collection) -> BTreeSet<usize> {
+    let mut dirs = BTreeSet::from([0]);
+    for image in &collection.images {
+        dirs.extend(image.dimensions.iter().map(|dimension| dimension.dir));
+    }
+    dirs
 }
 
 impl SlideBackend for LeicaSlide {
@@ -2400,6 +2550,32 @@ mod tests {
     }
 
     #[test]
+    fn detect_reads_only_first_ifd_description_payload() {
+        let path = temp_path("leica-detect-lightweight.scn");
+        let mut data = make_leica_tiff();
+        replace_entry_value(&mut data, TAG_TILEOFFSETS, 0xffff_ff00);
+        fs::write(&path, data).unwrap();
+
+        assert!(detect(&path));
+        assert!(OpenSlide::open(&path).is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_ignores_unreferenced_following_ifd() {
+        let path = temp_path("leica-open-selected-ifds.scn");
+        fs::write(&path, make_leica_tiff_with_next_ifd(0xffff_ff00)).unwrap();
+
+        assert!(detect(&path));
+        let slide = OpenSlide::open(&path).unwrap();
+        assert_eq!(slide.vendor(), "leica");
+        assert_eq!(slide.level_dimensions(0), Some((8, 4)));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn reads_stripped_leica_area_as_associated_image() {
         let path = temp_path("leica-stripped.bin");
         let strip0 = [10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
@@ -2575,6 +2751,10 @@ mod tests {
     }
 
     fn make_leica_tiff() -> Vec<u8> {
+        make_leica_tiff_with_next_ifd(0)
+    }
+
+    fn make_leica_tiff_with_next_ifd(next_ifd: u32) -> Vec<u8> {
         const ENTRY_COUNT: usize = 12;
         let ifd_len = 2 + ENTRY_COUNT * 12 + 4;
         let base = 8 + ifd_len;
@@ -2657,9 +2837,23 @@ mod tests {
         for entry in entries {
             out.extend_from_slice(&entry);
         }
-        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&next_ifd.to_le_bytes());
         out.extend_from_slice(&extra);
         out
+    }
+
+    fn replace_entry_value(data: &mut [u8], tag: u16, value: u32) {
+        let first_ifd = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        let entry_count = u16::from_le_bytes(data[first_ifd..first_ifd + 2].try_into().unwrap());
+        for idx in 0..entry_count as usize {
+            let entry = first_ifd + 2 + idx * 12;
+            let entry_tag = u16::from_le_bytes(data[entry..entry + 2].try_into().unwrap());
+            if entry_tag == tag {
+                data[entry + 8..entry + 12].copy_from_slice(&value.to_le_bytes());
+                return;
+            }
+        }
+        panic!("missing TIFF tag {tag}");
     }
 
     fn push_entry(entries: &mut Vec<[u8; 12]>, tag: u16, ty: u16, count: u32, value: u32) {
