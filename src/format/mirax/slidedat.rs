@@ -55,7 +55,7 @@ pub struct GeneralSection {
     pub camera_bitdepth: Option<i32>,
     pub images_x: i32,
     pub images_y: i32,
-    pub objective_magnification: i32,
+    pub objective_magnification: Option<i64>,
     pub image_divisions: i32,
 }
 
@@ -137,6 +137,11 @@ fn parse_int(s: &str) -> Result<i32> {
     s.trim()
         .parse::<i32>()
         .map_err(|e| OpenSlideError::Format(format!("Invalid integer '{}': {}", s, e)))
+}
+
+fn parse_objective_magnification(s: &str) -> Option<i64> {
+    let value = s.trim().trim_end_matches(['x', 'X']).trim();
+    value.parse::<i64>().ok().filter(|value| *value > 0)
 }
 
 fn get_value(ini: &Ini, section: &str, key: &str) -> Result<String> {
@@ -227,7 +232,7 @@ fn get_nonhier_val_offset(
     Ok((-1, None))
 }
 
-/// Get the nonhier offset for an associated image, verifying it's JPEG format.
+/// Get the nonhier offset for an associated image, verifying its image format.
 fn get_associated_image_offset(
     ini: &Ini,
     nonhier_count: i32,
@@ -240,11 +245,15 @@ fn get_associated_image_offset(
         return Ok(-1);
     }
 
-    if let Some(section_name) = section {
-        let format_val = get_value(ini, section_name.trim(), format_key)?;
-        // Verify format (we accept JPEG for associated images)
-        let _ = parse_image_format(&format_val)?;
-    }
+    let section_name = section.ok_or_else(|| {
+        OpenSlideError::Format(format!(
+            "Missing section for associated image {target_value}"
+        ))
+    })?;
+    let format_val = get_value(ini, section_name.trim(), format_key)?;
+    // EXTENSION (not in C OpenSlide): accept any associated-image format
+    // supported by this reader, not only JPEG.
+    let _ = parse_image_format(&format_val)?;
 
     Ok(offset)
 }
@@ -292,7 +301,9 @@ impl SlideDat {
             .and_then(|v| parse_int(&v).ok());
         let images_x = get_int(&ini, "GENERAL", "IMAGENUMBER_X")?;
         let images_y = get_int(&ini, "GENERAL", "IMAGENUMBER_Y")?;
-        let objective_magnification = get_int(&ini, "GENERAL", "OBJECTIVE_MAGNIFICATION")?;
+        let objective_magnification = ini
+            .get("GENERAL", "OBJECTIVE_MAGNIFICATION")
+            .and_then(|value| parse_objective_magnification(&value));
         let image_divisions = get_int_or_default(&ini, "GENERAL", "CameraImageDivisionsPerSide", 1);
 
         if images_x <= 0 || images_y <= 0 || image_divisions <= 0 {
@@ -308,6 +319,11 @@ impl SlideDat {
 
         if hier_count <= 0 {
             return Err(OpenSlideError::Format("HIER_COUNT must be positive".into()));
+        }
+        if nonhier_count < 0 {
+            return Err(OpenSlideError::Format(
+                "NONHIER_COUNT must be non-negative".into(),
+            ));
         }
 
         // Find "Slide zoom level" hierarchy
@@ -655,7 +671,7 @@ DIGITIZER_HEIGHT=512
         assert_eq!(sd.general.slide_id, "abc123-def456");
         assert_eq!(sd.general.images_x, 20);
         assert_eq!(sd.general.images_y, 15);
-        assert_eq!(sd.general.objective_magnification, 40);
+        assert_eq!(sd.general.objective_magnification, Some(40));
         assert_eq!(sd.general.image_divisions, 2);
 
         assert_eq!(sd.hierarchical.hier_count, 1);
@@ -690,5 +706,14 @@ DIGITIZER_HEIGHT=512
         assert_eq!(parse_image_format("PNG").unwrap(), ImageFormat::Png);
         assert_eq!(parse_image_format("BMP24").unwrap(), ImageFormat::Bmp);
         assert!(parse_image_format("GIF").is_err());
+    }
+
+    #[test]
+    fn objective_magnification_is_best_effort() {
+        assert_eq!(parse_objective_magnification("40"), Some(40));
+        assert_eq!(parse_objective_magnification("40x"), Some(40));
+        assert_eq!(parse_objective_magnification("40X"), Some(40));
+        assert_eq!(parse_objective_magnification("0"), None);
+        assert_eq!(parse_objective_magnification("unknown"), None);
     }
 }

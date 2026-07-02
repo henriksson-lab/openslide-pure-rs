@@ -4,6 +4,7 @@ use crate::pixel::{GrayImage, RgbaImage};
 const SOC: [u8; 2] = [0xff, 0x4f];
 const SIZ: [u8; 2] = [0xff, 0x51];
 const COD: [u8; 2] = [0xff, 0x52];
+const SOT: [u8; 2] = [0xff, 0x90];
 const SOD: [u8; 2] = [0xff, 0x93];
 const EOC: [u8; 2] = [0xff, 0xd9];
 const JP2_SIGNATURE_BOX: [u8; 12] = [
@@ -138,6 +139,12 @@ pub struct Jpeg2000TileContext {
     pub tile_height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Jpeg2000ComponentColorSpace {
+    Rgb,
+    YCbCr,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Jpeg2000DecodeOptions<'a> {
     pub expected_width: u32,
@@ -150,6 +157,7 @@ pub struct Jpeg2000DecodeOptions<'a> {
     pub tile: Option<Jpeg2000TileContext>,
     pub expected_color_space: Option<Jp2ColorSpace>,
     pub expected_multiple_component_transform: Option<u8>,
+    pub component_color_space: Jpeg2000ComponentColorSpace,
 }
 
 impl<'a> Jpeg2000DecodeOptions<'a> {
@@ -171,6 +179,7 @@ impl<'a> Jpeg2000DecodeOptions<'a> {
             tile: None,
             expected_color_space: None,
             expected_multiple_component_transform: None,
+            component_color_space: Jpeg2000ComponentColorSpace::Rgb,
         }
     }
 
@@ -196,6 +205,11 @@ impl<'a> Jpeg2000DecodeOptions<'a> {
 
     pub fn with_expected_multiple_component_transform(mut self, transform: u8) -> Self {
         self.expected_multiple_component_transform = Some(transform);
+        self
+    }
+
+    pub fn with_component_color_space(mut self, color_space: Jpeg2000ComponentColorSpace) -> Self {
+        self.component_color_space = color_space;
         self
     }
 }
@@ -403,6 +417,232 @@ impl Jpeg2000DecoderBackend for NoJpeg2000Decoder {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DicomToolkitJpeg2000Decoder;
+
+impl Jpeg2000DecoderBackend for DicomToolkitJpeg2000Decoder {
+    fn name(&self) -> &'static str {
+        "dicom-toolkit-jpeg2000"
+    }
+
+    fn capabilities(&self) -> Jpeg2000DecoderCapabilities {
+        Jpeg2000DecoderCapabilities::all_output_modes()
+    }
+
+    fn decode(&self, request: &Jpeg2000DecodeRequest<'_>) -> Result<Jpeg2000DecodedImage> {
+        let image = dicom_toolkit_jpeg2000::Image::new(
+            request.data,
+            &dicom_toolkit_jpeg2000::DecodeSettings::default(),
+        )
+        .map_err(|err| OpenSlideError::Decode(format!("JPEG 2000 decode setup failed: {err}")))?;
+        let bitmap = image.decode_native().map_err(|err| {
+            OpenSlideError::Decode(format!("JPEG 2000 native decode failed: {err}"))
+        })?;
+        let pixels = jpeg2000_native_pixels_to_u8(&bitmap)?;
+        let pixel_count = bitmap.width as usize * bitmap.height as usize;
+        if pixel_count == 0 || pixels.len() % pixel_count != 0 {
+            return Err(OpenSlideError::Decode(format!(
+                "JPEG 2000 decoder returned {} bytes for {}x{} image",
+                pixels.len(),
+                bitmap.width,
+                bitmap.height
+            )));
+        }
+        let components = bitmap.num_components as usize;
+        let output_pixels = match request.options.output {
+            Jpeg2000OutputFormat::Rgb => {
+                jpeg2000_pixels_to_rgb(&pixels, components, request.options.component_color_space)?
+            }
+            Jpeg2000OutputFormat::Rgba => {
+                jpeg2000_pixels_to_rgba(&pixels, components, request.options.component_color_space)?
+            }
+            Jpeg2000OutputFormat::Gray { channel } => jpeg2000_pixels_to_gray(
+                &pixels,
+                components,
+                channel,
+                request.options.component_color_space,
+            )?,
+        };
+        Ok(Jpeg2000DecodedImage {
+            width: bitmap.width,
+            height: bitmap.height,
+            output: request.options.output,
+            pixels: output_pixels,
+        })
+    }
+}
+
+fn jpeg2000_native_pixels_to_u8(bitmap: &dicom_toolkit_jpeg2000::RawBitmap) -> Result<Vec<u8>> {
+    let expected_samples =
+        bitmap.width as usize * bitmap.height as usize * bitmap.num_components as usize;
+    match bitmap.bytes_per_sample {
+        1 => {
+            if bitmap.data.len() != expected_samples {
+                return Err(OpenSlideError::Decode(format!(
+                    "JPEG 2000 native decoder returned {} bytes, expected {expected_samples}",
+                    bitmap.data.len()
+                )));
+            }
+            Ok(bitmap.data.clone())
+        }
+        2 => {
+            if bitmap.data.len() != expected_samples * 2 {
+                return Err(OpenSlideError::Decode(format!(
+                    "JPEG 2000 native decoder returned {} bytes, expected {}",
+                    bitmap.data.len(),
+                    expected_samples * 2
+                )));
+            }
+            let max_value = ((1u32 << bitmap.bit_depth) - 1).max(1);
+            let mut out = Vec::with_capacity(expected_samples);
+            for bytes in bitmap.data.chunks_exact(2) {
+                let sample = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
+                out.push(((sample * 255 + (max_value / 2)) / max_value) as u8);
+            }
+            Ok(out)
+        }
+        other => Err(OpenSlideError::Decode(format!(
+            "JPEG 2000 native decoder returned unsupported {other}-byte samples"
+        ))),
+    }
+}
+
+fn jpeg2000_pixels_to_rgb(
+    pixels: &[u8],
+    components: usize,
+    color_space: Jpeg2000ComponentColorSpace,
+) -> Result<Vec<u8>> {
+    match components {
+        1 => {
+            let mut rgb = Vec::with_capacity(pixels.len() * 3);
+            for &gray in pixels {
+                rgb.extend_from_slice(&[gray, gray, gray]);
+            }
+            Ok(rgb)
+        }
+        components if components >= 3 => {
+            let mut rgb = Vec::with_capacity(pixels.len() / components * 3);
+            for pixel in pixels.chunks_exact(components) {
+                match color_space {
+                    Jpeg2000ComponentColorSpace::Rgb => rgb.extend_from_slice(&pixel[..3]),
+                    Jpeg2000ComponentColorSpace::YCbCr => {
+                        let (r, g, b) = ycbcr_to_rgb(pixel[0], pixel[1], pixel[2]);
+                        rgb.extend_from_slice(&[r, g, b]);
+                    }
+                }
+            }
+            Ok(rgb)
+        }
+        _ => Err(OpenSlideError::Decode(format!(
+            "JPEG 2000 decoder returned unsupported {components}-component RGB input"
+        ))),
+    }
+}
+
+fn jpeg2000_pixels_to_rgba(
+    pixels: &[u8],
+    components: usize,
+    color_space: Jpeg2000ComponentColorSpace,
+) -> Result<Vec<u8>> {
+    match components {
+        1 => {
+            let mut rgba = Vec::with_capacity(pixels.len() * 4);
+            for &gray in pixels {
+                rgba.extend_from_slice(&[gray, gray, gray, 0xff]);
+            }
+            Ok(rgba)
+        }
+        2 => {
+            let mut rgba = Vec::with_capacity(pixels.len() / 2 * 4);
+            for pixel in pixels.chunks_exact(2) {
+                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+            }
+            Ok(rgba)
+        }
+        3 => {
+            let mut rgba = Vec::with_capacity(pixels.len() / 3 * 4);
+            for pixel in pixels.chunks_exact(3) {
+                let (r, g, b) = match color_space {
+                    Jpeg2000ComponentColorSpace::Rgb => (pixel[0], pixel[1], pixel[2]),
+                    Jpeg2000ComponentColorSpace::YCbCr => {
+                        ycbcr_to_rgb(pixel[0], pixel[1], pixel[2])
+                    }
+                };
+                rgba.extend_from_slice(&[r, g, b, 0xff]);
+            }
+            Ok(rgba)
+        }
+        components if components >= 4 => {
+            let mut rgba = Vec::with_capacity(pixels.len() / components * 4);
+            for pixel in pixels.chunks_exact(components) {
+                match color_space {
+                    Jpeg2000ComponentColorSpace::Rgb => rgba.extend_from_slice(&pixel[..4]),
+                    Jpeg2000ComponentColorSpace::YCbCr => {
+                        let (r, g, b) = ycbcr_to_rgb(pixel[0], pixel[1], pixel[2]);
+                        rgba.extend_from_slice(&[r, g, b, pixel[3]]);
+                    }
+                }
+            }
+            Ok(rgba)
+        }
+        _ => Err(OpenSlideError::Decode(
+            "JPEG 2000 decoder returned empty RGBA input".into(),
+        )),
+    }
+}
+
+fn jpeg2000_pixels_to_gray(
+    pixels: &[u8],
+    components: usize,
+    channel: u32,
+    color_space: Jpeg2000ComponentColorSpace,
+) -> Result<Vec<u8>> {
+    let channel = channel as usize;
+    if channel >= components {
+        return Err(OpenSlideError::Decode(format!(
+            "JPEG 2000 gray channel {channel} is outside decoded {components}-component image"
+        )));
+    }
+    if matches!(color_space, Jpeg2000ComponentColorSpace::YCbCr) && components >= 3 {
+        return Ok(pixels
+            .chunks_exact(components)
+            .map(|pixel| {
+                let (r, g, b) = ycbcr_to_rgb(pixel[0], pixel[1], pixel[2]);
+                [r, g, b][channel]
+            })
+            .collect());
+    }
+    Ok(pixels
+        .chunks_exact(components)
+        .map(|pixel| pixel[channel])
+        .collect())
+}
+
+fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> (u8, u8, u8) {
+    let y = i32::from(y);
+    let cb = i32::from(cb) - 128;
+    let cr = i32::from(cr) - 128;
+
+    // Match OpenSlide's JPEG 2000 YCbCr lookup tables.  R and B are rounded
+    // chroma deltas; G uses fixed-point precursors with rounding folded into
+    // the Cb table before the final signed shift.
+    let r_chroma = (1.402 * f64::from(cr)).round() as i32;
+    let g_cb = ((1_i32 << 16) as f64 * (0.5 - 0.34414 * f64::from(cb))).round() as i32;
+    let g_cr = ((1_i32 << 16) as f64 * (-0.71414 * f64::from(cr))).round() as i32;
+    let g_chroma = (g_cb + g_cr) >> 16;
+    let b_chroma = (1.772 * f64::from(cb)).round() as i32;
+
+    (
+        clamp_i32(y + r_chroma),
+        clamp_i32(y + g_chroma),
+        clamp_i32(y + b_chroma),
+    )
+}
+
+fn clamp_i32(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
 #[derive(Clone, Copy)]
 pub struct Jpeg2000DecoderConfig<'a> {
     pub backend: &'a dyn Jpeg2000DecoderBackend,
@@ -475,7 +715,7 @@ pub fn validate_image(
 }
 
 pub fn decode(data: &[u8], options: Jpeg2000DecodeOptions<'_>) -> Result<Jpeg2000DecodedImage> {
-    decode_with_config(data, options, Jpeg2000DecoderConfig::none())
+    decode_with_backend(data, options, &DicomToolkitJpeg2000Decoder)
 }
 
 pub fn decode_with_backend(
@@ -877,12 +1117,15 @@ fn inspect_codestream(data: &[u8], is_jp2_container: bool) -> Result<Jpeg2000Inf
     let mut coding_style = None;
     while offset.checked_add(4).is_some_and(|end| end <= data.len()) {
         if data[offset] != 0xff {
+            if info.is_some() {
+                break;
+            }
             return Err(OpenSlideError::Decode(format!(
                 "JPEG 2000 marker expected at byte {offset}"
             )));
         }
         let marker = [data[offset], data[offset + 1]];
-        if marker == SOD || marker == EOC {
+        if marker == SOT || marker == SOD || marker == EOC {
             break;
         }
         let segment_len = read_be_u16(data, offset + 2)? as usize;
@@ -1178,9 +1421,26 @@ mod tests {
     }
 
     #[test]
-    fn default_decoder_boundary_validates_then_reports_missing_backend() {
+    fn converts_ycbcr_components_before_rgb_or_gray_output() {
+        let pixels = [235, 128, 128, 76, 85, 255];
+
+        let rgb = jpeg2000_pixels_to_rgb(&pixels, 3, Jpeg2000ComponentColorSpace::YCbCr).unwrap();
+        assert_eq!(rgb, vec![235, 235, 235, 254, 0, 0]);
+
+        let red =
+            jpeg2000_pixels_to_gray(&pixels, 3, 0, Jpeg2000ComponentColorSpace::YCbCr).unwrap();
+        assert_eq!(red, vec![235, 254]);
+    }
+
+    #[test]
+    fn no_backend_boundary_validates_then_reports_missing_backend() {
         let data = synthetic_codestream(4, 2, 3, 8);
-        let err = decode_rgb(&data, 4, 2, 3, "test tile").unwrap_err();
+        let err = decode_with_backend(
+            &data,
+            Jpeg2000DecodeOptions::new(4, 2, 3, Jpeg2000OutputFormat::Rgb, "test tile"),
+            &NoJpeg2000Decoder,
+        )
+        .unwrap_err();
         match err {
             OpenSlideError::UnsupportedFormat(message) => {
                 assert!(message.contains("test tile JPEG 2000 raw codestream was validated"));

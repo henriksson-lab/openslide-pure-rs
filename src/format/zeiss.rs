@@ -200,9 +200,11 @@ impl ZeissSlide {
                 "Zeiss CZI contains no usable pyramid levels".into(),
             ));
         }
+        let common_max_downsample = common_scene_max_downsample(&subblocks);
 
         let levels = downsamples
             .into_iter()
+            .filter(|downsample| *downsample <= common_max_downsample)
             .map(|downsample| ZeissLevel {
                 width: base_width / downsample,
                 height: base_height / downsample,
@@ -234,6 +236,7 @@ impl ZeissSlide {
             properties.insert("zeiss.SizeS".into(), size_s.to_string());
         }
         insert_inferred_dimension_properties(&mut properties, &subblocks, &metadata_xml);
+        add_xml_props_from_metadata(&mut properties, &metadata_xml);
         if let Some(mpp_x) = parse_scaling_mpp(&metadata_xml, "X") {
             properties.insert(properties::PROPERTY_MPP_X.into(), mpp_x.to_string());
         }
@@ -247,6 +250,7 @@ impl ZeissSlide {
         }
         insert_metadata_properties(&mut properties, &metadata_xml);
         insert_dimension_range_properties(&mut properties, &subblocks);
+        insert_scene_region_properties(&mut properties, &subblocks);
         properties.insert("zeiss.SubBlockCount".into(), subblocks.len().to_string());
         properties.insert("zeiss.ChannelCount".into(), channel_count.to_string());
         for attachment in &associated_images {
@@ -404,7 +408,6 @@ impl SlideBackend for ZeissSlide {
             block.downsample == downsample
                 && block.z == 0
                 && block.t == 0
-                && block.scene == 0
                 && block.acquisition == 0
                 && block.angle == 0
                 && block.illumination == 0
@@ -471,7 +474,6 @@ impl SlideBackend for ZeissSlide {
                         block.downsample == downsample
                             && block.z == 0
                             && block.t == 0
-                            && block.scene == 0
                             && block.acquisition == 0
                             && block.angle == 0
                             && block.illumination == 0
@@ -1156,6 +1158,266 @@ fn decode_xml_entity(token: &str) -> Option<char> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct XmlElement<'a> {
+    name: &'a str,
+    open_tag: &'a str,
+    body: &'a str,
+}
+
+fn add_xml_props_from_metadata(properties: &mut HashMap<String, String>, metadata_xml: &str) {
+    for tag in [
+        "AttachmentInfos",
+        "DisplaySetting",
+        "Information",
+        "Scaling",
+    ] {
+        if let Some(element) = find_xml_element(metadata_xml, tag) {
+            let mut path = vec!["zeiss".to_string()];
+            add_xml_props(properties, &mut path, &element);
+        }
+    }
+}
+
+fn get_xml_element_name(path: &[String], element: &XmlElement<'_>) -> Option<String> {
+    let name_plural = format!("{}s", element.name);
+    let parent_name = path.last()?;
+    if parent_name == &name_plural || (parent_name == "Items" && element.name == "Distance") {
+        parse_xml_attribute(element.open_tag, "Id")
+            .or_else(|| parse_xml_attribute(element.open_tag, "Name"))
+    } else {
+        Some(element.name.to_string())
+    }
+}
+
+fn add_xml_props(
+    properties: &mut HashMap<String, String>,
+    path: &mut Vec<String>,
+    element: &XmlElement<'_>,
+) {
+    let Some(name) = get_xml_element_name(path, element) else {
+        return;
+    };
+    path.push(name);
+
+    for (attr, value) in xml_attributes(element.open_tag) {
+        if value.trim().is_empty() {
+            continue;
+        }
+        path.push(attr);
+        properties.insert(path.join("."), value);
+        path.pop();
+    }
+
+    let children = direct_xml_children(element.body);
+    if children.is_empty() {
+        let value = element.body.trim();
+        if !value.is_empty() {
+            properties.insert(path.join("."), unescape_xml(value));
+        }
+        path.pop();
+        return;
+    }
+
+    let mut names = BTreeSet::new();
+    let mut skip = BTreeSet::new();
+    for child in &children {
+        if let Some(child_name) = get_xml_element_name(path, child) {
+            if !names.insert(child_name.clone()) {
+                skip.insert(child_name);
+            }
+        }
+    }
+
+    for child in children {
+        let Some(child_name) = get_xml_element_name(path, &child) else {
+            continue;
+        };
+        if skip.contains(&child_name) {
+            continue;
+        }
+        add_xml_props(properties, path, &child);
+    }
+
+    path.pop();
+}
+
+fn find_xml_element<'a>(xml: &'a str, tag: &str) -> Option<XmlElement<'a>> {
+    let start = find_xml_start_tag(xml, tag)?;
+    let open_end = xml[start..].find('>')? + start;
+    let open_tag = &xml[start..=open_end];
+    let name = xml_element_name(open_tag)?;
+    let body_start = open_end + 1;
+    if open_tag.trim_end().ends_with("/>") {
+        return Some(XmlElement {
+            name,
+            open_tag,
+            body: "",
+        });
+    }
+    let close_start = find_matching_xml_end(&xml[body_start..], name)? + body_start;
+    Some(XmlElement {
+        name,
+        open_tag,
+        body: &xml[body_start..close_start],
+    })
+}
+
+fn direct_xml_children<'a>(xml: &'a str) -> Vec<XmlElement<'a>> {
+    let mut children = Vec::new();
+    let mut offset = 0usize;
+    while let Some(pos) = xml[offset..].find('<') {
+        let start = offset + pos;
+        if xml[start..].starts_with("</")
+            || xml[start..].starts_with("<!--")
+            || xml[start..].starts_with("<?")
+            || xml[start..].starts_with("<!")
+        {
+            offset = start + 1;
+            continue;
+        }
+        let Some(open_end) = xml[start..].find('>').map(|end| start + end) else {
+            break;
+        };
+        let open_tag = &xml[start..=open_end];
+        let Some(name) = xml_element_name(open_tag) else {
+            offset = open_end + 1;
+            continue;
+        };
+        if open_tag.trim_end().ends_with("/>") {
+            children.push(XmlElement {
+                name,
+                open_tag,
+                body: "",
+            });
+            offset = open_end + 1;
+            continue;
+        }
+        let body_start = open_end + 1;
+        let Some(close_start) =
+            find_matching_xml_end(&xml[body_start..], name).map(|close| body_start + close)
+        else {
+            break;
+        };
+        children.push(XmlElement {
+            name,
+            open_tag,
+            body: &xml[body_start..close_start],
+        });
+        let close_end = xml[close_start..]
+            .find('>')
+            .map(|end| close_start + end + 1)
+            .unwrap_or(xml.len());
+        offset = close_end;
+    }
+    children
+}
+
+fn find_matching_xml_end(xml: &str, tag: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut offset = 0usize;
+    while let Some(pos) = xml[offset..].find('<') {
+        let start = offset + pos;
+        if xml[start..].starts_with("</") {
+            let name_start = start + 2;
+            let name_end = name_start + xml[name_start..].find('>')?;
+            if xml_name_matches(xml[name_start..name_end].trim(), tag) {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start);
+                }
+            }
+            offset = name_end + 1;
+        } else {
+            let name = xml_element_name(&xml[start..])?;
+            let open_end = start + xml[start..].find('>')?;
+            if xml_name_matches(name, tag) && !xml[start..=open_end].trim_end().ends_with("/>") {
+                depth += 1;
+            }
+            offset = open_end + 1;
+        }
+    }
+    None
+}
+
+fn xml_element_name(open_tag: &str) -> Option<&str> {
+    let bytes = open_tag.as_bytes();
+    if bytes.first() != Some(&b'<') || bytes.get(1) == Some(&b'/') {
+        return None;
+    }
+    let mut end = 1usize;
+    while bytes
+        .get(end)
+        .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b':' | b'.' | b'-'))
+    {
+        end += 1;
+    }
+    (end > 1).then(|| {
+        let name = &open_tag[1..end];
+        name.rsplit_once(':').map_or(name, |(_, local)| local)
+    })
+}
+
+fn xml_attributes(open_tag: &str) -> Vec<(String, String)> {
+    let mut attrs = Vec::new();
+    let bytes = open_tag.as_bytes();
+    let mut pos = 1usize;
+    while bytes
+        .get(pos)
+        .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b':' | b'.' | b'-'))
+    {
+        pos += 1;
+    }
+    while pos < bytes.len() {
+        while bytes.get(pos).is_some_and(|b| b.is_ascii_whitespace()) {
+            pos += 1;
+        }
+        if bytes.get(pos).is_none_or(|b| matches!(*b, b'/' | b'>')) {
+            break;
+        }
+        let name_start = pos;
+        while bytes
+            .get(pos)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b':' | b'.' | b'-'))
+        {
+            pos += 1;
+        }
+        if pos == name_start {
+            pos += 1;
+            continue;
+        }
+        let name = open_tag[name_start..pos]
+            .rsplit_once(':')
+            .map_or(&open_tag[name_start..pos], |(_, local)| local)
+            .to_string();
+        while bytes.get(pos).is_some_and(|b| b.is_ascii_whitespace()) {
+            pos += 1;
+        }
+        if bytes.get(pos) != Some(&b'=') {
+            continue;
+        }
+        pos += 1;
+        while bytes.get(pos).is_some_and(|b| b.is_ascii_whitespace()) {
+            pos += 1;
+        }
+        let Some(quote) = bytes.get(pos).copied() else {
+            break;
+        };
+        if quote != b'"' && quote != b'\'' {
+            continue;
+        }
+        pos += 1;
+        let value_start = pos;
+        let Some(value_len) = open_tag[value_start..].find(quote as char) else {
+            break;
+        };
+        let value_end = value_start + value_len;
+        attrs.push((name, unescape_xml(open_tag[value_start..value_end].trim())));
+        pos = value_end + 1;
+    }
+    attrs
+}
+
 fn insert_metadata_properties(properties: &mut HashMap<String, String>, metadata_xml: &str) {
     let metadata_tags = [
         ("zeiss.Metadata.Name", "Name"),
@@ -1222,6 +1484,52 @@ fn insert_dimension_range_properties(
             );
         }
     }
+}
+
+fn insert_scene_region_properties(
+    properties: &mut HashMap<String, String>,
+    subblocks: &[CziSubBlock],
+) {
+    let mut bounds: BTreeMap<i32, (i64, i64, i64, i64)> = BTreeMap::new();
+    for block in subblocks.iter().filter(|block| block.downsample == 1) {
+        let x0 = i64::from(block.x);
+        let y0 = i64::from(block.y);
+        let x1 = x0 + i64::from(block.width);
+        let y1 = y0 + i64::from(block.height);
+        bounds
+            .entry(block.scene)
+            .and_modify(|bounds| {
+                bounds.0 = bounds.0.min(x0);
+                bounds.1 = bounds.1.min(y0);
+                bounds.2 = bounds.2.max(x1);
+                bounds.3 = bounds.3.max(y1);
+            })
+            .or_insert((x0, y0, x1, y1));
+    }
+
+    for (idx, (_scene, (x0, y0, x1, y1))) in bounds.into_iter().enumerate() {
+        properties.insert(format!("openslide.region[{idx}].x"), x0.to_string());
+        properties.insert(format!("openslide.region[{idx}].y"), y0.to_string());
+        properties.insert(
+            format!("openslide.region[{idx}].width"),
+            (x1 - x0).to_string(),
+        );
+        properties.insert(
+            format!("openslide.region[{idx}].height"),
+            (y1 - y0).to_string(),
+        );
+    }
+}
+
+fn common_scene_max_downsample(subblocks: &[CziSubBlock]) -> u64 {
+    let mut max_by_scene: BTreeMap<i32, u64> = BTreeMap::new();
+    for block in subblocks.iter().filter(|block| block.downsample > 0) {
+        max_by_scene
+            .entry(block.scene)
+            .and_modify(|max_downsample| *max_downsample = (*max_downsample).max(block.downsample))
+            .or_insert(block.downsample);
+    }
+    max_by_scene.values().copied().min().unwrap_or(1)
 }
 
 fn non_default_dimension_summary(subblocks: &[CziSubBlock]) -> String {
@@ -1917,6 +2225,45 @@ mod tests {
     }
 
     #[test]
+    fn composes_subblocks_from_all_scenes() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_composes_subblocks_from_all_scenes_{}",
+            std::process::id()
+        ));
+        fs::write(&path, make_two_scene_czi()).unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        assert_eq!(slide.level_dimensions(0), Some((2, 1)));
+        assert_eq!(slide.debug_grid_tile_count(0, 0), 2);
+        assert_eq!(
+            slide.properties().get("openslide.region[0].width"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("openslide.region[1].x"),
+            Some(&"1".to_string())
+        );
+
+        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
+        assert_eq!(red.data, vec![10, 200]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn common_scene_max_downsample_uses_minimum_scene_depth() {
+        let blocks = vec![
+            minimal_zeiss_block(0, 1),
+            minimal_zeiss_block(0, 2),
+            minimal_zeiss_block(0, 4),
+            minimal_zeiss_block(1, 1),
+            minimal_zeiss_block(1, 2),
+        ];
+
+        assert_eq!(common_scene_max_downsample(&blocks), 2);
+    }
+
+    #[test]
     fn reports_jpeg_xr_as_explicitly_unsupported() {
         let path = std::env::temp_dir().join(format!(
             "openslide_rs_reports_jpeg_xr_unsupported_{}",
@@ -2348,21 +2695,52 @@ mod tests {
                 <Image>
                   <Name>synthetic czi</Name>
                   <AcquisitionDate>2026-05-28T12:00:00Z</AcquisitionDate>
+                  <ObjectiveSettings>
+                    <ObjectiveRef Id="Objective:1"/>
+                  </ObjectiveSettings>
                 </Image>
                 <Instrument>
-                  <Objective>
+                  <Objectives>
+                    <Objective Id="Objective:1">
                     <ObjectiveName>Plan-Apochromat 20x</ObjectiveName>
                     <NominalMagnification>20X</NominalMagnification>
                     <Immersion>Oil</Immersion>
                     <LensNA>0.8</LensNA>
-                  </Objective>
+                    </Objective>
+                  </Objectives>
                 </Instrument>
               </Information>
+              <Scaling>
+                <Items>
+                  <Distance Id="X"><Value>2.5e-7</Value></Distance>
+                  <Distance Id="Y"><Value>5.0e-7</Value></Distance>
+                </Items>
+              </Scaling>
             </Metadata>
         "#;
         fs::write(&path, add_test_metadata(make_two_channel_gray_czi(), xml)).unwrap();
 
         let slide = ZeissSlide::open(&path).unwrap();
+        assert_eq!(
+            slide.properties().get("zeiss.Information.Image.Name"),
+            Some(&"synthetic czi".to_string())
+        );
+        assert_eq!(
+            slide
+                .properties()
+                .get("zeiss.Information.Image.ObjectiveSettings.ObjectiveRef.Id"),
+            Some(&"Objective:1".to_string())
+        );
+        assert_eq!(
+            slide
+                .properties()
+                .get("zeiss.Information.Instrument.Objectives.Objective:1.NominalMagnification"),
+            Some(&"20X".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("zeiss.Scaling.Items.X.Value"),
+            Some(&"2.5e-7".to_string())
+        );
         assert_eq!(
             slide.properties().get("zeiss.Metadata.Name"),
             Some(&"synthetic czi".to_string())
@@ -2378,6 +2756,14 @@ mod tests {
         assert_eq!(
             slide.properties().get(properties::PROPERTY_OBJECTIVE_POWER),
             Some(&"20".to_string())
+        );
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_MPP_X),
+            Some(&"0.25".to_string())
+        );
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_MPP_Y),
+            Some(&"0.5".to_string())
         );
         assert_eq!(
             slide.properties().get("zeiss.Dimension.C.Min"),
@@ -2606,6 +2992,118 @@ mod tests {
             height,
         );
         czi[data_pos..data_pos + data.len()].copy_from_slice(data);
+        czi
+    }
+
+    fn minimal_zeiss_block(scene: i32, downsample: u64) -> CziSubBlock {
+        CziSubBlock {
+            downsample,
+            pixel_type: CZI_PIXEL_GRAY8,
+            compression: CZI_COMPRESSION_UNCOMPRESSED,
+            file_position: 0,
+            file_part: 0,
+            dimension_count: 4,
+            x: 0,
+            y: 0,
+            z: 0,
+            t: 0,
+            width: 1,
+            height: 1,
+            scene,
+            channel: 0,
+            acquisition: 0,
+            angle: 0,
+            illumination: 0,
+            phase: 0,
+            rotation: 0,
+            mosaic: 0,
+        }
+    }
+
+    fn make_two_scene_czi() -> Vec<u8> {
+        let dir_pos = 544usize;
+        let entry_size = 32 + 4 * 20;
+        let subblock0_pos = dir_pos + ZISRAW_SUBBLK_DIR_HDR_LEN as usize + entry_size * 2;
+        let subblock0_data_pos =
+            subblock0_pos + ZISRAW_SEGMENT_HDR_LEN as usize + ZISRAW_SUBBLK_MIN_DATA_LEN as usize;
+        let subblock1_pos = subblock0_data_pos + 3;
+        let subblock1_data_pos =
+            subblock1_pos + ZISRAW_SEGMENT_HDR_LEN as usize + ZISRAW_SUBBLK_MIN_DATA_LEN as usize;
+        let mut czi = vec![0; subblock1_data_pos + 3];
+
+        write_sid(&mut czi, 0, SID_ZISRAWFILE);
+        write_u64(&mut czi, 16, 512);
+        write_u64(&mut czi, 24, 512);
+        write_i64(&mut czi, 84, dir_pos as i64);
+        write_i64(&mut czi, 92, 0);
+        write_i64(&mut czi, 104, 0);
+
+        write_sid(&mut czi, dir_pos, SID_ZISRAWDIRECTORY);
+        write_u64(
+            &mut czi,
+            dir_pos + 16,
+            (ZISRAW_SUBBLK_DIR_HDR_LEN as usize + entry_size * 2 - 32) as u64,
+        );
+        write_u64(
+            &mut czi,
+            dir_pos + 24,
+            (ZISRAW_SUBBLK_DIR_HDR_LEN as usize + entry_size * 2 - 32) as u64,
+        );
+        write_i32(&mut czi, dir_pos + 32, 2);
+        let entry0 = dir_pos + ZISRAW_SUBBLK_DIR_HDR_LEN as usize;
+        let entry1 = entry0 + entry_size;
+        write_directory_entry_with_scene(
+            &mut czi,
+            entry0,
+            CZI_PIXEL_BGR24,
+            subblock0_pos as u64,
+            CZI_COMPRESSION_UNCOMPRESSED,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+        );
+        write_directory_entry_with_scene(
+            &mut czi,
+            entry1,
+            CZI_PIXEL_BGR24,
+            subblock1_pos as u64,
+            CZI_COMPRESSION_UNCOMPRESSED,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+        );
+        write_subblock_with_scene(
+            &mut czi,
+            subblock0_pos,
+            CZI_PIXEL_BGR24,
+            CZI_COMPRESSION_UNCOMPRESSED,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+            &[30, 20, 10],
+        );
+        write_subblock_with_scene(
+            &mut czi,
+            subblock1_pos,
+            CZI_PIXEL_BGR24,
+            CZI_COMPRESSION_UNCOMPRESSED,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            &[220, 210, 200],
+        );
         czi
     }
 
@@ -2873,6 +3371,32 @@ mod tests {
         write_dimension(data, offset + 72, b"C", channel, 1, 1);
     }
 
+    fn write_directory_entry_with_scene(
+        data: &mut [u8],
+        offset: usize,
+        pixel_type: i32,
+        file_position: u64,
+        compression: i32,
+        channel: i32,
+        width: u32,
+        height: u32,
+        scene: i32,
+        x: i32,
+        y: i32,
+    ) {
+        data[offset..offset + 2].copy_from_slice(SCHEMA_DV);
+        write_i32(data, offset + 2, pixel_type);
+        write_u64(data, offset + 6, file_position);
+        write_i32(data, offset + 14, 0);
+        write_i32(data, offset + 18, compression);
+        data[offset + 22] = 0;
+        write_i32(data, offset + 28, 4);
+        write_dimension(data, offset + 32, b"X", x, width as i32, width as i32);
+        write_dimension(data, offset + 52, b"Y", y, height as i32, height as i32);
+        write_dimension(data, offset + 72, b"S", scene, 1, 1);
+        write_dimension(data, offset + 92, b"C", channel, 1, 1);
+    }
+
     fn write_subblock(
         data: &mut [u8],
         offset: usize,
@@ -2909,6 +3433,52 @@ mod tests {
             channel,
             width,
             height,
+        );
+        data[data_pos..data_pos + pixels.len()].copy_from_slice(pixels);
+    }
+
+    fn write_subblock_with_scene(
+        data: &mut [u8],
+        offset: usize,
+        pixel_type: i32,
+        compression: i32,
+        channel: i32,
+        width: u32,
+        height: u32,
+        scene: i32,
+        x: i32,
+        y: i32,
+        pixels: &[u8],
+    ) {
+        let data_pos =
+            offset + ZISRAW_SEGMENT_HDR_LEN as usize + ZISRAW_SUBBLK_MIN_DATA_LEN as usize;
+        write_sid(data, offset, b"ZISRAWSUBBLOCK");
+        write_u64(
+            data,
+            offset + 16,
+            (ZISRAW_SUBBLK_MIN_DATA_LEN as usize + pixels.len()) as u64,
+        );
+        write_u64(
+            data,
+            offset + 24,
+            (ZISRAW_SUBBLK_MIN_DATA_LEN as usize + pixels.len()) as u64,
+        );
+        let prefix = offset + ZISRAW_SEGMENT_HDR_LEN as usize;
+        write_u32(data, prefix, 0);
+        write_u32(data, prefix + 4, 0);
+        write_u64(data, prefix + 8, pixels.len() as u64);
+        write_directory_entry_with_scene(
+            data,
+            prefix + 16,
+            pixel_type,
+            offset as u64,
+            compression,
+            channel,
+            width,
+            height,
+            scene,
+            x,
+            y,
         );
         data[data_pos..data_pos + pixels.len()].copy_from_slice(pixels);
     }

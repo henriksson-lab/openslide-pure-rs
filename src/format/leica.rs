@@ -21,6 +21,7 @@ const TIFF_MAGIC_BIG: u16 = 43;
 const TYPE_ASCII: u16 = 2;
 const TYPE_SHORT: u16 = 3;
 const TYPE_LONG: u16 = 4;
+const TYPE_RATIONAL: u16 = 5;
 const TYPE_IFD: u16 = 13;
 const TYPE_LONG8: u16 = 16;
 const TYPE_IFD8: u16 = 18;
@@ -30,6 +31,7 @@ const TAG_IMAGELENGTH: u16 = 257;
 const TAG_BITSPERSAMPLE: u16 = 258;
 const TAG_COMPRESSION: u16 = 259;
 const TAG_PHOTOMETRIC: u16 = 262;
+const TAG_DOCUMENTNAME: u16 = 269;
 const TAG_IMAGEDESCRIPTION: u16 = 270;
 const TAG_MAKE: u16 = 271;
 const TAG_MODEL: u16 = 272;
@@ -37,12 +39,22 @@ const TAG_STRIPOFFSETS: u16 = 273;
 const TAG_SAMPLESPERPIXEL: u16 = 277;
 const TAG_ROWSPERSTRIP: u16 = 278;
 const TAG_STRIPBYTECOUNTS: u16 = 279;
+const TAG_XRESOLUTION: u16 = 282;
+const TAG_YRESOLUTION: u16 = 283;
 const TAG_PLANARCONFIG: u16 = 284;
+const TAG_XPOSITION: u16 = 286;
+const TAG_YPOSITION: u16 = 287;
+const TAG_RESOLUTIONUNIT: u16 = 296;
+const TAG_SOFTWARE: u16 = 305;
+const TAG_DATETIME: u16 = 306;
+const TAG_ARTIST: u16 = 315;
+const TAG_HOSTCOMPUTER: u16 = 316;
 const TAG_TILEWIDTH: u16 = 322;
 const TAG_TILELENGTH: u16 = 323;
 const TAG_TILEOFFSETS: u16 = 324;
 const TAG_TILEBYTECOUNTS: u16 = 325;
 const TAG_JPEGTABLES: u16 = 347;
+const TAG_COPYRIGHT: u16 = 33432;
 
 const COMPRESSION_NONE: u16 = 1;
 const COMPRESSION_JPEG: u16 = 7;
@@ -216,6 +228,10 @@ impl TiffDirectory {
         self.entry(tag)?.uints(endian)
     }
 
+    fn float(&self, endian: Endian, tag: u16) -> Option<f64> {
+        self.entry(tag)?.floats(endian)?.first().copied()
+    }
+
     fn ascii(&self, tag: u16) -> Option<String> {
         self.entry(tag)?.ascii()
     }
@@ -237,6 +253,32 @@ impl TiffEntry {
         }
     }
 
+    fn floats(&self, endian: Endian) -> Option<Vec<f64>> {
+        let count = usize::try_from(self.count).ok()?;
+        match self.value_type {
+            TYPE_SHORT | TYPE_LONG | TYPE_IFD | TYPE_LONG8 | TYPE_IFD8 => self
+                .uints(endian)
+                .map(|values| values.into_iter().map(|value| value as f64).collect()),
+            TYPE_RATIONAL => {
+                if self.raw.len() < count.checked_mul(8)? {
+                    return None;
+                }
+                let mut values = Vec::with_capacity(count);
+                for index in 0..count {
+                    let base = index * 8;
+                    let numerator = endian.read_u32(&self.raw[base..base + 4]);
+                    let denominator = endian.read_u32(&self.raw[base + 4..base + 8]);
+                    if denominator == 0 {
+                        return None;
+                    }
+                    values.push(numerator as f64 / denominator as f64);
+                }
+                Some(values)
+            }
+            _ => None,
+        }
+    }
+
     fn ascii(&self) -> Option<String> {
         if self.value_type != TYPE_ASCII && self.value_type != 1 {
             return None;
@@ -250,6 +292,20 @@ impl TiffEntry {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    fn c_string(&self) -> Option<String> {
+        if self.value_type != TYPE_ASCII && self.value_type != 1 {
+            return None;
+        }
+        let nul = self
+            .raw
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.raw.len());
+        std::str::from_utf8(&self.raw[..nul])
+            .ok()
+            .map(str::to_string)
     }
 }
 
@@ -601,7 +657,7 @@ fn leica_detect(path: &Path) -> bool {
     first.is_tiled()
         && first
             .ascii(TAG_IMAGEDESCRIPTION)
-            .is_some_and(|desc| is_leica_description(&desc))
+            .is_some_and(|desc| is_leica_description(&desc) && has_leica_default_namespace(&desc))
 }
 
 pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
@@ -616,7 +672,10 @@ fn leica_open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     let description = first
         .ascii(TAG_IMAGEDESCRIPTION)
         .ok_or_else(|| OpenSlideError::UnsupportedFormat("TIFF has no ImageDescription".into()))?;
-    if !first.is_tiled() || !is_leica_description(&description) {
+    if !first.is_tiled()
+        || !is_leica_description(&description)
+        || !has_leica_default_namespace(&description)
+    {
         return Err(OpenSlideError::UnsupportedFormat(
             "Not a Leica SCN slide".into(),
         ));
@@ -624,7 +683,21 @@ fn leica_open(path: &Path) -> Result<Box<dyn SlideBackend>> {
 
     let collection = parse_xml_description(&description)?;
     let tiff = TiffFile::open_selected(path, &referenced_directories(&collection))?;
-    let (levels, mut properties, associated_images) = create_levels(&tiff, &collection)?;
+    let (levels, mut properties, associated_images, quickhash_dir) =
+        create_levels_from_collection(&tiff, &collection)?;
+    let property_dir = levels
+        .first()
+        .and_then(|level| level.areas.first())
+        .map(|area| area.dir)
+        .ok_or_else(|| OpenSlideError::Format("Can't find Leica property directory".into()))?;
+    openslide_tifflike_init_properties_and_hash(
+        &mut properties,
+        &tiff,
+        quickhash_dir,
+        property_dir,
+    )?;
+    properties.remove("openslide.comment");
+    properties.remove("tiff.ImageDescription");
     add_tiff_properties(&mut properties, &tiff, &levels);
     add_level_properties(&mut properties, &levels);
     add_associated_properties(&mut properties, &associated_images);
@@ -778,21 +851,57 @@ fn is_leica_description(description: &str) -> bool {
     description.contains(LEICA_XMLNS_1) || description.contains(LEICA_XMLNS_2)
 }
 
+fn has_leica_default_namespace(xml: &str) -> bool {
+    let mut pos = 0usize;
+    while let Some((_start, end, tag)) = next_tag(xml, pos) {
+        pos = end;
+        if tag.starts_with('/') || tag.starts_with('?') || tag.starts_with('!') {
+            continue;
+        }
+        let (name, attrs) = split_tag(&tag);
+        if !local_name_eq(name, "scn") {
+            return false;
+        }
+        let Ok(attrs) = parse_attrs(attrs) else {
+            return false;
+        };
+        return attr_value(&attrs, "xmlns")
+            .is_some_and(|value| value == LEICA_XMLNS_1 || value == LEICA_XMLNS_2);
+    }
+    false
+}
+
 fn parse_xml_description(xml: &str) -> Result<Collection> {
     if !is_leica_description(xml) {
         return Err(OpenSlideError::UnsupportedFormat(
             "Leica XML namespace is missing".into(),
         ));
     }
+    if !has_leica_default_namespace(xml) {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Unexpected Leica XML namespace".into(),
+        ));
+    }
 
     let mut collection: Option<Collection> = None;
     let mut current_image: Option<Image> = None;
     let mut pos = 0usize;
+    let mut path: Vec<String> = Vec::new();
 
     while let Some((start, end, tag)) = next_tag(xml, pos) {
         pos = end;
-        if tag.starts_with('/') || tag.starts_with('?') || tag.starts_with('!') {
-            if local_name_eq(tag.trim_start_matches('/'), "image") {
+        let tag = tag.trim();
+        if tag.starts_with('/') {
+            let name = local_name(tag.trim_start_matches('/').trim());
+            if !path
+                .last()
+                .is_some_and(|current| current.eq_ignore_ascii_case(name))
+            {
+                return Err(OpenSlideError::Format(format!(
+                    "Mismatched Leica XML end tag: {name}"
+                )));
+            }
+            if local_name_eq(name, "image") {
                 if let Some(mut image) = current_image.take() {
                     finish_image(&mut image)?;
                     collection
@@ -804,12 +913,17 @@ fn parse_xml_description(xml: &str) -> Result<Collection> {
                         .push(image);
                 }
             }
+            path.pop();
+            continue;
+        }
+        if tag.starts_with('?') || tag.starts_with('!') {
             continue;
         }
 
         let self_closing = tag.trim_end().ends_with('/');
         let (name, attrs) = split_tag(&tag);
-        if local_name_eq(name, "collection") {
+        let local = local_name(name).to_string();
+        if local_name_eq(name, "collection") && xml_path_matches(&path, &["scn"]) {
             let attrs = parse_attrs(attrs)?;
             collection = Some(Collection {
                 barcode: attr_value(&attrs, "barcode").cloned(),
@@ -817,14 +931,15 @@ fn parse_xml_description(xml: &str) -> Result<Collection> {
                 nm_down: required_i64_attr(&attrs, "sizeY")?,
                 images: Vec::new(),
             });
-        } else if local_name_eq(name, "barcode") {
+        } else if local_name_eq(name, "barcode") && xml_path_matches(&path, &["scn", "collection"])
+        {
             if let Some(value) = text_until_end(xml, end, "barcode") {
                 if let Some(collection) = &mut collection {
                     let value = xml_text_value(value);
                     collection.barcode = Some(decode_base64(&value).unwrap_or(value));
                 }
             }
-        } else if local_name_eq(name, "image") {
+        } else if local_name_eq(name, "image") && xml_path_matches(&path, &["scn", "collection"]) {
             if let Some(mut image) = current_image.take() {
                 finish_image(&mut image)?;
                 collection
@@ -847,7 +962,9 @@ fn parse_xml_description(xml: &str) -> Result<Collection> {
                 nm_offset_y: 0,
                 dimensions: Vec::new(),
             });
-        } else if local_name_eq(name, "view") {
+        } else if local_name_eq(name, "view")
+            && xml_path_matches(&path, &["scn", "collection", "image"])
+        {
             let attrs = parse_attrs(attrs)?;
             let image = current_image
                 .as_mut()
@@ -856,37 +973,76 @@ fn parse_xml_description(xml: &str) -> Result<Collection> {
             image.nm_down = required_i64_attr(&attrs, "sizeY")?;
             image.nm_offset_x = required_i64_attr(&attrs, "offsetX")?;
             image.nm_offset_y = required_i64_attr(&attrs, "offsetY")?;
-        } else if local_name_eq(name, "creationDate") {
+        } else if local_name_eq(name, "creationDate")
+            && xml_path_matches(&path, &["scn", "collection", "image"])
+        {
             if let Some(value) = text_until_end(xml, end, "creationDate") {
                 if let Some(image) = &mut current_image {
                     image.creation_date = Some(xml_text_value(value));
                 }
             }
-        } else if local_name_eq(name, "device") {
+        } else if local_name_eq(name, "device")
+            && xml_path_matches(&path, &["scn", "collection", "image"])
+        {
             let attrs = parse_attrs(attrs)?;
             if let Some(image) = &mut current_image {
                 image.device_model = attr_value(&attrs, "model").cloned();
                 image.device_version = attr_value(&attrs, "version").cloned();
             }
-        } else if local_name_eq(name, "illuminationSource") {
+        } else if local_name_eq(name, "illuminationSource")
+            && xml_path_matches(
+                &path,
+                &[
+                    "scn",
+                    "collection",
+                    "image",
+                    "scanSettings",
+                    "illuminationSettings",
+                ],
+            )
+        {
             if let Some(value) = text_until_end(xml, end, "illuminationSource") {
                 if let Some(image) = &mut current_image {
                     image.illumination_source = Some(xml_text_value(value));
                 }
             }
-        } else if local_name_eq(name, "objective") {
+        } else if local_name_eq(name, "objective")
+            && xml_path_matches(
+                &path,
+                &[
+                    "scn",
+                    "collection",
+                    "image",
+                    "scanSettings",
+                    "objectiveSettings",
+                ],
+            )
+        {
             if let Some(value) = text_until_end(xml, end, "objective") {
                 if let Some(image) = &mut current_image {
                     image.objective = Some(xml_text_value(value));
                 }
             }
-        } else if local_name_eq(name, "numericalAperture") {
+        } else if local_name_eq(name, "numericalAperture")
+            && xml_path_matches(
+                &path,
+                &[
+                    "scn",
+                    "collection",
+                    "image",
+                    "scanSettings",
+                    "illuminationSettings",
+                ],
+            )
+        {
             if let Some(value) = text_until_end(xml, end, "numericalAperture") {
                 if let Some(image) = &mut current_image {
                     image.aperture = Some(xml_text_value(value));
                 }
             }
-        } else if local_name_eq(name, "dimension") {
+        } else if local_name_eq(name, "dimension")
+            && xml_path_matches(&path, &["scn", "collection", "image", "pixels"])
+        {
             let attrs = parse_attrs(attrs)?;
             if !dimension_is_z0(&attrs) {
                 continue;
@@ -905,8 +1061,21 @@ fn parse_xml_description(xml: &str) -> Result<Collection> {
             });
         }
 
-        if self_closing && local_name_eq(name, "image") {
-            current_image = None;
+        if self_closing {
+            if local_name_eq(name, "image") {
+                if let Some(mut image) = current_image.take() {
+                    finish_image(&mut image)?;
+                    collection
+                        .as_mut()
+                        .ok_or_else(|| {
+                            OpenSlideError::Format("Leica collection is missing".into())
+                        })?
+                        .images
+                        .push(image);
+                }
+            }
+        } else {
+            path.push(local);
         }
         let _ = start;
     }
@@ -940,6 +1109,14 @@ fn parse_xml_description(xml: &str) -> Result<Collection> {
     Ok(collection)
 }
 
+fn xml_path_matches(path: &[String], expected: &[&str]) -> bool {
+    path.len() == expected.len()
+        && path
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+}
+
 fn finish_image(image: &mut Image) -> Result<()> {
     if image.nm_across <= 0 || image.nm_down <= 0 {
         return Err(OpenSlideError::Format(
@@ -965,21 +1142,24 @@ fn finish_image(image: &mut Image) -> Result<()> {
     Ok(())
 }
 
-fn create_levels(
+fn create_levels_from_collection(
     tiff: &TiffFile,
     collection: &Collection,
 ) -> Result<(
     Vec<LeicaLevel>,
     HashMap<String, String>,
     HashMap<String, AssociatedImage>,
+    usize,
 )> {
     let mut properties = HashMap::new();
     properties.insert(properties::PROPERTY_VENDOR.into(), "leica".into());
-    set_property(
+    set_prop(
         &mut properties,
         "leica.barcode",
         collection.barcode.as_deref(),
     );
+    let legacy_quickhash = should_use_legacy_quickhash(collection);
+    let mut quickhash_dir = None;
 
     let main_images: Vec<&Image> = collection
         .images
@@ -996,28 +1176,28 @@ fn create_levels(
         .first()
         .ok_or_else(|| OpenSlideError::Format("Can't find Leica main image".into()))?;
 
-    set_property(&mut properties, "leica.aperture", first.aperture.as_deref());
-    set_property(
+    set_prop(&mut properties, "leica.aperture", first.aperture.as_deref());
+    set_prop(
         &mut properties,
         "leica.creation-date",
         first.creation_date.as_deref(),
     );
-    set_property(
+    set_prop(
         &mut properties,
         "leica.device-model",
         first.device_model.as_deref(),
     );
-    set_property(
+    set_prop(
         &mut properties,
         "leica.device-version",
         first.device_version.as_deref(),
     );
-    set_property(
+    set_prop(
         &mut properties,
         "leica.illumination-source",
         first.illumination_source.as_deref(),
     );
-    set_property(
+    set_prop(
         &mut properties,
         "leica.objective",
         first.objective.as_deref(),
@@ -1086,6 +1266,9 @@ fn create_levels(
                 jpeg_tables: tiff_level.jpeg_tables,
             });
         }
+        if legacy_quickhash && std::ptr::eq(image, first) {
+            quickhash_dir = image.dimensions.last().map(|dimension| dimension.dir);
+        }
     }
 
     for level in &mut levels {
@@ -1101,28 +1284,22 @@ fn create_levels(
         level.downsample = level.nm_per_pixel / base_nm_per_pixel;
     }
 
-    properties.insert(
-        properties::PROPERTY_MPP_X.into(),
-        format_float(base_nm_per_pixel / 1000.0),
-    );
-    properties.insert(
-        properties::PROPERTY_MPP_Y.into(),
-        format_float(base_nm_per_pixel / 1000.0),
-    );
     set_region_bounds_props(&mut properties, &levels[0]);
 
     let mut associated_images = HashMap::new();
-    let macro_image = collection
-        .images
-        .iter()
-        .filter(|image| {
-            image.is_macro
-                && image
-                    .illumination_source
-                    .as_deref()
-                    .is_some_and(is_brightfield_illumination)
-        })
-        .max_by_key(|image| image.nm_across.saturating_mul(image.nm_down));
+    let mut macro_images = collection.images.iter().filter(|image| {
+        image.is_macro
+            && image
+                .illumination_source
+                .as_deref()
+                .is_some_and(is_brightfield_illumination)
+    });
+    let macro_image = macro_images.next();
+    if macro_image.is_some() && macro_images.next().is_some() {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Multiple Leica brightfield macro images are not supported".into(),
+        ));
+    }
     if let Some(image) = macro_image {
         if let Some(dimension) = image.dimensions.first() {
             let area = read_area(tiff, dimension)?;
@@ -1157,35 +1334,49 @@ fn create_levels(
                 },
             );
         }
+        if !legacy_quickhash {
+            quickhash_dir = image.dimensions.last().map(|dimension| dimension.dir);
+        }
     }
 
-    Ok((levels, properties, associated_images))
+    let quickhash_dir = quickhash_dir.ok_or_else(|| {
+        OpenSlideError::Format("Couldn't locate TIFF directory for Leica quickhash".into())
+    })?;
+
+    Ok((levels, properties, associated_images, quickhash_dir))
+}
+
+fn should_use_legacy_quickhash(collection: &Collection) -> bool {
+    let mut brightfield_main_images = 0usize;
+    let mut macro_images = 0usize;
+    for image in &collection.images {
+        if image.is_macro {
+            macro_images += 1;
+        } else {
+            if !image
+                .illumination_source
+                .as_deref()
+                .is_some_and(is_brightfield_illumination)
+            {
+                return false;
+            }
+            brightfield_main_images += 1;
+        }
+    }
+    brightfield_main_images == 1 && macro_images <= 1
 }
 
 fn is_brightfield_illumination(value: &str) -> bool {
-    let normalized: String = value
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace() && *ch != '-' && *ch != '_')
-        .flat_map(char::to_lowercase)
-        .collect();
-    normalized == LEICA_VALUE_BRIGHTFIELD
+    value == LEICA_VALUE_BRIGHTFIELD
 }
 
 fn objective_power_value(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    let numeric = trimmed
-        .strip_suffix(['x', 'X'])
-        .map(str::trim)
-        .unwrap_or(trimmed);
-    numeric.parse::<f64>().is_ok().then_some(numeric)
+    value.parse::<i64>().ok()?;
+    Some(value)
 }
 
 fn option_str_eq(left: &Option<String>, right: &Option<String>) -> bool {
-    match (left.as_deref(), right.as_deref()) {
-        (Some(left), Some(right)) => left.trim().eq_ignore_ascii_case(right.trim()),
-        (None, None) => true,
-        _ => false,
-    }
+    left == right
 }
 
 #[derive(Debug)]
@@ -1456,9 +1647,63 @@ fn add_tiff_properties(
         return;
     };
 
-    for (name, tag) in [("tiff.Make", TAG_MAKE), ("tiff.Model", TAG_MODEL)] {
+    for (name, tag) in [
+        ("tiff.Make", TAG_MAKE),
+        ("tiff.Model", TAG_MODEL),
+        ("tiff.Software", TAG_SOFTWARE),
+        ("tiff.DateTime", TAG_DATETIME),
+        ("tiff.Artist", TAG_ARTIST),
+        ("tiff.HostComputer", TAG_HOSTCOMPUTER),
+        ("tiff.Copyright", TAG_COPYRIGHT),
+        ("tiff.DocumentName", TAG_DOCUMENTNAME),
+    ] {
         if let Some(value) = dir.ascii(tag) {
             props.insert(name.to_string(), value);
+        }
+    }
+
+    if let Some(value) = dir.float(tiff.endian, TAG_XRESOLUTION) {
+        props.insert("tiff.XResolution".into(), format_float(value));
+    }
+    if let Some(value) = dir.float(tiff.endian, TAG_YRESOLUTION) {
+        props.insert("tiff.YResolution".into(), format_float(value));
+    }
+    if let Some(value) = dir.float(tiff.endian, TAG_XPOSITION) {
+        props.insert("tiff.XPosition".into(), format_float(value));
+    }
+    if let Some(value) = dir.float(tiff.endian, TAG_YPOSITION) {
+        props.insert("tiff.YPosition".into(), format_float(value));
+    }
+    let unit = dir.uint(tiff.endian, TAG_RESOLUTIONUNIT).unwrap_or(2);
+    let unit_name = match unit {
+        1 => "none",
+        2 => "inch",
+        3 => "centimeter",
+        _ => "unknown",
+    };
+    props.insert("tiff.ResolutionUnit".into(), unit_name.into());
+    if let (Some(xres), Some(yres)) = (
+        dir.float(tiff.endian, TAG_XRESOLUTION),
+        dir.float(tiff.endian, TAG_YRESOLUTION),
+    ) {
+        let microns_per_unit = match unit {
+            2 => Some(25_400.0),
+            3 => Some(10_000.0),
+            _ => None,
+        };
+        if let Some(microns_per_unit) = microns_per_unit {
+            if xres > 0.0 {
+                props.insert(
+                    properties::PROPERTY_MPP_X.into(),
+                    format_float(microns_per_unit / xres),
+                );
+            }
+            if yres > 0.0 {
+                props.insert(
+                    properties::PROPERTY_MPP_Y.into(),
+                    format_float(microns_per_unit / yres),
+                );
+            }
         }
     }
 }
@@ -1511,7 +1756,7 @@ fn add_associated_properties(
     }
 }
 
-fn set_property(props: &mut HashMap<String, String>, name: &str, value: Option<&str>) {
+fn set_prop(props: &mut HashMap<String, String>, name: &str, value: Option<&str>) {
     if let Some(value) = value.filter(|value| !value.is_empty()) {
         props.insert(name.to_string(), value.to_string());
     }
@@ -1810,6 +2055,297 @@ fn read_file_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
     let mut data = vec![0u8; len as usize];
     file.read_exact(&mut data)?;
     Ok(data)
+}
+
+struct OpenslideHash {
+    sha256: Sha256,
+    enabled: bool,
+}
+
+impl OpenslideHash {
+    fn openslide_hash_quickhash1_create() -> Self {
+        Self {
+            sha256: Sha256::new(),
+            enabled: true,
+        }
+    }
+
+    fn openslide_hash_data(&mut self, data: &[u8]) {
+        if self.enabled && !data.is_empty() {
+            self.sha256.update(data);
+        }
+    }
+
+    fn openslide_hash_string(&mut self, value: Option<&str>) {
+        self.openslide_hash_data(value.unwrap_or("").as_bytes());
+        self.openslide_hash_data(&[0]);
+    }
+
+    fn openslide_hash_file_part(&mut self, filename: &Path, offset: u64, size: u64) -> Result<()> {
+        if !self.enabled || size == 0 {
+            return Ok(());
+        }
+        let mut file = File::open(filename)?;
+        let file_len = file.metadata()?.len();
+        let end = offset.checked_add(size).ok_or_else(|| {
+            OpenSlideError::Format(format!(
+                "File range overflows: offset={}, len={}",
+                offset, size
+            ))
+        })?;
+        if end > file_len {
+            return Err(OpenSlideError::Format(format!(
+                "File range extends outside file: offset={}, len={}, file_len={}",
+                offset, size, file_len
+            )));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes_left = size;
+        let mut buf = [0u8; 4096];
+        while bytes_left > 0 {
+            let to_read = buf.len().min(bytes_left as usize);
+            file.read_exact(&mut buf[..to_read])?;
+            self.openslide_hash_data(&buf[..to_read]);
+            bytes_left -= to_read as u64;
+        }
+        Ok(())
+    }
+
+    fn openslide_hash_disable(&mut self) {
+        self.enabled = false;
+    }
+
+    fn openslide_hash_get_string(self) -> Option<String> {
+        self.enabled.then(|| self.sha256.finalize_hex())
+    }
+}
+
+fn openslide_tifflike_init_properties_and_hash(
+    props: &mut HashMap<String, String>,
+    tiff: &TiffFile,
+    lowest_resolution_level: usize,
+    property_dir: usize,
+) -> Result<()> {
+    let mut quickhash1 = OpenslideHash::openslide_hash_quickhash1_create();
+    hash_tiff_level(&mut quickhash1, tiff, lowest_resolution_level)
+        .map_err(|err| OpenSlideError::Format(format!("Cannot hash TIFF tiles: {err}")))?;
+    store_and_hash_properties(tiff, property_dir, props, &mut quickhash1);
+    if let Some(value) = quickhash1.openslide_hash_get_string() {
+        props.insert(properties::PROPERTY_QUICKHASH1.into(), value);
+    }
+    Ok(())
+}
+
+fn store_and_hash_properties(
+    tiff: &TiffFile,
+    dir: usize,
+    props: &mut HashMap<String, String>,
+    quickhash1: &mut OpenslideHash,
+) {
+    props.insert(
+        "openslide.comment".into(),
+        tiff.directory(dir)
+            .and_then(|dir| dir.entry(TAG_IMAGEDESCRIPTION))
+            .and_then(TiffEntry::c_string)
+            .unwrap_or_default(),
+    );
+    for (name, tag) in [
+        ("tiff.ImageDescription", TAG_IMAGEDESCRIPTION),
+        ("tiff.Make", TAG_MAKE),
+        ("tiff.Model", TAG_MODEL),
+        ("tiff.Software", TAG_SOFTWARE),
+        ("tiff.DateTime", TAG_DATETIME),
+        ("tiff.Artist", TAG_ARTIST),
+        ("tiff.HostComputer", TAG_HOSTCOMPUTER),
+        ("tiff.Copyright", TAG_COPYRIGHT),
+        ("tiff.DocumentName", TAG_DOCUMENTNAME),
+    ] {
+        quickhash1.openslide_hash_string(Some(name));
+        let value = tiff
+            .directory(dir)
+            .and_then(|dir| dir.entry(tag))
+            .and_then(TiffEntry::c_string);
+        if let Some(value) = &value {
+            props.insert(name.to_string(), value.clone());
+        }
+        quickhash1.openslide_hash_string(value.as_deref());
+    }
+}
+
+fn hash_tiff_level(hash: &mut OpenslideHash, tiff: &TiffFile, dir: usize) -> Result<()> {
+    let directory = tiff
+        .directory(dir)
+        .ok_or_else(|| OpenSlideError::Format(format!("Missing TIFF directory {dir}")))?;
+    let (offsets, lengths) = if directory.has(TAG_TILEOFFSETS) {
+        (
+            directory
+                .uints(tiff.endian, TAG_TILEOFFSETS)
+                .ok_or_else(|| {
+                    OpenSlideError::Format(format!("Invalid tile/strip counts for directory {dir}"))
+                })?,
+            directory
+                .uints(tiff.endian, TAG_TILEBYTECOUNTS)
+                .ok_or_else(|| {
+                    OpenSlideError::Format(format!("Invalid tile/strip counts for directory {dir}"))
+                })?,
+        )
+    } else if directory.has(TAG_STRIPOFFSETS) {
+        (
+            directory
+                .uints(tiff.endian, TAG_STRIPOFFSETS)
+                .ok_or_else(|| {
+                    OpenSlideError::Format(format!("Invalid tile/strip counts for directory {dir}"))
+                })?,
+            directory
+                .uints(tiff.endian, TAG_STRIPBYTECOUNTS)
+                .ok_or_else(|| {
+                    OpenSlideError::Format(format!("Invalid tile/strip counts for directory {dir}"))
+                })?,
+        )
+    } else {
+        return Err(OpenSlideError::Format(format!(
+            "Directory {dir} is neither tiled nor stripped"
+        )));
+    };
+    if offsets.is_empty() || offsets.len() != lengths.len() {
+        return Err(OpenSlideError::Format(format!(
+            "Invalid tile/strip counts for directory {dir}"
+        )));
+    }
+    let mut total = 0u64;
+    for length in &lengths {
+        total = total.saturating_add(*length);
+        if total > (5 << 20) {
+            hash.openslide_hash_disable();
+            return Ok(());
+        }
+    }
+    for (offset, length) in offsets.into_iter().zip(lengths) {
+        hash.openslide_hash_file_part(&tiff.path, offset, length)?;
+    }
+    Ok(())
+}
+
+struct Sha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    bit_len: u64,
+}
+
+impl Sha256 {
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buffer: [0; 64],
+            buffer_len: 0,
+            bit_len: 0,
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.bit_len = self.bit_len.wrapping_add((data.len() as u64) * 8);
+        if self.buffer_len != 0 {
+            let needed = 64 - self.buffer_len;
+            let take = needed.min(data.len());
+            self.buffer[self.buffer_len..self.buffer_len + take].copy_from_slice(&data[..take]);
+            self.buffer_len += take;
+            data = &data[take..];
+            if self.buffer_len == 64 {
+                let block = self.buffer;
+                self.compress(&block);
+                self.buffer_len = 0;
+            }
+        }
+        while data.len() >= 64 {
+            self.compress(&data[..64]);
+            data = &data[64..];
+        }
+        if !data.is_empty() {
+            self.buffer[..data.len()].copy_from_slice(data);
+            self.buffer_len = data.len();
+        }
+    }
+
+    fn finalize_hex(mut self) -> String {
+        self.buffer[self.buffer_len] = 0x80;
+        self.buffer_len += 1;
+        if self.buffer_len > 56 {
+            self.buffer[self.buffer_len..].fill(0);
+            let block = self.buffer;
+            self.compress(&block);
+            self.buffer_len = 0;
+        }
+        self.buffer[self.buffer_len..56].fill(0);
+        self.buffer[56..64].copy_from_slice(&self.bit_len.to_be_bytes());
+        let block = self.buffer;
+        self.compress(&block);
+
+        let mut out = String::with_capacity(64);
+        for word in self.state {
+            out.push_str(&format!("{word:08x}"));
+        }
+        out
+    }
+
+    fn compress(&mut self, block: &[u8]) {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut w = [0u32; 64];
+        for (i, chunk) in block.chunks_exact(4).take(16).enumerate() {
+            w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        self.state[0] = self.state[0].wrapping_add(a);
+        self.state[1] = self.state[1].wrapping_add(b);
+        self.state[2] = self.state[2].wrapping_add(c);
+        self.state[3] = self.state[3].wrapping_add(d);
+        self.state[4] = self.state[4].wrapping_add(e);
+        self.state[5] = self.state[5].wrapping_add(f);
+        self.state[6] = self.state[6].wrapping_add(g);
+        self.state[7] = self.state[7].wrapping_add(h);
+    }
 }
 
 fn inflate_tiff_deflate(raw: &[u8]) -> Result<Vec<u8>> {
@@ -2339,66 +2875,63 @@ mod tests {
     }
 
     #[test]
-    fn accepts_case_variant_brightfield_illumination() {
+    fn rejects_case_variant_brightfield_illumination() {
         let path = temp_path("leica-brightfield-case.scn");
         fs::write(&path, make_leica_tiff()).unwrap();
         let tiff = TiffFile::open(&path).unwrap();
         let xml = minimal_leica_xml().replace("brightfield", "BrightField");
         let collection = parse_xml_description(&xml).unwrap();
-        let (_levels, properties, _associated) = create_levels(&tiff, &collection).unwrap();
 
-        assert_eq!(
-            properties.get("leica.illumination-source"),
-            Some(&"BrightField".to_string())
-        );
+        assert!(create_levels_from_collection(&tiff, &collection).is_err());
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn accepts_separator_variant_brightfield_illumination() {
+    fn rejects_separator_variant_brightfield_illumination() {
         let path = temp_path("leica-brightfield-separator.scn");
         fs::write(&path, make_leica_tiff()).unwrap();
         let tiff = TiffFile::open(&path).unwrap();
         let xml = minimal_leica_xml().replace("brightfield", "Bright-Field");
         let collection = parse_xml_description(&xml).unwrap();
-        let (_levels, properties, _associated) = create_levels(&tiff, &collection).unwrap();
 
-        assert_eq!(
-            properties.get("leica.illumination-source"),
-            Some(&"Bright-Field".to_string())
-        );
-        assert!(is_brightfield_illumination("bright field"));
-        assert!(is_brightfield_illumination("bright_field"));
+        assert!(create_levels_from_collection(&tiff, &collection).is_err());
+        assert!(!is_brightfield_illumination("bright field"));
+        assert!(!is_brightfield_illumination("bright_field"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn compares_leica_grouping_metadata_case_insensitively() {
-        assert!(option_str_eq(
+    fn compares_leica_grouping_metadata_exactly() {
+        assert!(!option_str_eq(
             &Some(" BrightField ".to_string()),
             &Some("brightfield".to_string())
         ));
-        assert!(option_str_eq(
+        assert!(!option_str_eq(
             &Some("40X".to_string()),
             &Some("40x".to_string())
+        ));
+        assert!(option_str_eq(
+            &Some("brightfield".to_string()),
+            &Some("brightfield".to_string())
         ));
         assert!(!option_str_eq(&Some("20x".to_string()), &None));
     }
 
     #[test]
-    fn accepts_leica_objective_power_with_x_suffix() {
+    fn duplicates_only_integer_leica_objective_power() {
         let path = temp_path("leica-objective-x.scn");
         fs::write(&path, make_leica_tiff()).unwrap();
         let tiff = TiffFile::open(&path).unwrap();
         let xml =
             minimal_leica_xml().replace("<objective>40</objective>", "<objective>40X</objective>");
         let collection = parse_xml_description(&xml).unwrap();
-        let (_levels, properties, _associated) = create_levels(&tiff, &collection).unwrap();
+        let (_levels, properties, _associated, _quickhash_dir) =
+            create_levels_from_collection(&tiff, &collection).unwrap();
 
-        assert_eq!(
-            properties.get(properties::PROPERTY_OBJECTIVE_POWER),
-            Some(&"40".to_string())
-        );
+        assert_eq!(properties.get(properties::PROPERTY_OBJECTIVE_POWER), None);
+        assert_eq!(objective_power_value("40"), Some("40"));
+        assert_eq!(objective_power_value("40X"), None);
+        assert_eq!(objective_power_value("40.0"), None);
         assert_eq!(objective_power_value("Plan Apo 40X"), None);
         let _ = fs::remove_file(path);
     }
@@ -2512,6 +3045,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_hierarchy_wrong_leica_xml_fields() {
+        let dimension_outside_pixels = minimal_leica_xml().replace(
+            r#"<pixels><dimension ifd="0" sizeX="4" sizeY="2" z="0"/></pixels>"#,
+            r#"<dimension ifd="0" sizeX="4" sizeY="2" z="0"/>"#,
+        );
+        assert!(parse_xml_description(&dimension_outside_pixels).is_err());
+
+        let misplaced_illumination = minimal_leica_xml().replace(
+            r#"<scanSettings><illuminationSettings><illuminationSource>brightfield</illuminationSource><numericalAperture>0.75</numericalAperture></illuminationSettings><objectiveSettings><objective>40</objective></objectiveSettings></scanSettings>"#,
+            r#"<illuminationSource>brightfield</illuminationSource><scanSettings><illuminationSettings><numericalAperture>0.75</numericalAperture></illuminationSettings><objectiveSettings><objective>40</objective></objectiveSettings></scanSettings>"#,
+        );
+        let collection = parse_xml_description(&misplaced_illumination).unwrap();
+        assert_eq!(collection.images[0].illumination_source, None);
+    }
+
+    #[test]
     fn opens_leica_metadata_and_reads_supported_tiff_tiles() {
         let path = temp_path("leica.scn");
         fs::write(&path, make_leica_tiff()).unwrap();
@@ -2531,6 +3080,18 @@ mod tests {
             slide.properties().get(properties::PROPERTY_MPP_X),
             Some(&"0.5".to_string())
         );
+        assert_eq!(
+            slide.properties().get("tiff.Software"),
+            Some(&"Leica SCN Test".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("tiff.ResolutionUnit"),
+            Some(&"centimeter".to_string())
+        );
+        assert!(slide
+            .properties()
+            .get(properties::PROPERTY_QUICKHASH1)
+            .is_some());
         assert_eq!(
             slide.properties().get(properties::PROPERTY_BOUNDS_WIDTH),
             Some(&"4".to_string())
@@ -2563,6 +3124,21 @@ mod tests {
     }
 
     #[test]
+    fn detect_rejects_leica_uri_outside_default_namespace() {
+        let path = temp_path("leica-detect-namespace.scn");
+        let xml = minimal_leica_xml().replace(
+            &format!(r#"xmlns="{LEICA_XMLNS_2}""#),
+            &format!(r#"xmlns="urn:not-leica" data-uri="{LEICA_XMLNS_2}""#),
+        );
+        fs::write(&path, make_leica_tiff_with_xml(&xml, 0)).unwrap();
+
+        assert!(!detect(&path));
+        assert!(open(&path).is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn open_ignores_unreferenced_following_ifd() {
         let path = temp_path("leica-open-selected-ifds.scn");
         fs::write(&path, make_leica_tiff_with_next_ifd(0xffff_ff00)).unwrap();
@@ -2572,6 +3148,25 @@ mod tests {
         assert_eq!(slide.vendor(), "leica");
         assert_eq!(slide.level_dimensions(0), Some((8, 4)));
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_multiple_brightfield_macro_images() {
+        let path = temp_path("leica-multiple-macro.scn");
+        let macro_xml = r#"<image><view sizeX="4000" sizeY="2000" offsetX="0" offsetY="0"/><scanSettings><illuminationSettings><illuminationSource>brightfield</illuminationSource></illuminationSettings></scanSettings><pixels><dimension ifd="0" sizeX="4" sizeY="2" z="0"/></pixels></image>"#;
+        let xml = minimal_leica_xml().replace(
+            "</collection>",
+            &format!("{macro_xml}{macro_xml}</collection>"),
+        );
+        fs::write(&path, make_leica_tiff_with_xml(&xml, 0)).unwrap();
+
+        let err = match open(&path) {
+            Ok(_) => panic!("expected multiple Leica brightfield macro images error"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("Multiple Leica brightfield macro images"));
         let _ = fs::remove_file(path);
     }
 
@@ -2751,11 +3346,15 @@ mod tests {
     }
 
     fn make_leica_tiff() -> Vec<u8> {
-        make_leica_tiff_with_next_ifd(0)
+        make_leica_tiff_with_xml(&minimal_leica_xml(), 0)
     }
 
     fn make_leica_tiff_with_next_ifd(next_ifd: u32) -> Vec<u8> {
-        const ENTRY_COUNT: usize = 12;
+        make_leica_tiff_with_xml(&minimal_leica_xml(), next_ifd)
+    }
+
+    fn make_leica_tiff_with_xml(xml: &str, next_ifd: u32) -> Vec<u8> {
+        const ENTRY_COUNT: usize = 16;
         let ifd_len = 2 + ENTRY_COUNT * 12 + 4;
         let base = 8 + ifd_len;
         let mut extra = Vec::new();
@@ -2770,7 +3369,7 @@ mod tests {
         }
 
         let description = {
-            let mut bytes = minimal_leica_xml().into_bytes();
+            let mut bytes = xml.as_bytes().to_vec();
             bytes.push(0);
             bytes
         };
@@ -2789,6 +3388,18 @@ mod tests {
             base,
             &[12u32.to_le_bytes(), 12u32.to_le_bytes()].concat(),
         );
+        let xres_offset = add(
+            &mut extra,
+            base,
+            &[20_000u32.to_le_bytes(), 1u32.to_le_bytes()].concat(),
+        );
+        let yres_offset = add(
+            &mut extra,
+            base,
+            &[20_000u32.to_le_bytes(), 1u32.to_le_bytes()].concat(),
+        );
+        let software = b"Leica SCN Test\0";
+        let software_offset = add(&mut extra, base, software);
 
         let mut entries = Vec::new();
         push_entry(&mut entries, TAG_IMAGEWIDTH, TYPE_LONG, 1, 4);
@@ -2810,7 +3421,17 @@ mod tests {
             desc_offset,
         );
         push_entry(&mut entries, 277, TYPE_SHORT, 1, 3);
+        push_entry(&mut entries, TAG_XRESOLUTION, TYPE_RATIONAL, 1, xres_offset);
+        push_entry(&mut entries, TAG_YRESOLUTION, TYPE_RATIONAL, 1, yres_offset);
         push_entry(&mut entries, 284, TYPE_SHORT, 1, 1);
+        push_entry(&mut entries, TAG_RESOLUTIONUNIT, TYPE_SHORT, 1, 3);
+        push_entry(
+            &mut entries,
+            TAG_SOFTWARE,
+            TYPE_ASCII,
+            software.len() as u32,
+            software_offset,
+        );
         push_entry(&mut entries, TAG_TILEWIDTH, TYPE_LONG, 1, 2);
         push_entry(&mut entries, TAG_TILELENGTH, TYPE_LONG, 1, 2);
         push_entry(

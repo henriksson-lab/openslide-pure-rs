@@ -91,6 +91,11 @@ impl OpenSlide {
         self.backend.read_associated_image(name)
     }
 
+    /// Read the slide-level ICC profile, if present.
+    pub fn icc_profile(&self) -> Result<Option<Vec<u8>>> {
+        self.backend.icc_profile()
+    }
+
     /// Get the vendor name for this slide.
     pub fn vendor(&self) -> &'static str {
         self.backend.vendor()
@@ -120,26 +125,7 @@ impl OpenSlide {
         w: u32,
         h: u32,
     ) -> Result<RgbaImage> {
-        let size = w as usize * h as usize;
-        let mut rgba = vec![0u8; size * 4];
-        if channels[3].is_none() {
-            for pixel in rgba.chunks_exact_mut(4) {
-                pixel[3] = 255;
-            }
-        }
-
-        for (out_idx, ch_opt) in channels.iter().enumerate() {
-            if let Some(ch) = ch_opt {
-                let gray = self.read_region(*ch, x, y, level, w, h)?;
-                for i in 0..size {
-                    if i < gray.data.len() {
-                        rgba[i * 4 + out_idx] = gray.data[i];
-                    }
-                }
-            }
-        }
-
-        RgbaImage::from_rgba(w, h, rgba)
+        self.backend.read_region_rgba(channels, x, y, level, w, h)
     }
 
     /// Debug: get the number of tiles in the grid for a given channel and level.

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
@@ -27,7 +27,16 @@ const TYPE_LONG8: u16 = 16;
 const TYPE_IFD8: u16 = 18;
 
 const TAG_IMAGEDESCRIPTION: u16 = 270;
+const TAG_IMAGEWIDTH: u16 = 256;
+const TAG_IMAGELENGTH: u16 = 257;
 const TAG_SOFTWARE: u16 = 305;
+const TAG_SUBFILETYPE: u16 = 254;
+const TAG_TILELENGTH: u16 = 323;
+const TAG_TILEWIDTH: u16 = 322;
+
+const LABEL_DESCRIPTION: &str = "Label";
+const MACRO_DESCRIPTION: &str = "Macro";
+const FILETYPE_REDUCEDIMAGE: u64 = 1;
 
 #[derive(Debug, Clone, Copy)]
 enum Endian {
@@ -70,6 +79,7 @@ struct FirstIfd {
 #[derive(Debug)]
 struct TiffEntry {
     value_type: u16,
+    count: u64,
     raw: Vec<u8>,
 }
 
@@ -179,7 +189,14 @@ impl FirstIfd {
                 data
             };
 
-            entries.insert(tag, TiffEntry { value_type, raw });
+            entries.insert(
+                tag,
+                TiffEntry {
+                    value_type,
+                    count,
+                    raw,
+                },
+            );
         }
 
         Ok(Self { entries })
@@ -187,18 +204,49 @@ impl FirstIfd {
 
     fn ascii(&self, tag: u16) -> Option<String> {
         let entry = self.entries.get(&tag)?;
-        if entry.value_type != TYPE_ASCII {
+        entry.ascii()
+    }
+
+    fn uint(&self, tag: u16, endian: Endian) -> Option<u64> {
+        let entry = self.entries.get(&tag)?;
+        entry.uint(endian)
+    }
+
+    fn has_tag(&self, tag: u16) -> bool {
+        self.entries.contains_key(&tag)
+    }
+
+    fn is_tiled(&self) -> bool {
+        self.has_tag(TAG_TILEWIDTH) && self.has_tag(TAG_TILELENGTH)
+    }
+}
+
+impl TiffEntry {
+    fn ascii(&self) -> Option<String> {
+        if self.value_type != TYPE_ASCII {
             return None;
         }
-        let nul = entry
+        let nul = self
             .raw
             .iter()
             .position(|&b| b == 0)
-            .unwrap_or(entry.raw.len());
-        std::str::from_utf8(&entry.raw[..nul])
+            .unwrap_or(self.raw.len());
+        std::str::from_utf8(&self.raw[..nul])
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    fn uint(&self, endian: Endian) -> Option<u64> {
+        if self.count == 0 {
+            return None;
+        }
+        match self.value_type {
+            TYPE_SHORT if self.raw.len() >= 2 => Some(endian.read_u16(&self.raw[..2]) as u64),
+            TYPE_LONG if self.raw.len() >= 4 => Some(endian.read_u32(&self.raw[..4]) as u64),
+            TYPE_LONG8 | TYPE_IFD8 if self.raw.len() >= 8 => Some(endian.read_u64(&self.raw[..8])),
+            _ => None,
+        }
     }
 }
 
@@ -213,12 +261,22 @@ fn value_type_size(value_type: u16) -> Option<u64> {
 }
 
 struct PhilipsTiffSlide {
+    path: PathBuf,
     inner: Box<dyn SlideBackend>,
     properties: HashMap<String, String>,
     level_dimensions: Vec<(u64, u64)>,
     level_downsamples: Vec<f64>,
     inner_downsamples: Vec<f64>,
-    associated_images: HashMap<String, Vec<u8>>,
+    associated_images: HashMap<String, AssociatedImage>,
+}
+
+enum AssociatedImage {
+    Tiff {
+        dir_index: usize,
+        width: u64,
+        height: u64,
+    },
+    Xml(Vec<u8>),
 }
 
 pub fn detect(path: &Path) -> bool {
@@ -231,7 +289,10 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     verify_philips_root(&root)?;
     verify_main_image_count(&root)?;
 
-    let inner = tiff::open(path)?;
+    let (tiff_endian, tiff_directories) = read_tiff_directories(path)?;
+    validate_philips_tiff_levels(tiff_endian, &tiff_directories)?;
+
+    let inner = tiff::open_tiled(path)?;
     let mut properties = inner.properties().clone();
     properties.insert(properties::PROPERTY_VENDOR.into(), "philips".into());
     properties.remove("tiff.ImageDescription");
@@ -239,30 +300,50 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     add_openslide_properties(&mut properties);
 
     let (level_dimensions, level_downsamples, inner_downsamples) =
-        build_level_metadata(inner.as_ref(), &root)?;
+        build_level_metadata(inner.as_ref(), &root, tiff_endian, &tiff_directories)?;
     add_level_properties(&mut properties, &level_dimensions, &level_downsamples);
 
-    let associated_images = read_xml_associated_images(&root);
-    for (name, data) in &associated_images {
-        if let Ok(format) = detect_associated_image_format(data) {
-            properties.insert(
-                format!("philips.associated.{name}.format"),
-                associated_format_name(format).into(),
-            );
-            if let Ok(image) = decode::decode_to_rgba(format, data) {
+    let mut associated_images = read_tiff_associated_images(tiff_endian, &tiff_directories)?;
+    for (name, data) in read_xml_associated_images(&root) {
+        associated_images
+            .entry(name)
+            .or_insert(AssociatedImage::Xml(data));
+    }
+    for (name, image) in &associated_images {
+        match image {
+            AssociatedImage::Tiff { width, height, .. } => {
                 properties.insert(
                     format!("openslide.associated.{name}.width"),
-                    image.width.to_string(),
+                    width.to_string(),
                 );
                 properties.insert(
                     format!("openslide.associated.{name}.height"),
-                    image.height.to_string(),
+                    height.to_string(),
                 );
+            }
+            AssociatedImage::Xml(data) => {
+                if let Ok(format) = detect_associated_image_format(data) {
+                    properties.insert(
+                        format!("philips.associated.{name}.format"),
+                        associated_format_name(format).into(),
+                    );
+                    if let Ok(image) = decode::decode_to_rgba(format, data) {
+                        properties.insert(
+                            format!("openslide.associated.{name}.width"),
+                            image.width.to_string(),
+                        );
+                        properties.insert(
+                            format!("openslide.associated.{name}.height"),
+                            image.height.to_string(),
+                        );
+                    }
+                }
             }
         }
     }
 
     Ok(Box::new(PhilipsTiffSlide {
+        path: path.to_path_buf(),
         inner,
         properties,
         level_dimensions,
@@ -290,17 +371,235 @@ fn read_philips_description(path: &Path) -> Result<String> {
     Ok(description)
 }
 
+fn validate_philips_tiff_levels(endian: Endian, directories: &[FirstIfd]) -> Result<()> {
+    let mut previous_dimensions = None;
+    for (dir_index, dir) in directories.iter().enumerate() {
+        if !dir.is_tiled() {
+            continue;
+        }
+
+        let width = dir.uint(TAG_IMAGEWIDTH, endian).ok_or_else(|| {
+            OpenSlideError::Format(format!("Missing TIFF width for directory {dir_index}"))
+        })?;
+        let height = dir.uint(TAG_IMAGELENGTH, endian).ok_or_else(|| {
+            OpenSlideError::Format(format!("Missing TIFF height for directory {dir_index}"))
+        })?;
+
+        if let Some((previous_width, previous_height)) = previous_dimensions {
+            let subfiletype = dir.uint(TAG_SUBFILETYPE, endian).ok_or_else(|| {
+                OpenSlideError::Format(format!("Directory {dir_index} is not reduced-resolution"))
+            })?;
+            if subfiletype & FILETYPE_REDUCEDIMAGE == 0 {
+                return Err(OpenSlideError::Format(format!(
+                    "Directory {dir_index} is not reduced-resolution"
+                )));
+            }
+            if width > previous_width || height > previous_height {
+                return Err(OpenSlideError::Format(format!(
+                    "Unexpected dimensions for directory {dir_index}"
+                )));
+            }
+        }
+        previous_dimensions = Some((width, height));
+    }
+    Ok(())
+}
+
+fn read_tiff_associated_images(
+    endian: Endian,
+    directories: &[FirstIfd],
+) -> Result<HashMap<String, AssociatedImage>> {
+    let mut associated_images = HashMap::new();
+    for (dir_index, dir) in directories.iter().enumerate() {
+        if dir.is_tiled() {
+            continue;
+        }
+        let Some(description) = dir.ascii(TAG_IMAGEDESCRIPTION) else {
+            continue;
+        };
+        let name = if description.starts_with(LABEL_DESCRIPTION) {
+            "label"
+        } else if description.starts_with(MACRO_DESCRIPTION) {
+            "macro"
+        } else {
+            continue;
+        };
+        let width = dir.uint(TAG_IMAGEWIDTH, endian).ok_or_else(|| {
+            OpenSlideError::Format(format!(
+                "Missing associated image width in directory {dir_index}"
+            ))
+        })?;
+        let height = dir.uint(TAG_IMAGELENGTH, endian).ok_or_else(|| {
+            OpenSlideError::Format(format!(
+                "Missing associated image height in directory {dir_index}"
+            ))
+        })?;
+        associated_images.insert(
+            name.to_string(),
+            AssociatedImage::Tiff {
+                dir_index,
+                width,
+                height,
+            },
+        );
+    }
+    Ok(associated_images)
+}
+
+fn read_tiff_directories(path: &Path) -> Result<(Endian, Vec<FirstIfd>)> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header[..8])?;
+
+    let endian = match &header[0..2] {
+        b"II" => Endian::Little,
+        b"MM" => Endian::Big,
+        _ => return Err(OpenSlideError::UnsupportedFormat("Not a TIFF file".into())),
+    };
+
+    let magic = endian.read_u16(&header[2..4]);
+    let (bigtiff, mut next_ifd_offset) = match magic {
+        TIFF_MAGIC_CLASSIC => (false, endian.read_u32(&header[4..8]) as u64),
+        TIFF_MAGIC_BIG => {
+            file.read_exact(&mut header[8..16])?;
+            if endian.read_u16(&header[4..6]) != 8 || endian.read_u16(&header[6..8]) != 0 {
+                return Err(OpenSlideError::Format(
+                    "Unsupported BigTIFF offset header".into(),
+                ));
+            }
+            (true, endian.read_u64(&header[8..16]))
+        }
+        _ => return Err(OpenSlideError::UnsupportedFormat("Not a TIFF file".into())),
+    };
+
+    let mut directories = Vec::new();
+    while next_ifd_offset != 0 {
+        if next_ifd_offset >= file_len {
+            return Err(OpenSlideError::Format(
+                "TIFF directory is outside file".into(),
+            ));
+        }
+        if directories.len() > 4096 {
+            return Err(OpenSlideError::Format(
+                "TIFF directory chain is unexpectedly long".into(),
+            ));
+        }
+
+        file.seek(SeekFrom::Start(next_ifd_offset))?;
+        let entry_count = if bigtiff {
+            let mut buf = [0u8; 8];
+            file.read_exact(&mut buf)?;
+            endian.read_u64(&buf)
+        } else {
+            let mut buf = [0u8; 2];
+            file.read_exact(&mut buf)?;
+            endian.read_u16(&buf) as u64
+        };
+        if entry_count > 100_000 {
+            return Err(OpenSlideError::Format(format!(
+                "Unreasonable TIFF directory entry count: {entry_count}"
+            )));
+        }
+
+        let entry_size = if bigtiff { 20usize } else { 12usize };
+        let inline_size = if bigtiff { 8usize } else { 4usize };
+        let mut entries = HashMap::new();
+        for _ in 0..entry_count {
+            let mut entry_buf = vec![0u8; entry_size];
+            file.read_exact(&mut entry_buf)?;
+
+            let tag = endian.read_u16(&entry_buf[0..2]);
+            let value_type = endian.read_u16(&entry_buf[2..4]);
+            let count = if bigtiff {
+                endian.read_u64(&entry_buf[4..12])
+            } else {
+                endian.read_u32(&entry_buf[4..8]) as u64
+            };
+            let value_field = if bigtiff {
+                &entry_buf[12..20]
+            } else {
+                &entry_buf[8..12]
+            };
+            let Some(value_size) =
+                value_type_size(value_type).and_then(|size| size.checked_mul(count))
+            else {
+                continue;
+            };
+            if value_size > 128 * 1024 * 1024 {
+                return Err(OpenSlideError::Format(format!(
+                    "Refusing to allocate {value_size} bytes for TIFF tag {tag}"
+                )));
+            }
+
+            let raw = if value_size <= inline_size as u64 {
+                value_field[..value_size as usize].to_vec()
+            } else {
+                let value_offset = if bigtiff {
+                    endian.read_u64(value_field)
+                } else {
+                    endian.read_u32(value_field) as u64
+                };
+                let value_end = value_offset.checked_add(value_size).ok_or_else(|| {
+                    OpenSlideError::Format(format!("TIFF tag {tag} value offset overflow"))
+                })?;
+                if value_end > file_len {
+                    return Err(OpenSlideError::Format(format!(
+                        "TIFF tag {tag} value extends outside file"
+                    )));
+                }
+
+                let return_pos = file.stream_position()?;
+                file.seek(SeekFrom::Start(value_offset))?;
+                let mut data = vec![0u8; value_size as usize];
+                file.read_exact(&mut data)?;
+                file.seek(SeekFrom::Start(return_pos))?;
+                data
+            };
+
+            entries.insert(
+                tag,
+                TiffEntry {
+                    value_type,
+                    count,
+                    raw,
+                },
+            );
+        }
+
+        let mut next_offset_buf = vec![0u8; if bigtiff { 8 } else { 4 }];
+        file.read_exact(&mut next_offset_buf)?;
+        next_ifd_offset = if bigtiff {
+            endian.read_u64(&next_offset_buf)
+        } else {
+            endian.read_u32(&next_offset_buf) as u64
+        };
+        directories.push(FirstIfd { entries });
+    }
+
+    Ok((endian, directories))
+}
+
 fn build_level_metadata(
     inner: &dyn SlideBackend,
     root: &XmlNode,
+    endian: Endian,
+    directories: &[FirstIfd],
 ) -> Result<(Vec<(u64, u64)>, Vec<f64>, Vec<f64>)> {
-    let level_count = inner.level_count();
-    let mut dimensions = Vec::with_capacity(level_count as usize);
-    let mut inner_downsamples = Vec::with_capacity(level_count as usize);
-    for level in 0..level_count {
-        dimensions.push(inner.level_dimensions(level).ok_or_else(|| {
+    let mut dimensions = tiled_level_dimensions(endian, directories)?;
+    let level_count = dimensions.len();
+    let inner_level_count = inner.level_count() as usize;
+    if inner_level_count != level_count {
+        return Err(OpenSlideError::Format(format!(
+            "Philips TIFF has {level_count} tiled levels, but generic TIFF has {inner_level_count} levels"
+        )));
+    }
+
+    let mut inner_downsamples = Vec::with_capacity(level_count);
+    for level in 0..level_count as u32 {
+        let _ = inner.level_dimensions(level).ok_or_else(|| {
             OpenSlideError::Format(format!("Missing generic TIFF dimensions for level {level}"))
-        })?);
+        })?;
         inner_downsamples.push(inner.level_downsample(level).ok_or_else(|| {
             OpenSlideError::Format(format!("Missing generic TIFF downsample for level {level}"))
         })?);
@@ -308,9 +607,11 @@ fn build_level_metadata(
 
     let spacings = pixel_spacings(root);
     if spacings.is_empty() {
-        return Ok((dimensions, inner_downsamples.clone(), inner_downsamples));
+        return Err(OpenSlideError::Format(
+            "Philips XML has no level spacings".into(),
+        ));
     }
-    if spacings.len() != level_count as usize {
+    if spacings.len() != level_count {
         return Err(OpenSlideError::Format(format!(
             "Philips XML has {} level spacings, but TIFF has {} levels",
             spacings.len(),
@@ -334,7 +635,7 @@ fn build_level_metadata(
         ));
     }
 
-    let mut downsamples = vec![1.0; level_count as usize];
+    let mut downsamples = vec![1.0; level_count];
     for (i, &(spacing_w, spacing_h)) in parsed.iter().enumerate().skip(1) {
         let downsample = ((spacing_w / l0_w) + (spacing_h / l0_h)) / 2.0;
         if !downsample.is_finite() || downsample <= 0.0 {
@@ -351,6 +652,28 @@ fn build_level_metadata(
     }
 
     Ok((dimensions, downsamples, inner_downsamples))
+}
+
+fn tiled_level_dimensions(endian: Endian, directories: &[FirstIfd]) -> Result<Vec<(u64, u64)>> {
+    let mut dimensions = Vec::new();
+    for (dir_index, dir) in directories.iter().enumerate() {
+        if !dir.is_tiled() {
+            continue;
+        }
+        let width = dir.uint(TAG_IMAGEWIDTH, endian).ok_or_else(|| {
+            OpenSlideError::Format(format!("Missing TIFF width for directory {dir_index}"))
+        })?;
+        let height = dir.uint(TAG_IMAGELENGTH, endian).ok_or_else(|| {
+            OpenSlideError::Format(format!("Missing TIFF height for directory {dir_index}"))
+        })?;
+        dimensions.push((width, height));
+    }
+    if dimensions.is_empty() {
+        return Err(OpenSlideError::Format(
+            "Philips TIFF has no tiled levels".into(),
+        ));
+    }
+    Ok(dimensions)
 }
 
 impl SlideBackend for PhilipsTiffSlide {
@@ -428,10 +751,17 @@ impl SlideBackend for PhilipsTiffSlide {
     }
 
     fn read_associated_image(&self, name: &str) -> Result<RgbaImage> {
-        let data = self.associated_images.get(name).ok_or_else(|| {
+        let image = self.associated_images.get(name).ok_or_else(|| {
             OpenSlideError::InvalidArgument(format!("No associated image '{name}'"))
         })?;
-        decode::decode_to_rgba(detect_associated_image_format(data)?, data)
+        match image {
+            AssociatedImage::Tiff { dir_index, .. } => {
+                read_associated_with_tiff_crate(&self.path, *dir_index)
+            }
+            AssociatedImage::Xml(data) => {
+                decode::decode_to_rgba(detect_associated_image_format(data)?, data)
+            }
+        }
     }
 
     fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize {
@@ -1012,6 +1342,135 @@ fn associated_format_name(format: ImageFormat) -> &'static str {
     }
 }
 
+fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<RgbaImage> {
+    let file = File::open(path)?;
+    let mut decoder = ::tiff::decoder::Decoder::new(file)
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF decoder setup failed: {err}")))?;
+    decoder
+        .seek_to_image(dir_index)
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF directory seek failed: {err}")))?;
+    let (width, height) = decoder
+        .dimensions()
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF dimensions read failed: {err}")))?;
+    let color_type = decoder
+        .colortype()
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF color type read failed: {err}")))?;
+    let image = decoder
+        .read_image()
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF image decode failed: {err}")))?;
+
+    let pixel_count = width as usize * height as usize;
+    let mut rgba = Vec::with_capacity(pixel_count * 4);
+    match (&image, color_type) {
+        (::tiff::decoder::DecodingResult::U8(data), ::tiff::ColorType::Gray(8)) => {
+            if data.len() < pixel_count {
+                return Err(OpenSlideError::Decode(
+                    "Decoded Philips associated TIFF image is truncated".into(),
+                ));
+            }
+            for &gray in data.iter().take(pixel_count) {
+                rgba.extend_from_slice(&[gray, gray, gray, 0xff]);
+            }
+        }
+        (::tiff::decoder::DecodingResult::U16(data), ::tiff::ColorType::Gray(16)) => {
+            if data.len() < pixel_count {
+                return Err(OpenSlideError::Decode(
+                    "Decoded Philips associated TIFF image is truncated".into(),
+                ));
+            }
+            for &gray in data.iter().take(pixel_count) {
+                let gray = downscale_u16_to_u8(gray);
+                rgba.extend_from_slice(&[gray, gray, gray, 0xff]);
+            }
+        }
+        (::tiff::decoder::DecodingResult::U8(data), ::tiff::ColorType::GrayA(8)) => {
+            if data.len() < pixel_count.saturating_mul(2) {
+                return Err(OpenSlideError::Decode(
+                    "Decoded Philips associated TIFF image is truncated".into(),
+                ));
+            }
+            for pixel in data.chunks_exact(2).take(pixel_count) {
+                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+            }
+        }
+        (::tiff::decoder::DecodingResult::U16(data), ::tiff::ColorType::GrayA(16)) => {
+            if data.len() < pixel_count.saturating_mul(2) {
+                return Err(OpenSlideError::Decode(
+                    "Decoded Philips associated TIFF image is truncated".into(),
+                ));
+            }
+            for pixel in data.chunks_exact(2).take(pixel_count) {
+                let gray = downscale_u16_to_u8(pixel[0]);
+                let alpha = downscale_u16_to_u8(pixel[1]);
+                rgba.extend_from_slice(&[gray, gray, gray, alpha]);
+            }
+        }
+        (
+            ::tiff::decoder::DecodingResult::U8(data),
+            ::tiff::ColorType::RGB(8) | ::tiff::ColorType::YCbCr(8),
+        ) => {
+            if data.len() < pixel_count.saturating_mul(3) {
+                return Err(OpenSlideError::Decode(
+                    "Decoded Philips associated TIFF image is truncated".into(),
+                ));
+            }
+            for pixel in data.chunks_exact(3).take(pixel_count) {
+                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xff]);
+            }
+        }
+        (::tiff::decoder::DecodingResult::U16(data), ::tiff::ColorType::RGB(16)) => {
+            if data.len() < pixel_count.saturating_mul(3) {
+                return Err(OpenSlideError::Decode(
+                    "Decoded Philips associated TIFF image is truncated".into(),
+                ));
+            }
+            for pixel in data.chunks_exact(3).take(pixel_count) {
+                rgba.extend_from_slice(&[
+                    downscale_u16_to_u8(pixel[0]),
+                    downscale_u16_to_u8(pixel[1]),
+                    downscale_u16_to_u8(pixel[2]),
+                    0xff,
+                ]);
+            }
+        }
+        (::tiff::decoder::DecodingResult::U8(data), ::tiff::ColorType::RGBA(8)) => {
+            if data.len() < pixel_count.saturating_mul(4) {
+                return Err(OpenSlideError::Decode(
+                    "Decoded Philips associated TIFF image is truncated".into(),
+                ));
+            }
+            rgba.extend_from_slice(&data[..pixel_count * 4]);
+        }
+        (::tiff::decoder::DecodingResult::U16(data), ::tiff::ColorType::RGBA(16)) => {
+            if data.len() < pixel_count.saturating_mul(4) {
+                return Err(OpenSlideError::Decode(
+                    "Decoded Philips associated TIFF image is truncated".into(),
+                ));
+            }
+            for pixel in data.chunks_exact(4).take(pixel_count) {
+                rgba.extend_from_slice(&[
+                    downscale_u16_to_u8(pixel[0]),
+                    downscale_u16_to_u8(pixel[1]),
+                    downscale_u16_to_u8(pixel[2]),
+                    downscale_u16_to_u8(pixel[3]),
+                ]);
+            }
+        }
+        (other_image, other_color) => {
+            return Err(OpenSlideError::Decode(format!(
+                "Unsupported Philips associated TIFF output: color={:?}, sample={:?}",
+                other_color, other_image
+            )))
+        }
+    }
+
+    RgbaImage::from_rgba(width, height, rgba)
+}
+
+fn downscale_u16_to_u8(value: u16) -> u8 {
+    (value >> 8) as u8
+}
+
 fn normalize_xml_token(value: &str) -> String {
     value
         .chars()
@@ -1135,7 +1594,10 @@ mod tests {
     const TAG_BITSPERSAMPLE: u16 = 258;
     const TAG_COMPRESSION: u16 = 259;
     const TAG_PHOTOMETRIC: u16 = 262;
+    const TAG_STRIPOFFSETS: u16 = 273;
     const TAG_SAMPLESPERPIXEL: u16 = 277;
+    const TAG_ROWSPERSTRIP: u16 = 278;
+    const TAG_STRIPBYTECOUNTS: u16 = 279;
     const TAG_PLANARCONFIG: u16 = 284;
     const TAG_TILEWIDTH: u16 = 322;
     const TAG_TILELENGTH: u16 = 323;
@@ -1203,6 +1665,147 @@ mod tests {
 
         let level1_red = slide.read_region(0, 2, 0, 1, 1, 1).unwrap();
         assert_eq!(level1_red.data, vec![220]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_tiff_directory_associated_image() {
+        let path = temp_path("philips-associated.tif");
+        fs::write(&path, make_philips_tiff_with_associated()).unwrap();
+
+        let slide = OpenSlide::open(&path).unwrap();
+        assert_eq!(slide.associated_image_names(), vec!["label"]);
+        assert_eq!(
+            slide.properties().get("openslide.associated.label.width"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("openslide.associated.label.height"),
+            Some(&"1".to_string())
+        );
+        assert!(slide
+            .properties()
+            .get("philips.associated.label.format")
+            .is_none());
+
+        let label = slide.read_associated_image("label").unwrap();
+        assert_eq!(label.width, 2);
+        assert_eq!(label.height, 1);
+        assert_eq!(label.data, vec![9, 8, 7, 255, 6, 5, 4, 255]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reduced_stripped_associated_image_is_not_a_level() {
+        let path = temp_path("philips-associated-reduced.tif");
+        fs::write(&path, make_philips_tiff_with_reduced_associated()).unwrap();
+
+        let slide = OpenSlide::open(&path).unwrap();
+        assert_eq!(slide.level_count(), 2);
+        assert_eq!(slide.level_dimensions(0), Some((4, 4)));
+        assert_eq!(slide.level_dimensions(1), Some((2, 2)));
+        assert_eq!(slide.associated_image_names(), vec!["label"]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tiff_directory_associated_images_are_last_wins() {
+        let dirs = vec![
+            test_associated_dir("Label", Some(2), Some(1)),
+            test_associated_dir("Label", Some(3), Some(4)),
+        ];
+        let images = read_tiff_associated_images(Endian::Little, &dirs).unwrap();
+        match images.get("label").unwrap() {
+            AssociatedImage::Tiff {
+                dir_index,
+                width,
+                height,
+            } => {
+                assert_eq!(*dir_index, 1);
+                assert_eq!((*width, *height), (3, 4));
+            }
+            AssociatedImage::Xml(_) => panic!("expected TIFF associated image"),
+        }
+    }
+
+    #[test]
+    fn tiff_directory_associated_image_missing_dimensions_is_error() {
+        let dirs = vec![test_associated_dir("Macro", Some(2), None)];
+        let err = match read_tiff_associated_images(Endian::Little, &dirs) {
+            Ok(_) => panic!("expected missing associated image dimension error"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("Missing associated image height in directory 0"));
+    }
+
+    #[test]
+    fn tile_width_and_length_classify_directory_as_tiled() {
+        let dirs = vec![
+            test_tiled_dir(4, 4, Some(0)),
+            test_tile_shape_dir_without_offsets(5, 3, Some(1)),
+        ];
+        let err = match validate_philips_tiff_levels(Endian::Little, &dirs) {
+            Ok(_) => panic!("expected increasing-dimensions validation error"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("Unexpected dimensions for directory 1"));
+    }
+
+    #[test]
+    fn rejects_later_philips_tiled_directory_without_reduced_flag() {
+        let path = temp_path("philips-level-flag.tif");
+        fs::write(&path, make_philips_tiff_with_level1(0, 3, 3)).unwrap();
+
+        let err = match OpenSlide::open(&path) {
+            Ok(_) => panic!("expected Philips reduced-resolution flag error"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("Directory 1 is not reduced-resolution"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_philips_tiled_directory_with_increasing_dimensions() {
+        let path = temp_path("philips-level-dimensions.tif");
+        fs::write(&path, make_philips_tiff_with_level1(1, 5, 3)).unwrap();
+
+        let err = match OpenSlide::open(&path) {
+            Ok(_) => panic!("expected Philips increasing-dimensions error"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("Unexpected dimensions for directory 1"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_philips_xml_without_level_spacings() {
+        let path = temp_path("philips-no-spacings.tif");
+        fs::write(
+            &path,
+            make_philips_tiff_with_xml(&philips_xml_without_spacings()),
+        )
+        .unwrap();
+
+        let err = match OpenSlide::open(&path) {
+            Ok(_) => panic!("expected missing Philips spacing error"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("Philips XML has no level spacings"));
 
         let _ = fs::remove_file(path);
     }
@@ -1359,6 +1962,56 @@ mod tests {
         assert_eq!(scanned_images(&mixed_case_root, "WSI").len(), 1);
     }
 
+    fn test_associated_dir(description: &str, width: Option<u32>, height: Option<u32>) -> FirstIfd {
+        let mut entries = HashMap::new();
+        entries.insert(
+            TAG_IMAGEDESCRIPTION,
+            TiffEntry {
+                value_type: TYPE_ASCII,
+                count: description.len() as u64 + 1,
+                raw: format!("{description}\0").into_bytes(),
+            },
+        );
+        if let Some(width) = width {
+            entries.insert(TAG_IMAGEWIDTH, test_long_entry(width));
+        }
+        if let Some(height) = height {
+            entries.insert(TAG_IMAGELENGTH, test_long_entry(height));
+        }
+        FirstIfd { entries }
+    }
+
+    fn test_long_entry(value: u32) -> TiffEntry {
+        TiffEntry {
+            value_type: TYPE_LONG,
+            count: 1,
+            raw: value.to_le_bytes().to_vec(),
+        }
+    }
+
+    fn test_tiled_dir(width: u32, height: u32, subfiletype: Option<u32>) -> FirstIfd {
+        let mut dir = test_tile_shape_dir_without_offsets(width, height, subfiletype);
+        dir.entries.insert(TAG_TILEOFFSETS, test_long_entry(0));
+        dir.entries.insert(TAG_TILEBYTECOUNTS, test_long_entry(0));
+        dir
+    }
+
+    fn test_tile_shape_dir_without_offsets(
+        width: u32,
+        height: u32,
+        subfiletype: Option<u32>,
+    ) -> FirstIfd {
+        let mut entries = HashMap::new();
+        entries.insert(TAG_IMAGEWIDTH, test_long_entry(width));
+        entries.insert(TAG_IMAGELENGTH, test_long_entry(height));
+        entries.insert(TAG_TILEWIDTH, test_long_entry(2));
+        entries.insert(TAG_TILELENGTH, test_long_entry(2));
+        if let Some(subfiletype) = subfiletype {
+            entries.insert(TAG_SUBFILETYPE, test_long_entry(subfiletype));
+        }
+        FirstIfd { entries }
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         let nanos = SystemTime::now()
@@ -1396,8 +2049,102 @@ mod tests {
             .to_string()
     }
 
+    fn philips_xml_without_spacings() -> String {
+        r#"<DataObject ObjectType="DPUfsImport">
+  <Attribute Name="PIM_DP_SCANNED_IMAGES">
+    <Array>
+      <DataObject ObjectType="DPScannedImage">
+        <Attribute Name="PIM_DP_IMAGE_TYPE">WSI</Attribute>
+      </DataObject>
+    </Array>
+  </Attribute>
+</DataObject>"#
+            .to_string()
+    }
+
     fn make_philips_tiff() -> Vec<u8> {
+        make_philips_tiff_inner(false)
+    }
+
+    fn make_philips_tiff_with_xml(xml: &str) -> Vec<u8> {
+        make_philips_tiff_inner_with_xml(false, 1, 3, 3, xml)
+    }
+
+    fn make_philips_tiff_with_associated() -> Vec<u8> {
+        make_philips_tiff_inner(true)
+    }
+
+    fn make_philips_tiff_with_reduced_associated() -> Vec<u8> {
+        make_philips_tiff_inner_with_associated_subfiletype(Some(1))
+    }
+
+    fn make_philips_tiff_inner(include_associated: bool) -> Vec<u8> {
+        make_philips_tiff_inner_with_level1(include_associated, 1, 3, 3)
+    }
+
+    fn make_philips_tiff_inner_with_associated_subfiletype(
+        associated_subfiletype: Option<u32>,
+    ) -> Vec<u8> {
         let xml = philips_xml();
+        make_philips_tiff_inner_with_xml_and_associated_subfiletype(
+            true,
+            1,
+            3,
+            3,
+            &xml,
+            associated_subfiletype,
+        )
+    }
+
+    fn make_philips_tiff_with_level1(
+        level1_subfiletype: u32,
+        level1_width: u32,
+        level1_height: u32,
+    ) -> Vec<u8> {
+        make_philips_tiff_inner_with_level1(false, level1_subfiletype, level1_width, level1_height)
+    }
+
+    fn make_philips_tiff_inner_with_level1(
+        include_associated: bool,
+        level1_subfiletype: u32,
+        level1_width: u32,
+        level1_height: u32,
+    ) -> Vec<u8> {
+        let xml = philips_xml();
+        make_philips_tiff_inner_with_xml(
+            include_associated,
+            level1_subfiletype,
+            level1_width,
+            level1_height,
+            &xml,
+        )
+    }
+
+    fn make_philips_tiff_inner_with_xml(
+        include_associated: bool,
+        level1_subfiletype: u32,
+        level1_width: u32,
+        level1_height: u32,
+        xml: &str,
+    ) -> Vec<u8> {
+        make_philips_tiff_inner_with_xml_and_associated_subfiletype(
+            include_associated,
+            level1_subfiletype,
+            level1_width,
+            level1_height,
+            xml,
+            None,
+        )
+    }
+
+    fn make_philips_tiff_inner_with_xml_and_associated_subfiletype(
+        include_associated: bool,
+        level1_subfiletype: u32,
+        level1_width: u32,
+        level1_height: u32,
+        xml: &str,
+        associated_subfiletype: Option<u32>,
+    ) -> Vec<u8> {
         let software = b"Philips Digital Pathology\0";
 
         let level0_tiles = vec![
@@ -1415,16 +2162,24 @@ mod tests {
 
         let entries0 = directory_entries(true);
         let entries1 = directory_entries(false);
+        let associated_entries = associated_directory_entries(associated_subfiletype.is_some());
         let dir0_offset = 8usize;
         let dir0_len = 2 + entries0.len() * 12 + 4;
         let dir1_offset = dir0_offset + dir0_len;
         let dir1_len = 2 + entries1.len() * 12 + 4;
-        let data_base = dir1_offset + dir1_len;
+        let dir2_offset = dir1_offset + dir1_len;
+        let dir2_len = if include_associated {
+            2 + associated_entries.len() * 12 + 4
+        } else {
+            0
+        };
+        let data_base = dir2_offset + dir2_len;
         let mut extra = Vec::new();
 
         let bits_offset = add(&mut extra, data_base, &[8, 0, 8, 0, 8, 0]);
         let desc_offset = add(&mut extra, data_base, format!("{xml}\0").as_bytes());
         let software_offset = add(&mut extra, data_base, software);
+        let label_desc_offset = add(&mut extra, data_base, b"Label\0");
 
         let level0_tile_offsets = level0_tiles
             .iter()
@@ -1440,6 +2195,7 @@ mod tests {
         let byte_counts = vec![12u32; 4];
         let level0_byte_counts_offset = add_u32_array(&mut extra, data_base, &byte_counts);
         let level1_byte_counts_offset = add_u32_array(&mut extra, data_base, &byte_counts);
+        let label_strip_offset = add(&mut extra, data_base, &[9, 8, 7, 6, 5, 4]);
 
         let mut out = Vec::new();
         out.extend_from_slice(b"II");
@@ -1465,11 +2221,15 @@ mod tests {
         write_directory(
             &mut out,
             entries1,
-            0,
+            if include_associated {
+                dir2_offset as u32
+            } else {
+                0
+            },
             DirectoryValues {
-                subfiletype: 1,
-                width: 3,
-                height: 3,
+                subfiletype: level1_subfiletype,
+                width: level1_width,
+                height: level1_height,
                 bits_offset,
                 desc_offset,
                 desc_len: (xml.len() + 1) as u32,
@@ -1479,6 +2239,22 @@ mod tests {
                 tile_byte_counts_offset: level1_byte_counts_offset,
             },
         );
+        if include_associated {
+            write_associated_directory(
+                &mut out,
+                associated_entries,
+                AssociatedDirectoryValues {
+                    subfiletype: associated_subfiletype.unwrap_or(0),
+                    width: 2,
+                    height: 1,
+                    bits_offset,
+                    desc_offset: label_desc_offset,
+                    desc_len: 6,
+                    strip_offset: label_strip_offset,
+                    strip_byte_count: 6,
+                },
+            );
+        }
         out.extend_from_slice(&extra);
         out
     }
@@ -1495,6 +2271,18 @@ mod tests {
         software_len: u32,
         tile_offsets_offset: u32,
         tile_byte_counts_offset: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    struct AssociatedDirectoryValues {
+        subfiletype: u32,
+        width: u32,
+        height: u32,
+        bits_offset: u32,
+        desc_offset: u32,
+        desc_len: u32,
+        strip_offset: u32,
+        strip_byte_count: u32,
     }
 
     fn directory_entries(first: bool) -> Vec<u16> {
@@ -1516,6 +2304,27 @@ mod tests {
         ];
         if !first {
             tags.retain(|tag| *tag != TAG_SOFTWARE);
+        }
+        tags.sort_unstable();
+        tags
+    }
+
+    fn associated_directory_entries(has_subfiletype: bool) -> Vec<u16> {
+        let mut tags = vec![
+            TAG_IMAGEWIDTH,
+            TAG_IMAGELENGTH,
+            TAG_BITSPERSAMPLE,
+            TAG_COMPRESSION,
+            TAG_PHOTOMETRIC,
+            TAG_IMAGEDESCRIPTION,
+            TAG_STRIPOFFSETS,
+            TAG_SAMPLESPERPIXEL,
+            TAG_ROWSPERSTRIP,
+            TAG_STRIPBYTECOUNTS,
+            TAG_PLANARCONFIG,
+        ];
+        if has_subfiletype {
+            tags.push(TAG_SUBFILETYPE);
         }
         tags.sort_unstable();
         tags
@@ -1558,6 +2367,34 @@ mod tests {
             }
         }
         out.extend_from_slice(&next_offset.to_le_bytes());
+    }
+
+    fn write_associated_directory(
+        out: &mut Vec<u8>,
+        tags: Vec<u16>,
+        values: AssociatedDirectoryValues,
+    ) {
+        out.extend_from_slice(&(tags.len() as u16).to_le_bytes());
+        for tag in tags {
+            match tag {
+                TAG_SUBFILETYPE => push_entry(out, tag, TYPE_LONG, 1, values.subfiletype),
+                TAG_IMAGEWIDTH => push_entry(out, tag, TYPE_LONG, 1, values.width),
+                TAG_IMAGELENGTH => push_entry(out, tag, TYPE_LONG, 1, values.height),
+                TAG_BITSPERSAMPLE => push_entry(out, tag, TYPE_SHORT, 3, values.bits_offset),
+                TAG_COMPRESSION => push_entry(out, tag, TYPE_SHORT, 1, 1),
+                TAG_PHOTOMETRIC => push_entry(out, tag, TYPE_SHORT, 1, 2),
+                TAG_IMAGEDESCRIPTION => {
+                    push_entry(out, tag, TYPE_ASCII, values.desc_len, values.desc_offset)
+                }
+                TAG_STRIPOFFSETS => push_entry(out, tag, TYPE_LONG, 1, values.strip_offset),
+                TAG_SAMPLESPERPIXEL => push_entry(out, tag, TYPE_SHORT, 1, 3),
+                TAG_ROWSPERSTRIP => push_entry(out, tag, TYPE_LONG, 1, values.height),
+                TAG_STRIPBYTECOUNTS => push_entry(out, tag, TYPE_LONG, 1, values.strip_byte_count),
+                TAG_PLANARCONFIG => push_entry(out, tag, TYPE_SHORT, 1, 1),
+                _ => unreachable!(),
+            }
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
     }
 
     fn add(extra: &mut Vec<u8>, base: usize, bytes: &[u8]) -> u32 {

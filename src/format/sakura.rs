@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
-use crate::format::SlideBackend;
+use crate::format::{tiff::OpenslideHash, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
 
@@ -39,12 +39,14 @@ struct TileSource {
     blob_col: usize,
     address: TileAddress,
     level_col: Option<usize>,
+    focal_plane: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TileAddress {
     Xy { x_col: usize, y_col: usize },
     Linear { index_col: usize },
+    SakuraTileId { id_col: usize },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -55,12 +57,13 @@ struct TileBlobIndex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TileKey {
     level: Option<i64>,
+    color: Option<u8>,
     x: i64,
     y: i64,
 }
 
 pub fn detect(path: &Path) -> bool {
-    has_sqlite_header(path) && scan_file_for(path, SAKURA_MAGIC).unwrap_or(false)
+    sakura_detect(path).unwrap_or(false)
 }
 
 pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
@@ -79,9 +82,12 @@ impl SakuraSlide {
         properties.insert(properties::PROPERTY_VENDOR.into(), "sakura".into());
 
         let sqlite = SqliteDatabase::open(path).ok();
-        let tile_source = sqlite.as_ref().and_then(find_tile_source);
+        let mut tile_source = sqlite
+            .as_ref()
+            .and_then(|db| find_sakura_tile_id_source(db).or_else(|| find_tile_source(db)));
         if let Some(db) = &sqlite {
             add_schema_properties(db, &mut properties);
+            add_properties(db, &mut properties);
             add_sqlite_metadata_properties(db, &mut properties);
         }
         let associated_images = sqlite
@@ -101,6 +107,7 @@ impl SakuraSlide {
                 match source.address {
                     TileAddress::Xy { x_col, .. } => source.columns[x_col].clone(),
                     TileAddress::Linear { index_col } => source.columns[index_col].clone(),
+                    TileAddress::SakuraTileId { id_col } => source.columns[id_col].clone(),
                 },
             );
             if let TileAddress::Xy { y_col, .. } = source.address {
@@ -113,8 +120,27 @@ impl SakuraSlide {
                 );
             }
         }
+        if let (Some(db), Some(source)) = (&sqlite, &tile_source) {
+            if let Some(quickhash1) = compute_quickhash1(db, source)? {
+                properties.insert(properties::PROPERTY_QUICKHASH1.into(), quickhash1);
+            }
+        }
 
-        let mut levels = if let Some(header) = find_header_like_record(path)? {
+        let header = if let Some(db) = &sqlite {
+            match read_header(db)? {
+                Some(header) => Some(header),
+                None => find_header_like_record(path)?,
+            }
+        } else {
+            find_header_like_record(path)?
+        };
+
+        let mut levels = if let Some(header) = header {
+            if let Some(source) = &mut tile_source {
+                if matches!(source.address, TileAddress::SakuraTileId { .. }) {
+                    source.focal_plane = Some(chosen_focal_plane(header.focal_planes));
+                }
+            }
             properties.insert(
                 "sakura.Header.tile-size".into(),
                 header.tile_size.to_string(),
@@ -125,12 +151,21 @@ impl SakuraSlide {
                 "sakura.Header.focal-planes".into(),
                 header.focal_planes.to_string(),
             );
-            vec![SakuraLevel {
-                width: header.width,
-                height: header.height,
-                downsample: 1.0,
-                tile_size: header.tile_size,
-            }]
+            let upstream_levels = if let (Some(db), Some(source)) = (&sqlite, &tile_source) {
+                build_sakura_tile_id_levels(db, source, header)?
+            } else {
+                Vec::new()
+            };
+            if upstream_levels.is_empty() {
+                vec![SakuraLevel {
+                    width: header.width,
+                    height: header.height,
+                    downsample: 1.0,
+                    tile_size: header.tile_size,
+                }]
+            } else {
+                upstream_levels
+            }
         } else {
             Vec::new()
         };
@@ -176,6 +211,8 @@ impl SakuraSlide {
         db: &SqliteDatabase,
         source: &TileSource,
         level: u32,
+        level_data: &SakuraLevel,
+        channel: u32,
         tile_x: i64,
         tile_y: i64,
     ) -> Result<Option<Vec<u8>>> {
@@ -190,12 +227,79 @@ impl SakuraSlide {
             return Ok(None);
         };
         let key = TileKey {
-            level: source.level_col.map(|_| level as i64),
+            level: match source.address {
+                TileAddress::SakuraTileId { .. } => Some(level_data.downsample as i64),
+                _ => source.level_col.map(|_| level as i64),
+            },
+            color: match source.address {
+                TileAddress::SakuraTileId { .. } => Some(channel as u8),
+                _ => None,
+            },
             x: tile_x,
             y: tile_y,
         };
         Ok(index.tiles.get(&key).cloned())
     }
+}
+
+fn sakura_detect(path: &Path) -> Result<bool> {
+    let db = SqliteDatabase::open(path)?;
+    let unique_table_name = get_unique_table_name(&db)?;
+    let Some(unique_table) = db
+        .tables
+        .iter()
+        .find(|table| table.name == unique_table_name)
+    else {
+        return Ok(false);
+    };
+    let rows = db.read_table_rows(unique_table.root_page)?;
+    Ok(has_sakura_magic_bytes(unique_table, &rows))
+}
+
+fn get_unique_table_name(db: &SqliteDatabase) -> Result<String> {
+    let Some(table) = db
+        .tables
+        .iter()
+        .find(|table| table.name == "DataManagerSQLiteConfigXPO")
+    else {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Missing Sakura unique table config".into(),
+        ));
+    };
+    let Some(table_name_col) = column_index(table, "TableName") else {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Missing Sakura TableName column".into(),
+        ));
+    };
+    let rows = db.read_table_rows(table.root_page)?;
+    if rows.len() != 1 {
+        return Err(OpenSlideError::Format(
+            "Found != 1 Sakura unique tables".into(),
+        ));
+    }
+    rows[0]
+        .text(table_name_col)
+        .map(str::to_string)
+        .ok_or_else(|| OpenSlideError::UnsupportedFormat("Missing Sakura unique table name".into()))
+}
+
+fn has_sakura_magic_bytes(table: &SqliteTable, rows: &[SqliteRow]) -> bool {
+    let Some(id_col) = column_index(table, "id") else {
+        return false;
+    };
+    let Some(data_col) = column_index(table, "data") else {
+        return false;
+    };
+    rows.iter().any(|row| {
+        row.text(id_col) == Some("++MagicBytes") && row.bytes(data_col) == Some(SAKURA_MAGIC)
+    })
+}
+
+fn column_index(table: &SqliteTable, name: &str) -> Option<usize> {
+    table
+        .columns
+        .iter()
+        .position(|column| column.eq_ignore_ascii_case(name))
 }
 
 impl SlideBackend for SakuraSlide {
@@ -267,19 +371,31 @@ impl SlideBackend for SakuraSlide {
 
         for row in row_start..row_end {
             for col in col_start..col_end {
-                let Some(blob) = self.cached_tile_blob(db, source, level, col, row)? else {
+                let Some(blob) =
+                    self.cached_tile_blob(db, source, level, level_data, channel, col, row)?
+                else {
                     continue;
                 };
-                let (rgb, tile_w, tile_h) = decode_tile_blob(&blob)?;
-                blit_rgb_channel(
-                    &rgb,
-                    tile_w,
-                    tile_h,
-                    channel,
-                    &mut output,
-                    col as f64 * tile_size - lx,
-                    row as f64 * tile_size - ly,
-                );
+                if matches!(source.address, TileAddress::SakuraTileId { .. }) {
+                    let tile = decode::decode_channel(ImageFormat::Jpeg, &blob, 0)?;
+                    blit_gray_channel(
+                        &tile,
+                        &mut output,
+                        col as f64 * tile_size - lx,
+                        row as f64 * tile_size - ly,
+                    );
+                } else {
+                    let (rgb, tile_w, tile_h) = decode_tile_blob(&blob)?;
+                    blit_rgb_channel(
+                        &rgb,
+                        tile_w,
+                        tile_h,
+                        channel,
+                        &mut output,
+                        col as f64 * tile_size - lx,
+                        row as f64 * tile_size - ly,
+                    );
+                }
             }
         }
 
@@ -435,7 +551,24 @@ impl SqliteDatabase {
             let Some((x, y)) = tile_coordinates(source, &row, level, levels) else {
                 continue;
             };
-            index.tiles.insert(TileKey { level, x, y }, blob.to_vec());
+            let (level, color) = match source.address {
+                TileAddress::SakuraTileId { id_col } => {
+                    let Some(tile_id) = row.text(id_col) else {
+                        continue;
+                    };
+                    let Some(parsed) = parse_tileid(tile_id)? else {
+                        continue;
+                    };
+                    if Some(parsed.focal_plane) != source.focal_plane {
+                        continue;
+                    }
+                    (Some(parsed.downsample), Some(parsed.color as u8))
+                }
+                _ => (level, None),
+            };
+            index
+                .tiles
+                .insert(TileKey { level, color, x, y }, blob.to_vec());
         }
         Ok(index)
     }
@@ -621,6 +754,15 @@ impl SqliteRow {
         }
     }
 
+    fn float(&self, index: usize) -> Option<f64> {
+        match self.values.get(index) {
+            Some(SqliteValue::Real(value)) if value.is_finite() => Some(*value),
+            Some(SqliteValue::Integer(value)) => Some(*value as f64),
+            Some(SqliteValue::Text(value)) => value.trim().parse().ok(),
+            _ => None,
+        }
+    }
+
     fn text(&self, index: usize) -> Option<&str> {
         match self.values.get(index) {
             Some(SqliteValue::Text(value)) => Some(value),
@@ -631,6 +773,14 @@ impl SqliteRow {
     fn blob(&self, index: usize) -> Option<&[u8]> {
         match self.values.get(index) {
             Some(SqliteValue::Blob(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn bytes(&self, index: usize) -> Option<&[u8]> {
+        match self.values.get(index) {
+            Some(SqliteValue::Blob(value)) => Some(value),
+            Some(SqliteValue::Text(value)) => Some(value.as_bytes()),
             _ => None,
         }
     }
@@ -657,6 +807,25 @@ fn find_tile_source(db: &SqliteDatabase) -> Option<TileSource> {
         .filter_map(|table| Some((tile_source_score(table), tile_source_from_table(table)?)))
         .max_by_key(|(score, _)| *score)
         .map(|(_, source)| source)
+}
+
+fn find_sakura_tile_id_source(db: &SqliteDatabase) -> Option<TileSource> {
+    let unique_table_name = get_unique_table_name(db).ok()?;
+    let table = db
+        .tables
+        .iter()
+        .find(|table| table.name == unique_table_name)?;
+    Some(TileSource {
+        table_name: table.name.clone(),
+        root_page: table.root_page,
+        columns: table.columns.clone(),
+        blob_col: column_index(table, "data")?,
+        address: TileAddress::SakuraTileId {
+            id_col: column_index(table, "id")?,
+        },
+        level_col: None,
+        focal_plane: None,
+    })
 }
 
 fn tile_source_from_table(table: &SqliteTable) -> Option<TileSource> {
@@ -739,6 +908,7 @@ fn tile_source_from_table(table: &SqliteTable) -> Option<TileSource> {
         blob_col,
         address,
         level_col,
+        focal_plane: None,
     })
 }
 
@@ -761,6 +931,7 @@ fn address_columns(address: &TileAddress) -> Vec<usize> {
     match *address {
         TileAddress::Xy { x_col, y_col } => vec![x_col, y_col],
         TileAddress::Linear { index_col } => vec![index_col],
+        TileAddress::SakuraTileId { id_col } => vec![id_col],
     }
 }
 
@@ -795,6 +966,19 @@ fn tile_coordinates(
 ) -> Option<(i64, i64)> {
     match source.address {
         TileAddress::Xy { x_col, y_col } => Some((row.integer(x_col)?, row.integer(y_col)?)),
+        TileAddress::SakuraTileId { id_col } => {
+            let parsed = parse_tileid(row.text(id_col)?).ok()??;
+            if Some(parsed.focal_plane) != source.focal_plane {
+                return None;
+            }
+            let tile_span = parsed
+                .downsample
+                .checked_mul(levels.first()?.tile_size as i64)?;
+            if tile_span <= 0 || parsed.x % tile_span != 0 || parsed.y % tile_span != 0 {
+                return None;
+            }
+            Some((parsed.x / tile_span, parsed.y / tile_span))
+        }
         TileAddress::Linear { index_col } => {
             let index = row.integer(index_col)?;
             if index < 0 {
@@ -811,6 +995,253 @@ fn tile_coordinates(
             Some((index % tiles_across, index / tiles_across))
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SakuraTileId {
+    x: i64,
+    y: i64,
+    downsample: i64,
+    color: i64,
+    focal_plane: i64,
+}
+
+fn make_tileid(x: i64, y: i64, downsample: i64, color: i64, focal_plane: i64) -> String {
+    format!("T;{x}|{y};{downsample};{color};{focal_plane}")
+}
+
+fn parse_tileid(tileid: &str) -> Result<Option<SakuraTileId>> {
+    if !tileid.starts_with("T;") || tileid.ends_with('#') {
+        return Ok(None);
+    }
+    let fields = tileid[2..]
+        .split([';', '|'])
+        .map(str::parse::<i64>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| OpenSlideError::Format(format!("Bad field value in tile ID {tileid}")))?;
+    if fields.len() != 5 {
+        return Err(OpenSlideError::Format(format!(
+            "Bad field count in tile ID {tileid}"
+        )));
+    }
+    let parsed = SakuraTileId {
+        x: fields[0],
+        y: fields[1],
+        downsample: fields[2],
+        color: fields[3],
+        focal_plane: fields[4],
+    };
+    if parsed.x < 0
+        || parsed.y < 0
+        || parsed.downsample < 1
+        || !(0..=2).contains(&parsed.color)
+        || parsed.focal_plane < 0
+    {
+        return Err(OpenSlideError::Format(format!(
+            "Bad field value in tile ID {tileid}"
+        )));
+    }
+    if tileid
+        != make_tileid(
+            parsed.x,
+            parsed.y,
+            parsed.downsample,
+            parsed.color,
+            parsed.focal_plane,
+        )
+    {
+        return Err(OpenSlideError::Format(format!(
+            "Couldn't round-trip tile ID {tileid}"
+        )));
+    }
+    Ok(Some(parsed))
+}
+
+fn chosen_focal_plane(focal_planes: u32) -> i64 {
+    if focal_planes == 0 {
+        return 0;
+    }
+    i64::from((focal_planes / 2) + (focal_planes % 2) - 1)
+}
+
+fn build_sakura_tile_id_levels(
+    db: &SqliteDatabase,
+    source: &TileSource,
+    header: SakuraHeader,
+) -> Result<Vec<SakuraLevel>> {
+    if !matches!(source.address, TileAddress::SakuraTileId { .. }) {
+        return Ok(Vec::new());
+    }
+    let rows = db.read_table_rows(source.root_page)?;
+    let mut downsamples = BTreeSet::new();
+    for row in rows {
+        let TileAddress::SakuraTileId { id_col } = source.address else {
+            return Ok(Vec::new());
+        };
+        let Some(tileid) = row.text(id_col) else {
+            continue;
+        };
+        let Some(parsed) = parse_tileid(tileid)? else {
+            continue;
+        };
+        if parsed.focal_plane != 0 {
+            continue;
+        }
+        if parsed.downsample & (parsed.downsample - 1) != 0 {
+            return Err(OpenSlideError::Format(format!(
+                "Invalid downsample {}",
+                parsed.downsample
+            )));
+        }
+        downsamples.insert(parsed.downsample);
+    }
+    Ok(downsamples
+        .into_iter()
+        .map(|downsample| SakuraLevel {
+            width: header.width / downsample as u64,
+            height: header.height / downsample as u64,
+            downsample: downsample as f64,
+            tile_size: header.tile_size,
+        })
+        .collect())
+}
+
+fn compute_quickhash1(db: &SqliteDatabase, source: &TileSource) -> Result<Option<String>> {
+    if !matches!(source.address, TileAddress::SakuraTileId { .. }) {
+        return Ok(None);
+    }
+    let mut quickhash1 = OpenslideHash::openslide_hash_quickhash1_create();
+    if !hash_columns(
+        &mut quickhash1,
+        db,
+        "SVSlideDataXPO",
+        &["SlideId", "Date", "Creator", "Description", "Keywords"],
+    )? {
+        return Ok(None);
+    }
+    if !hash_columns(
+        &mut quickhash1,
+        db,
+        "SVHRScanDataXPO",
+        &["ScanId", "Date", "Name", "Description"],
+    )? {
+        return Ok(None);
+    }
+    if !hash_unique_table_values(&mut quickhash1, db, "Header", true)? {
+        return Ok(None);
+    }
+    if !hash_sakura_tiles(&mut quickhash1, db, source)? {
+        return Ok(None);
+    }
+    Ok(quickhash1.openslide_hash_get_string())
+}
+
+fn hash_columns(
+    quickhash1: &mut OpenslideHash,
+    db: &SqliteDatabase,
+    table_name: &str,
+    columns: &[&str],
+) -> Result<bool> {
+    let Some(table) = db.tables.iter().find(|table| table.name == table_name) else {
+        return Ok(false);
+    };
+    let Some(oid_col) = column_index(table, "OID") else {
+        return Ok(false);
+    };
+    let Some(column_indexes) = columns
+        .iter()
+        .map(|column| column_index(table, column))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(false);
+    };
+    let mut rows = db.read_table_rows(table.root_page)?;
+    rows.sort_by_key(|row| row.integer(oid_col).unwrap_or(i64::MAX));
+    for row in rows {
+        for col in &column_indexes {
+            if let Some(bytes) = row.bytes(*col) {
+                quickhash1.openslide_hash_data(bytes);
+            }
+            quickhash1.openslide_hash_data(&[0]);
+        }
+    }
+    Ok(true)
+}
+
+fn hash_unique_table_values(
+    quickhash1: &mut OpenslideHash,
+    db: &SqliteDatabase,
+    id: &str,
+    nul_terminate: bool,
+) -> Result<bool> {
+    let unique_table_name = get_unique_table_name(db)?;
+    let Some(table) = db
+        .tables
+        .iter()
+        .find(|table| table.name == unique_table_name)
+    else {
+        return Ok(false);
+    };
+    let Some(id_col) = column_index(table, "id") else {
+        return Ok(false);
+    };
+    let Some(data_col) = column_index(table, "data") else {
+        return Ok(false);
+    };
+    let mut found = false;
+    for row in db.read_table_rows(table.root_page)? {
+        if row.text(id_col) == Some(id) {
+            found = true;
+            if let Some(bytes) = row.bytes(data_col) {
+                quickhash1.openslide_hash_data(bytes);
+            }
+            if nul_terminate {
+                quickhash1.openslide_hash_data(&[0]);
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn hash_sakura_tiles(
+    quickhash1: &mut OpenslideHash,
+    db: &SqliteDatabase,
+    source: &TileSource,
+) -> Result<bool> {
+    let TileAddress::SakuraTileId { id_col } = source.address else {
+        return Ok(false);
+    };
+    let rows = db.read_table_rows(source.root_page)?;
+    let mut tileids = Vec::new();
+    let mut max_downsample = 0;
+    for row in &rows {
+        let Some(tileid) = row.text(id_col) else {
+            continue;
+        };
+        let Some(parsed) = parse_tileid(tileid)? else {
+            continue;
+        };
+        if parsed.downsample > max_downsample {
+            tileids.clear();
+            max_downsample = parsed.downsample;
+        }
+        if parsed.downsample == max_downsample {
+            tileids.push(tileid.to_string());
+        }
+    }
+    let data_col = source.blob_col;
+    tileids.sort();
+    for tileid in tileids {
+        for row in &rows {
+            if row.text(id_col) == Some(tileid.as_str()) {
+                if let Some(bytes) = row.bytes(data_col) {
+                    quickhash1.openslide_hash_data(bytes);
+                }
+                break;
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn infer_single_level(db: &SqliteDatabase, source: &TileSource) -> Result<Option<SakuraLevel>> {
@@ -863,6 +1294,7 @@ fn infer_single_level(db: &SqliteDatabase, source: &TileSource) -> Result<Option
             let tiles_down = row_count.div_ceil(tiles_across);
             (tiles_across - 1, tiles_down - 1)
         }
+        TileAddress::SakuraTileId { .. } => return Ok(None),
     };
     Ok(Some(SakuraLevel {
         width: (max_x + 1) * tile_size as u64,
@@ -1149,6 +1581,146 @@ fn add_schema_properties(db: &SqliteDatabase, properties: &mut HashMap<String, S
             format!("sakura.sqlite.table[{i}].columns"),
             table.columns.join(","),
         );
+    }
+}
+
+fn add_properties(db: &SqliteDatabase, properties: &mut HashMap<String, String>) {
+    let Some(slide_table) = db
+        .tables
+        .iter()
+        .find(|table| table.name == "SVSlideDataXPO")
+    else {
+        add_version_property(db, properties);
+        return;
+    };
+    let Some(scan_table) = db
+        .tables
+        .iter()
+        .find(|table| table.name == "SVHRScanDataXPO")
+    else {
+        add_version_property(db, properties);
+        return;
+    };
+    let Ok(slide_rows) = db.read_table_rows(slide_table.root_page) else {
+        add_version_property(db, properties);
+        return;
+    };
+    let Ok(scan_rows) = db.read_table_rows(scan_table.root_page) else {
+        add_version_property(db, properties);
+        return;
+    };
+    let Some(slide_oid_col) = column_index(slide_table, "OID") else {
+        add_version_property(db, properties);
+        return;
+    };
+    let Some(scan_parent_col) = column_index(scan_table, "ParentSlide") else {
+        add_version_property(db, properties);
+        return;
+    };
+
+    let joined = scan_rows.iter().find_map(|scan_row| {
+        let parent = scan_row.integer(scan_parent_col)?;
+        let slide_row = slide_rows
+            .iter()
+            .find(|slide_row| slide_row.integer(slide_oid_col) == Some(parent))?;
+        Some((slide_row, scan_row))
+    });
+
+    if let Some((slide_row, scan_row)) = joined {
+        for column in [
+            "SlideId",
+            "Date",
+            "Description",
+            "Creator",
+            "DiagnosisCode",
+            "Keywords",
+        ] {
+            add_text_property(properties, slide_table, slide_row, column);
+        }
+        for column in ["ScanId", "FocussingMethod"] {
+            add_text_property(properties, scan_table, scan_row, column);
+        }
+        for column in ["ResolutionMmPerPix", "NominalLensMagnification"] {
+            add_float_property(properties, scan_table, scan_row, column);
+        }
+        if let Some(mmpp) =
+            column_index(scan_table, "ResolutionMmPerPix").and_then(|col| scan_row.float(col))
+        {
+            properties.insert(
+                crate::properties::PROPERTY_MPP_X.into(),
+                format_float(mmpp * 1000.0),
+            );
+            properties.insert(
+                crate::properties::PROPERTY_MPP_Y.into(),
+                format_float(mmpp * 1000.0),
+            );
+        }
+        if let Some(value) = properties
+            .get("sakura.NominalLensMagnification")
+            .filter(|value| !value.is_empty())
+            .cloned()
+        {
+            properties.insert(crate::properties::PROPERTY_OBJECTIVE_POWER.into(), value);
+        }
+    }
+
+    add_version_property(db, properties);
+}
+
+fn add_text_property(
+    properties: &mut HashMap<String, String>,
+    table: &SqliteTable,
+    row: &SqliteRow,
+    column: &str,
+) {
+    let Some(value) = column_index(table, column)
+        .and_then(|col| row.value_as_property(col))
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    properties.insert(format!("sakura.{column}"), value);
+}
+
+fn add_float_property(
+    properties: &mut HashMap<String, String>,
+    table: &SqliteTable,
+    row: &SqliteRow,
+    column: &str,
+) {
+    let Some(value) = column_index(table, column).and_then(|col| row.float(col)) else {
+        return;
+    };
+    properties.insert(format!("sakura.{column}"), format_float(value));
+}
+
+fn add_version_property(db: &SqliteDatabase, properties: &mut HashMap<String, String>) {
+    let Ok(unique_table_name) = get_unique_table_name(db) else {
+        return;
+    };
+    let Some(table) = db
+        .tables
+        .iter()
+        .find(|table| table.name == unique_table_name)
+    else {
+        return;
+    };
+    let Some(id_col) = column_index(table, "id") else {
+        return;
+    };
+    let Some(data_col) = column_index(table, "data") else {
+        return;
+    };
+    let Ok(rows) = db.read_table_rows(table.root_page) else {
+        return;
+    };
+    for row in rows {
+        if row.text(id_col) == Some("++VersionBytes") {
+            if let Some(value) = row.value_as_property(data_col) {
+                properties.insert("sakura.VersionBytes".into(), value);
+            }
+            return;
+        }
     }
 }
 
@@ -1496,6 +2068,27 @@ fn blit_rgb_channel(
     }
 }
 
+fn blit_gray_channel(tile: &GrayImage, output: &mut GrayImage, dst_x: f64, dst_y: f64) {
+    let start_x = dst_x.floor() as i64;
+    let start_y = dst_y.floor() as i64;
+    let src_x0 = (-start_x).max(0) as u32;
+    let src_y0 = (-start_y).max(0) as u32;
+    let dst_x0 = start_x.max(0) as u32;
+    let dst_y0 = start_y.max(0) as u32;
+    if dst_x0 >= output.width || dst_y0 >= output.height {
+        return;
+    }
+    let copy_w = (tile.width.saturating_sub(src_x0)).min(output.width - dst_x0);
+    let copy_h = (tile.height.saturating_sub(src_y0)).min(output.height - dst_y0);
+    for row in 0..copy_h {
+        let src_base = ((src_y0 + row) * tile.width + src_x0) as usize;
+        let dst_base = ((dst_y0 + row) * output.width + dst_x0) as usize;
+        let src = &tile.data[src_base..src_base + copy_w as usize];
+        let dst = &mut output.data[dst_base..dst_base + copy_w as usize];
+        dst.copy_from_slice(src);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SakuraHeader {
     tile_size: u32,
@@ -1504,42 +2097,50 @@ struct SakuraHeader {
     focal_planes: u32,
 }
 
-fn has_sqlite_header(path: &Path) -> bool {
-    let Ok(mut file) = File::open(path) else {
-        return false;
+fn read_header(db: &SqliteDatabase) -> Result<Option<SakuraHeader>> {
+    let unique_table_name = get_unique_table_name(db)?;
+    let Some(table) = db
+        .tables
+        .iter()
+        .find(|table| table.name == unique_table_name)
+    else {
+        return Ok(None);
     };
-    let mut header = [0; SQLITE_MAGIC.len()];
-    file.read_exact(&mut header)
-        .is_ok_and(|_| &header == SQLITE_MAGIC)
+    let Some(id_col) = column_index(table, "id") else {
+        return Ok(None);
+    };
+    let Some(data_col) = column_index(table, "data") else {
+        return Ok(None);
+    };
+    for row in db.read_table_rows(table.root_page)? {
+        if row.text(id_col) == Some("Header") {
+            let Some(data) = row.bytes(data_col) else {
+                return Err(OpenSlideError::Format(
+                    "Sakura Header row does not contain data".into(),
+                ));
+            };
+            return Ok(Some(parse_sakura_header(data)?));
+        }
+    }
+    Ok(None)
 }
 
-fn scan_file_for(path: &Path, needle: &[u8]) -> Result<bool> {
-    let mut file = File::open(path)?;
-    let mut buf = vec![0; 64 * 1024];
-    let mut tail = Vec::new();
-    let mut scanned = 0u64;
-
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            return Ok(false);
-        }
-        scanned += n as u64;
-        if scanned > SCAN_LIMIT {
-            return Ok(false);
-        }
-
-        let mut window = Vec::with_capacity(tail.len() + n);
-        window.extend_from_slice(&tail);
-        window.extend_from_slice(&buf[..n]);
-        if contains_subslice(&window, needle) {
-            return Ok(true);
-        }
-
-        let keep = needle.len().saturating_sub(1).min(window.len());
-        tail.clear();
-        tail.extend_from_slice(&window[window.len() - keep..]);
+fn parse_sakura_header(data: &[u8]) -> Result<SakuraHeader> {
+    if data.len() < 20 {
+        return Err(OpenSlideError::Format("Short Sakura Header data".into()));
     }
+    let tile_size = read_u32(data, 0);
+    if tile_size == 0 || tile_size > i32::MAX as u32 {
+        return Err(OpenSlideError::Format(format!(
+            "Invalid tile size: {tile_size}"
+        )));
+    }
+    Ok(SakuraHeader {
+        tile_size,
+        width: read_u32(data, 4) as u64,
+        height: read_u32(data, 8) as u64,
+        focal_planes: read_u32(data, 16),
+    })
 }
 
 fn find_header_like_record(path: &Path) -> Result<Option<SakuraHeader>> {
@@ -1582,12 +2183,6 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes)
 }
 
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
-}
-
 fn find_all<'a>(haystack: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
     haystack
         .windows(needle.len())
@@ -1601,9 +2196,9 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn detects_sqlite_sakura_magic() {
+    fn rejects_raw_sakura_magic_without_sqlite_tables() {
         let path = std::env::temp_dir().join(format!(
-            "openslide_rs_detects_sqlite_sakura_magic_{}",
+            "openslide_rs_rejects_raw_sakura_magic_{}",
             std::process::id()
         ));
         let mut data = Vec::new();
@@ -1612,8 +2207,100 @@ mod tests {
         data.extend_from_slice(SAKURA_MAGIC);
         fs::write(&path, data).unwrap();
 
-        assert!(detect(&path));
+        assert!(!detect(&path));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn detects_sakura_magic_from_unique_table_rows() {
+        let unique_table = SqliteTable {
+            name: "ImageData".into(),
+            root_page: 2,
+            columns: vec!["id".into(), "data".into()],
+        };
+        let rows = vec![SqliteRow {
+            values: vec![
+                SqliteValue::Text("++MagicBytes".into()),
+                SqliteValue::Text("SVGigaPixelImage".into()),
+            ],
+        }];
+
+        assert!(has_sakura_magic_bytes(&unique_table, &rows));
+
+        let blob_rows = vec![SqliteRow {
+            values: vec![
+                SqliteValue::Text("++MagicBytes".into()),
+                SqliteValue::Blob(b"SVGigaPixelImage".to_vec()),
+            ],
+        }];
+        assert!(has_sakura_magic_bytes(&unique_table, &blob_rows));
+
+        let wrong_rows = vec![SqliteRow {
+            values: vec![
+                SqliteValue::Text("++MagicBytes".into()),
+                SqliteValue::Text("not sakura".into()),
+            ],
+        }];
+        assert!(!has_sakura_magic_bytes(&unique_table, &wrong_rows));
+    }
+
+    #[test]
+    fn parses_sakura_header_from_unique_table_data_layout() {
+        let mut data = vec![0; 20];
+        data[0..4].copy_from_slice(&240u32.to_le_bytes());
+        data[4..8].copy_from_slice(&1234u32.to_le_bytes());
+        data[8..12].copy_from_slice(&5678u32.to_le_bytes());
+        data[16..20].copy_from_slice(&5u32.to_le_bytes());
+
+        let header = parse_sakura_header(&data).unwrap();
+        assert_eq!(header.tile_size, 240);
+        assert_eq!(header.width, 1234);
+        assert_eq!(header.height, 5678);
+        assert_eq!(header.focal_planes, 5);
+    }
+
+    #[test]
+    fn rejects_invalid_sakura_header_tile_size() {
+        let mut data = vec![0; 20];
+        data[4..8].copy_from_slice(&1234u32.to_le_bytes());
+        data[8..12].copy_from_slice(&5678u32.to_le_bytes());
+
+        let err = parse_sakura_header(&data).unwrap_err();
+        assert!(format!("{err}").contains("Invalid tile size"));
+    }
+
+    #[test]
+    fn reads_sqlite_numeric_values_as_float() {
+        let row = SqliteRow {
+            values: vec![
+                SqliteValue::Real(0.00025),
+                SqliteValue::Integer(40),
+                SqliteValue::Text("20".into()),
+            ],
+        };
+
+        assert_eq!(row.float(0), Some(0.00025));
+        assert_eq!(row.float(1), Some(40.0));
+        assert_eq!(row.float(2), Some(20.0));
+    }
+
+    #[test]
+    fn parses_upstream_sakura_tile_ids() {
+        let parsed = parse_tileid("T;512|256;2;1;0").unwrap().unwrap();
+
+        assert_eq!(
+            parsed,
+            SakuraTileId {
+                x: 512,
+                y: 256,
+                downsample: 2,
+                color: 1,
+                focal_plane: 0,
+            }
+        );
+        assert_eq!(parse_tileid("++MagicBytes").unwrap(), None);
+        assert!(parse_tileid("T;0512|256;2;1;0").is_err());
+        assert!(parse_tileid("T;512|256;2;3;0").is_err());
     }
 
     #[test]
@@ -1767,6 +2454,7 @@ mod tests {
             blob_col: 1,
             address: TileAddress::Linear { index_col: 0 },
             level_col: None,
+            focal_plane: None,
         };
         let row = SqliteRow {
             values: vec![SqliteValue::Integer(5), SqliteValue::Blob(vec![1, 2, 3])],
@@ -1782,6 +2470,36 @@ mod tests {
     }
 
     #[test]
+    fn maps_sakura_tile_id_to_grid_coordinates() {
+        let source = TileSource {
+            table_name: "ImageData".into(),
+            root_page: 5,
+            columns: vec!["id".into(), "data".into()],
+            blob_col: 1,
+            address: TileAddress::SakuraTileId { id_col: 0 },
+            level_col: None,
+            focal_plane: Some(0),
+        };
+        let row = SqliteRow {
+            values: vec![
+                SqliteValue::Text("T;512|256;2;1;0".into()),
+                SqliteValue::Blob(vec![1, 2, 3]),
+            ],
+        };
+        let levels = vec![SakuraLevel {
+            width: 512,
+            height: 512,
+            downsample: 2.0,
+            tile_size: 128,
+        }];
+
+        assert_eq!(
+            tile_coordinates(&source, &row, Some(2), &levels),
+            Some((2, 1))
+        );
+    }
+
+    #[test]
     fn accepts_integer_like_sqlite_values_for_tile_coordinates() {
         let source = TileSource {
             table_name: "ImageTiles".into(),
@@ -1790,6 +2508,7 @@ mod tests {
             blob_col: 2,
             address: TileAddress::Xy { x_col: 0, y_col: 1 },
             level_col: None,
+            focal_plane: None,
         };
         let levels = vec![SakuraLevel {
             width: 768,

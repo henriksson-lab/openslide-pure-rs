@@ -14,16 +14,17 @@ pub enum ImageFormat {
 
 use crate::error::Result;
 use crate::pixel::{GrayImage, RgbaImage};
+use std::path::Path;
 
-static DEFAULT_JPEG2000_DECODER: jpeg2000::NoJpeg2000Decoder = jpeg2000::NoJpeg2000Decoder;
+static DEFAULT_JPEG2000_DECODER: jpeg2000::DicomToolkitJpeg2000Decoder =
+    jpeg2000::DicomToolkitJpeg2000Decoder;
 static DEFAULT_JPEGXR_DECODER: jpegxr::NoJpegXrDecoder = jpegxr::NoJpegXrDecoder;
 
 /// Decoder backend selection used by format handlers.
 ///
 /// This keeps unsupported-but-detected codec paths routed through one API
 /// boundary.  The default instance validates requests and reports that no
-/// JPEG 2000/JPEG XR backend is linked; future real decoders can be wired here
-/// without changing every format reader.
+/// JPEG XR backend is linked; JPEG 2000 uses the pure-Rust decoder backend.
 #[derive(Clone, Copy)]
 pub struct DecoderApi<'a> {
     jpeg2000: &'a dyn jpeg2000::Jpeg2000DecoderBackend,
@@ -123,6 +124,122 @@ pub fn decode_rgb(format: ImageFormat, data: &[u8]) -> Result<(Vec<u8>, u32, u32
     }
 }
 
+pub fn decode_rgb_libjpeg(format: ImageFormat, data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    match format {
+        ImageFormat::Jpeg => jpeg::decode_jpeg_rgb_libjpeg(data),
+        _ => decode_rgb(format, data),
+    }
+}
+
+pub fn decode_tiff_ycbcr_rgb_libjpeg(
+    format: ImageFormat,
+    data: &[u8],
+) -> Result<(Vec<u8>, u32, u32)> {
+    match format {
+        ImageFormat::Jpeg => jpeg::decode_jpeg_tiff_ycbcr_rgb_libjpeg(data),
+        _ => decode_rgb(format, data),
+    }
+}
+
+pub fn decode_rgb_region(
+    format: ImageFormat,
+    data: &[u8],
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    match format {
+        ImageFormat::Jpeg => jpeg::decode_jpeg_rgb_region(data, x, y, w, h),
+        _ => {
+            let (rgb, width, height) = decode_rgb(format, data)?;
+            let mut out = vec![0; w as usize * h as usize * 3];
+            for row in 0..h.min(height.saturating_sub(y)) {
+                let copied_w = (x + w).min(width).saturating_sub(x);
+                let src = ((y + row) as usize * width as usize + x as usize) * 3;
+                let dst = row as usize * w as usize * 3;
+                let len = copied_w as usize * 3;
+                out[dst..dst + len].copy_from_slice(&rgb[src..src + len]);
+            }
+            Ok((out, w, h))
+        }
+    }
+}
+
+pub fn decode_bgra_rgb_region(
+    format: ImageFormat,
+    data: &[u8],
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    match format {
+        ImageFormat::Jpeg => jpeg::decode_jpeg_bgra_rgb_region(data, x, y, w, h),
+        _ => decode_rgb_region(format, data, x, y, w, h),
+    }
+}
+
+pub fn decode_bgra_rgb_region_with_jpeg_color_space(
+    format: ImageFormat,
+    data: &[u8],
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    jpeg_color_space: i32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    match format {
+        ImageFormat::Jpeg => {
+            jpeg::decode_jpeg_bgra_rgb_region_with_color_space(data, x, y, w, h, jpeg_color_space)
+        }
+        _ => decode_rgb_region(format, data, x, y, w, h),
+    }
+}
+
+pub fn decode_tiff_bgra_rgb_region(
+    format: ImageFormat,
+    data: &[u8],
+    tables: Option<&[u8]>,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    jpeg_color_space: i32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    match format {
+        ImageFormat::Jpeg => {
+            jpeg::decode_jpeg_tiff_bgra_rgb_region(data, tables, x, y, w, h, jpeg_color_space)
+        }
+        _ => decode_rgb_region(format, data, x, y, w, h),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decode_jpeg_file_range_rgb(
+    path: &Path,
+    header_start: u64,
+    sof_position: u64,
+    header_stop: u64,
+    data_start: u64,
+    data_stop: u64,
+    tile_w: u32,
+    tile_h: u32,
+    scale_denom: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    jpeg::decode_jpeg_file_range_rgb(
+        path,
+        header_start,
+        sof_position,
+        header_stop,
+        data_start,
+        data_stop,
+        tile_w,
+        tile_h,
+        scale_denom,
+    )
+}
+
 /// Decode image data and extract a single channel (0=R, 1=G, 2=B).
 pub fn decode_channel(format: ImageFormat, data: &[u8], channel: u32) -> Result<GrayImage> {
     match format {
@@ -140,6 +257,135 @@ pub fn decode_channel(format: ImageFormat, data: &[u8], channel: u32) -> Result<
                 height: rgba.height,
                 data: gray,
             })
+        }
+    }
+}
+
+pub fn decode_channel_region(
+    format: ImageFormat,
+    data: &[u8],
+    channel: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<GrayImage> {
+    match format {
+        ImageFormat::Jpeg => jpeg::decode_jpeg_channel_region(data, channel, x, y, w, h),
+        _ => {
+            let image = decode_channel(format, data, channel)?;
+            let mut out = GrayImage::new(w, h);
+            for row in 0..h.min(image.height.saturating_sub(y)) {
+                let src = ((y + row) as usize * image.width as usize + x as usize)
+                    ..((y + row) as usize * image.width as usize
+                        + (x + w).min(image.width) as usize);
+                let dst = row as usize * w as usize;
+                let len = src.end.saturating_sub(src.start).min(w as usize);
+                out.data[dst..dst + len].copy_from_slice(&image.data[src.start..src.start + len]);
+            }
+            Ok(out)
+        }
+    }
+}
+
+pub fn decode_channel_region_from_file(
+    format: ImageFormat,
+    path: &Path,
+    offset: u64,
+    channel: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<GrayImage> {
+    match format {
+        ImageFormat::Jpeg => {
+            jpeg::decode_jpeg_channel_region_from_file(path, offset, channel, x, y, w, h)
+        }
+        _ => {
+            let data = std::fs::read(path)?;
+            decode_channel_region(format, &data, channel, x, y, w, h)
+        }
+    }
+}
+
+pub fn decode_rgb_region_from_file(
+    format: ImageFormat,
+    path: &Path,
+    offset: u64,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    match format {
+        ImageFormat::Jpeg => jpeg::decode_jpeg_rgb_region_from_file(path, offset, x, y, w, h),
+        _ => {
+            let data = std::fs::read(path)?;
+            let (rgb, width, height) = decode_rgb(format, &data)?;
+            let mut out = vec![0; w as usize * h as usize * 3];
+            for row in 0..h.min(height.saturating_sub(y)) {
+                let src = ((y + row) as usize * width as usize + x as usize) * 3;
+                let dst = row as usize * w as usize * 3;
+                let len = ((x + w).min(width) - x) as usize * 3;
+                out[dst..dst + len].copy_from_slice(&rgb[src..src + len]);
+            }
+            Ok((out, w, h))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decode_sampled_rgb_region_from_file(
+    format: ImageFormat,
+    path: &Path,
+    offset: u64,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    sample_x0: f64,
+    sample_y0: f64,
+    sample_step: f64,
+    out_w: u32,
+    out_h: u32,
+    use_libjpeg_scale: bool,
+) -> Result<(Vec<u8>, u32, u32)> {
+    match format {
+        ImageFormat::Jpeg => jpeg::decode_jpeg_sampled_rgb_region_from_file(
+            path,
+            offset,
+            x,
+            y,
+            w,
+            h,
+            sample_x0,
+            sample_y0,
+            sample_step,
+            out_w,
+            out_h,
+            use_libjpeg_scale,
+        ),
+        _ => {
+            let (rgb, width, height) =
+                decode_rgb_region_from_file(format, path, offset, x, y, w, h)?;
+            let mut out = vec![0; out_w as usize * out_h as usize * 3];
+            for out_y in 0..out_h {
+                let src_y = (sample_y0 + f64::from(out_y) * sample_step)
+                    .floor()
+                    .clamp(0.0, f64::from(height.saturating_sub(1)))
+                    as u32;
+                for out_x in 0..out_w {
+                    let src_x = (sample_x0 + f64::from(out_x) * sample_step)
+                        .floor()
+                        .clamp(0.0, f64::from(width.saturating_sub(1)))
+                        as u32;
+                    let src = (src_y as usize * width as usize + src_x as usize) * 3;
+                    let dst = (out_y as usize * out_w as usize + out_x as usize) * 3;
+                    out[dst..dst + 3].copy_from_slice(&rgb[src..src + 3]);
+                }
+            }
+            Ok((out, out_w, out_h))
         }
     }
 }

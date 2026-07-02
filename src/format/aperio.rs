@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::decode;
 use crate::decode::ImageFormat;
 use crate::error::{OpenSlideError, Result};
+use crate::format::tiff::OpenslideHash;
 use crate::format::SlideBackend;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
@@ -15,18 +16,35 @@ const TIFFTAG_IMAGE_WIDTH: u16 = 256;
 const TIFFTAG_IMAGE_LENGTH: u16 = 257;
 const TIFFTAG_BITS_PER_SAMPLE: u16 = 258;
 const TIFFTAG_COMPRESSION: u16 = 259;
+const TIFFTAG_SUBFILE_TYPE: u16 = 254;
 const TIFFTAG_PHOTOMETRIC: u16 = 262;
 const TIFFTAG_IMAGE_DESCRIPTION: u16 = 270;
+const TIFFTAG_MAKE: u16 = 271;
+const TIFFTAG_MODEL: u16 = 272;
 const TIFFTAG_STRIP_OFFSETS: u16 = 273;
 const TIFFTAG_SAMPLES_PER_PIXEL: u16 = 277;
 const TIFFTAG_ROWS_PER_STRIP: u16 = 278;
 const TIFFTAG_STRIP_BYTE_COUNTS: u16 = 279;
+const TIFFTAG_XRESOLUTION: u16 = 282;
+const TIFFTAG_YRESOLUTION: u16 = 283;
 const TIFFTAG_PLANAR_CONFIGURATION: u16 = 284;
+const TIFFTAG_XPOSITION: u16 = 286;
+const TIFFTAG_YPOSITION: u16 = 287;
+const TIFFTAG_RESOLUTION_UNIT: u16 = 296;
+const TIFFTAG_SOFTWARE: u16 = 305;
+const TIFFTAG_DATE_TIME: u16 = 306;
+const TIFFTAG_ARTIST: u16 = 315;
+const TIFFTAG_HOST_COMPUTER: u16 = 316;
+const TIFFTAG_PREDICTOR: u16 = 317;
 const TIFFTAG_TILE_WIDTH: u16 = 322;
 const TIFFTAG_TILE_LENGTH: u16 = 323;
 const TIFFTAG_TILE_OFFSETS: u16 = 324;
 const TIFFTAG_TILE_BYTE_COUNTS: u16 = 325;
 const TIFFTAG_JPEG_TABLES: u16 = 347;
+const TIFFTAG_IMAGE_DEPTH: u16 = 32997;
+const TIFFTAG_DOCUMENT_NAME: u16 = 269;
+const TIFFTAG_COPYRIGHT: u16 = 33432;
+const TIFFTAG_ICC_PROFILE: u16 = 34675;
 
 const COMPRESSION_NONE: u16 = 1;
 const COMPRESSION_LZW: u16 = 5;
@@ -41,6 +59,9 @@ const COMPRESSION_PACKBITS: u16 = 32773;
 const PHOTOMETRIC_RGB: u16 = 2;
 const PHOTOMETRIC_YCBCR: u16 = 6;
 const PLANARCONFIG_SEPARATE: u16 = 2;
+
+const APERIO_SUBFILE_LABEL: u64 = 1;
+const APERIO_SUBFILE_MACRO: u64 = 9;
 
 #[derive(Debug, Clone, Copy)]
 enum Endian {
@@ -137,6 +158,36 @@ impl TiffDirectory {
             .position(|b| *b == 0)
             .unwrap_or(entry.data.len());
         Some(String::from_utf8_lossy(&entry.data[..end]).into_owned())
+    }
+
+    fn float(&self, tag: u16, endian: Endian) -> Option<f64> {
+        let entry = self.entries.get(&tag)?;
+        match entry.field_type {
+            5 | 10 if entry.data.len() >= 8 => {
+                let numerator =
+                    endian.u32([entry.data[0], entry.data[1], entry.data[2], entry.data[3]]);
+                let denominator =
+                    endian.u32([entry.data[4], entry.data[5], entry.data[6], entry.data[7]]);
+                (denominator != 0).then_some(numerator as f64 / denominator as f64)
+            }
+            11 if entry.data.len() >= 4 => Some(f32::from_bits(endian.u32([
+                entry.data[0],
+                entry.data[1],
+                entry.data[2],
+                entry.data[3],
+            ])) as f64),
+            12 if entry.data.len() >= 8 => Some(f64::from_bits(endian.u64([
+                entry.data[0],
+                entry.data[1],
+                entry.data[2],
+                entry.data[3],
+                entry.data[4],
+                entry.data[5],
+                entry.data[6],
+                entry.data[7],
+            ]))),
+            _ => None,
+        }
     }
 
     fn is_tiled(&self) -> bool {
@@ -251,10 +302,12 @@ struct AperioLevel {
     photometric: u16,
     samples_per_pixel: u16,
     planar_config: u16,
+    predictor: u16,
     endian: Endian,
     bits_per_sample: Vec<u16>,
     tile_offsets: Vec<u64>,
     tile_byte_counts: Vec<u64>,
+    missing_tiles: HashSet<usize>,
     jpeg_tables: Option<Vec<u8>>,
 }
 
@@ -265,6 +318,12 @@ struct AssociatedImage {
     height: u32,
 }
 
+struct RgbTile {
+    width: u32,
+    height: u32,
+    rgb: Vec<u8>,
+}
+
 pub(crate) struct AperioSlide {
     path: PathBuf,
     endian: Endian,
@@ -272,6 +331,7 @@ pub(crate) struct AperioSlide {
     directories: Vec<TiffDirectory>,
     properties: HashMap<String, String>,
     associated_images: HashMap<String, AssociatedImage>,
+    icc_profile: Option<Vec<u8>>,
 }
 
 pub(crate) fn detect(path: &Path) -> bool {
@@ -307,18 +367,18 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     let mut associated_images = HashMap::new();
 
     for dir in &tiff.directories {
+        if dir.value_u64(TIFFTAG_IMAGE_DEPTH, tiff.endian).unwrap_or(1) != 1 {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "Unsupported Aperio TIFF ImageDepth in directory {}",
+                dir.index
+            )));
+        }
         if dir.is_tiled() {
             levels.push(read_level(dir, tiff.endian)?);
         } else if let Some(image) = read_associated_info(dir, tiff.endian) {
-            let name = associated_name(dir).or_else(|| {
-                if dir.index == 1 {
-                    Some("thumbnail".to_string())
-                } else {
-                    None
-                }
-            });
+            let name = associated_name(dir, tiff.endian);
             if let Some(name) = name {
-                associated_images.entry(name).or_insert(image);
+                associated_images.insert(name, image);
             }
         }
     }
@@ -336,10 +396,12 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
         let y_downsample = base_h / level.height as f64;
         level.downsample = (x_downsample + y_downsample) / 2.0;
     }
+    propagate_missing_tiles(&mut levels);
 
-    let mut properties = aperio_properties(&description);
+    let mut properties = read_properties(&description);
     properties.insert(properties::PROPERTY_VENDOR.into(), "aperio".into());
-    add_standard_properties(&mut properties);
+    add_tifflike_properties_and_hash(path, &tiff, &levels, &mut properties)?;
+    add_properties(&mut properties);
     add_level_properties(&mut properties, &levels);
     for (name, image) in &associated_images {
         properties.insert(
@@ -355,6 +417,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     Ok(Box::new(AperioSlide {
         path: path.to_path_buf(),
         endian: tiff.endian,
+        icc_profile: aperio_icc_profile(&tiff, levels[0].dir_index),
         levels,
         directories: tiff.directories,
         properties,
@@ -408,9 +471,10 @@ impl SlideBackend for AperioSlide {
             )));
         }
 
+        let level_index = level as usize;
         let level = self
             .levels
-            .get(level as usize)
+            .get(level_index)
             .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {}", level)))?;
 
         let mut output = GrayImage::new(w, h);
@@ -431,13 +495,92 @@ impl SlideBackend for AperioSlide {
         let mut file = File::open(&self.path)?;
         for row in start_row..end_row {
             for col in start_col..end_col {
-                let tile = self.read_tile_channel(&mut file, level, col, row, channel)?;
+                let tile =
+                    self.read_tile_channel(&mut file, level_index, level, col, row, channel)?;
                 blit_gray(
                     &tile,
                     &mut output,
                     col as f64 * level.tile_w as f64 - lx,
                     row as f64 * level.tile_h as f64 - ly,
                 );
+            }
+        }
+
+        Ok(output)
+    }
+
+    fn read_region_rgba(
+        &self,
+        channels: [Option<u32>; 4],
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<RgbaImage> {
+        for channel in channels.into_iter().flatten() {
+            if channel >= 3 {
+                return Err(OpenSlideError::InvalidArgument(format!(
+                    "Invalid channel {} (Aperio slides expose RGB channels 0-2)",
+                    channel
+                )));
+            }
+        }
+
+        let level_index = level as usize;
+        let level = self
+            .levels
+            .get(level_index)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {}", level)))?;
+
+        let mut output = RgbaImage::new(w, h);
+        if w == 0 || h == 0 {
+            return Ok(output);
+        }
+        if channels[3].is_none() {
+            for pixel in output.data.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+        }
+
+        let lx = x as f64 / level.downsample;
+        let ly = y as f64 / level.downsample;
+        let start_col = floor_div(lx, level.tile_w as f64).max(0) as u64;
+        let start_row = floor_div(ly, level.tile_h as f64).max(0) as u64;
+        let end_col = ceil_div(lx + w as f64, level.tile_w as f64)
+            .max(0)
+            .min(level.tiles_across as i64) as u64;
+        let end_row = ceil_div(ly + h as f64, level.tile_h as f64)
+            .max(0)
+            .min(level.tiles_down as i64) as u64;
+
+        let mut file = File::open(&self.path)?;
+        for row in start_row..end_row {
+            for col in start_col..end_col {
+                let tile_index = row
+                    .checked_mul(level.tiles_across)
+                    .and_then(|v| v.checked_add(col))
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| OpenSlideError::Format("Tile index overflow".into()))?;
+                let dst_x = col as f64 * level.tile_w as f64 - lx;
+                let dst_y = row as f64 * level.tile_h as f64 - ly;
+                if let Some(tile) = self.read_tile_rgb(&mut file, level_index, level, tile_index)? {
+                    blit_rgb_rgba(&tile, channels, &mut output, dst_x, dst_y);
+                } else {
+                    for (out_idx, ch_opt) in channels.iter().enumerate() {
+                        if let Some(channel) = ch_opt {
+                            let gray = self.read_tile_channel(
+                                &mut file,
+                                level_index,
+                                level,
+                                col,
+                                row,
+                                *channel,
+                            )?;
+                            blit_gray_into_rgba(&gray, out_idx, &mut output, dst_x, dst_y);
+                        }
+                    }
+                }
             }
         }
 
@@ -463,7 +606,9 @@ impl SlideBackend for AperioSlide {
         let compression = dir
             .value_u64(TIFFTAG_COMPRESSION, self.endian)
             .unwrap_or(COMPRESSION_NONE as u64) as u16;
-        if compression == COMPRESSION_LZW {
+        if compression == COMPRESSION_LZW
+            || associated_dir_uses_tiff_decoder_for_predictor(dir, self.endian)
+        {
             return get_associated_image_data(&self.path, image.dir_index);
         }
         let mut file = File::open(&self.path)?;
@@ -475,12 +620,79 @@ impl SlideBackend for AperioSlide {
             .get(level as usize)
             .map_or(0, |l| l.tile_offsets.len())
     }
+
+    fn icc_profile(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.icc_profile.clone())
+    }
 }
 
 impl AperioSlide {
+    fn read_tile_rgb(
+        &self,
+        file: &mut File,
+        _level_index: usize,
+        level: &AperioLevel,
+        tile_index: usize,
+    ) -> Result<Option<RgbTile>> {
+        if level.missing_tiles.contains(&tile_index) || level.planar_config != 1 {
+            return Ok(None);
+        }
+        let data = self.read_tile_payload(file, level, tile_index)?;
+        if data.is_empty() {
+            return Ok(Some(RgbTile {
+                width: level.tile_w,
+                height: level.tile_h,
+                rgb: vec![0; level.tile_w as usize * level.tile_h as usize * 3],
+            }));
+        }
+
+        match level.compression {
+            COMPRESSION_JPEG | COMPRESSION_OLD_JPEG => {
+                let jpeg = merge_jpeg_tables(&data, level.jpeg_tables.as_deref())?;
+                let (rgb, width, height) = decode::decode_rgb(ImageFormat::Jpeg, &jpeg)?;
+                Ok(Some(RgbTile { width, height, rgb }))
+            }
+            COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB => {
+                let colorspace = aperio_jpeg2000_colorspace(level.compression);
+                let context = format!(
+                    "Aperio JPEG 2000 ({colorspace}) TIFF directory {} tile compression {} photometric {} samples {} expected {}x{} RGB",
+                    level.dir_index,
+                    level.compression,
+                    level.photometric,
+                    level.samples_per_pixel,
+                    level.tile_w,
+                    level.tile_h
+                );
+                let (rgb, width, height) = decode::default_decoder_api().decode_jpeg2000_rgb(
+                    &data,
+                    decode::jpeg2000::Jpeg2000DecodeOptions::new(
+                        level.tile_w,
+                        level.tile_h,
+                        level.samples_per_pixel.min(3),
+                        decode::jpeg2000::Jpeg2000OutputFormat::Rgb,
+                        &context,
+                    )
+                    .with_source(decode::jpeg2000::Jpeg2000DecodeSource::TiffTile)
+                    .with_component_color_space(aperio_jpeg2000_component_color_space(
+                        level.compression,
+                    ))
+                    .with_tile(decode::jpeg2000::Jpeg2000TileContext {
+                        tile_x: (tile_index as u64 % level.tiles_across) as u32,
+                        tile_y: (tile_index as u64 / level.tiles_across) as u32,
+                        tile_width: level.tile_w,
+                        tile_height: level.tile_h,
+                    }),
+                )?;
+                Ok(Some(RgbTile { width, height, rgb }))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn read_tile_channel(
         &self,
         file: &mut File,
+        level_index: usize,
         level: &AperioLevel,
         col: u64,
         row: u64,
@@ -492,11 +704,15 @@ impl AperioSlide {
             .ok_or_else(|| OpenSlideError::Format("Tile index overflow".into()))?;
         let tile_index = usize::try_from(tile_index)
             .map_err(|_| OpenSlideError::Format("Tile index too large".into()))?;
+        if level.missing_tiles.contains(&tile_index) {
+            return self.render_missing_tile_channel(level_index, col, row, channel);
+        }
         if level.planar_config == PLANARCONFIG_SEPARATE
             && !matches!(
                 level.compression,
                 COMPRESSION_JPEG | COMPRESSION_OLD_JPEG | COMPRESSION_LZW
             )
+            && !aperio_uses_tiff_decoder_for_predictor(level)
         {
             let data = self.read_planar_tile(file, level, tile_index)?;
             return decode_raw_channel_with_photometric(
@@ -512,7 +728,7 @@ impl AperioSlide {
             );
         }
 
-        if level.compression == COMPRESSION_LZW {
+        if level.compression == COMPRESSION_LZW || aperio_uses_tiff_decoder_for_predictor(level) {
             let byte_count_index = if level.planar_config == PLANARCONFIG_SEPARATE {
                 let tiles_per_plane = usize::try_from(level.tiles_across * level.tiles_down)
                     .map_err(|_| {
@@ -618,6 +834,9 @@ impl AperioSlide {
                         &context,
                     )
                     .with_source(decode::jpeg2000::Jpeg2000DecodeSource::TiffTile)
+                    .with_component_color_space(aperio_jpeg2000_component_color_space(
+                        level.compression,
+                    ))
                     .with_tile(decode::jpeg2000::Jpeg2000TileContext {
                         tile_x: (tile_index as u64 % level.tiles_across) as u32,
                         tile_y: (tile_index as u64 / level.tiles_across) as u32,
@@ -661,6 +880,95 @@ impl AperioSlide {
     ) -> Result<Vec<u8>> {
         read_aperio_planar_tile(file, level, tile_index)
     }
+
+    fn render_missing_tile_channel(
+        &self,
+        level_index: usize,
+        col: u64,
+        row: u64,
+        channel: u32,
+    ) -> Result<GrayImage> {
+        let level = &self.levels[level_index];
+        let mut output = GrayImage::new(level.tile_w, level.tile_h);
+        let Some(prev_level_index) = level_index.checked_sub(1) else {
+            return Ok(output);
+        };
+        let prev = &self.levels[prev_level_index];
+        let relative_ds = prev.downsample / level.downsample;
+        if relative_ds <= 0.0 {
+            return Ok(output);
+        }
+
+        let prev_x = ((col as f64 * level.tile_w as f64 - 1.0) / relative_ds).floor() as i64;
+        let prev_y = ((row as f64 * level.tile_h as f64 - 1.0) / relative_ds).floor() as i64;
+        let prev_w = ((level.tile_w as f64 + 2.0) / relative_ds).ceil() as u32;
+        let prev_h = ((level.tile_h as f64 + 2.0) / relative_ds).ceil() as u32;
+        let source = self.read_region(
+            channel,
+            (prev_x as f64 * prev.downsample).round() as i64,
+            (prev_y as f64 * prev.downsample).round() as i64,
+            prev_level_index as u32,
+            prev_w,
+            prev_h,
+        )?;
+
+        for dst_y in 0..level.tile_h {
+            for dst_x in 0..level.tile_w {
+                let src_x = ((dst_x as f64 + 1.0) / relative_ds).floor() as u32;
+                let src_y = ((dst_y as f64 + 1.0) / relative_ds).floor() as u32;
+                if src_x < source.width && src_y < source.height {
+                    let src_idx = src_y as usize * source.width as usize + src_x as usize;
+                    let dst_idx = dst_y as usize * level.tile_w as usize + dst_x as usize;
+                    output.data[dst_idx] = source.data[src_idx];
+                }
+            }
+        }
+
+        Ok(output)
+    }
+}
+
+fn propagate_missing_tiles(levels: &mut [AperioLevel]) {
+    for i in 0..levels.len().saturating_sub(1) {
+        let missing = levels[i].missing_tiles.iter().copied().collect::<Vec<_>>();
+        let tile_concat_x = ((levels[i].tiles_across as f64 / levels[i + 1].tiles_across as f64)
+            .round() as u64)
+            .max(1);
+        let tile_concat_y =
+            ((levels[i].tiles_down as f64 / levels[i + 1].tiles_down as f64).round() as u64).max(1);
+
+        for tile_no in missing {
+            let tile_no = tile_no as u64;
+            let tile_col = tile_no % levels[i].tiles_across;
+            let tile_row = tile_no / levels[i].tiles_across;
+            let next_col = tile_col / tile_concat_x;
+            let next_row = tile_row / tile_concat_y;
+            let next_tile_no = next_row * levels[i + 1].tiles_across + next_col;
+            if let Ok(next_tile_no) = usize::try_from(next_tile_no) {
+                levels[i + 1].missing_tiles.insert(next_tile_no);
+            }
+        }
+    }
+}
+
+fn aperio_uses_tiff_decoder_for_predictor(level: &AperioLevel) -> bool {
+    level.predictor != 1
+        && matches!(
+            level.compression,
+            COMPRESSION_PACKBITS | COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE
+        )
+}
+
+fn associated_dir_uses_tiff_decoder_for_predictor(dir: &TiffDirectory, endian: Endian) -> bool {
+    let predictor = dir.value_u64(TIFFTAG_PREDICTOR, endian).unwrap_or(1);
+    let compression = dir
+        .value_u64(TIFFTAG_COMPRESSION, endian)
+        .unwrap_or(COMPRESSION_NONE as u64) as u16;
+    predictor != 1
+        && matches!(
+            compression,
+            COMPRESSION_PACKBITS | COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE
+        )
 }
 
 fn read_aperio_tile_payload(
@@ -752,12 +1060,18 @@ fn read_level(dir: &TiffDirectory, endian: Endian) -> Result<AperioLevel> {
     let tiles_down = height.div_ceil(tile_h as u64);
     let expected_logical_tiles = usize::try_from(tiles_across.saturating_mul(tiles_down))
         .map_err(|_| OpenSlideError::Format("Too many tiles".into()))?;
-    let samples_per_pixel = dir
-        .value_u64(TIFFTAG_SAMPLES_PER_PIXEL, endian)
-        .unwrap_or(3) as u16;
-    let planar_config = dir
-        .value_u64(TIFFTAG_PLANAR_CONFIGURATION, endian)
-        .unwrap_or(1) as u16;
+    let compression = required_value(dir, endian, TIFFTAG_COMPRESSION)? as u16;
+    let photometric = required_value(dir, endian, TIFFTAG_PHOTOMETRIC)? as u16;
+    let samples_per_pixel = required_value(dir, endian, TIFFTAG_SAMPLES_PER_PIXEL)? as u16;
+    let planar_config = required_value(dir, endian, TIFFTAG_PLANAR_CONFIGURATION)? as u16;
+    let predictor = dir
+        .value_u64(TIFFTAG_PREDICTOR, endian)
+        .map(|value| value as u16)
+        .unwrap_or(1);
+    let bits_per_sample = required_values(dir, endian, TIFFTAG_BITS_PER_SAMPLE)?
+        .into_iter()
+        .map(|v| v as u16)
+        .collect::<Vec<_>>();
     let expected_storage_tiles = if planar_config == PLANARCONFIG_SEPARATE {
         expected_logical_tiles
             .checked_mul(usize::from(samples_per_pixel))
@@ -773,6 +1087,12 @@ fn read_level(dir: &TiffDirectory, endian: Endian) -> Result<AperioLevel> {
             expected_storage_tiles
         )));
     }
+    let missing_tiles = tile_byte_counts
+        .iter()
+        .take(expected_logical_tiles)
+        .enumerate()
+        .filter_map(|(tile_no, &byte_count)| (byte_count == 0).then_some(tile_no))
+        .collect();
 
     Ok(AperioLevel {
         dir_index: dir.index,
@@ -783,23 +1103,16 @@ fn read_level(dir: &TiffDirectory, endian: Endian) -> Result<AperioLevel> {
         tile_h,
         tiles_across,
         tiles_down,
-        compression: dir
-            .value_u64(TIFFTAG_COMPRESSION, endian)
-            .unwrap_or(COMPRESSION_NONE as u64) as u16,
-        photometric: dir
-            .value_u64(TIFFTAG_PHOTOMETRIC, endian)
-            .unwrap_or(PHOTOMETRIC_RGB as u64) as u16,
+        compression,
+        photometric,
         samples_per_pixel,
         planar_config,
+        predictor,
         endian,
-        bits_per_sample: dir
-            .values_u64(TIFFTAG_BITS_PER_SAMPLE, endian)
-            .unwrap_or_else(|| vec![8; samples_per_pixel as usize])
-            .into_iter()
-            .map(|v| v as u16)
-            .collect(),
+        bits_per_sample,
         tile_offsets,
         tile_byte_counts,
+        missing_tiles,
         jpeg_tables: dir
             .entries
             .get(&TIFFTAG_JPEG_TABLES)
@@ -825,55 +1138,35 @@ fn read_associated_info(dir: &TiffDirectory, endian: Endian) -> Option<Associate
     })
 }
 
-fn associated_name(dir: &TiffDirectory) -> Option<String> {
-    let desc = dir.string(TIFFTAG_IMAGE_DESCRIPTION)?;
-    associated_name_from_description(&desc)
+fn associated_name(dir: &TiffDirectory, endian: Endian) -> Option<String> {
+    if dir.index == 1 {
+        return Some("thumbnail".to_string());
+    }
+    if let Some(name) = dir
+        .string(TIFFTAG_IMAGE_DESCRIPTION)
+        .and_then(|description| associated_name_from_description(&description))
+    {
+        return Some(name);
+    }
+    match dir.value_u64(TIFFTAG_SUBFILE_TYPE, endian) {
+        Some(APERIO_SUBFILE_LABEL) => Some("label".to_string()),
+        Some(APERIO_SUBFILE_MACRO) => Some("macro".to_string()),
+        _ => None,
+    }
 }
 
 fn associated_name_from_description(description: &str) -> Option<String> {
-    for line in description.split(['|', '\r', '\n']) {
-        let normalized = normalize_associated_name_text(line);
-        if normalized.is_empty() || normalized.starts_with("aperio ") {
-            continue;
-        }
-        if normalized.contains("label") || normalized.contains("barcode") {
-            return Some("label".to_string());
-        }
-        if normalized.contains("macro") || normalized.contains("overview") {
-            return Some("macro".to_string());
-        }
-        if normalized.contains("thumbnail")
-            || normalized == "thumb"
-            || normalized.starts_with("thumb ")
-            || normalized.starts_with("thumbimage")
-            || normalized.contains("thumb ")
-        {
-            return Some("thumbnail".to_string());
-        }
-    }
-    None
+    let mut lines = description.split(['\r', '\n']);
+    lines.next()?;
+    lines
+        .next()
+        .and_then(|line| line.split(' ').next())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
 }
 
-fn normalize_associated_name_text(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn aperio_properties(description: &str) -> HashMap<String, String> {
+fn read_properties(description: &str) -> HashMap<String, String> {
     let mut props = HashMap::new();
-    props.insert("aperio.ImageDescription".into(), description.to_string());
     for part in description.split(['|', '\r', '\n']).skip(1) {
         let Some((key, value)) = part.split_once('=') else {
             continue;
@@ -887,7 +1180,7 @@ fn aperio_properties(description: &str) -> HashMap<String, String> {
     props
 }
 
-fn add_standard_properties(props: &mut HashMap<String, String>) {
+fn add_properties(props: &mut HashMap<String, String>) {
     if let Some(value) = aperio_prop(props, "AppMag") {
         if value.parse::<f64>().is_ok() {
             props.insert(properties::PROPERTY_OBJECTIVE_POWER.into(), value);
@@ -909,12 +1202,6 @@ fn add_standard_properties(props: &mut HashMap<String, String>) {
             props.insert(properties::PROPERTY_MPP_Y.into(), value);
         }
     }
-    if let Some(value) = aperio_prop(props, "Background Color")
-        .or_else(|| aperio_prop(props, "BackgroundColor"))
-        .and_then(|value| normalize_background_color(&value))
-    {
-        props.insert(properties::PROPERTY_BACKGROUND_COLOR.into(), value);
-    }
 }
 
 fn aperio_prop(props: &HashMap<String, String>, vendor_key: &str) -> Option<String> {
@@ -925,34 +1212,6 @@ fn aperio_prop(props: &HashMap<String, String>, vendor_key: &str) -> Option<Stri
             .find(|(key, _)| key.eq_ignore_ascii_case(&wanted))
             .map(|(_, value)| value.clone())
     })
-}
-
-fn normalize_background_color(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    let hex = trimmed
-        .strip_prefix('#')
-        .or_else(|| trimmed.strip_prefix("0x"))
-        .or_else(|| trimmed.strip_prefix("0X"))
-        .unwrap_or(trimmed);
-    if hex.len() == 6 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Some(hex.to_ascii_lowercase());
-    }
-
-    let mut components = Vec::new();
-    for part in trimmed.split(|ch: char| ch.is_ascii_whitespace() || ch == ',' || ch == ';') {
-        if part.is_empty() {
-            continue;
-        }
-        let value = part.parse::<u8>().ok()?;
-        components.push(value);
-    }
-    if components.len() == 3 {
-        return Some(format!(
-            "{:02x}{:02x}{:02x}",
-            components[0], components[1], components[2]
-        ));
-    }
-    None
 }
 
 fn add_level_properties(props: &mut HashMap<String, String>, levels: &[AperioLevel]) {
@@ -968,7 +1227,7 @@ fn add_level_properties(props: &mut HashMap<String, String>, levels: &[AperioLev
         );
         props.insert(
             format!("openslide.level[{}].downsample", i),
-            level.downsample.to_string(),
+            format_float(level.downsample),
         );
         props.insert(
             format!("openslide.level[{}].tile-width", i),
@@ -979,6 +1238,116 @@ fn add_level_properties(props: &mut HashMap<String, String>, levels: &[AperioLev
             level.tile_h.to_string(),
         );
     }
+}
+
+fn add_tifflike_properties_and_hash(
+    path: &Path,
+    tiff: &TiffFile,
+    levels: &[AperioLevel],
+    props: &mut HashMap<String, String>,
+) -> Result<()> {
+    let mut quickhash1 = OpenslideHash::openslide_hash_quickhash1_create();
+    if let Some(level) = levels.last() {
+        hash_aperio_tiff_level(path, level, &mut quickhash1)
+            .map_err(|err| OpenSlideError::Format(format!("Cannot hash TIFF tiles: {err}")))?;
+    }
+    if let Some(dir) = tiff.directories.first() {
+        store_and_hash_aperio_tiff_strings(dir, &mut quickhash1, props);
+        store_aperio_tiff_properties(dir, tiff.endian, props);
+    }
+    if let Some(value) = quickhash1.openslide_hash_get_string() {
+        props.insert(properties::PROPERTY_QUICKHASH1.into(), value);
+    }
+    if let Some(profile) = aperio_icc_profile(tiff, levels[0].dir_index) {
+        props.insert(
+            properties::PROPERTY_ICC_SIZE.into(),
+            profile.len().to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn hash_aperio_tiff_level(
+    path: &Path,
+    level: &AperioLevel,
+    hash: &mut OpenslideHash,
+) -> Result<()> {
+    let mut total = 0u64;
+    for length in &level.tile_byte_counts {
+        total = total.saturating_add(*length);
+        if total > (5 << 20) {
+            hash.openslide_hash_disable();
+            return Ok(());
+        }
+    }
+    for (offset, length) in level.tile_offsets.iter().zip(&level.tile_byte_counts) {
+        hash.openslide_hash_file_part(path, *offset, *length)?;
+    }
+    Ok(())
+}
+
+fn store_and_hash_aperio_tiff_strings(
+    dir: &TiffDirectory,
+    quickhash1: &mut OpenslideHash,
+    props: &mut HashMap<String, String>,
+) {
+    if let Some(value) = dir.string(TIFFTAG_IMAGE_DESCRIPTION) {
+        props.insert("openslide.comment".to_string(), value);
+    }
+    for (name, tag) in [
+        ("tiff.ImageDescription", TIFFTAG_IMAGE_DESCRIPTION),
+        ("tiff.Make", TIFFTAG_MAKE),
+        ("tiff.Model", TIFFTAG_MODEL),
+        ("tiff.Software", TIFFTAG_SOFTWARE),
+        ("tiff.DateTime", TIFFTAG_DATE_TIME),
+        ("tiff.Artist", TIFFTAG_ARTIST),
+        ("tiff.HostComputer", TIFFTAG_HOST_COMPUTER),
+        ("tiff.Copyright", TIFFTAG_COPYRIGHT),
+        ("tiff.DocumentName", TIFFTAG_DOCUMENT_NAME),
+    ] {
+        quickhash1.openslide_hash_string(Some(name));
+        let value = dir.string(tag);
+        if let Some(value) = &value {
+            props.insert(name.to_string(), value.clone());
+        }
+        quickhash1.openslide_hash_string(value.as_deref());
+    }
+}
+
+fn store_aperio_tiff_properties(
+    dir: &TiffDirectory,
+    endian: Endian,
+    props: &mut HashMap<String, String>,
+) {
+    for (name, tag) in [
+        ("tiff.XResolution", TIFFTAG_XRESOLUTION),
+        ("tiff.YResolution", TIFFTAG_YRESOLUTION),
+        ("tiff.XPosition", TIFFTAG_XPOSITION),
+        ("tiff.YPosition", TIFFTAG_YPOSITION),
+    ] {
+        if let Some(value) = dir.float(tag, endian) {
+            props.insert(name.to_string(), format_float(value));
+        }
+    }
+    let value = match dir.value_u64(TIFFTAG_RESOLUTION_UNIT, endian).unwrap_or(2) {
+        1 => "none",
+        2 => "inch",
+        3 => "centimeter",
+        _ => "unknown",
+    };
+    props.insert("tiff.ResolutionUnit".to_string(), value.to_string());
+}
+
+fn aperio_icc_profile(tiff: &TiffFile, dir_index: usize) -> Option<Vec<u8>> {
+    tiff.directories
+        .get(dir_index)
+        .and_then(|dir| dir.entries.get(&TIFFTAG_ICC_PROFILE))
+        .map(|entry| entry.data.clone())
+        .filter(|profile| !profile.is_empty())
+}
+
+fn format_float(value: f64) -> String {
+    crate::format::tiff::format_float(value)
 }
 
 fn read_directory_rgba(file: &mut File, dir: &TiffDirectory, endian: Endian) -> Result<RgbaImage> {
@@ -1128,7 +1497,8 @@ fn read_directory_rgba(file: &mut File, dir: &TiffDirectory, endian: Endian) -> 
                         decode::jpeg2000::Jpeg2000OutputFormat::Rgba,
                         &context,
                     )
-                    .with_source(decode::jpeg2000::Jpeg2000DecodeSource::AssociatedImage),
+                    .with_source(decode::jpeg2000::Jpeg2000DecodeSource::AssociatedImage)
+                    .with_component_color_space(aperio_jpeg2000_component_color_space(compression)),
                 )?
             }
             other => {
@@ -1238,6 +1608,9 @@ fn read_tiled_directory_rgba(
                             &context,
                         )
                         .with_source(decode::jpeg2000::Jpeg2000DecodeSource::AssociatedImage)
+                        .with_component_color_space(aperio_jpeg2000_component_color_space(
+                            level.compression,
+                        ))
                         .with_tile(decode::jpeg2000::Jpeg2000TileContext {
                             tile_x: col as u32,
                             tile_y: row as u32,
@@ -1264,19 +1637,20 @@ fn read_tiled_directory_rgba(
     Ok(output)
 }
 
-#[cfg(test)]
-fn unsupported_jpeg2000_compression_error(compression: u16, context: &str) -> OpenSlideError {
-    let colorspace = aperio_jpeg2000_colorspace(compression);
-    OpenSlideError::UnsupportedFormat(format!(
-        "Aperio JPEG 2000 ({colorspace}) {context} compression is detected but not decoded by this repo"
-    ))
-}
-
 fn aperio_jpeg2000_colorspace(compression: u16) -> &'static str {
     match compression {
         COMPRESSION_JP2K_YCBCR => "YCbCr",
         COMPRESSION_JP2K_RGB => "RGB",
         _ => "unknown",
+    }
+}
+
+fn aperio_jpeg2000_component_color_space(
+    compression: u16,
+) -> decode::jpeg2000::Jpeg2000ComponentColorSpace {
+    match compression {
+        COMPRESSION_JP2K_YCBCR => decode::jpeg2000::Jpeg2000ComponentColorSpace::YCbCr,
+        _ => decode::jpeg2000::Jpeg2000ComponentColorSpace::Rgb,
     }
 }
 
@@ -2119,6 +2493,72 @@ fn blit_gray(src: &GrayImage, dst: &mut GrayImage, dst_x: f64, dst_y: f64) {
     }
 }
 
+fn blit_gray_into_rgba(
+    src: &GrayImage,
+    channel: usize,
+    dst: &mut RgbaImage,
+    dst_x: f64,
+    dst_y: f64,
+) {
+    let dst_x = dst_x.round() as i64;
+    let dst_y = dst_y.round() as i64;
+    let src_x0 = 0_i64.max(-dst_x) as u32;
+    let src_y0 = 0_i64.max(-dst_y) as u32;
+    let dst_x0 = dst_x.max(0) as u32;
+    let dst_y0 = dst_y.max(0) as u32;
+    let copy_w = src
+        .width
+        .saturating_sub(src_x0)
+        .min(dst.width.saturating_sub(dst_x0));
+    let copy_h = src
+        .height
+        .saturating_sub(src_y0)
+        .min(dst.height.saturating_sub(dst_y0));
+
+    for y in 0..copy_h {
+        for x in 0..copy_w {
+            let src_idx = ((src_y0 + y) * src.width + src_x0 + x) as usize;
+            let dst_idx = (((dst_y0 + y) * dst.width + dst_x0 + x) * 4) as usize + channel;
+            dst.data[dst_idx] = src.data[src_idx];
+        }
+    }
+}
+
+fn blit_rgb_rgba(
+    src: &RgbTile,
+    channels: [Option<u32>; 4],
+    dst: &mut RgbaImage,
+    dst_x: f64,
+    dst_y: f64,
+) {
+    let dst_x = dst_x.round() as i64;
+    let dst_y = dst_y.round() as i64;
+    let src_x0 = 0_i64.max(-dst_x) as u32;
+    let src_y0 = 0_i64.max(-dst_y) as u32;
+    let dst_x0 = dst_x.max(0) as u32;
+    let dst_y0 = dst_y.max(0) as u32;
+    let copy_w = src
+        .width
+        .saturating_sub(src_x0)
+        .min(dst.width.saturating_sub(dst_x0));
+    let copy_h = src
+        .height
+        .saturating_sub(src_y0)
+        .min(dst.height.saturating_sub(dst_y0));
+
+    for y in 0..copy_h {
+        for x in 0..copy_w {
+            let src_base = ((src_y0 + y) * src.width + src_x0 + x) as usize * 3;
+            let dst_base = ((dst_y0 + y) * dst.width + dst_x0 + x) as usize * 4;
+            for (out_idx, channel) in channels.iter().enumerate() {
+                if let Some(channel) = channel {
+                    dst.data[dst_base + out_idx] = src.rgb[src_base + *channel as usize];
+                }
+            }
+        }
+    }
+}
+
 fn blit_rgba(src: &RgbaImage, dst: &mut RgbaImage, dst_x: u32, dst_y: u32) {
     if dst_x >= dst.width || dst_y >= dst.height {
         return;
@@ -2273,11 +2713,8 @@ mod tests {
     #[test]
     fn parses_aperio_description_properties() {
         let props =
-            aperio_properties("Aperio Image Library|AppMag = 20|MPP=0.5021|ScanScope ID = SS1");
-        assert_eq!(
-            props.get("aperio.ImageDescription").unwrap(),
-            "Aperio Image Library|AppMag = 20|MPP=0.5021|ScanScope ID = SS1"
-        );
+            read_properties("Aperio Image Library|AppMag = 20|MPP=0.5021|ScanScope ID = SS1");
+        assert!(props.get("aperio.ImageDescription").is_none());
         assert_eq!(props.get("aperio.AppMag").unwrap(), "20");
         assert_eq!(props.get("aperio.MPP").unwrap(), "0.5021");
         assert_eq!(props.get("aperio.ScanScope ID").unwrap(), "SS1");
@@ -2286,7 +2723,7 @@ mod tests {
     #[test]
     fn parses_aperio_line_delimited_description_properties() {
         let props =
-            aperio_properties("Aperio Image Library|AppMag = 20\r\nMPP=0.5021\nScanScope ID = SS1");
+            read_properties("Aperio Image Library|AppMag = 20\r\nMPP=0.5021\nScanScope ID = SS1");
 
         assert_eq!(props.get("aperio.AppMag").unwrap(), "20");
         assert_eq!(props.get("aperio.MPP").unwrap(), "0.5021");
@@ -2294,11 +2731,11 @@ mod tests {
     }
 
     #[test]
-    fn standard_properties_accept_aperio_case_variants_and_background() {
-        let mut props = aperio_properties(
+    fn standard_properties_accept_aperio_case_variants_without_background() {
+        let mut props = read_properties(
             "Aperio Image Library|appmag=40|MPP X=0.25|mpp_y=0.26|Background Color=255 128 0",
         );
-        add_standard_properties(&mut props);
+        add_properties(&mut props);
 
         assert_eq!(
             props.get(properties::PROPERTY_OBJECTIVE_POWER).unwrap(),
@@ -2306,61 +2743,94 @@ mod tests {
         );
         assert_eq!(props.get(properties::PROPERTY_MPP_X).unwrap(), "0.25");
         assert_eq!(props.get(properties::PROPERTY_MPP_Y).unwrap(), "0.26");
-        assert_eq!(
-            props.get(properties::PROPERTY_BACKGROUND_COLOR).unwrap(),
-            "ff8000"
-        );
+        assert!(props.get(properties::PROPERTY_BACKGROUND_COLOR).is_none());
 
-        let mut props = aperio_properties("Aperio Image Library|BackgroundColor=#00FF7f");
-        add_standard_properties(&mut props);
+        let mut props = read_properties("Aperio Image Library|BackgroundColor=#00FF7f");
+        add_properties(&mut props);
+        assert!(props.get(properties::PROPERTY_BACKGROUND_COLOR).is_none());
+    }
+
+    #[test]
+    fn level_downsample_uses_tifflike_float_formatting() {
+        let mut props = HashMap::new();
+        let mut level = test_level(0, 3, 1, 1, 1, []);
+        level.downsample = 0.1;
+
+        add_level_properties(&mut props, &[level]);
+
         assert_eq!(
-            props.get(properties::PROPERTY_BACKGROUND_COLOR).unwrap(),
-            "00ff7f"
+            props.get("openslide.level[0].downsample"),
+            Some(&"0.10000000000000001".to_string())
         );
     }
 
     #[test]
-    fn associated_name_recognizes_aperio_description_variants() {
+    fn associated_name_uses_aperio_directory_description_and_subfile_fallback() {
+        let thumbnail = TiffDirectory {
+            index: 1,
+            entries: HashMap::new(),
+        };
         assert_eq!(
-            associated_name_from_description("Aperio Image Library\nLabel Image").as_deref(),
+            associated_name(&thumbnail, Endian::Little).as_deref(),
+            Some("thumbnail")
+        );
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            TIFFTAG_IMAGE_DESCRIPTION,
+            TiffEntry {
+                field_type: 2,
+                count: 25,
+                data: b"Aperio Image Library\nLabel Image\0".to_vec(),
+            },
+        );
+        let label = TiffDirectory { index: 2, entries };
+        assert_eq!(
+            associated_name(&label, Endian::Little).as_deref(),
+            Some("Label")
+        );
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            TIFFTAG_SUBFILE_TYPE,
+            TiffEntry {
+                field_type: 4,
+                count: 1,
+                data: (APERIO_SUBFILE_LABEL as u32).to_le_bytes().to_vec(),
+            },
+        );
+        let label = TiffDirectory { index: 3, entries };
+        assert_eq!(
+            associated_name(&label, Endian::Little).as_deref(),
             Some("label")
         );
-        assert_eq!(
-            associated_name_from_description("Aperio Image Library\nBarcode label").as_deref(),
-            Some("label")
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            TIFFTAG_SUBFILE_TYPE,
+            TiffEntry {
+                field_type: 4,
+                count: 1,
+                data: (APERIO_SUBFILE_MACRO as u32).to_le_bytes().to_vec(),
+            },
         );
+        let macro_dir = TiffDirectory { index: 4, entries };
         assert_eq!(
-            associated_name_from_description("Aperio Image Library\nSlide overview").as_deref(),
+            associated_name(&macro_dir, Endian::Little).as_deref(),
             Some("macro")
         );
-        assert_eq!(
-            associated_name_from_description("Aperio Image Library\nThumb").as_deref(),
-            Some("thumbnail")
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            TIFFTAG_IMAGE_DESCRIPTION,
+            TiffEntry {
+                field_type: 2,
+                count: 12,
+                data: b"Label Image\0".to_vec(),
+            },
         );
-        assert_eq!(
-            associated_name_from_description("Aperio Image Library\nThumbImage").as_deref(),
-            Some("thumbnail")
-        );
-        assert_eq!(
-            associated_name_from_description("Aperio Image Library\nThumb image").as_deref(),
-            Some("thumbnail")
-        );
-        assert_eq!(
-            associated_name_from_description("Aperio Image Library|Label Image").as_deref(),
-            Some("label")
-        );
-        assert_eq!(
-            associated_name_from_description("Aperio Image Library|Macro Image").as_deref(),
-            Some("macro")
-        );
-        assert_eq!(
-            associated_name_from_description("Aperio Image Library|Thumbnail Image").as_deref(),
-            Some("thumbnail")
-        );
-        assert_eq!(
-            associated_name_from_description("Aperio Image Library"),
-            None
-        );
+        let description_only = TiffDirectory { index: 2, entries };
+        assert_eq!(associated_name(&description_only, Endian::Little), None);
     }
 
     #[test]
@@ -2397,7 +2867,20 @@ mod tests {
     }
 
     #[test]
-    fn level_defaults_missing_bits_per_sample_to_samples_per_pixel() {
+    fn missing_tiles_propagate_to_lower_levels() {
+        let mut levels = vec![
+            test_level(0, 4, 4, 1, 1, [5]),
+            test_level(1, 2, 2, 1, 1, []),
+        ];
+
+        propagate_missing_tiles(&mut levels);
+
+        assert!(levels[0].missing_tiles.contains(&5));
+        assert!(levels[1].missing_tiles.contains(&0));
+    }
+
+    #[test]
+    fn level_requires_tiled_tiff_core_tags() {
         let mut entries = HashMap::new();
         entries.insert(
             TIFFTAG_IMAGE_WIDTH,
@@ -2455,18 +2938,41 @@ mod tests {
                 data: 4u16.to_le_bytes().to_vec(),
             },
         );
+        entries.insert(
+            TIFFTAG_COMPRESSION,
+            TiffEntry {
+                field_type: 3,
+                count: 1,
+                data: COMPRESSION_NONE.to_le_bytes().to_vec(),
+            },
+        );
+        entries.insert(
+            TIFFTAG_PHOTOMETRIC,
+            TiffEntry {
+                field_type: 3,
+                count: 1,
+                data: PHOTOMETRIC_RGB.to_le_bytes().to_vec(),
+            },
+        );
+        entries.insert(
+            TIFFTAG_PLANAR_CONFIGURATION,
+            TiffEntry {
+                field_type: 3,
+                count: 1,
+                data: 1u16.to_le_bytes().to_vec(),
+            },
+        );
         let dir = TiffDirectory { index: 0, entries };
 
-        let level = read_level(&dir, Endian::Little).unwrap();
+        let err = read_level(&dir, Endian::Little).unwrap_err();
 
-        assert_eq!(level.samples_per_pixel, 4);
-        assert_eq!(level.bits_per_sample, vec![8, 8, 8, 8]);
+        assert!(format!("{err}").contains("Missing or invalid TIFF tag 258"));
     }
 
     #[test]
-    fn jpeg2000_tiles_report_explicit_decode_gap() {
+    fn jpeg2000_tiles_decode_with_default_backend() {
         let path = temp_path("aperio-jp2k-tile.bin");
-        let jp2k = synthetic_jpeg2000_codestream(1, 1, 3, 8);
+        let jp2k = encoded_jpeg2000_codestream(&[10, 20, 30], 1, 1, 3);
         fs::write(&path, &jp2k).unwrap();
         let mut file = File::open(&path).unwrap();
         let slide = AperioSlide {
@@ -2476,6 +2982,7 @@ mod tests {
             directories: Vec::new(),
             properties: HashMap::new(),
             associated_images: HashMap::new(),
+            icc_profile: None,
         };
         let level = AperioLevel {
             dir_index: 3,
@@ -2490,28 +2997,27 @@ mod tests {
             photometric: PHOTOMETRIC_RGB,
             samples_per_pixel: 3,
             planar_config: 1,
+            predictor: 1,
             endian: Endian::Little,
             bits_per_sample: vec![8, 8, 8],
             tile_offsets: vec![0],
             tile_byte_counts: vec![jp2k.len() as u64],
+            missing_tiles: HashSet::new(),
             jpeg_tables: None,
         };
 
-        let err = slide
-            .read_tile_channel(&mut file, &level, 0, 0, 0)
-            .unwrap_err();
-        match err {
-            OpenSlideError::UnsupportedFormat(message) => {
-                assert!(message.contains("Aperio JPEG 2000 (RGB)"));
-                assert!(message.contains("TIFF directory 3"));
-                assert!(message.contains(&format!("compression {COMPRESSION_JP2K_RGB}")));
-                assert!(message.contains("photometric 2"));
-                assert!(message.contains("samples 3"));
-                assert!(message.contains("expected 1x1 gray channel 0"));
-                assert!(message.contains("detected but not decoded"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let red = slide
+            .read_tile_channel(&mut file, 0, &level, 0, 0, 0)
+            .unwrap();
+        let green = slide
+            .read_tile_channel(&mut file, 0, &level, 0, 0, 1)
+            .unwrap();
+        let blue = slide
+            .read_tile_channel(&mut file, 0, &level, 0, 0, 2)
+            .unwrap();
+        assert_eq!(red.data, vec![10]);
+        assert_eq!(green.data, vec![20]);
+        assert_eq!(blue.data, vec![30]);
 
         let _ = fs::remove_file(path);
     }
@@ -2529,6 +3035,7 @@ mod tests {
             directories: Vec::new(),
             properties: HashMap::new(),
             associated_images: HashMap::new(),
+            icc_profile: None,
         };
         let level = AperioLevel {
             dir_index: 3,
@@ -2543,15 +3050,17 @@ mod tests {
             photometric: PHOTOMETRIC_RGB,
             samples_per_pixel: 3,
             planar_config: 1,
+            predictor: 1,
             endian: Endian::Little,
             bits_per_sample: vec![8, 8, 8],
             tile_offsets: vec![0],
             tile_byte_counts: vec![jp2k.len() as u64],
+            missing_tiles: HashSet::new(),
             jpeg_tables: None,
         };
 
         let err = slide
-            .read_tile_channel(&mut file, &level, 0, 0, 0)
+            .read_tile_channel(&mut file, 0, &level, 0, 0, 0)
             .unwrap_err();
         assert!(format!("{err}").contains("JPEG 2000 dimensions mismatch"));
 
@@ -2559,17 +3068,66 @@ mod tests {
     }
 
     #[test]
-    fn jpeg2000_associated_compression_reports_decode_gap() {
-        let err =
-            unsupported_jpeg2000_compression_error(COMPRESSION_JP2K_YCBCR, "associated TIFF strip");
-        match err {
-            OpenSlideError::UnsupportedFormat(message) => {
-                assert!(message.contains("Aperio JPEG 2000 (YCbCr)"));
-                assert!(message.contains("associated TIFF strip"));
-                assert!(message.contains("detected but not decoded"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+    fn jpeg2000_associated_strip_decodes_with_default_backend() {
+        let path = temp_path("aperio-jp2k-associated.bin");
+        let jp2k = encoded_jpeg2000_codestream(&[10, 20, 30], 1, 1, 3);
+        fs::write(&path, &jp2k).unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(
+            TIFFTAG_IMAGE_WIDTH,
+            TiffEntry {
+                field_type: 4,
+                count: 1,
+                data: 1u32.to_le_bytes().to_vec(),
+            },
+        );
+        entries.insert(
+            TIFFTAG_IMAGE_LENGTH,
+            TiffEntry {
+                field_type: 4,
+                count: 1,
+                data: 1u32.to_le_bytes().to_vec(),
+            },
+        );
+        entries.insert(
+            TIFFTAG_COMPRESSION,
+            TiffEntry {
+                field_type: 3,
+                count: 1,
+                data: COMPRESSION_JP2K_RGB.to_le_bytes().to_vec(),
+            },
+        );
+        entries.insert(
+            TIFFTAG_ROWS_PER_STRIP,
+            TiffEntry {
+                field_type: 4,
+                count: 1,
+                data: 1u32.to_le_bytes().to_vec(),
+            },
+        );
+        entries.insert(
+            TIFFTAG_STRIP_OFFSETS,
+            TiffEntry {
+                field_type: 4,
+                count: 1,
+                data: 0u32.to_le_bytes().to_vec(),
+            },
+        );
+        entries.insert(
+            TIFFTAG_STRIP_BYTE_COUNTS,
+            TiffEntry {
+                field_type: 4,
+                count: 1,
+                data: (jp2k.len() as u32).to_le_bytes().to_vec(),
+            },
+        );
+        let dir = TiffDirectory { index: 4, entries };
+        let mut file = File::open(&path).unwrap();
+
+        let rgba = read_directory_rgba(&mut file, &dir, Endian::Little).unwrap();
+
+        assert_eq!(rgba.data, vec![10, 20, 30, 0xff]);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -2602,6 +3160,45 @@ mod tests {
     }
 
     #[test]
+    fn deflate_predictor_associated_decode_uses_tiff_crate() {
+        use tiff::encoder::{colortype, Compression, DeflateLevel, Predictor, TiffEncoder};
+
+        let path = temp_path("deflate-predictor-associated.tif");
+        {
+            let file = File::create(&path).unwrap();
+            let mut encoder = TiffEncoder::new(file)
+                .unwrap()
+                .with_compression(Compression::Deflate(DeflateLevel::default()))
+                .with_predictor(Predictor::Horizontal);
+            let image = encoder.new_image::<colortype::RGB8>(2, 1).unwrap();
+            image.write_data(&[10, 20, 30, 40, 50, 60]).unwrap();
+        }
+        let tiff = TiffFile::open(&path).unwrap();
+        let slide = AperioSlide {
+            path: path.clone(),
+            endian: tiff.endian,
+            levels: Vec::new(),
+            directories: tiff.directories,
+            properties: HashMap::new(),
+            associated_images: [(
+                "label".to_string(),
+                AssociatedImage {
+                    dir_index: 0,
+                    width: 2,
+                    height: 1,
+                },
+            )]
+            .into(),
+            icc_profile: None,
+        };
+
+        let rgba = slide.read_associated_image("label").unwrap();
+
+        assert_eq!(rgba.data, vec![10, 20, 30, 0xff, 40, 50, 60, 0xff]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn lzw_region_decode_uses_tiff_crate() {
         use tiff::encoder::{colortype, Compression, TiffEncoder};
 
@@ -2620,6 +3217,36 @@ mod tests {
         }
 
         let slide = lzw_test_slide(path.clone(), 3, 2, vec![8, 8, 8]);
+        let red = slide.read_region(0, 1, 0, 0, 2, 2).unwrap();
+        assert_eq!(red.data, vec![40, 70, 41, 71]);
+        let blue = slide.read_region(2, 0, 1, 0, 3, 1).unwrap();
+        assert_eq!(blue.data, vec![31, 61, 91]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn deflate_predictor_region_decode_uses_tiff_crate() {
+        use tiff::encoder::{colortype, Compression, DeflateLevel, Predictor, TiffEncoder};
+
+        let path = temp_path("deflate-predictor-region.tif");
+        {
+            let file = File::create(&path).unwrap();
+            let mut encoder = TiffEncoder::new(file)
+                .unwrap()
+                .with_compression(Compression::Deflate(DeflateLevel::default()))
+                .with_predictor(Predictor::Horizontal);
+            let image = encoder.new_image::<colortype::RGB8>(3, 2).unwrap();
+            image
+                .write_data(&[
+                    10, 20, 30, 40, 50, 60, 70, 80, 90, 11, 21, 31, 41, 51, 61, 71, 81, 91,
+                ])
+                .unwrap();
+        }
+
+        let mut slide = lzw_test_slide(path.clone(), 3, 2, vec![8, 8, 8]);
+        slide.levels[0].compression = COMPRESSION_DEFLATE;
+        slide.levels[0].predictor = 2;
         let red = slide.read_region(0, 1, 0, 0, 2, 2).unwrap();
         assert_eq!(red.data, vec![40, 70, 41, 71]);
         let blue = slide.read_region(2, 0, 1, 0, 3, 1).unwrap();
@@ -2725,15 +3352,52 @@ mod tests {
                 photometric: PHOTOMETRIC_RGB,
                 samples_per_pixel: 3,
                 planar_config: 1,
+                predictor: 1,
                 endian: Endian::Little,
                 bits_per_sample,
                 tile_offsets: vec![0],
                 tile_byte_counts: vec![1],
+                missing_tiles: HashSet::new(),
                 jpeg_tables: None,
             }],
             directories: Vec::new(),
             properties: HashMap::new(),
             associated_images: HashMap::new(),
+            icc_profile: None,
+        }
+    }
+
+    fn test_level(
+        dir_index: usize,
+        width: u64,
+        height: u64,
+        tile_w: u32,
+        tile_h: u32,
+        missing_tiles: impl IntoIterator<Item = usize>,
+    ) -> AperioLevel {
+        let tiles_across = width.div_ceil(tile_w as u64);
+        let tiles_down = height.div_ceil(tile_h as u64);
+        let tile_count = (tiles_across * tiles_down) as usize;
+        AperioLevel {
+            dir_index,
+            width,
+            height,
+            downsample: 1.0,
+            tile_w,
+            tile_h,
+            tiles_across,
+            tiles_down,
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            planar_config: 1,
+            predictor: 1,
+            endian: Endian::Little,
+            bits_per_sample: vec![8, 8, 8],
+            tile_offsets: vec![0; tile_count],
+            tile_byte_counts: vec![1; tile_count],
+            missing_tiles: missing_tiles.into_iter().collect(),
+            jpeg_tables: None,
         }
     }
 
@@ -2794,5 +3458,19 @@ mod tests {
             data.push(1);
         }
         data
+    }
+
+    fn encoded_jpeg2000_codestream(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        components: u8,
+    ) -> Vec<u8> {
+        let options = dicom_toolkit_jpeg2000::EncodeOptions {
+            num_decomposition_levels: 0,
+            ..dicom_toolkit_jpeg2000::EncodeOptions::default()
+        };
+        dicom_toolkit_jpeg2000::encode(pixels, width, height, components, 8, false, &options)
+            .unwrap()
     }
 }

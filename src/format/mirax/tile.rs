@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::decode::ImageFormat;
+use crate::error::{OpenSlideError, Result};
 
 /// Reference to a compressed image stored in a data file.
 #[derive(Debug, Clone)]
@@ -70,13 +71,18 @@ pub fn compute_zoom_level_params(
     overlap_y: &[f64],
     has_position_data: bool,
     has_overlaps: bool,
-) -> Vec<ZoomLevelParams> {
+) -> Result<Vec<ZoomLevelParams>> {
     let zoom_levels = concat_exponents.len();
     let mut params = Vec::with_capacity(zoom_levels);
     let mut total_concat_exponent = 0;
 
     for i in 0..zoom_levels {
         total_concat_exponent += concat_exponents[i];
+        if total_concat_exponent > 30 {
+            return Err(OpenSlideError::Format(format!(
+                "image_concat exponent too large: {total_concat_exponent}"
+            )));
+        }
         let image_concat = 1i32 << total_concat_exponent;
         let positions_per_image = (image_concat / image_divisions).max(1);
 
@@ -109,7 +115,7 @@ pub fn compute_zoom_level_params(
         });
     }
 
-    params
+    Ok(params)
 }
 
 /// Compute the base dimensions of the slide (level 0 pixel dimensions).
@@ -201,7 +207,8 @@ mod tests {
             &[0.0, 0.0],
             false,
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(params.len(), 2);
 
         // Level 0: concat_exp=0 -> image_concat=1
@@ -227,7 +234,8 @@ mod tests {
             &[10.0, 5.0],
             true,
             false,
-        );
+        )
+        .unwrap();
 
         // Level 0: image_concat=1, with position data
         assert_eq!(params[0].image_concat, 1);

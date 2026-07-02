@@ -91,23 +91,17 @@ impl TileGrid {
     /// The region is specified in this level's coordinate space.
     /// Returns (col, row, entry) for each overlapping tile.
     pub fn tiles_in_region(&self, x: f64, y: f64, w: f64, h: f64) -> Vec<(i64, i64, &TileEntry)> {
-        if self.tile_advance_x <= 0.0 || self.tile_advance_y <= 0.0 {
-            return Vec::new();
-        }
-
-        let col_start = (x / self.tile_advance_x).floor() as i64;
-        let col_end = ((x + w) / self.tile_advance_x).ceil() as i64;
-        let row_start = (y / self.tile_advance_y).floor() as i64;
-        let row_end = ((y + h) / self.tile_advance_y).ceil() as i64;
-
         let mut result = Vec::new();
-        for row in row_start..row_end {
-            for col in col_start..col_end {
-                if let Some(entry) = self.tiles.get(&(col, row)) {
-                    result.push((col, row, entry));
-                }
+        let right = x + w;
+        let bottom = y + h;
+        for (&(col, row), entry) in &self.tiles {
+            let tile_x = col as f64 * self.tile_advance_x + entry.offset_x;
+            let tile_y = row as f64 * self.tile_advance_y + entry.offset_y;
+            if tile_x < right && tile_x + entry.w > x && tile_y < bottom && tile_y + entry.h > y {
+                result.push((col, row, entry));
             }
         }
+        result.sort_by_key(|&(col, row, _)| (row, col));
         result
     }
 
@@ -177,5 +171,30 @@ mod tests {
         let grid = TileGrid::new(256.0, 256.0);
         let tiles = grid.tiles_in_region(0.0, 0.0, 512.0, 512.0);
         assert_eq!(tiles.len(), 0);
+    }
+
+    #[test]
+    fn tiles_in_region_uses_actual_offset_tile_bounds() {
+        let mut grid = TileGrid::new(256.0, 256.0);
+        grid.add_tile(1, 0, -80.0, 0.0, 128.0, 128.0, make_tile(1));
+
+        let tiles = grid.tiles_in_region(170.0, 0.0, 10.0, 10.0);
+
+        assert_eq!(tiles.len(), 1);
+        assert_eq!((tiles[0].0, tiles[0].1), (1, 0));
+    }
+
+    #[test]
+    fn tiles_in_region_returns_row_major_grid_order() {
+        let mut grid = TileGrid::new(256.0, 256.0);
+        grid.add_tile(1, 1, 0.0, 0.0, 256.0, 256.0, make_tile(11));
+        grid.add_tile(0, 1, 0.0, 0.0, 256.0, 256.0, make_tile(10));
+        grid.add_tile(1, 0, -64.0, 0.0, 256.0, 256.0, make_tile(1));
+        grid.add_tile(0, 0, 0.0, 0.0, 256.0, 256.0, make_tile(0));
+
+        let tiles = grid.tiles_in_region(128.0, 0.0, 256.0, 512.0);
+        let coords: Vec<_> = tiles.into_iter().map(|(col, row, _)| (col, row)).collect();
+
+        assert_eq!(coords, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
     }
 }

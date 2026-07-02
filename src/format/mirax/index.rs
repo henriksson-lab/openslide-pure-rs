@@ -345,8 +345,13 @@ impl IndexFile {
                 });
             }
 
-            if next_ptr <= 0 {
+            if next_ptr == 0 {
                 break;
+            }
+            if next_ptr < 0 {
+                return Err(OpenSlideError::Format(
+                    "Can't read next page pointer".into(),
+                ));
             }
             self.seek(next_ptr as i64)?;
         }

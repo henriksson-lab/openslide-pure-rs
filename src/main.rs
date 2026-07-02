@@ -96,7 +96,9 @@ fn print_mirax_info(path: &str) {
     if let Some(ref st) = sd.general.slide_type {
         println!("Slide type:     {}", st);
     }
-    println!("Magnification:  {}x", sd.general.objective_magnification);
+    if let Some(objective_magnification) = sd.general.objective_magnification {
+        println!("Magnification:  {}x", objective_magnification);
+    }
     println!(
         "Image grid:     {} x {}",
         sd.general.images_x, sd.general.images_y

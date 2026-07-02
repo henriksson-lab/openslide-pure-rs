@@ -1,10 +1,139 @@
+use std::ffi::CString;
 use std::io::{BufReader, Cursor};
+use std::os::raw::{c_char, c_double, c_int, c_uchar, c_uint};
+use std::path::Path;
 
 use crate::error::{OpenSlideError, Result};
-use crate::pixel::RgbaImage;
+use crate::pixel::{GrayImage, RgbaImage};
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
+
+extern "C" {
+    fn osr_jpeg_crop_channel(
+        data: *const c_uchar,
+        len: usize,
+        channel: c_uint,
+        x: c_uint,
+        y: c_uint,
+        w: c_uint,
+        h: c_uint,
+        out: *mut c_uchar,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn osr_jpeg_decode_rgb(
+        data: *const c_uchar,
+        len: usize,
+        expected_w: c_uint,
+        expected_h: c_uint,
+        out: *mut c_uchar,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn osr_jpeg_decode_tiff_ycbcr_rgb(
+        data: *const c_uchar,
+        len: usize,
+        expected_w: c_uint,
+        expected_h: c_uint,
+        out: *mut c_uchar,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn osr_jpeg_file_range_rgb(
+        path: *const c_char,
+        header_start: u64,
+        sof_position: u64,
+        header_stop: u64,
+        data_start: u64,
+        data_stop: u64,
+        tile_w: c_uint,
+        tile_h: c_uint,
+        scale_denom: c_uint,
+        expected_w: c_uint,
+        expected_h: c_uint,
+        out: *mut c_uchar,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn osr_jpeg_crop_rgb(
+        data: *const c_uchar,
+        len: usize,
+        x: c_uint,
+        y: c_uint,
+        w: c_uint,
+        h: c_uint,
+        out: *mut c_uchar,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn osr_jpeg_crop_bgra_rgb(
+        data: *const c_uchar,
+        len: usize,
+        x: c_uint,
+        y: c_uint,
+        w: c_uint,
+        h: c_uint,
+        jpeg_color_space: c_int,
+        out: *mut c_uchar,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn osr_jpeg_tiff_bgra_crop_rgb(
+        data: *const c_uchar,
+        len: usize,
+        tables: *const c_uchar,
+        tables_len: usize,
+        x: c_uint,
+        y: c_uint,
+        w: c_uint,
+        h: c_uint,
+        jpeg_color_space: c_int,
+        out: *mut c_uchar,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn osr_jpeg_file_crop_channel(
+        path: *const c_char,
+        offset: u64,
+        channel: c_uint,
+        x: c_uint,
+        y: c_uint,
+        w: c_uint,
+        h: c_uint,
+        out: *mut c_uchar,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn osr_jpeg_file_crop_rgb(
+        path: *const c_char,
+        offset: u64,
+        x: c_uint,
+        y: c_uint,
+        w: c_uint,
+        h: c_uint,
+        out: *mut c_uchar,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn osr_jpeg_file_sampled_rgb(
+        path: *const c_char,
+        offset: u64,
+        x: c_uint,
+        y: c_uint,
+        w: c_uint,
+        h: c_uint,
+        sample_x0: c_double,
+        sample_y0: c_double,
+        sample_step: c_double,
+        out_w: c_uint,
+        out_h: c_uint,
+        use_libjpeg_scale: c_int,
+        out: *mut c_uchar,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+}
 
 /// Decode JPEG data into an RGBA image.
 ///
@@ -34,7 +163,7 @@ pub fn decode_jpeg_rgba(data: &[u8]) -> Result<RgbaImage> {
         // Decode without color conversion by requesting output = input colorspace.
         // This gives us raw component values (Y, Cb, Cr, A) or (C, M, Y, K).
         // Then manually convert the first 3 channels to RGB and keep 4th as alpha.
-        let options = DecoderOptions::default().jpeg_set_out_colorspace(input_cs);
+        let options = DecoderOptions::new_fast().jpeg_set_out_colorspace(input_cs);
         let reader = BufReader::new(Cursor::new(data));
         let mut decoder = JpegDecoder::new_with_options(reader, options);
 
@@ -63,7 +192,7 @@ pub fn decode_jpeg_rgba(data: &[u8]) -> Result<RgbaImage> {
         RgbaImage::from_rgba(w, h, rgba)
     } else if components == 1 {
         // Grayscale: replicate to RGB, alpha = 0xFF
-        let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::Luma);
+        let options = DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::Luma);
         let reader = BufReader::new(Cursor::new(data));
         let mut decoder = JpegDecoder::new_with_options(reader, options);
 
@@ -91,7 +220,7 @@ pub fn decode_jpeg_rgba(data: &[u8]) -> Result<RgbaImage> {
 /// Decode JPEG data, returning raw RGB bytes and dimensions.
 /// For 3-component JPEGs only. Does not handle alpha.
 pub fn decode_jpeg_rgb(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    let options = DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::RGB);
     let reader = BufReader::new(Cursor::new(data));
     let mut decoder = JpegDecoder::new_with_options(reader, options);
 
@@ -104,6 +233,241 @@ pub fn decode_jpeg_rgb(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
         .ok_or_else(|| OpenSlideError::Decode("No JPEG image info".into()))?;
 
     Ok((pixels, info.width as u32, info.height as u32))
+}
+
+pub fn decode_jpeg_rgb_libjpeg(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    decode_jpeg_rgb_libjpeg_with(data, false)
+}
+
+pub fn decode_jpeg_tiff_ycbcr_rgb_libjpeg(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    decode_jpeg_rgb_libjpeg_with(data, true)
+}
+
+fn decode_jpeg_rgb_libjpeg_with(data: &[u8], tiff_ycbcr: bool) -> Result<(Vec<u8>, u32, u32)> {
+    let header_reader = BufReader::new(Cursor::new(data));
+    let mut header_decoder = JpegDecoder::new(header_reader);
+    header_decoder
+        .decode_headers()
+        .map_err(|e| OpenSlideError::Decode(format!("JPEG header read failed: {e}")))?;
+    let info = header_decoder
+        .info()
+        .ok_or_else(|| OpenSlideError::Decode("No JPEG image info".into()))?;
+    let width = info.width as u32;
+    let height = info.height as u32;
+    let mut rgb = vec![0; width as usize * height as usize * 3];
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        if tiff_ycbcr {
+            osr_jpeg_decode_tiff_ycbcr_rgb(
+                data.as_ptr(),
+                data.len(),
+                width,
+                height,
+                rgb.as_mut_ptr(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        } else {
+            osr_jpeg_decode_rgb(
+                data.as_ptr(),
+                data.len(),
+                width,
+                height,
+                rgb.as_mut_ptr(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        }
+    };
+    if ok != 0 {
+        Ok((rgb, width, height))
+    } else {
+        let label = if tiff_ycbcr {
+            "TIFF YCbCr JPEG RGB decode failed"
+        } else {
+            "JPEG RGB decode failed"
+        };
+        Err(OpenSlideError::Decode(format!(
+            "{}: {}",
+            label,
+            jpeg_crop_error_message(&err)
+        )))
+    }
+}
+
+pub fn decode_jpeg_rgb_region(
+    data: &[u8],
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let mut rgb = vec![0; w as usize * h as usize * 3];
+    if w == 0 || h == 0 {
+        return Ok((rgb, w, h));
+    }
+
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        osr_jpeg_crop_rgb(
+            data.as_ptr(),
+            data.len(),
+            x,
+            y,
+            w,
+            h,
+            rgb.as_mut_ptr(),
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok != 0 {
+        Ok((rgb, w, h))
+    } else {
+        Err(OpenSlideError::Decode(format!(
+            "JPEG RGB crop decode failed: {}",
+            jpeg_crop_error_message(&err)
+        )))
+    }
+}
+
+pub fn decode_jpeg_bgra_rgb_region(
+    data: &[u8],
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    decode_jpeg_bgra_rgb_region_with_color_space(data, x, y, w, h, 0)
+}
+
+pub fn decode_jpeg_bgra_rgb_region_with_color_space(
+    data: &[u8],
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    jpeg_color_space: i32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let mut rgb = vec![0; w as usize * h as usize * 3];
+    if w == 0 || h == 0 {
+        return Ok((rgb, w, h));
+    }
+
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        osr_jpeg_crop_bgra_rgb(
+            data.as_ptr(),
+            data.len(),
+            x,
+            y,
+            w,
+            h,
+            jpeg_color_space,
+            rgb.as_mut_ptr(),
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok != 0 {
+        Ok((rgb, w, h))
+    } else {
+        Err(OpenSlideError::Decode(format!(
+            "JPEG BGRA crop decode failed: {}",
+            jpeg_crop_error_message(&err)
+        )))
+    }
+}
+
+pub fn decode_jpeg_tiff_bgra_rgb_region(
+    data: &[u8],
+    tables: Option<&[u8]>,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    jpeg_color_space: i32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let mut rgb = vec![0; w as usize * h as usize * 3];
+    if w == 0 || h == 0 {
+        return Ok((rgb, w, h));
+    }
+
+    let (tables_ptr, tables_len) = tables
+        .map(|tables| (tables.as_ptr(), tables.len()))
+        .unwrap_or((std::ptr::null(), 0));
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        osr_jpeg_tiff_bgra_crop_rgb(
+            data.as_ptr(),
+            data.len(),
+            tables_ptr,
+            tables_len,
+            x,
+            y,
+            w,
+            h,
+            jpeg_color_space,
+            rgb.as_mut_ptr(),
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok != 0 {
+        Ok((rgb, w, h))
+    } else {
+        Err(OpenSlideError::Decode(format!(
+            "TIFF JPEG BGRA crop decode failed: {}",
+            jpeg_crop_error_message(&err)
+        )))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decode_jpeg_file_range_rgb(
+    path: &Path,
+    header_start: u64,
+    sof_position: u64,
+    header_stop: u64,
+    data_start: u64,
+    data_stop: u64,
+    tile_w: u32,
+    tile_h: u32,
+    scale_denom: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let out_w = (tile_w / scale_denom.max(1)).max(1);
+    let out_h = (tile_h / scale_denom.max(1)).max(1);
+    let mut rgb = vec![0; out_w as usize * out_h as usize * 3];
+    let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        OpenSlideError::InvalidArgument("JPEG path contains an interior NUL byte".into())
+    })?;
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        osr_jpeg_file_range_rgb(
+            path.as_ptr(),
+            header_start,
+            sof_position,
+            header_stop,
+            data_start,
+            data_stop,
+            tile_w,
+            tile_h,
+            scale_denom.max(1),
+            out_w,
+            out_h,
+            rgb.as_mut_ptr(),
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok != 0 {
+        Ok((rgb, out_w, out_h))
+    } else {
+        Err(OpenSlideError::Decode(format!(
+            "JPEG range RGB decode failed: {}",
+            jpeg_crop_error_message(&err)
+        )))
+    }
 }
 
 /// Decode JPEG data and extract a single RGB channel as a grayscale image.
@@ -127,6 +491,220 @@ pub fn decode_jpeg_channel(data: &[u8], channel: u32) -> Result<crate::pixel::Gr
         height,
         data: gray,
     })
+}
+
+/// Decode a rectangular crop from a JPEG into one RGB channel.
+///
+/// This uses libjpeg's scanline/crop API so very large Hamamatsu JPEG strips
+/// can be read without allocating a full decoded image.
+pub fn decode_jpeg_channel_region(
+    data: &[u8],
+    channel: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<GrayImage> {
+    if channel > 2 {
+        return Err(OpenSlideError::InvalidArgument(format!(
+            "Channel {} out of range (0-2)",
+            channel
+        )));
+    }
+    let mut out = GrayImage::new(w, h);
+    if w == 0 || h == 0 {
+        return Ok(out);
+    }
+
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        osr_jpeg_crop_channel(
+            data.as_ptr(),
+            data.len(),
+            channel,
+            x,
+            y,
+            w,
+            h,
+            out.data.as_mut_ptr(),
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok != 0 {
+        return Ok(out);
+    }
+
+    let nul = err.iter().position(|&byte| byte == 0).unwrap_or(err.len());
+    let message = String::from_utf8_lossy(
+        &err[..nul]
+            .iter()
+            .map(|&byte| byte as u8)
+            .collect::<Vec<_>>(),
+    )
+    .into_owned();
+    Err(OpenSlideError::Decode(format!(
+        "JPEG crop decode failed: {}",
+        if message.is_empty() {
+            "unknown libjpeg error"
+        } else {
+            &message
+        }
+    )))
+}
+
+pub fn decode_jpeg_channel_region_from_file(
+    path: &Path,
+    offset: u64,
+    channel: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<GrayImage> {
+    if channel > 2 {
+        return Err(OpenSlideError::InvalidArgument(format!(
+            "Channel {} out of range (0-2)",
+            channel
+        )));
+    }
+    let mut out = GrayImage::new(w, h);
+    if w == 0 || h == 0 {
+        return Ok(out);
+    }
+
+    let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        OpenSlideError::InvalidArgument("JPEG path contains an interior NUL byte".into())
+    })?;
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        osr_jpeg_file_crop_channel(
+            path.as_ptr(),
+            offset,
+            channel,
+            x,
+            y,
+            w,
+            h,
+            out.data.as_mut_ptr(),
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok != 0 {
+        return Ok(out);
+    }
+
+    Err(OpenSlideError::Decode(format!(
+        "JPEG file crop decode failed: {}",
+        jpeg_crop_error_message(&err)
+    )))
+}
+
+pub fn decode_jpeg_rgb_region_from_file(
+    path: &Path,
+    offset: u64,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        OpenSlideError::InvalidArgument("JPEG path contains an interior NUL byte".into())
+    })?;
+    let mut rgb = vec![0; w as usize * h as usize * 3];
+    if w == 0 || h == 0 {
+        return Ok((rgb, w, h));
+    }
+
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        osr_jpeg_file_crop_rgb(
+            path.as_ptr(),
+            offset,
+            x,
+            y,
+            w,
+            h,
+            rgb.as_mut_ptr(),
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok != 0 {
+        Ok((rgb, w, h))
+    } else {
+        Err(OpenSlideError::Decode(format!(
+            "JPEG file RGB crop decode failed: {}",
+            jpeg_crop_error_message(&err)
+        )))
+    }
+}
+
+pub fn decode_jpeg_sampled_rgb_region_from_file(
+    path: &Path,
+    offset: u64,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    sample_x0: f64,
+    sample_y0: f64,
+    sample_step: f64,
+    out_w: u32,
+    out_h: u32,
+    use_libjpeg_scale: bool,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        OpenSlideError::InvalidArgument("JPEG path contains an interior NUL byte".into())
+    })?;
+    let mut rgb = vec![0; out_w as usize * out_h as usize * 3];
+    if w == 0 || h == 0 || out_w == 0 || out_h == 0 {
+        return Ok((rgb, out_w, out_h));
+    }
+
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        osr_jpeg_file_sampled_rgb(
+            path.as_ptr(),
+            offset,
+            x,
+            y,
+            w,
+            h,
+            sample_x0,
+            sample_y0,
+            sample_step,
+            out_w,
+            out_h,
+            i32::from(use_libjpeg_scale),
+            rgb.as_mut_ptr(),
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok != 0 {
+        Ok((rgb, out_w, out_h))
+    } else {
+        Err(OpenSlideError::Decode(format!(
+            "JPEG file sampled RGB decode failed: {}",
+            jpeg_crop_error_message(&err)
+        )))
+    }
+}
+
+fn jpeg_crop_error_message(err: &[i8]) -> String {
+    let nul = err.iter().position(|&byte| byte == 0).unwrap_or(err.len());
+    let bytes = err[..nul]
+        .iter()
+        .map(|&byte| byte as u8)
+        .collect::<Vec<_>>();
+    let message = String::from_utf8_lossy(&bytes).into_owned();
+    if message.is_empty() {
+        "unknown libjpeg error".into()
+    } else {
+        message
+    }
 }
 
 /// Convert YCbCrA (4 bytes/pixel) to RGBA.

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use configparser::ini::Ini;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
@@ -82,10 +83,10 @@ pub fn detect(path: &Path) -> bool {
 /// Try to open a Hamamatsu slide, returning a metadata-capable backend.
 pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     if hamamatsu_vms_vmu_detect(path) {
-        return Ok(Box::new(HamamatsuSlide::open_vms_vmu(path)?));
+        return Ok(Box::new(HamamatsuSlide::hamamatsu_vms_vmu_open(path)?));
     }
     if hamamatsu_ndpi_detect(path) {
-        return Ok(Box::new(HamamatsuSlide::open_ndpi(path)?));
+        return Ok(Box::new(HamamatsuSlide::hamamatsu_ndpi_open(path)?));
     }
     Err(OpenSlideError::UnsupportedFormat(
         "Not a Hamamatsu NDPI/VMS/VMU file".into(),
@@ -115,6 +116,7 @@ enum LevelSource {
         num_cols: u64,
         tile_w: u32,
         tile_h: u32,
+        source_downsample: f64,
     },
     VmuNgr {
         path: PathBuf,
@@ -122,6 +124,7 @@ enum LevelSource {
         column_width: u64,
     },
     Ndpi(NdpiLevel),
+    NdpiScaled(NdpiLevel),
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +132,8 @@ struct NdpiLevel {
     path: PathBuf,
     dir_index: u32,
     endian: Endian,
+    width: u64,
+    height: u64,
     tile_w: u32,
     tile_h: u32,
     tiles_across: u64,
@@ -154,7 +159,7 @@ enum AssociatedImage {
 }
 
 impl HamamatsuSlide {
-    fn open_vms_vmu(path: &Path) -> Result<Self> {
+    fn hamamatsu_vms_vmu_open(path: &Path) -> Result<Self> {
         let ini = read_key_file(path)?;
         let group = if let Some(group) = resolve_group(&ini, GROUP_VMS) {
             group
@@ -167,44 +172,17 @@ impl HamamatsuSlide {
         };
 
         let dirname = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut properties = extract_key_file_properties(&ini, &group);
+        let mut properties = HashMap::new();
         properties.insert(properties::PROPERTY_VENDOR.into(), "hamamatsu".into());
 
-        if let Some(source_lens) =
-            get_key_value_any(&ini, &group, &["SourceLens", "Objective", "ObjectivePower"])
-        {
-            if let Some(objective) = objective_power_value(&source_lens) {
-                properties.insert(
-                    properties::PROPERTY_OBJECTIVE_POWER.into(),
-                    objective.into(),
-                );
-            }
-        }
-
         let levels = if group.eq_ignore_ascii_case(GROUP_VMS) {
-            open_vms_levels(path, &ini, &group, dirname, &mut properties)?
+            hamamatsu_vms_part2(path, &ini, &group, dirname)?
         } else {
-            let levels = open_vmu_levels(&ini, &group, dirname)?;
-            if let Some(level0) = levels.first() {
-                set_vms_mpp_property(
-                    &ini,
-                    &group,
-                    KEY_PHYSICAL_WIDTH,
-                    level0.width,
-                    properties::PROPERTY_MPP_X,
-                    &mut properties,
-                );
-                set_vms_mpp_property(
-                    &ini,
-                    &group,
-                    KEY_PHYSICAL_HEIGHT,
-                    level0.height,
-                    properties::PROPERTY_MPP_Y,
-                    &mut properties,
-                );
-            }
-            levels
+            hamamatsu_vmu_part2(&ini, &group, dirname)?
         };
+        if let Some(level0) = levels.first() {
+            add_properties(&ini, &group, level0, &mut properties);
+        }
 
         let mut associated_images = HashMap::new();
         for (keys, name) in [
@@ -275,7 +253,7 @@ impl HamamatsuSlide {
         })
     }
 
-    fn open_ndpi(path: &Path) -> Result<Self> {
+    fn hamamatsu_ndpi_open(path: &Path) -> Result<Self> {
         let tiff = TiffFile::open(path)?;
         if !tiff
             .dirs
@@ -315,18 +293,22 @@ impl HamamatsuSlide {
             if lens > 0.0 {
                 let focal_plane = dir.first_sint(NDPI_FOCAL_PLANE).unwrap_or(0);
                 if focal_plane == 0 {
-                    candidate_levels.push(Level {
-                        width,
-                        height,
-                        downsample: 1.0,
-                        source,
-                    });
+                    add_ndpi_level_with_scaled(
+                        &mut candidate_levels,
+                        Level {
+                            width,
+                            height,
+                            downsample: 1.0,
+                            source,
+                        },
+                    );
                 }
             } else if (lens + 1.0).abs() < f64::EPSILON {
                 if let (Some(offset), Some(length)) = (
                     dir.first_uint(TIFFTAG_STRIPOFFSETS),
                     dir.first_uint(TIFFTAG_STRIPBYTECOUNTS),
                 ) {
+                    let offset = fix_offset_ndpi(dir.offset, offset);
                     associated_images.insert(
                         "macro".into(),
                         AssociatedImage::FileRange {
@@ -348,7 +330,7 @@ impl HamamatsuSlide {
         let mut properties = HashMap::new();
         properties.insert(properties::PROPERTY_VENDOR.into(), "hamamatsu".into());
         if let Some(dir0) = tiff.dirs.first() {
-            set_ndpi_properties(dir0, &mut properties);
+            ndpi_set_props(dir0, &mut properties);
         }
 
         Ok(Self {
@@ -419,11 +401,14 @@ impl SlideBackend for HamamatsuSlide {
                 num_cols,
                 tile_w,
                 tile_h,
+                source_downsample,
             } => read_vms_region(
+                level_data,
                 image_files,
                 *num_cols,
                 *tile_w,
                 *tile_h,
+                *source_downsample,
                 channel,
                 x,
                 y,
@@ -436,9 +421,92 @@ impl SlideBackend for HamamatsuSlide {
                 column_width,
             } => read_vmu_region(path, *start, *column_width, level_data, channel, x, y, w, h),
             LevelSource::Ndpi(ndpi) => read_ndpi_region(ndpi, level_data, channel, x, y, w, h),
+            LevelSource::NdpiScaled(ndpi) => {
+                read_scaled_ndpi_region(ndpi, level_data, channel, x, y, w, h)
+            }
             LevelSource::Unsupported => Err(OpenSlideError::UnsupportedFormat(
                 "Hamamatsu pixel reads are not supported for this level layout".into(),
             )),
+        }
+    }
+
+    fn read_region_rgba(
+        &self,
+        channels: [Option<u32>; 4],
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<RgbaImage> {
+        if channels != [Some(0), Some(1), Some(2), None] {
+            let size = w as usize * h as usize;
+            let mut rgba = vec![0u8; size * 4];
+            if channels[3].is_none() {
+                for pixel in rgba.chunks_exact_mut(4) {
+                    pixel[3] = 255;
+                }
+            }
+            for (out_idx, ch_opt) in channels.iter().enumerate() {
+                if let Some(ch) = ch_opt {
+                    let gray = self.read_region(*ch, x, y, level, w, h)?;
+                    for i in 0..size.min(gray.data.len()) {
+                        rgba[i * 4 + out_idx] = gray.data[i];
+                    }
+                }
+            }
+            return RgbaImage::from_rgba(w, h, rgba);
+        }
+
+        let level_data = self
+            .levels
+            .get(level as usize)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {}", level)))?;
+        match &level_data.source {
+            LevelSource::Vms {
+                image_files,
+                num_cols,
+                tile_w,
+                tile_h,
+                source_downsample,
+            } => read_vms_region_rgba(
+                level_data,
+                image_files,
+                *num_cols,
+                *tile_w,
+                *tile_h,
+                *source_downsample,
+                x,
+                y,
+                w,
+                h,
+            ),
+            LevelSource::Ndpi(ndpi)
+                if matches!(ndpi.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG)
+                    && ndpi.planar_config == PLANARCONFIG_CONTIG =>
+            {
+                read_ndpi_region_rgba(ndpi, level_data, x, y, w, h)
+            }
+            LevelSource::NdpiScaled(ndpi)
+                if matches!(ndpi.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG)
+                    && ndpi.planar_config == PLANARCONFIG_CONTIG =>
+            {
+                read_scaled_ndpi_region_rgba(ndpi, level_data, x, y, w, h)
+            }
+            _ => {
+                let size = w as usize * h as usize;
+                let mut rgba = vec![0u8; size * 4];
+                for pixel in rgba.chunks_exact_mut(4) {
+                    pixel[3] = 255;
+                }
+                for (out_idx, channel) in [0, 1, 2].into_iter().enumerate() {
+                    let gray = self.read_region(channel, x, y, level, w, h)?;
+                    for i in 0..size.min(gray.data.len()) {
+                        rgba[i * 4 + out_idx] = gray.data[i];
+                    }
+                }
+                RgbaImage::from_rgba(w, h, rgba)
+            }
         }
     }
 
@@ -608,29 +676,50 @@ fn get_key_value_any(ini: &Ini, group: &str, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn extract_key_file_properties(ini: &Ini, group: &str) -> HashMap<String, String> {
-    let mut props = HashMap::new();
+fn add_properties(
+    ini: &Ini,
+    group: &str,
+    level0: &Level,
+    properties: &mut HashMap<String, String>,
+) {
     if let Some(group) = resolve_group(ini, group) {
-        props.insert("hamamatsu.key-file-group".into(), group.clone());
-        let Some(section) = ini.get_map_ref().get(&group) else {
-            return props;
-        };
-        for (key, value) in section {
-            if let Some(value) = value {
-                props.insert(format!("hamamatsu.{key}"), value.clone());
+        if let Some(section) = ini.get_map_ref().get(&group) {
+            for (key, value) in section {
+                if let Some(value) = value {
+                    properties.insert(format!("hamamatsu.{key}"), value.clone());
+                }
             }
         }
     }
-    props
+    if let Some(source_lens) =
+        get_key_value_any(ini, group, &["SourceLens", "Objective", "ObjectivePower"])
+    {
+        if let Some(objective) = objective_power_value(&source_lens) {
+            properties.insert(
+                properties::PROPERTY_OBJECTIVE_POWER.into(),
+                objective.into(),
+            );
+        }
+    }
+    add_mpp_property(
+        ini,
+        group,
+        KEY_PHYSICAL_WIDTH,
+        level0.width,
+        properties::PROPERTY_MPP_X,
+        properties,
+    );
+    add_mpp_property(
+        ini,
+        group,
+        KEY_PHYSICAL_HEIGHT,
+        level0.height,
+        properties::PROPERTY_MPP_Y,
+        properties,
+    );
 }
 
-fn open_vms_levels(
-    path: &Path,
-    ini: &Ini,
-    group: &str,
-    dirname: &Path,
-    properties: &mut HashMap<String, String>,
-) -> Result<Vec<Level>> {
+fn hamamatsu_vms_part2(path: &Path, ini: &Ini, group: &str, dirname: &Path) -> Result<Vec<Level>> {
     let num_cols = require_int(ini, group, KEY_NUM_JPEG_COLS)?;
     let num_rows = require_int(ini, group, KEY_NUM_JPEG_ROWS)?;
     if num_cols < 1 || num_rows < 1 {
@@ -669,48 +758,91 @@ fn open_vms_levels(
         .first()
         .ok_or_else(|| OpenSlideError::Format("VMS file has no image files".into()))?;
     let (tile_w, tile_h) = read_jpeg_dimensions(first)?;
+    let mut dimensions = Vec::with_capacity(image_files.len());
+    dimensions.push((tile_w, tile_h));
+    for (index, image_file) in image_files.iter().enumerate().skip(1) {
+        let (width, height) = read_jpeg_dimensions(image_file)?;
+        let col = index as i64 % num_cols;
+        let row = index as i64 / num_cols;
+        if col != num_cols - 1 && width != tile_w {
+            return Err(OpenSlideError::Format(format!(
+                "VMS JPEG width not consistent for image {index}: expected {tile_w}, found {width}"
+            )));
+        }
+        if row != num_rows - 1 && height != tile_h {
+            return Err(OpenSlideError::Format(format!(
+                "VMS JPEG height not consistent for image {index}: expected {tile_h}, found {height}"
+            )));
+        }
+        dimensions.push((width, height));
+    }
     let tile_w_u32 = u32::try_from(tile_w)
         .map_err(|_| OpenSlideError::Format("VMS JPEG tile width is too large".into()))?;
     let tile_h_u32 = u32::try_from(tile_h)
         .map_err(|_| OpenSlideError::Format("VMS JPEG tile height is too large".into()))?;
-    let width = tile_w
-        .checked_mul(num_cols as u64)
-        .ok_or_else(|| OpenSlideError::Format("VMS width overflow".into()))?;
-    let height = tile_h
-        .checked_mul(num_rows as u64)
-        .ok_or_else(|| OpenSlideError::Format("VMS height overflow".into()))?;
+    let width = (0..num_cols as usize).try_fold(0u64, |sum, col| {
+        sum.checked_add(dimensions[col].0)
+            .ok_or_else(|| OpenSlideError::Format("VMS width overflow".into()))
+    })?;
+    let height = (0..num_rows as usize).try_fold(0u64, |sum, row| {
+        sum.checked_add(dimensions[row * num_cols as usize].1)
+            .ok_or_else(|| OpenSlideError::Format("VMS height overflow".into()))
+    })?;
 
-    set_vms_mpp_property(
-        ini,
-        group,
-        KEY_PHYSICAL_WIDTH,
-        width,
-        properties::PROPERTY_MPP_X,
-        properties,
-    );
-    set_vms_mpp_property(
-        ini,
-        group,
-        KEY_PHYSICAL_HEIGHT,
-        height,
-        properties::PROPERTY_MPP_Y,
-        properties,
-    );
+    let (map_w, map_h) = read_jpeg_dimensions(&map_file)?;
+    let map_w_u32 = u32::try_from(map_w)
+        .map_err(|_| OpenSlideError::Format("VMS map JPEG width is too large".into()))?;
+    let map_h_u32 = u32::try_from(map_h)
+        .map_err(|_| OpenSlideError::Format("VMS map JPEG height is too large".into()))?;
 
-    Ok(vec![Level {
+    let mut levels = Vec::new();
+    let base_source = LevelSource::Vms {
+        image_files,
+        num_cols: num_cols as u64,
+        tile_w: tile_w_u32,
+        tile_h: tile_h_u32,
+        source_downsample: 1.0,
+    };
+    levels.push(Level {
         width,
         height,
         downsample: 1.0,
-        source: LevelSource::Vms {
-            image_files,
-            num_cols: num_cols as u64,
-            tile_w: tile_w_u32,
-            tile_h: tile_h_u32,
-        },
-    }])
+        source: base_source.clone(),
+    });
+    for downsample in [2_u64, 4] {
+        levels.push(Level {
+            width: width.div_ceil(downsample),
+            height: height.div_ceil(downsample),
+            downsample: 1.0,
+            source: base_source.clone(),
+        });
+    }
+    let map_source = LevelSource::Vms {
+        image_files: vec![map_file],
+        num_cols: 1,
+        tile_w: map_w_u32,
+        tile_h: map_h_u32,
+        source_downsample: (width as f64 / map_w as f64).max(height as f64 / map_h as f64),
+    };
+    levels.push(Level {
+        width: map_w,
+        height: map_h,
+        downsample: 1.0,
+        source: map_source.clone(),
+    });
+    for downsample in [2_u64, 4, 8] {
+        levels.push(Level {
+            width: map_w.div_ceil(downsample),
+            height: map_h.div_ceil(downsample),
+            downsample: 1.0,
+            source: map_source.clone(),
+        });
+    }
+
+    normalize_levels(levels)
 }
 
-fn open_vmu_levels(ini: &Ini, group: &str, dirname: &Path) -> Result<Vec<Level>> {
+fn hamamatsu_vmu_part2(ini: &Ini, group: &str, dirname: &Path) -> Result<Vec<Level>> {
     let bits_per_pixel = require_int(ini, group, KEY_BITS_PER_PIXEL)?;
     let pixel_order = get_key_value_any(ini, group, &[KEY_PIXEL_ORDER]).unwrap_or_default();
     if bits_per_pixel != 36 {
@@ -752,9 +884,15 @@ fn open_vmu_levels(ini: &Ini, group: &str, dirname: &Path) -> Result<Vec<Level>>
             "Map",
         ],
     ) {
-        if let Some(map_file) = resolve_sidecar_path(dirname, &map_file) {
-            paths.push(map_file);
+        let map_file = resolve_sidecar_path(dirname, &map_file)
+            .ok_or_else(|| OpenSlideError::Format("Missing VMU map file".into()))?;
+        if !map_file.is_file() {
+            return Err(OpenSlideError::Format(format!(
+                "VMU map file is not readable: {}",
+                map_file.display()
+            )));
         }
+        paths.push(map_file);
     }
 
     let mut levels = Vec::new();
@@ -928,7 +1066,7 @@ fn parse_vms_image_key_suffix(suffix: &str) -> Result<Option<(i64, i64)>> {
     }
 }
 
-fn set_vms_mpp_property(
+fn add_mpp_property(
     ini: &Ini,
     group: &str,
     key: &str,
@@ -954,10 +1092,41 @@ fn objective_power_value(value: &str) -> Option<&str> {
     numeric.parse::<f64>().is_ok().then_some(numeric)
 }
 
+fn add_ndpi_level_with_scaled(levels: &mut Vec<Level>, level: Level) {
+    levels.push(level.clone());
+    let LevelSource::Ndpi(ndpi) = &level.source else {
+        return;
+    };
+    if !matches!(ndpi.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG) {
+        return;
+    }
+    for downsample in [2_u64, 4] {
+        levels.push(Level {
+            width: level.width.div_ceil(downsample),
+            height: level.height.div_ceil(downsample),
+            downsample: 1.0,
+            source: LevelSource::NdpiScaled(ndpi.clone()),
+        });
+    }
+}
+
 fn normalize_levels(mut levels: Vec<Level>) -> Result<Vec<Level>> {
     levels.retain(|level| level.width > 0 && level.height > 0);
     levels.sort_by(|a, b| b.width.cmp(&a.width).then_with(|| b.height.cmp(&a.height)));
-    levels.dedup_by(|a, b| a.width == b.width && a.height == b.height);
+    let mut deduped: Vec<Level> = Vec::with_capacity(levels.len());
+    for level in levels {
+        if let Some(last) = deduped
+            .last_mut()
+            .filter(|last| last.width == level.width && last.height == level.height)
+        {
+            if level_source_preference(&level.source) < level_source_preference(&last.source) {
+                *last = level;
+            }
+        } else {
+            deduped.push(level);
+        }
+    }
+    let mut levels = deduped;
     let Some(base) = levels.first().cloned() else {
         return Err(OpenSlideError::Format(
             "Couldn't find any Hamamatsu pyramid levels".into(),
@@ -969,6 +1138,15 @@ fn normalize_levels(mut levels: Vec<Level>) -> Result<Vec<Level>> {
         level.downsample = ds_x.max(ds_y);
     }
     Ok(levels)
+}
+
+fn level_source_preference(source: &LevelSource) -> u8 {
+    match source {
+        LevelSource::Ndpi(_) => 0,
+        LevelSource::NdpiScaled(_) => 1,
+        LevelSource::Vms { .. } | LevelSource::VmuNgr { .. } => 1,
+        LevelSource::Unsupported => 2,
+    }
 }
 
 fn read_jpeg_dimensions(path: &Path) -> Result<(u64, u64)> {
@@ -1019,6 +1197,194 @@ fn read_jpeg_dimensions(path: &Path) -> Result<(u64, u64)> {
         "Couldn't find JPEG dimensions in {}",
         path.display()
     )))
+}
+
+#[derive(Debug)]
+struct JpegRestartInfo {
+    header_start: u64,
+    width: u32,
+    height: u32,
+    tile_w: u32,
+    tile_h: u32,
+    tiles_across: u64,
+    sof_position: u64,
+    header_stop: u64,
+    file_stop: u64,
+    starts: Vec<u64>,
+}
+
+static JPEG_RESTART_INFO_CACHE: OnceLock<
+    Mutex<HashMap<(PathBuf, u64, u64), Arc<JpegRestartInfo>>>,
+> = OnceLock::new();
+
+fn vms_restart_info(path: &Path) -> Result<Option<Arc<JpegRestartInfo>>> {
+    let file_stop = fs::metadata(path)?.len();
+    jpeg_restart_info(path, 0, file_stop)
+}
+
+fn jpeg_restart_info(
+    path: &Path,
+    header_start: u64,
+    file_stop: u64,
+) -> Result<Option<Arc<JpegRestartInfo>>> {
+    let cache = JPEG_RESTART_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (path.to_path_buf(), header_start, file_stop);
+    if let Some(info) = cache
+        .lock()
+        .map_err(|_| OpenSlideError::Format("JPEG restart cache poisoned".into()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(Some(info));
+    }
+
+    let Some(info) = parse_jpeg_restart_info(path, header_start, file_stop)? else {
+        return Ok(None);
+    };
+    let info = Arc::new(info);
+    cache
+        .lock()
+        .map_err(|_| OpenSlideError::Format("JPEG restart cache poisoned".into()))?
+        .insert(key, info.clone());
+    Ok(Some(info))
+}
+
+fn parse_jpeg_restart_info(
+    path: &Path,
+    header_start: u64,
+    file_stop: u64,
+) -> Result<Option<JpegRestartInfo>> {
+    let mut file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if header_start >= file_stop || file_stop > file_len {
+        return Ok(None);
+    }
+    let mut data = Vec::with_capacity(1024 * 1024);
+    file.seek(SeekFrom::Start(header_start))?;
+    file.by_ref().take(1024 * 1024).read_to_end(&mut data)?;
+    if data.len() < 4 || data[0] != 0xff || data[1] != 0xd8 {
+        return Ok(None);
+    }
+
+    let mut pos = 2usize;
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut sof_position = 0u64;
+    let mut header_stop = 0u64;
+    let mut restart_interval = 0u32;
+    let mut h_samp = 1u32;
+    let mut v_samp = 1u32;
+    while pos + 4 <= data.len() {
+        if data[pos] != 0xff {
+            return Ok(None);
+        }
+        while pos < data.len() && data[pos] == 0xff {
+            pos += 1;
+        }
+        if pos >= data.len() {
+            return Ok(None);
+        }
+        let marker_pos = pos - 1;
+        let marker = data[pos];
+        pos += 1;
+        if marker == 0xda {
+            if pos + 2 > data.len() {
+                return Ok(None);
+            }
+            let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            header_stop = header_start + (pos + len) as u64;
+            break;
+        }
+        if marker == 0xd9 {
+            return Ok(None);
+        }
+        if pos + 2 > data.len() {
+            return Ok(None);
+        }
+        let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        if len < 2 || pos + len > data.len() {
+            return Ok(None);
+        }
+        if marker == 0xdd && len >= 4 {
+            restart_interval = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as u32;
+        }
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            if len < 11 {
+                return Ok(None);
+            }
+            sof_position = header_start + marker_pos as u64;
+            height = u16::from_be_bytes([data[pos + 3], data[pos + 4]]) as u32;
+            width = u16::from_be_bytes([data[pos + 5], data[pos + 6]]) as u32;
+            h_samp = u32::from(data[pos + 9] >> 4).max(1);
+            v_samp = u32::from(data[pos + 9] & 0x0f).max(1);
+        }
+        pos += len;
+    }
+
+    if width == 0 || height == 0 || restart_interval == 0 || header_stop == 0 {
+        return Ok(None);
+    }
+    let mcu_w = 8 * h_samp;
+    let mcu_h = 8 * v_samp;
+    let tile_w = mcu_w
+        .checked_mul(restart_interval)
+        .ok_or_else(|| OpenSlideError::Format("VMS JPEG restart tile width overflow".into()))?;
+    let tile_h = mcu_h;
+    if tile_w == 0 || tile_h == 0 || width % tile_w != 0 {
+        return Ok(None);
+    }
+    let tiles_across = u64::from(width / tile_w);
+    let tiles_down = u64::from(height.div_ceil(tile_h));
+    let tile_count = tiles_across
+        .checked_mul(tiles_down)
+        .ok_or_else(|| OpenSlideError::Format("VMS JPEG restart tile count overflow".into()))?;
+    let tile_count_usize = usize::try_from(tile_count)
+        .map_err(|_| OpenSlideError::Format("VMS JPEG restart tile count overflow".into()))?;
+
+    let mut starts = Vec::with_capacity(tile_count_usize);
+    starts.push(header_stop);
+    file.seek(SeekFrom::Start(header_stop))?;
+    let mut chunk = [0u8; 64 * 1024];
+    let mut absolute = header_stop;
+    let mut last_ff = false;
+    while starts.len() < tile_count_usize && absolute < file_stop {
+        let remaining = usize::try_from((file_stop - absolute).min(chunk.len() as u64))
+            .map_err(|_| OpenSlideError::Format("JPEG restart scan size overflow".into()))?;
+        let read = file.read(&mut chunk[..remaining])?;
+        if read == 0 {
+            break;
+        }
+        for (index, &byte) in chunk[..read].iter().enumerate() {
+            if last_ff {
+                if (0xd0..=0xd7).contains(&byte) {
+                    starts.push(absolute + index as u64 + 1);
+                    if starts.len() == tile_count_usize {
+                        break;
+                    }
+                }
+                last_ff = byte == 0xff;
+            } else {
+                last_ff = byte == 0xff;
+            }
+        }
+        absolute += read as u64;
+    }
+    if starts.len() != tile_count_usize {
+        return Ok(None);
+    }
+
+    Ok(Some(JpegRestartInfo {
+        header_start,
+        width,
+        height,
+        tile_w,
+        tile_h,
+        tiles_across,
+        sof_position,
+        header_stop,
+        file_stop,
+        starts,
+    }))
 }
 
 #[derive(Debug)]
@@ -1117,10 +1483,16 @@ fn ndpi_level_source(
         if offsets.len() < usize::try_from(tiles_across.checked_mul(tiles_down)?).ok()? {
             return None;
         }
+        let offsets = offsets
+            .into_iter()
+            .map(|offset| fix_offset_ndpi(dir.offset, offset))
+            .collect();
         return Some(NdpiLevel {
             path: path.to_path_buf(),
             dir_index: u32::try_from(dir_index).ok()?,
             endian,
+            width,
+            height,
             tile_w: u32::try_from(tile_w).ok()?,
             tile_h: u32::try_from(tile_h).ok()?,
             tiles_across,
@@ -1142,10 +1514,16 @@ fn ndpi_level_source(
     if width == 0 || rows_per_strip == 0 || offsets.len() != byte_counts.len() {
         return None;
     }
+    let offsets = offsets
+        .into_iter()
+        .map(|offset| fix_offset_ndpi(dir.offset, offset))
+        .collect();
     Some(NdpiLevel {
         path: path.to_path_buf(),
         dir_index: u32::try_from(dir_index).ok()?,
         endian,
+        width,
+        height,
         tile_w: u32::try_from(width).ok()?,
         tile_h: u32::try_from(rows_per_strip.min(height)).ok()?,
         tiles_across: 1,
@@ -1161,11 +1539,23 @@ fn ndpi_level_source(
     })
 }
 
+fn fix_offset_ndpi(diroff: u64, offset: u64) -> u64 {
+    let mut result = (diroff & !u64::from(u32::MAX)) | (offset & u64::from(u32::MAX));
+    if result >= diroff {
+        if let Some(adjusted) = result.checked_sub(u64::from(u32::MAX) + 1) {
+            result = adjusted.min(result);
+        }
+    }
+    result
+}
+
 fn read_vms_region(
+    level: &Level,
     image_files: &[PathBuf],
     num_cols: u64,
     tile_w: u32,
     tile_h: u32,
+    source_downsample: f64,
     channel: u32,
     x: i64,
     y: i64,
@@ -1177,13 +1567,20 @@ fn read_vms_region(
         return Ok(output);
     }
 
-    let start_col = floor_div(x as f64, tile_w as f64).max(0) as u64;
-    let start_row = floor_div(y as f64, tile_h as f64).max(0) as u64;
-    let end_col = ceil_div(x as f64 + w as f64, tile_w as f64)
+    let source_downsample = source_downsample.max(1.0);
+    let relative_downsample = (level.downsample / source_downsample).max(1.0);
+    let source_downsample = (level.downsample / relative_downsample).max(1.0);
+    let view_x = x as f64 / source_downsample;
+    let view_y = y as f64 / source_downsample;
+    let full_w = w as f64 * relative_downsample;
+    let full_h = h as f64 * relative_downsample;
+    let start_col = floor_div(view_x, tile_w as f64).max(0) as u64;
+    let start_row = floor_div(view_y, tile_h as f64).max(0) as u64;
+    let end_col = ceil_div(view_x + full_w, tile_w as f64)
         .max(0)
         .min(num_cols as i64) as u64;
     let num_rows = (image_files.len() as u64).div_ceil(num_cols);
-    let end_row = ceil_div(y as f64 + h as f64, tile_h as f64)
+    let end_row = ceil_div(view_y + full_h, tile_h as f64)
         .max(0)
         .min(num_rows as i64) as u64;
 
@@ -1191,16 +1588,310 @@ fn read_vms_region(
         for col in start_col..end_col {
             let tile_index = usize::try_from(row * num_cols + col)
                 .map_err(|_| OpenSlideError::Format("VMS tile index overflow".into()))?;
-            let data = fs::read(image_files.get(tile_index).ok_or_else(|| {
+            let path = image_files.get(tile_index).ok_or_else(|| {
                 OpenSlideError::Format("VMS tile index outside image file list".into())
-            })?)?;
-            let tile = decode::decode_channel(ImageFormat::Jpeg, &data, channel)?;
-            blit_gray(
+            })?;
+            let (jpeg_w, jpeg_h) = read_jpeg_dimensions(path)?;
+            let tile_origin_x = col as f64 * tile_w as f64;
+            let tile_origin_y = row as f64 * tile_h as f64;
+            let Some((crop_x, crop_y, crop_w, crop_h)) = source_overlap_rect(
+                tile_origin_x,
+                tile_origin_y,
+                jpeg_w as u32,
+                jpeg_h as u32,
+                view_x,
+                view_y,
+                full_w,
+                full_h,
+            ) else {
+                continue;
+            };
+            let tile = decode::decode_channel_region_from_file(
+                ImageFormat::Jpeg,
+                path,
+                0,
+                channel,
+                crop_x,
+                crop_y,
+                crop_w,
+                crop_h,
+            )?;
+            blit_gray_scaled_visible(
                 &tile,
+                crop_w,
+                crop_h,
                 &mut output,
-                col as f64 * tile_w as f64 - x as f64,
-                row as f64 * tile_h as f64 - y as f64,
+                tile_origin_x + crop_x as f64,
+                tile_origin_y + crop_y as f64,
+                view_x,
+                view_y,
+                relative_downsample,
             );
+        }
+    }
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_vms_restart_sampled_rgb_region(
+    path: &Path,
+    crop_x: u32,
+    crop_y: u32,
+    crop_w: u32,
+    crop_h: u32,
+    sample_x0: f64,
+    sample_y0: f64,
+    sample_step: f64,
+    out_w: u32,
+    out_h: u32,
+) -> Result<Option<(Vec<u8>, u32, u32)>> {
+    let Some(info) = vms_restart_info(path)? else {
+        return Ok(None);
+    };
+    if crop_x.saturating_add(crop_w) > info.width || crop_y.saturating_add(crop_h) > info.height {
+        return Ok(None);
+    }
+
+    let scale_denom = if sample_step >= 8.0 {
+        8
+    } else if (sample_step - 4.0).abs() < 1e-9 {
+        4
+    } else if (sample_step - 2.0).abs() < 1e-9 {
+        2
+    } else {
+        1
+    };
+    let scaled_tile_w = (info.tile_w / scale_denom).max(1);
+    let scaled_tile_h = (info.tile_h / scale_denom).max(1);
+    let mut out = vec![0; out_w as usize * out_h as usize * 3];
+    let mut decoded_tiles: HashMap<(usize, u32), (Vec<u8>, u32, u32)> = HashMap::new();
+
+    for out_y in 0..out_h {
+        let src_y = crop_y as i64
+            + floor_div(sample_y0 + f64::from(out_y) * sample_step, 1.0)
+                .clamp(0, i64::from(crop_h.saturating_sub(1)));
+        if src_y < 0 || src_y >= i64::from(info.height) {
+            return Ok(None);
+        }
+        let tile_row = u64::try_from(src_y)
+            .map_err(|_| OpenSlideError::Format("VMS sampled Y overflow".into()))?
+            / u64::from(info.tile_h);
+        let local_y = u32::try_from(
+            u64::try_from(src_y)
+                .map_err(|_| OpenSlideError::Format("VMS sampled Y overflow".into()))?
+                % u64::from(info.tile_h),
+        )
+        .map_err(|_| OpenSlideError::Format("VMS local Y overflow".into()))?;
+        let scaled_y = (local_y / scale_denom).min(scaled_tile_h - 1);
+
+        let mut out_x = 0;
+        while out_x < out_w {
+            let src_x = crop_x as i64
+                + floor_div(sample_x0 + f64::from(out_x) * sample_step, 1.0)
+                    .clamp(0, i64::from(crop_w.saturating_sub(1)));
+            if src_x < 0 || src_x >= i64::from(info.width) {
+                return Ok(None);
+            }
+            let tile_col = u64::try_from(src_x)
+                .map_err(|_| OpenSlideError::Format("VMS sampled X overflow".into()))?
+                / u64::from(info.tile_w);
+            let tile_no = tile_row
+                .checked_mul(info.tiles_across)
+                .and_then(|base| base.checked_add(tile_col))
+                .ok_or_else(|| OpenSlideError::Format("VMS restart tile index overflow".into()))?;
+            let tile_index = usize::try_from(tile_no)
+                .map_err(|_| OpenSlideError::Format("VMS restart tile index overflow".into()))?;
+            if !decoded_tiles.contains_key(&(tile_index, scale_denom)) {
+                let data_start = info.starts[tile_index];
+                let data_stop = info
+                    .starts
+                    .get(tile_index + 1)
+                    .copied()
+                    .unwrap_or(info.file_stop);
+                let tile = decode::decode_jpeg_file_range_rgb(
+                    path,
+                    info.header_start,
+                    info.sof_position,
+                    info.header_stop,
+                    data_start,
+                    data_stop,
+                    info.tile_w,
+                    info.tile_h,
+                    scale_denom,
+                )?;
+                decoded_tiles.insert((tile_index, scale_denom), tile);
+            }
+            let (tile_rgb, tile_rgb_w, _tile_rgb_h) = decoded_tiles
+                .get(&(tile_index, scale_denom))
+                .ok_or_else(|| OpenSlideError::Format("VMS decoded tile cache miss".into()))?;
+
+            while out_x < out_w {
+                let src_x = crop_x as i64
+                    + floor_div(sample_x0 + f64::from(out_x) * sample_step, 1.0)
+                        .clamp(0, i64::from(crop_w.saturating_sub(1)));
+                let src_x_u64 = u64::try_from(src_x)
+                    .map_err(|_| OpenSlideError::Format("VMS sampled X overflow".into()))?;
+                if src_x_u64 / u64::from(info.tile_w) != tile_col {
+                    break;
+                }
+                let local_x = u32::try_from(src_x_u64 % u64::from(info.tile_w))
+                    .map_err(|_| OpenSlideError::Format("VMS local X overflow".into()))?;
+                let scaled_x = (local_x / scale_denom).min(scaled_tile_w - 1);
+                let src = (scaled_y as usize * *tile_rgb_w as usize + scaled_x as usize) * 3;
+                let dst = (out_y as usize * out_w as usize + out_x as usize) * 3;
+                out[dst..dst + 3].copy_from_slice(&tile_rgb[src..src + 3]);
+                out_x += 1;
+            }
+        }
+    }
+
+    Ok(Some((out, out_w, out_h)))
+}
+
+fn read_vms_region_rgba(
+    level: &Level,
+    image_files: &[PathBuf],
+    num_cols: u64,
+    tile_w: u32,
+    tile_h: u32,
+    source_downsample: f64,
+    x: i64,
+    y: i64,
+    w: u32,
+    h: u32,
+) -> Result<RgbaImage> {
+    let mut output = RgbaImage::new(w, h);
+    if w == 0 || h == 0 {
+        return Ok(output);
+    }
+    for pixel in output.data.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+
+    let source_downsample = source_downsample.max(1.0);
+    let relative_downsample = (level.downsample / source_downsample).max(1.0);
+    let source_downsample = (level.downsample / relative_downsample).max(1.0);
+    let view_x = x as f64 / source_downsample;
+    let view_y = y as f64 / source_downsample;
+    let full_w = w as f64 * relative_downsample;
+    let full_h = h as f64 * relative_downsample;
+    let start_col = floor_div(view_x, tile_w as f64).max(0) as u64;
+    let start_row = floor_div(view_y, tile_h as f64).max(0) as u64;
+    let end_col = ceil_div(view_x + full_w, tile_w as f64)
+        .max(0)
+        .min(num_cols as i64) as u64;
+    let num_rows = (image_files.len() as u64).div_ceil(num_cols);
+    let end_row = ceil_div(view_y + full_h, tile_h as f64)
+        .max(0)
+        .min(num_rows as i64) as u64;
+
+    for row in start_row..end_row {
+        for col in start_col..end_col {
+            let tile_index = usize::try_from(row * num_cols + col)
+                .map_err(|_| OpenSlideError::Format("VMS tile index overflow".into()))?;
+            let path = image_files.get(tile_index).ok_or_else(|| {
+                OpenSlideError::Format("VMS tile index outside image file list".into())
+            })?;
+            let (jpeg_w, jpeg_h) = read_jpeg_dimensions(path)?;
+            let tile_origin_x = col as f64 * tile_w as f64;
+            let tile_origin_y = row as f64 * tile_h as f64;
+            let Some((crop_x, crop_y, crop_w, crop_h)) = source_overlap_rect(
+                tile_origin_x,
+                tile_origin_y,
+                jpeg_w as u32,
+                jpeg_h as u32,
+                view_x,
+                view_y,
+                full_w,
+                full_h,
+            ) else {
+                continue;
+            };
+
+            let src_origin_x = tile_origin_x + crop_x as f64;
+            let src_origin_y = tile_origin_y + crop_y as f64;
+            let dst_x0 = floor_div(src_origin_x - view_x, relative_downsample).max(0) as u32;
+            let dst_y0 = floor_div(src_origin_y - view_y, relative_downsample).max(0) as u32;
+            let dst_x1 = ceil_div(src_origin_x + crop_w as f64 - view_x, relative_downsample)
+                .max(0)
+                .min(output.width as i64) as u32;
+            let dst_y1 = ceil_div(src_origin_y + crop_h as f64 - view_y, relative_downsample)
+                .max(0)
+                .min(output.height as i64) as u32;
+            if dst_x1 <= dst_x0 || dst_y1 <= dst_y0 {
+                continue;
+            }
+
+            let sample_x0 = view_x + dst_x0 as f64 * relative_downsample - src_origin_x;
+            let sample_y0 = view_y + dst_y0 as f64 * relative_downsample - src_origin_y;
+            let out_w = dst_x1 - dst_x0;
+            let out_h = dst_y1 - dst_y0;
+            if let Some((rgb, rgb_w, _rgb_h)) = read_vms_restart_sampled_rgb_region(
+                path,
+                crop_x,
+                crop_y,
+                crop_w,
+                crop_h,
+                sample_x0,
+                sample_y0,
+                relative_downsample,
+                out_w,
+                out_h,
+            )? {
+                blit_rgb_visible(
+                    &rgb,
+                    rgb_w,
+                    out_w,
+                    out_h,
+                    &mut output,
+                    dst_x0 as f64,
+                    dst_y0 as f64,
+                );
+            } else if (relative_downsample - 1.0).abs() < 1e-9 {
+                let (rgb, rgb_w, _rgb_h) = decode::decode_rgb_region_from_file(
+                    ImageFormat::Jpeg,
+                    path,
+                    0,
+                    crop_x,
+                    crop_y,
+                    crop_w,
+                    crop_h,
+                )?;
+                blit_rgb_visible(
+                    &rgb,
+                    rgb_w,
+                    crop_w,
+                    crop_h,
+                    &mut output,
+                    dst_x0 as f64,
+                    dst_y0 as f64,
+                );
+            } else {
+                let (rgb, rgb_w, _rgb_h) = decode::decode_sampled_rgb_region_from_file(
+                    ImageFormat::Jpeg,
+                    path,
+                    0,
+                    crop_x,
+                    crop_y,
+                    crop_w,
+                    crop_h,
+                    sample_x0,
+                    sample_y0,
+                    relative_downsample,
+                    out_w,
+                    out_h,
+                    false,
+                )?;
+                blit_rgb_visible(
+                    &rgb,
+                    rgb_w,
+                    out_w,
+                    out_h,
+                    &mut output,
+                    dst_x0 as f64,
+                    dst_y0 as f64,
+                );
+            }
         }
     }
     Ok(output)
@@ -1312,15 +2003,297 @@ fn read_ndpi_region(
             } else {
                 ndpi.tile_h
             };
-            let tile = read_ndpi_tile(&mut file, ndpi, tile_index, decode_w, decode_h, channel)?;
-            blit_gray_visible(
-                &tile,
+            let tile_origin_x = col as f64 * ndpi.tile_w as f64;
+            let tile_origin_y = row as f64 * ndpi.tile_h as f64;
+            if matches!(ndpi.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG) {
+                let Some((crop_x, crop_y, crop_w, crop_h)) = source_overlap_rect(
+                    tile_origin_x,
+                    tile_origin_y,
+                    visible_w,
+                    visible_h,
+                    lx,
+                    ly,
+                    w as f64,
+                    h as f64,
+                ) else {
+                    continue;
+                };
+                let tile = read_ndpi_tile_region(
+                    ndpi, tile_index, crop_x, crop_y, crop_w, crop_h, channel,
+                )?;
+                blit_gray_visible(
+                    &tile,
+                    crop_w,
+                    crop_h,
+                    &mut output,
+                    tile_origin_x + crop_x as f64 - lx,
+                    tile_origin_y + crop_y as f64 - ly,
+                );
+            } else {
+                let tile =
+                    read_ndpi_tile(&mut file, ndpi, tile_index, decode_w, decode_h, channel)?;
+                blit_gray_visible(
+                    &tile,
+                    visible_w,
+                    visible_h,
+                    &mut output,
+                    tile_origin_x - lx,
+                    tile_origin_y - ly,
+                );
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn read_scaled_ndpi_region(
+    ndpi: &NdpiLevel,
+    level: &Level,
+    channel: u32,
+    x: i64,
+    y: i64,
+    w: u32,
+    h: u32,
+) -> Result<GrayImage> {
+    let mut output = GrayImage::new(w, h);
+    if w == 0 || h == 0 {
+        return Ok(output);
+    }
+
+    let relative_downsample = ((ndpi.width as f64 / level.width as f64)
+        .max(ndpi.height as f64 / level.height as f64))
+    .max(1.0);
+    let source_downsample = (level.downsample / relative_downsample).max(1.0);
+    let view_x = x as f64 / source_downsample;
+    let view_y = y as f64 / source_downsample;
+    let full_w = w as f64 * relative_downsample;
+    let full_h = h as f64 * relative_downsample;
+    let start_col = floor_div(view_x, ndpi.tile_w as f64).max(0) as u64;
+    let start_row = floor_div(view_y, ndpi.tile_h as f64).max(0) as u64;
+    let end_col = ceil_div(view_x + full_w, ndpi.tile_w as f64)
+        .max(0)
+        .min(ndpi.tiles_across as i64) as u64;
+    let end_row = ceil_div(view_y + full_h, ndpi.tile_h as f64)
+        .max(0)
+        .min(ndpi.tiles_down as i64) as u64;
+
+    let mut file = fs::File::open(&ndpi.path)?;
+    for row in start_row..end_row {
+        for col in start_col..end_col {
+            let tile_index = usize::try_from(row * ndpi.tiles_across + col)
+                .map_err(|_| OpenSlideError::Format("NDPI tile index overflow".into()))?;
+            let visible_w = (ndpi.width - col * ndpi.tile_w as u64).min(ndpi.tile_w as u64) as u32;
+            let visible_h = (ndpi.height - row * ndpi.tile_h as u64).min(ndpi.tile_h as u64) as u32;
+            let decode_w = ndpi.tile_w;
+            let decode_h = if ndpi.tiles_across == 1 {
+                visible_h
+            } else {
+                ndpi.tile_h
+            };
+            let tile_origin_x = col as f64 * ndpi.tile_w as f64;
+            let tile_origin_y = row as f64 * ndpi.tile_h as f64;
+            if matches!(ndpi.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG) {
+                let Some((crop_x, crop_y, crop_w, crop_h)) = source_overlap_rect(
+                    tile_origin_x,
+                    tile_origin_y,
+                    visible_w,
+                    visible_h,
+                    view_x,
+                    view_y,
+                    full_w,
+                    full_h,
+                ) else {
+                    continue;
+                };
+                let tile = read_ndpi_tile_region(
+                    ndpi, tile_index, crop_x, crop_y, crop_w, crop_h, channel,
+                )?;
+                blit_gray_scaled_visible(
+                    &tile,
+                    crop_w,
+                    crop_h,
+                    &mut output,
+                    tile_origin_x + crop_x as f64,
+                    tile_origin_y + crop_y as f64,
+                    view_x,
+                    view_y,
+                    relative_downsample,
+                );
+            } else {
+                let tile =
+                    read_ndpi_tile(&mut file, ndpi, tile_index, decode_w, decode_h, channel)?;
+                blit_gray_scaled_visible(
+                    &tile,
+                    visible_w,
+                    visible_h,
+                    &mut output,
+                    tile_origin_x,
+                    tile_origin_y,
+                    view_x,
+                    view_y,
+                    relative_downsample,
+                );
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn read_ndpi_region_rgba(
+    ndpi: &NdpiLevel,
+    level: &Level,
+    x: i64,
+    y: i64,
+    w: u32,
+    h: u32,
+) -> Result<RgbaImage> {
+    let mut output = RgbaImage::new(w, h);
+    if w == 0 || h == 0 {
+        return Ok(output);
+    }
+    for pixel in output.data.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+
+    let lx = x as f64 / level.downsample;
+    let ly = y as f64 / level.downsample;
+    let start_col = floor_div(lx, ndpi.tile_w as f64).max(0) as u64;
+    let start_row = floor_div(ly, ndpi.tile_h as f64).max(0) as u64;
+    let end_col = ceil_div(lx + w as f64, ndpi.tile_w as f64)
+        .max(0)
+        .min(ndpi.tiles_across as i64) as u64;
+    let end_row = ceil_div(ly + h as f64, ndpi.tile_h as f64)
+        .max(0)
+        .min(ndpi.tiles_down as i64) as u64;
+
+    for row in start_row..end_row {
+        for col in start_col..end_col {
+            let tile_index = usize::try_from(row * ndpi.tiles_across + col)
+                .map_err(|_| OpenSlideError::Format("NDPI tile index overflow".into()))?;
+            let visible_w = (level.width - col * ndpi.tile_w as u64).min(ndpi.tile_w as u64) as u32;
+            let visible_h =
+                (level.height - row * ndpi.tile_h as u64).min(ndpi.tile_h as u64) as u32;
+            let tile_origin_x = col as f64 * ndpi.tile_w as f64;
+            let tile_origin_y = row as f64 * ndpi.tile_h as f64;
+            let Some((crop_x, crop_y, crop_w, crop_h)) = source_overlap_rect(
+                tile_origin_x,
+                tile_origin_y,
                 visible_w,
                 visible_h,
+                lx,
+                ly,
+                w as f64,
+                h as f64,
+            ) else {
+                continue;
+            };
+            let (rgb, tile_w, _tile_h) =
+                read_ndpi_tile_rgb_region(ndpi, tile_index, crop_x, crop_y, crop_w, crop_h)?;
+            blit_rgb_visible(
+                &rgb,
+                tile_w,
+                crop_w,
+                crop_h,
                 &mut output,
-                col as f64 * ndpi.tile_w as f64 - lx,
-                row as f64 * ndpi.tile_h as f64 - ly,
+                tile_origin_x + crop_x as f64 - lx,
+                tile_origin_y + crop_y as f64 - ly,
             );
+        }
+    }
+    Ok(output)
+}
+
+fn read_scaled_ndpi_region_rgba(
+    ndpi: &NdpiLevel,
+    level: &Level,
+    x: i64,
+    y: i64,
+    w: u32,
+    h: u32,
+) -> Result<RgbaImage> {
+    let mut output = RgbaImage::new(w, h);
+    if w == 0 || h == 0 {
+        return Ok(output);
+    }
+    for pixel in output.data.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+
+    let relative_downsample = ((ndpi.width as f64 / level.width as f64)
+        .max(ndpi.height as f64 / level.height as f64))
+    .max(1.0);
+    let source_downsample = (level.downsample / relative_downsample).max(1.0);
+    let view_x = x as f64 / source_downsample;
+    let view_y = y as f64 / source_downsample;
+    let full_w = w as f64 * relative_downsample;
+    let full_h = h as f64 * relative_downsample;
+    let start_col = floor_div(view_x, ndpi.tile_w as f64).max(0) as u64;
+    let start_row = floor_div(view_y, ndpi.tile_h as f64).max(0) as u64;
+    let end_col = ceil_div(view_x + full_w, ndpi.tile_w as f64)
+        .max(0)
+        .min(ndpi.tiles_across as i64) as u64;
+    let end_row = ceil_div(view_y + full_h, ndpi.tile_h as f64)
+        .max(0)
+        .min(ndpi.tiles_down as i64) as u64;
+
+    for row in start_row..end_row {
+        for col in start_col..end_col {
+            let tile_index = usize::try_from(row * ndpi.tiles_across + col)
+                .map_err(|_| OpenSlideError::Format("NDPI tile index overflow".into()))?;
+            let visible_w = (ndpi.width - col * ndpi.tile_w as u64).min(ndpi.tile_w as u64) as u32;
+            let visible_h = (ndpi.height - row * ndpi.tile_h as u64).min(ndpi.tile_h as u64) as u32;
+            let tile_origin_x = col as f64 * ndpi.tile_w as f64;
+            let tile_origin_y = row as f64 * ndpi.tile_h as f64;
+            let Some((crop_x, crop_y, crop_w, crop_h)) = source_overlap_rect(
+                tile_origin_x,
+                tile_origin_y,
+                visible_w,
+                visible_h,
+                view_x,
+                view_y,
+                full_w,
+                full_h,
+            ) else {
+                continue;
+            };
+            let src_origin_x = tile_origin_x + crop_x as f64;
+            let src_origin_y = tile_origin_y + crop_y as f64;
+            let dst_x0 = floor_div(src_origin_x - view_x, relative_downsample).max(0) as u32;
+            let dst_y0 = floor_div(src_origin_y - view_y, relative_downsample).max(0) as u32;
+            let dst_x1 = ceil_div(src_origin_x + crop_w as f64 - view_x, relative_downsample)
+                .max(0)
+                .min(output.width as i64) as u32;
+            let dst_y1 = ceil_div(src_origin_y + crop_h as f64 - view_y, relative_downsample)
+                .max(0)
+                .min(output.height as i64) as u32;
+            if dst_x1 > dst_x0 && dst_y1 > dst_y0 {
+                let sample_x0 = view_x + dst_x0 as f64 * relative_downsample - src_origin_x;
+                let sample_y0 = view_y + dst_y0 as f64 * relative_downsample - src_origin_y;
+                let out_w = dst_x1 - dst_x0;
+                let out_h = dst_y1 - dst_y0;
+                let (rgb, rgb_w, _rgb_h) = read_ndpi_tile_sampled_rgb_region(
+                    ndpi,
+                    tile_index,
+                    crop_x,
+                    crop_y,
+                    crop_w,
+                    crop_h,
+                    sample_x0,
+                    sample_y0,
+                    relative_downsample,
+                    out_w,
+                    out_h,
+                )?;
+                blit_rgb_visible(
+                    &rgb,
+                    rgb_w,
+                    out_w,
+                    out_h,
+                    &mut output,
+                    dst_x0 as f64,
+                    dst_y0 as f64,
+                );
+            }
         }
     }
     Ok(output)
@@ -1397,6 +2370,259 @@ fn read_ndpi_tile(
             other
         ))),
     }
+}
+
+fn read_ndpi_tile_region(
+    ndpi: &NdpiLevel,
+    tile_index: usize,
+    crop_x: u32,
+    crop_y: u32,
+    crop_w: u32,
+    crop_h: u32,
+    channel: u32,
+) -> Result<GrayImage> {
+    if ndpi.planar_config != PLANARCONFIG_CONTIG {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Planar JPEG-compressed Hamamatsu NDPI data is not supported".into(),
+        ));
+    }
+    let offset = *ndpi
+        .offsets
+        .get(tile_index)
+        .ok_or_else(|| OpenSlideError::Format("NDPI tile offset missing".into()))?;
+    match ndpi.compression {
+        COMPRESSION_JPEG | COMPRESSION_OLD_JPEG => decode::decode_channel_region_from_file(
+            ImageFormat::Jpeg,
+            &ndpi.path,
+            offset,
+            channel,
+            crop_x,
+            crop_y,
+            crop_w,
+            crop_h,
+        ),
+        other => Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported NDPI TIFF compression {} for region JPEG decode",
+            other
+        ))),
+    }
+}
+
+fn read_ndpi_tile_rgb_region(
+    ndpi: &NdpiLevel,
+    tile_index: usize,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    if ndpi.planar_config != PLANARCONFIG_CONTIG {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Planar NDPI RGB crop reads are not supported".into(),
+        ));
+    }
+    let offset = *ndpi
+        .offsets
+        .get(tile_index)
+        .ok_or_else(|| OpenSlideError::Format("NDPI tile offset index out of range".into()))?;
+    match ndpi.compression {
+        COMPRESSION_JPEG | COMPRESSION_OLD_JPEG => {
+            decode::decode_rgb_region_from_file(ImageFormat::Jpeg, &ndpi.path, offset, x, y, w, h)
+        }
+        other => Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported NDPI RGB crop compression {other}"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_ndpi_tile_sampled_rgb_region(
+    ndpi: &NdpiLevel,
+    tile_index: usize,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    sample_x0: f64,
+    sample_y0: f64,
+    sample_step: f64,
+    out_w: u32,
+    out_h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    if ndpi.planar_config != PLANARCONFIG_CONTIG {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Planar NDPI sampled RGB crop reads are not supported".into(),
+        ));
+    }
+    let offset = *ndpi
+        .offsets
+        .get(tile_index)
+        .ok_or_else(|| OpenSlideError::Format("NDPI tile offset index out of range".into()))?;
+    let byte_count = *ndpi
+        .byte_counts
+        .get(tile_index)
+        .ok_or_else(|| OpenSlideError::Format("NDPI tile byte count index out of range".into()))?;
+    match ndpi.compression {
+        COMPRESSION_JPEG | COMPRESSION_OLD_JPEG => {
+            if let Some((rgb, rgb_w, rgb_h)) = read_jpeg_restart_sampled_rgb_region(
+                &ndpi.path,
+                offset,
+                offset.checked_add(byte_count).ok_or_else(|| {
+                    OpenSlideError::Format("NDPI JPEG byte range overflow".into())
+                })?,
+                x,
+                y,
+                w,
+                h,
+                sample_x0,
+                sample_y0,
+                sample_step,
+                out_w,
+                out_h,
+            )? {
+                return Ok((rgb, rgb_w, rgb_h));
+            }
+            decode::decode_sampled_rgb_region_from_file(
+                ImageFormat::Jpeg,
+                &ndpi.path,
+                offset,
+                x,
+                y,
+                w,
+                h,
+                sample_x0,
+                sample_y0,
+                sample_step,
+                out_w,
+                out_h,
+                true,
+            )
+        }
+        other => Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported NDPI sampled RGB crop compression {other}"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_jpeg_restart_sampled_rgb_region(
+    path: &Path,
+    header_start: u64,
+    file_stop: u64,
+    crop_x: u32,
+    crop_y: u32,
+    crop_w: u32,
+    crop_h: u32,
+    sample_x0: f64,
+    sample_y0: f64,
+    sample_step: f64,
+    out_w: u32,
+    out_h: u32,
+) -> Result<Option<(Vec<u8>, u32, u32)>> {
+    let Some(info) = jpeg_restart_info(path, header_start, file_stop)? else {
+        return Ok(None);
+    };
+    if crop_x.saturating_add(crop_w) > info.width || crop_y.saturating_add(crop_h) > info.height {
+        return Ok(None);
+    }
+
+    let scale_denom = if sample_step >= 8.0 {
+        8
+    } else if (sample_step - 4.0).abs() < 1e-9 {
+        4
+    } else if (sample_step - 2.0).abs() < 1e-9 {
+        2
+    } else {
+        return Ok(None);
+    };
+    let scaled_tile_w = (info.tile_w / scale_denom).max(1);
+    let scaled_tile_h = (info.tile_h / scale_denom).max(1);
+    let mut out = vec![0; out_w as usize * out_h as usize * 3];
+    let mut decoded_tiles: HashMap<(usize, u32), (Vec<u8>, u32, u32)> = HashMap::new();
+
+    for out_y in 0..out_h {
+        let src_y = crop_y as i64
+            + floor_div(sample_y0 + f64::from(out_y) * sample_step, 1.0)
+                .clamp(0, i64::from(crop_h.saturating_sub(1)));
+        if src_y < 0 || src_y >= i64::from(info.height) {
+            return Ok(None);
+        }
+        let tile_row = u64::try_from(src_y)
+            .map_err(|_| OpenSlideError::Format("JPEG restart sampled Y overflow".into()))?
+            / u64::from(info.tile_h);
+        let local_y = u32::try_from(
+            u64::try_from(src_y)
+                .map_err(|_| OpenSlideError::Format("JPEG restart sampled Y overflow".into()))?
+                % u64::from(info.tile_h),
+        )
+        .map_err(|_| OpenSlideError::Format("JPEG restart local Y overflow".into()))?;
+        let scaled_y = (local_y / scale_denom).min(scaled_tile_h - 1);
+
+        let mut out_x = 0;
+        while out_x < out_w {
+            let src_x = crop_x as i64
+                + floor_div(sample_x0 + f64::from(out_x) * sample_step, 1.0)
+                    .clamp(0, i64::from(crop_w.saturating_sub(1)));
+            if src_x < 0 || src_x >= i64::from(info.width) {
+                return Ok(None);
+            }
+            let tile_col = u64::try_from(src_x)
+                .map_err(|_| OpenSlideError::Format("JPEG restart sampled X overflow".into()))?
+                / u64::from(info.tile_w);
+            let tile_no = tile_row
+                .checked_mul(info.tiles_across)
+                .and_then(|base| base.checked_add(tile_col))
+                .ok_or_else(|| OpenSlideError::Format("JPEG restart tile index overflow".into()))?;
+            let tile_index = usize::try_from(tile_no)
+                .map_err(|_| OpenSlideError::Format("JPEG restart tile index overflow".into()))?;
+            if !decoded_tiles.contains_key(&(tile_index, scale_denom)) {
+                let data_start = info.starts[tile_index];
+                let data_stop = info
+                    .starts
+                    .get(tile_index + 1)
+                    .copied()
+                    .unwrap_or(info.file_stop);
+                let tile = decode::decode_jpeg_file_range_rgb(
+                    path,
+                    info.header_start,
+                    info.sof_position,
+                    info.header_stop,
+                    data_start,
+                    data_stop,
+                    info.tile_w,
+                    info.tile_h,
+                    scale_denom,
+                )?;
+                decoded_tiles.insert((tile_index, scale_denom), tile);
+            }
+            let (tile_rgb, tile_rgb_w, _tile_rgb_h) = decoded_tiles
+                .get(&(tile_index, scale_denom))
+                .ok_or_else(|| {
+                    OpenSlideError::Format("JPEG restart decoded tile cache miss".into())
+                })?;
+
+            while out_x < out_w {
+                let src_x = crop_x as i64
+                    + floor_div(sample_x0 + f64::from(out_x) * sample_step, 1.0)
+                        .clamp(0, i64::from(crop_w.saturating_sub(1)));
+                let src_x_u64 = u64::try_from(src_x).map_err(|_| {
+                    OpenSlideError::Format("JPEG restart sampled X overflow".into())
+                })?;
+                if src_x_u64 / u64::from(info.tile_w) != tile_col {
+                    break;
+                }
+                let local_x = u32::try_from(src_x_u64 % u64::from(info.tile_w))
+                    .map_err(|_| OpenSlideError::Format("JPEG restart local X overflow".into()))?;
+                let scaled_x = (local_x / scale_denom).min(scaled_tile_w - 1);
+                let src = (scaled_y as usize * *tile_rgb_w as usize + scaled_x as usize) * 3;
+                let dst = (out_y as usize * out_w as usize + out_x as usize) * 3;
+                out[dst..dst + 3].copy_from_slice(&tile_rgb[src..src + 3]);
+                out_x += 1;
+            }
+        }
+    }
+
+    Ok(Some((out, out_w, out_h)))
 }
 
 fn decode_raw_channel(
@@ -1911,10 +3137,6 @@ fn has_jpeg_marker(data: &[u8], wanted: u8) -> bool {
     false
 }
 
-fn blit_gray(src: &GrayImage, dst: &mut GrayImage, dst_x: f64, dst_y: f64) {
-    blit_gray_visible(src, src.width, src.height, dst, dst_x, dst_y);
-}
-
 fn blit_gray_visible(
     src: &GrayImage,
     visible_w: u32,
@@ -1944,6 +3166,120 @@ fn blit_gray_visible(
     }
 }
 
+#[cfg(test)]
+fn blit_gray_scaled(
+    src: &GrayImage,
+    dst: &mut GrayImage,
+    src_origin_x: f64,
+    src_origin_y: f64,
+    view_x: f64,
+    view_y: f64,
+    downsample: f64,
+) {
+    blit_gray_scaled_visible(
+        src,
+        src.width,
+        src.height,
+        dst,
+        src_origin_x,
+        src_origin_y,
+        view_x,
+        view_y,
+        downsample,
+    );
+}
+
+fn blit_gray_scaled_visible(
+    src: &GrayImage,
+    visible_w: u32,
+    visible_h: u32,
+    dst: &mut GrayImage,
+    src_origin_x: f64,
+    src_origin_y: f64,
+    view_x: f64,
+    view_y: f64,
+    downsample: f64,
+) {
+    let visible_w = visible_w.min(src.width);
+    let visible_h = visible_h.min(src.height);
+    let dst_x0 = floor_div(src_origin_x - view_x, downsample).max(0) as u32;
+    let dst_y0 = floor_div(src_origin_y - view_y, downsample).max(0) as u32;
+    let dst_x1 = ceil_div(src_origin_x + visible_w as f64 - view_x, downsample)
+        .max(0)
+        .min(dst.width as i64) as u32;
+    let dst_y1 = ceil_div(src_origin_y + visible_h as f64 - view_y, downsample)
+        .max(0)
+        .min(dst.height as i64) as u32;
+
+    for dst_y in dst_y0..dst_y1 {
+        let src_y = (view_y + dst_y as f64 * downsample - src_origin_y).floor() as i64;
+        if src_y < 0 || src_y >= visible_h as i64 {
+            continue;
+        }
+        for dst_x in dst_x0..dst_x1 {
+            let src_x = (view_x + dst_x as f64 * downsample - src_origin_x).floor() as i64;
+            if src_x < 0 || src_x >= visible_w as i64 {
+                continue;
+            }
+            let src_idx = src_y as usize * src.width as usize + src_x as usize;
+            let dst_idx = dst_y as usize * dst.width as usize + dst_x as usize;
+            dst.data[dst_idx] = src.data[src_idx];
+        }
+    }
+}
+
+fn blit_rgb_visible(
+    src_rgb: &[u8],
+    src_width: u32,
+    visible_w: u32,
+    visible_h: u32,
+    dst: &mut RgbaImage,
+    dst_x: f64,
+    dst_y: f64,
+) {
+    let dx0 = dst_x.round() as i64;
+    let dy0 = dst_y.round() as i64;
+    let visible_w = visible_w.min(src_width);
+    let visible_h = visible_h.min((src_rgb.len() / 3 / src_width.max(1) as usize) as u32);
+
+    for row in 0..visible_h as i64 {
+        let dy = dy0 + row;
+        if dy < 0 || dy >= dst.height as i64 {
+            continue;
+        }
+        for col in 0..visible_w as i64 {
+            let dx = dx0 + col;
+            if dx < 0 || dx >= dst.width as i64 {
+                continue;
+            }
+            let src_idx = (row as usize * src_width as usize + col as usize) * 3;
+            let dst_idx = (dy as usize * dst.width as usize + dx as usize) * 4;
+            dst.data[dst_idx..dst_idx + 3].copy_from_slice(&src_rgb[src_idx..src_idx + 3]);
+        }
+    }
+}
+
+fn source_overlap_rect(
+    src_origin_x: f64,
+    src_origin_y: f64,
+    src_w: u32,
+    src_h: u32,
+    view_x: f64,
+    view_y: f64,
+    view_w: f64,
+    view_h: f64,
+) -> Option<(u32, u32, u32, u32)> {
+    let x0 = floor_div(view_x - src_origin_x, 1.0).max(0) as u32;
+    let y0 = floor_div(view_y - src_origin_y, 1.0).max(0) as u32;
+    let x1 = ceil_div(view_x + view_w - src_origin_x, 1.0)
+        .max(0)
+        .min(src_w as i64) as u32;
+    let y1 = ceil_div(view_y + view_h - src_origin_y, 1.0)
+        .max(0)
+        .min(src_h as i64) as u32;
+    (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
+}
+
 fn floor_div(a: f64, b: f64) -> i64 {
     (a / b).floor() as i64
 }
@@ -1961,7 +3297,7 @@ fn read_span(file: &mut fs::File, offset: u64, byte_count: u64) -> Result<Vec<u8
     Ok(data)
 }
 
-fn set_ndpi_properties(dir: &TiffDir, properties: &mut HashMap<String, String>) {
+fn ndpi_set_props(dir: &TiffDir, properties: &mut HashMap<String, String>) {
     if let Some(lens) = dir.first_float(NDPI_SOURCELENS) {
         let lens = format_float(lens);
         properties.insert("hamamatsu.SourceLens".into(), lens.clone());
@@ -2036,6 +3372,7 @@ struct TiffFile {
 
 #[derive(Debug)]
 struct TiffDir {
+    offset: u64,
     entries: HashMap<u16, TiffValue>,
 }
 
@@ -2054,27 +3391,27 @@ enum Endian {
 
 impl TiffFile {
     fn open(path: &Path) -> Result<Self> {
-        let data = fs::read(path)?;
-        Self::parse(data)
-    }
-
-    fn parse(data: Vec<u8>) -> Result<Self> {
-        if data.len() < 8 {
+        let mut file = fs::File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len < 8 {
             return Err(OpenSlideError::Format("Not a TIFF file".into()));
         }
-        let endian = match &data[0..2] {
+        let mut header = [0u8; 16];
+        file.read_exact(&mut header[..8])?;
+        let endian = match &header[0..2] {
             b"II" => Endian::Little,
             b"MM" => Endian::Big,
             _ => return Err(OpenSlideError::Format("Not a TIFF file".into())),
         };
-        let magic = read_u16(&data, 2, endian)?;
+        let magic = read_u16_from_chunk(&header[2..4], endian);
         let (bigtiff, mut offset) = match magic {
-            42 => (false, read_u32(&data, 4, endian)? as u64),
+            42 => (false, read_u32_from_chunk(&header[4..8], endian) as u64),
             43 => {
-                if data.len() < 16 || read_u16(&data, 4, endian)? != 8 {
+                file.read_exact(&mut header[8..16])?;
+                if read_u16_from_chunk(&header[4..6], endian) != 8 {
                     return Err(OpenSlideError::Format("Unsupported BigTIFF header".into()));
                 }
-                (true, read_u64(&data, 8, endian)?)
+                (true, read_u64_from_chunk(&header[8..16], endian))
             }
             _ => return Err(OpenSlideError::Format("Not a TIFF file".into())),
         };
@@ -2085,9 +3422,8 @@ impl TiffFile {
             if !seen.insert(offset) {
                 return Err(OpenSlideError::Format("TIFF directory loop".into()));
             }
-            let dir_offset = usize::try_from(offset)
-                .map_err(|_| OpenSlideError::Format("TIFF directory offset overflow".into()))?;
-            let (dir, next) = parse_tiff_dir(&data, dir_offset, endian, bigtiff)?;
+            let (mut dir, next) = parse_tiff_dir(&mut file, file_len, offset, endian, bigtiff)?;
+            dir.offset = offset;
             dirs.push(dir);
             offset = next;
         }
@@ -2199,67 +3535,91 @@ impl TiffValue {
 }
 
 fn parse_tiff_dir(
-    data: &[u8],
-    offset: usize,
+    file: &mut fs::File,
+    file_len: u64,
+    offset: u64,
     endian: Endian,
     bigtiff: bool,
 ) -> Result<(TiffDir, u64)> {
     if bigtiff {
-        let count = read_u64(data, offset, endian)?;
+        let count_bytes = read_file_range_exact(file, offset, 8)?;
+        let count = read_u64_from_chunk(&count_bytes, endian);
         let count_usize = usize::try_from(count)
             .map_err(|_| OpenSlideError::Format("BigTIFF entry count overflow".into()))?;
         let entries_start = offset
             .checked_add(8)
             .ok_or_else(|| OpenSlideError::Format("BigTIFF entry offset overflow".into()))?;
+        let table_len = count_usize
+            .checked_mul(20)
+            .ok_or_else(|| OpenSlideError::Format("BigTIFF entry table size overflow".into()))?;
         let next_offset_pos = entries_start
-            .checked_add(count_usize.checked_mul(20).ok_or_else(|| {
-                OpenSlideError::Format("BigTIFF entry table size overflow".into())
-            })?)
+            .checked_add(table_len as u64)
             .ok_or_else(|| OpenSlideError::Format("BigTIFF entry table overflow".into()))?;
-        ensure_range(data, next_offset_pos, 8)?;
+        ensure_file_range(file_len, next_offset_pos, 8)?;
+        let table = read_file_range_exact(file, entries_start, table_len)?;
 
         let mut entries = HashMap::new();
         for i in 0..count_usize {
-            let pos = entries_start + i * 20;
-            let tag = read_u16(data, pos, endian)?;
-            let field_type = read_u16(data, pos + 2, endian)?;
-            let value_count = read_u64(data, pos + 4, endian)?;
-            let value = entry_value(data, pos + 12, 8, endian, field_type, value_count)?;
+            let pos = i * 20;
+            let tag = read_u16_from_chunk(&table[pos..pos + 2], endian);
+            let field_type = read_u16_from_chunk(&table[pos + 2..pos + 4], endian);
+            let value_count = read_u64_from_chunk(&table[pos + 4..pos + 12], endian);
+            let value = entry_value(
+                file,
+                file_len,
+                &table[pos + 12..pos + 20],
+                8,
+                endian,
+                field_type,
+                value_count,
+            )?;
             entries.insert(tag, value);
         }
-        let next = read_u64(data, next_offset_pos, endian)?;
-        Ok((TiffDir { entries }, next))
+        let next_bytes = read_file_range_exact(file, next_offset_pos, 8)?;
+        let next = read_u64_from_chunk(&next_bytes, endian);
+        Ok((TiffDir { offset: 0, entries }, next))
     } else {
-        let count = read_u16(data, offset, endian)? as usize;
+        let count_bytes = read_file_range_exact(file, offset, 2)?;
+        let count = read_u16_from_chunk(&count_bytes, endian) as usize;
         let entries_start = offset
             .checked_add(2)
             .ok_or_else(|| OpenSlideError::Format("TIFF entry offset overflow".into()))?;
-        let next_offset_pos = entries_start
-            .checked_add(
-                count
-                    .checked_mul(12)
-                    .ok_or_else(|| OpenSlideError::Format("TIFF entry table overflow".into()))?,
-            )
+        let table_len = count
+            .checked_mul(12)
             .ok_or_else(|| OpenSlideError::Format("TIFF entry table overflow".into()))?;
-        ensure_range(data, next_offset_pos, 4)?;
+        let next_offset_pos = entries_start
+            .checked_add(table_len as u64)
+            .ok_or_else(|| OpenSlideError::Format("TIFF entry table overflow".into()))?;
+        ensure_file_range(file_len, next_offset_pos, 4)?;
+        let table = read_file_range_exact(file, entries_start, table_len)?;
 
         let mut entries = HashMap::new();
         for i in 0..count {
-            let pos = entries_start + i * 12;
-            let tag = read_u16(data, pos, endian)?;
-            let field_type = read_u16(data, pos + 2, endian)?;
-            let value_count = read_u32(data, pos + 4, endian)? as u64;
-            let value = entry_value(data, pos + 8, 4, endian, field_type, value_count)?;
+            let pos = i * 12;
+            let tag = read_u16_from_chunk(&table[pos..pos + 2], endian);
+            let field_type = read_u16_from_chunk(&table[pos + 2..pos + 4], endian);
+            let value_count = read_u32_from_chunk(&table[pos + 4..pos + 8], endian) as u64;
+            let value = entry_value(
+                file,
+                file_len,
+                &table[pos + 8..pos + 12],
+                4,
+                endian,
+                field_type,
+                value_count,
+            )?;
             entries.insert(tag, value);
         }
-        let next = read_u32(data, next_offset_pos, endian)? as u64;
-        Ok((TiffDir { entries }, next))
+        let next_bytes = read_file_range_exact(file, next_offset_pos, 4)?;
+        let next = read_u32_from_chunk(&next_bytes, endian) as u64;
+        Ok((TiffDir { offset: 0, entries }, next))
     }
 }
 
 fn entry_value(
-    data: &[u8],
-    value_pos: usize,
+    file: &mut fs::File,
+    file_len: u64,
+    value_field: &[u8],
     inline_width: usize,
     endian: Endian,
     field_type: u16,
@@ -2273,18 +3633,15 @@ fn entry_value(
         .and_then(|v| usize::try_from(v).ok())
         .ok_or_else(|| OpenSlideError::Format("TIFF value size overflow".into()))?;
     let data = if byte_count <= inline_width {
-        ensure_range(data, value_pos, inline_width)?;
-        data[value_pos..value_pos + byte_count].to_vec()
+        value_field[..byte_count].to_vec()
     } else {
         let offset = if inline_width == 8 {
-            read_u64(data, value_pos, endian)?
+            read_u64_from_chunk(value_field, endian)
         } else {
-            read_u32(data, value_pos, endian)? as u64
+            read_u32_from_chunk(value_field, endian) as u64
         };
-        let offset = usize::try_from(offset)
-            .map_err(|_| OpenSlideError::Format("TIFF value offset overflow".into()))?;
-        ensure_range(data, offset, byte_count)?;
-        data[offset..offset + byte_count].to_vec()
+        ensure_file_range(file_len, offset, byte_count)?;
+        read_file_range_exact(file, offset, byte_count)?
     };
     Ok(TiffValue {
         field_type,
@@ -2356,29 +3713,24 @@ fn chunks_to_rationals(data: &[u8], endian: Endian, signed: bool) -> Option<Vec<
     Some(out)
 }
 
-fn ensure_range(data: &[u8], offset: usize, len: usize) -> Result<()> {
+fn ensure_file_range(file_len: u64, offset: u64, len: usize) -> Result<()> {
+    let len = u64::try_from(len)
+        .map_err(|_| OpenSlideError::Format("TIFF value length overflow".into()))?;
     let end = offset
         .checked_add(len)
         .ok_or_else(|| OpenSlideError::Format("TIFF range overflow".into()))?;
-    if end > data.len() {
+    if end > file_len {
         return Err(OpenSlideError::Format("Truncated TIFF data".into()));
     }
     Ok(())
 }
 
-fn read_u16(data: &[u8], offset: usize, endian: Endian) -> Result<u16> {
-    ensure_range(data, offset, 2)?;
-    Ok(read_u16_from_chunk(&data[offset..offset + 2], endian))
-}
-
-fn read_u32(data: &[u8], offset: usize, endian: Endian) -> Result<u32> {
-    ensure_range(data, offset, 4)?;
-    Ok(read_u32_from_chunk(&data[offset..offset + 4], endian))
-}
-
-fn read_u64(data: &[u8], offset: usize, endian: Endian) -> Result<u64> {
-    ensure_range(data, offset, 8)?;
-    Ok(read_u64_from_chunk(&data[offset..offset + 8], endian))
+fn read_file_range_exact(file: &mut fs::File, offset: u64, len: usize) -> Result<Vec<u8>> {
+    ensure_file_range(file.metadata()?.len(), offset, len)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut data = vec![0; len];
+    file.read_exact(&mut data)?;
+    Ok(data)
 }
 
 fn read_u16_from_chunk(chunk: &[u8], endian: Endian) -> u16 {
@@ -2455,6 +3807,92 @@ mod tests {
         assert!(slide.associated_image_names().contains(&"label"));
         let green = slide.read_region(1, 0, 0, 0, 1, 1).unwrap();
         assert_eq!(green.pixel(0, 0), 96);
+    }
+
+    #[test]
+    fn opens_vms_with_smaller_edge_jpegs() {
+        let dir = unique_temp_dir("hamamatsu-vms-edge-jpegs");
+        fs::create_dir_all(&dir).unwrap();
+        let vms = dir.join("slide.vms");
+        let map = dir.join("map.jpg");
+        let image00 = dir.join("image00.jpg");
+        let image10 = dir.join("image10.jpg");
+        let image01 = dir.join("image01.jpg");
+        let image11 = dir.join("image11.jpg");
+        fs::write(&map, minimal_jpeg(16, 16)).unwrap();
+        fs::write(&image00, minimal_jpeg(100, 80)).unwrap();
+        fs::write(&image10, minimal_jpeg(40, 80)).unwrap();
+        fs::write(&image01, minimal_jpeg(100, 20)).unwrap();
+        fs::write(&image11, minimal_jpeg(40, 20)).unwrap();
+        fs::write(
+            &vms,
+            "[Virtual Microscope Specimen]\nNoJpegColumns=2\nNoJpegRows=2\nMapFile=map.jpg\nImageFile(0,0)=image00.jpg\nImageFile(1,0)=image10.jpg\nImageFile(0,1)=image01.jpg\nImageFile(1,1)=image11.jpg\n",
+        )
+        .unwrap();
+
+        let slide = OpenSlide::open(&vms).unwrap();
+
+        assert_eq!(slide.level_count(), 7);
+        assert_eq!(slide.level_dimensions(0), Some((140, 100)));
+        assert_eq!(slide.level_dimensions(1), Some((70, 50)));
+        assert_eq!(slide.level_dimensions(2), Some((35, 25)));
+        assert_eq!(slide.level_dimensions(3), Some((16, 16)));
+        assert_eq!(slide.level_dimensions(4), Some((8, 8)));
+        assert_eq!(slide.level_dimensions(5), Some((4, 4)));
+        assert_eq!(slide.level_dimensions(6), Some((2, 2)));
+        assert_eq!(slide.level_downsample(1), Some(2.0));
+        assert_eq!(slide.level_downsample(6), Some(70.0));
+    }
+
+    #[test]
+    fn rejects_vms_non_edge_jpeg_width_mismatch() {
+        let dir = unique_temp_dir("hamamatsu-vms-width-mismatch");
+        fs::create_dir_all(&dir).unwrap();
+        let vms = dir.join("slide.vms");
+        let map = dir.join("map.jpg");
+        fs::write(&map, minimal_jpeg(16, 16)).unwrap();
+        for (name, width) in [("image0.jpg", 100), ("image1.jpg", 90), ("image2.jpg", 100)] {
+            fs::write(dir.join(name), minimal_jpeg(width, 80)).unwrap();
+        }
+        fs::write(
+            &vms,
+            "[Virtual Microscope Specimen]\nNoJpegColumns=3\nNoJpegRows=1\nMapFile=map.jpg\nImageFile(0,0)=image0.jpg\nImageFile(1,0)=image1.jpg\nImageFile(2,0)=image2.jpg\n",
+        )
+        .unwrap();
+
+        let err = match OpenSlide::open(&vms) {
+            Ok(_) => panic!("expected VMS JPEG width mismatch error"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("VMS JPEG width not consistent"));
+    }
+
+    #[test]
+    fn fixes_ndpi_offsets_relative_to_directory_offset() {
+        assert_eq!(fix_offset_ndpi(0x1_0000_8000, 0x2000), 0x1_0000_2000);
+        assert_eq!(fix_offset_ndpi(0x1_0000_1000, 0x2000), 0x2000);
+    }
+
+    #[test]
+    fn rejects_vmu_with_unreadable_map_file() {
+        let dir = unique_temp_dir("hamamatsu-vmu-missing-map");
+        fs::create_dir_all(&dir).unwrap();
+        let vmu = dir.join("slide.vmu");
+        let level0 = dir.join("level0.l0");
+        fs::write(&level0, ngr_image(4, 2, 2, &[1, 2, 3])).unwrap();
+        fs::write(
+            &vmu,
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nMapFile=missing.l1\nBitsPerPixel=36\nPixelOrder=RGB\n",
+        )
+        .unwrap();
+
+        let err = match OpenSlide::open(&vmu) {
+            Ok(_) => panic!("expected unreadable VMU map file error"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("VMU map file is not readable"));
     }
 
     #[test]
@@ -2653,8 +4091,8 @@ mod tests {
 
         assert_eq!(slide.level_dimensions(0), Some((2, 1)));
         assert_eq!(
-            slide.properties().get("hamamatsu.key-file-group"),
-            Some(&"uncompressed virtual microscope specimen".to_string())
+            slide.properties().get("hamamatsu.PhysicalWidth"),
+            Some(&"2000".to_string())
         );
         assert_eq!(
             slide.properties().get(properties::PROPERTY_MPP_X),
@@ -2714,6 +4152,27 @@ mod tests {
             slide.properties().get("hamamatsu.CustomThree"),
             Some(&"gamma".to_string())
         );
+    }
+
+    #[test]
+    fn opens_ndpi_jpeg_scaled_levels() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-jpeg-scaled");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("slide.ndpi");
+        fs::write(
+            &path,
+            minimal_ndpi_with_image(COMPRESSION_JPEG, &minimal_jpeg(200, 100)),
+        )
+        .unwrap();
+
+        let slide = OpenSlide::open(&path).unwrap();
+
+        assert_eq!(slide.level_count(), 3);
+        assert_eq!(slide.level_dimensions(0), Some((200, 100)));
+        assert_eq!(slide.level_dimensions(1), Some((100, 50)));
+        assert_eq!(slide.level_dimensions(2), Some((50, 25)));
+        assert_eq!(slide.level_downsample(1), Some(2.0));
+        assert_eq!(slide.level_downsample(2), Some(4.0));
     }
 
     #[test]
@@ -2911,6 +4370,20 @@ mod tests {
     }
 
     #[test]
+    fn blits_vms_tiles_with_level_downsample() {
+        let src = GrayImage {
+            width: 4,
+            height: 2,
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let mut dst = GrayImage::new(2, 1);
+
+        blit_gray_scaled(&src, &mut dst, 0.0, 0.0, 1.0, 0.0, 2.0);
+
+        assert_eq!(dst.data, vec![2, 4]);
+    }
+
+    #[test]
     fn reads_planar_ndpi_rgb_tile() {
         let dir = unique_temp_dir("hamamatsu-ndpi-planar-read");
         fs::create_dir_all(&dir).unwrap();
@@ -2920,6 +4393,8 @@ mod tests {
             path,
             dir_index: 0,
             endian: Endian::Little,
+            width: 2,
+            height: 2,
             tile_w: 2,
             tile_h: 2,
             tiles_across: 1,
@@ -2938,6 +4413,50 @@ mod tests {
         let green = read_ndpi_tile(&mut file, &ndpi, 0, 2, 2, 1).unwrap();
 
         assert_eq!(green.data, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn reads_scaled_ndpi_region_in_source_level_coordinates() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-scaled-coordinates");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tile-data.bin");
+        let mut data = Vec::new();
+        for y in 0..4u8 {
+            for x in 0..4u8 {
+                data.extend_from_slice(&[x + y * 4, 0, 0]);
+            }
+        }
+        fs::write(&path, data).unwrap();
+
+        let ndpi = NdpiLevel {
+            path,
+            dir_index: 0,
+            endian: Endian::Little,
+            width: 4,
+            height: 4,
+            tile_w: 4,
+            tile_h: 4,
+            tiles_across: 1,
+            tiles_down: 1,
+            offsets: vec![0],
+            byte_counts: vec![4 * 4 * 3],
+            compression: COMPRESSION_NONE,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            photometric: PHOTOMETRIC_RGB,
+            planar_config: PLANARCONFIG_CONTIG,
+            jpeg_tables: None,
+        };
+        let level = Level {
+            width: 2,
+            height: 2,
+            downsample: 4.0,
+            source: LevelSource::NdpiScaled(ndpi.clone()),
+        };
+
+        let red = read_scaled_ndpi_region(&ndpi, &level, 0, 4, 0, 1, 1).unwrap();
+
+        assert_eq!(red.data, vec![2]);
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
@@ -2966,6 +4485,19 @@ mod tests {
                 }
             }
         }
+        data
+    }
+
+    fn minimal_jpeg(width: u16, height: u16) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0xff, 0xd8, 0xff, 0xc0]);
+        data.extend_from_slice(&17u16.to_be_bytes());
+        data.push(8);
+        data.extend_from_slice(&height.to_be_bytes());
+        data.extend_from_slice(&width.to_be_bytes());
+        data.push(3);
+        data.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
+        data.extend_from_slice(&[0xff, 0xd9]);
         data
     }
 

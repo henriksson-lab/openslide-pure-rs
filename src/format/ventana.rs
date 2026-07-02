@@ -33,18 +33,25 @@ const TAG_STRIPOFFSETS: u16 = 273;
 const TAG_SAMPLESPERPIXEL: u16 = 277;
 const TAG_STRIPBYTECOUNTS: u16 = 279;
 const TAG_PLANARCONFIG: u16 = 284;
+const TAG_PREDICTOR: u16 = 317;
 const TAG_TILEWIDTH: u16 = 322;
 const TAG_TILELENGTH: u16 = 323;
 const TAG_TILEOFFSETS: u16 = 324;
 const TAG_TILEBYTECOUNTS: u16 = 325;
 const TAG_JPEGTABLES: u16 = 347;
+#[cfg(test)]
+const TAG_ICCPROFILE: u16 = 34675;
 const TAG_XMLPACKET: u16 = 700;
 
 const COMPRESSION_NONE: u16 = 1;
+const COMPRESSION_LZW: u16 = 5;
 const COMPRESSION_JPEG: u16 = 7;
 const COMPRESSION_ADOBE_DEFLATE: u16 = 8;
 const COMPRESSION_DEFLATE: u16 = 32946;
 const COMPRESSION_PACKBITS: u16 = 32773;
+const COMPRESSION_JP2K_YCBCR: u16 = 33003;
+const COMPRESSION_JP2K_RGB: u16 = 33005;
+const COMPRESSION_JP2K: u16 = 34712;
 
 const PHOTOMETRIC_BLACK_IS_ZERO: u16 = 1;
 const PHOTOMETRIC_RGB: u16 = 2;
@@ -125,9 +132,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
 
             if level_no == 0 {
                 if let Some(xml) = dir.string(TAG_XMLPACKET) {
-                    if xml.contains("<EncodeInfo") {
-                        bif = Some(parse_bif_info(&xml, tile_width, tile_height)?);
-                    }
+                    bif = Some(parse_bif_info(&xml, tile_width, tile_height)?);
                 }
             }
 
@@ -143,7 +148,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
             });
         } else if let Some(name) = associated_image_name(&description) {
             if let Some(image) = read_associated_info(&tiff, dir) {
-                associated_images.entry(name.to_string()).or_insert(image);
+                associated_images.insert(name.to_string(), image);
             }
         }
     }
@@ -153,13 +158,30 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
             "Ventana slide has no pyramid levels".into(),
         ));
     }
-    raw_levels.sort_by_key(|level| level.level_no);
+    let mut prev_magnification = f64::INFINITY;
     for (expected, level) in raw_levels.iter().enumerate() {
         if level.level_no != expected as i64 {
             return Err(OpenSlideError::Format(format!(
-                "Unexpected Ventana level number {}",
+                "Unexpected encounter with Ventana level {}",
                 level.level_no
             )));
+        }
+        if !level.magnification.is_finite()
+            || level.magnification <= 0.0
+            || level.magnification >= prev_magnification
+        {
+            return Err(OpenSlideError::Format(format!(
+                "Unexpected Ventana magnification in level {}",
+                level.level_no
+            )));
+        }
+        prev_magnification = level.magnification;
+        if level.tile_width != raw_levels[0].tile_width
+            || level.tile_height != raw_levels[0].tile_height
+        {
+            return Err(OpenSlideError::Format(
+                "Inconsistent Ventana TIFF tile sizes".into(),
+            ));
         }
     }
 
@@ -169,11 +191,6 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
         .map(|bif| bif.bounds(raw_levels[0].tile_width, raw_levels[0].tile_height));
     let mut levels = Vec::with_capacity(raw_levels.len());
     for raw in raw_levels {
-        if raw.magnification <= 0.0 || level0_mag <= 0.0 {
-            return Err(OpenSlideError::Format(
-                "Invalid Ventana level magnification".into(),
-            ));
-        }
         let downsample = level0_mag / raw.magnification;
         let (width, height) = if let Some((base_w, base_h)) = bif_bounds {
             (
@@ -194,6 +211,20 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
         });
     }
     levels.sort_by(|a, b| b.width.cmp(&a.width).then_with(|| b.height.cmp(&a.height)));
+
+    let lowest_resolution_level = levels
+        .last()
+        .ok_or_else(|| OpenSlideError::Format("Ventana slide has no levels".into()))?
+        .dir_index;
+    let tifflike = tiff::TiffFile::open(path)?;
+    let icc_profile = tiff::tiff_icc_profile(&tifflike, levels[0].dir_index);
+    tiff::openslide_tifflike_init_properties_and_hash(
+        &mut properties,
+        &tifflike,
+        lowest_resolution_level,
+        levels[0].dir_index,
+        levels[0].dir_index,
+    )?;
 
     add_level_properties(&mut properties, &levels);
     if let Some(bif) = &bif {
@@ -222,9 +253,14 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     };
 
     let delegate = if bif_tilemap.is_none() {
-        match tiff::open(path) {
+        match tiff::open_tiled(path) {
             Ok(delegate) if delegate_matches(delegate.as_ref(), &levels) => Some(delegate),
-            _ => None,
+            Ok(_) => {
+                return Err(OpenSlideError::Format(
+                    "Ventana generic TIFF delegate does not match parsed levels".into(),
+                ))
+            }
+            Err(err) => return Err(err),
         }
     } else {
         None
@@ -235,6 +271,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
         properties,
         levels,
         associated_images,
+        icc_profile,
         bif_tilemap,
         delegate,
     }))
@@ -245,6 +282,7 @@ struct VentanaSlide {
     properties: HashMap<String, String>,
     levels: Vec<Level>,
     associated_images: HashMap<String, AssociatedImage>,
+    icc_profile: Option<Vec<u8>>,
     bif_tilemap: Option<BifTilemap>,
     delegate: Option<Box<dyn SlideBackend>>,
 }
@@ -357,6 +395,58 @@ impl SlideBackend for VentanaSlide {
         )))
     }
 
+    fn read_region_rgba(
+        &self,
+        channels: [Option<u32>; 4],
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<RgbaImage> {
+        for channel in channels.into_iter().flatten() {
+            if channel >= self.channel_count() {
+                return Err(OpenSlideError::InvalidArgument(format!(
+                    "Invalid channel {} (slide has {} channels)",
+                    channel,
+                    self.channel_count()
+                )));
+            }
+        }
+        if self.level_dimensions(level).is_none() {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid level {}",
+                level
+            )));
+        }
+        if let Some(delegate) = &self.delegate {
+            return delegate.read_region_rgba(channels, x, y, level, w, h);
+        }
+        if let Some(tilemap) = &self.bif_tilemap {
+            return tilemap.read_region_rgba(&self.path, channels, x, y, level, w, h);
+        }
+        let size = w as usize * h as usize;
+        let mut rgba = vec![0u8; size * 4];
+        if channels[3].is_none() {
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+        }
+
+        for (out_idx, ch_opt) in channels.iter().enumerate() {
+            if let Some(ch) = ch_opt {
+                let gray = self.read_region(*ch, x, y, level, w, h)?;
+                for i in 0..size {
+                    if i < gray.data.len() {
+                        rgba[i * 4 + out_idx] = gray.data[i];
+                    }
+                }
+            }
+        }
+
+        RgbaImage::from_rgba(w, h, rgba)
+    }
+
     fn properties(&self) -> &HashMap<String, String> {
         &self.properties
     }
@@ -376,10 +466,22 @@ impl SlideBackend for VentanaSlide {
             let mut data = Vec::with_capacity(source.byte_count.min(16 << 20) as usize);
             reader.read_to_end(&mut data)?;
             if let Some(format) = detect_associated_image_format(&data) {
-                return decode::decode_to_rgba(format, &data);
+                if let Ok(image) = decode::decode_to_rgba(format, &data) {
+                    return Ok(image);
+                }
             }
         }
-        read_associated_with_tiff_crate(&self.path, image.dir_index)
+        read_associated_tiled_with_internal_decoder(
+            &self.path,
+            image.dir_index,
+            image.width as u32,
+            image.height as u32,
+        )
+        .or_else(|_| read_associated_with_tiff_crate(&self.path, image.dir_index))
+    }
+
+    fn icc_profile(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.icc_profile.clone())
     }
 
     fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize {
@@ -407,6 +509,8 @@ struct BifTilemap {
 
 #[derive(Debug, Clone)]
 struct BifTilemapLevel {
+    dir_index: usize,
+    tiles_across: u64,
     tile_width: u32,
     tile_height: u32,
     tile_offsets: Vec<u64>,
@@ -416,6 +520,7 @@ struct BifTilemapLevel {
     samples_per_pixel: u16,
     bits_per_sample: Vec<u16>,
     planar_config: u16,
+    predictor: u16,
     endian: Endian,
     tiles_per_plane: usize,
     jpeg_tables: Option<Vec<u8>>,
@@ -466,11 +571,12 @@ impl BifTilemap {
                     level.dir_index
                 ))
             })?;
-            match BifTilemapLevel::from_dir(tiff, dir, bif) {
-                Ok(parsed) => parsed_levels.push(Some(parsed)),
-                Err(err) if level_index == 0 => return Err(err),
-                Err(_) => parsed_levels.push(None),
-            }
+            let parsed = BifTilemapLevel::from_dir(tiff, dir).map_err(|err| {
+                OpenSlideError::Format(format!(
+                    "Invalid Ventana BIF TIFF level {level_index}: {err}"
+                ))
+            })?;
+            parsed_levels.push(Some(parsed));
         }
 
         Ok(Self {
@@ -515,16 +621,59 @@ impl BifTilemap {
         let ly = y as f64 / downsample;
         let tile_advance_x = self.tile_advance_x / downsample;
         let tile_advance_y = self.tile_advance_y / downsample;
+        let subtiles_per_tile = downsample as i64;
+        if subtiles_per_tile <= 0 || (downsample - subtiles_per_tile as f64).abs() > 0.001 {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "Ventana BIF non-integral level {level} downsample is not supported"
+            )));
+        }
 
+        let subtile_w = level_data.tile_width as f64 / subtiles_per_tile as f64;
+        let subtile_h = level_data.tile_height as f64 / subtiles_per_tile as f64;
         let mut output = GrayImage::new(w, h);
-        let mut first_tile = 0usize;
         for area in &self.areas {
-            for row in 0..area.tiles_down {
-                for col in 0..area.tiles_across {
-                    let local_tile = bif_scan_tile_index(area, col, row)?;
-                    let tile_no = first_tile.checked_add(local_tile).ok_or_else(|| {
-                        OpenSlideError::Format("Ventana BIF tile index overflow".into())
-                    })?;
+            let area_origin_x = area.x / downsample;
+            let area_origin_y = area.y / downsample;
+            let cols = overlapping_index_range(
+                area_origin_x,
+                tile_advance_x,
+                subtile_w,
+                lx,
+                w,
+                area.tiles_across,
+            );
+            let rows = overlapping_index_range(
+                area_origin_y,
+                tile_advance_y,
+                subtile_h,
+                ly,
+                h,
+                area.tiles_down,
+            );
+
+            for row in rows {
+                for col in cols.clone() {
+                    let grid_col = area.start_col + col;
+                    let grid_row = area.start_row + row;
+                    if grid_col < 0 || grid_row < 0 {
+                        return Err(OpenSlideError::Format(
+                            "Ventana BIF tilemap coordinate is negative".into(),
+                        ));
+                    }
+                    let tile_col = grid_col / subtiles_per_tile;
+                    let tile_row = grid_row / subtiles_per_tile;
+                    if tile_col < 0 || tile_row < 0 {
+                        return Err(OpenSlideError::Format(
+                            "Ventana BIF TIFF tile coordinate is negative".into(),
+                        ));
+                    }
+                    let tile_no = (tile_row as u64)
+                        .checked_mul(level_data.tiles_across)
+                        .and_then(|base| base.checked_add(tile_col as u64))
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or_else(|| {
+                            OpenSlideError::Format("Ventana BIF tile index overflow".into())
+                        })?;
                     if tile_no >= level_data.tile_offsets.len()
                         || tile_no >= level_data.tile_byte_counts.len()
                     {
@@ -534,21 +683,201 @@ impl BifTilemap {
                         )));
                     }
 
-                    let tile_origin_x = area.x / downsample + col as f64 * tile_advance_x;
-                    let tile_origin_y = area.y / downsample + row as f64 * tile_advance_y;
+                    let tile_origin_x = area_origin_x + col as f64 * tile_advance_x;
+                    let tile_origin_y = area_origin_y + row as f64 * tile_advance_y;
                     let tile = level_data.decode_tile(path, tile_no)?;
+                    let subtile_x = (grid_col % subtiles_per_tile) as f64 * subtile_w;
+                    let subtile_y = (grid_row % subtiles_per_tile) as f64 * subtile_h;
                     blit_decoded_tile_channel(
                         &tile,
                         channel,
                         &mut output,
+                        subtile_x.round() as u32,
+                        subtile_y.round() as u32,
+                        subtile_w.ceil() as u32,
+                        subtile_h.ceil() as u32,
                         tile_origin_x - lx,
                         tile_origin_y - ly,
                     );
                 }
             }
-            first_tile = first_tile
-                .checked_add(area_tile_count(area)?)
-                .ok_or_else(|| OpenSlideError::Format("Ventana BIF tile count overflow".into()))?;
+        }
+
+        Ok(output)
+    }
+
+    fn read_region_rgba(
+        &self,
+        path: &Path,
+        channels: [Option<u32>; 4],
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<RgbaImage> {
+        let level_data = self
+            .levels
+            .get(level as usize)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                OpenSlideError::UnsupportedFormat(format!(
+                    "Ventana BIF AOI tilemap read_region is not available for level {level}"
+                ))
+            })?;
+        let downsample = self
+            .level_downsamples
+            .get(level as usize)
+            .copied()
+            .unwrap_or(1.0);
+        if downsample <= 0.0 {
+            return Err(OpenSlideError::Format(format!(
+                "Invalid Ventana BIF level {level} downsample"
+            )));
+        }
+        let lx = x as f64 / downsample;
+        let ly = y as f64 / downsample;
+        let tile_advance_x = self.tile_advance_x / downsample;
+        let tile_advance_y = self.tile_advance_y / downsample;
+        let subtiles_per_tile = downsample as i64;
+        if subtiles_per_tile <= 0 || (downsample - subtiles_per_tile as f64).abs() > 0.001 {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "Ventana BIF non-integral level {level} downsample is not supported"
+            )));
+        }
+
+        let subtile_w = level_data.tile_width as f64 / subtiles_per_tile as f64;
+        let subtile_h = level_data.tile_height as f64 / subtiles_per_tile as f64;
+        let mut output = RgbaImage::new(w, h);
+        let cache_full_tiles = true;
+        let mut decoded_tiles: HashMap<usize, DecodedTile> = HashMap::new();
+        if channels[3].is_none() {
+            for pixel in output.data.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+        }
+
+        for area in &self.areas {
+            let area_origin_x = area.x / downsample;
+            let area_origin_y = area.y / downsample;
+            let cols = overlapping_index_range(
+                area_origin_x,
+                tile_advance_x,
+                subtile_w,
+                lx,
+                w,
+                area.tiles_across,
+            );
+            let rows = overlapping_index_range(
+                area_origin_y,
+                tile_advance_y,
+                subtile_h,
+                ly,
+                h,
+                area.tiles_down,
+            );
+
+            for row in rows {
+                for col in cols.clone() {
+                    let grid_col = area.start_col + col;
+                    let grid_row = area.start_row + row;
+                    if grid_col < 0 || grid_row < 0 {
+                        return Err(OpenSlideError::Format(
+                            "Ventana BIF tilemap coordinate is negative".into(),
+                        ));
+                    }
+                    let tile_col = grid_col / subtiles_per_tile;
+                    let tile_row = grid_row / subtiles_per_tile;
+                    if tile_col < 0 || tile_row < 0 {
+                        return Err(OpenSlideError::Format(
+                            "Ventana BIF TIFF tile coordinate is negative".into(),
+                        ));
+                    }
+                    let tile_no = (tile_row as u64)
+                        .checked_mul(level_data.tiles_across)
+                        .and_then(|base| base.checked_add(tile_col as u64))
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or_else(|| {
+                            OpenSlideError::Format("Ventana BIF tile index overflow".into())
+                        })?;
+                    if tile_no >= level_data.tile_offsets.len()
+                        || tile_no >= level_data.tile_byte_counts.len()
+                    {
+                        return Err(OpenSlideError::Format(format!(
+                            "Ventana BIF tile index {} is outside TIFF tile arrays",
+                            tile_no
+                        )));
+                    }
+
+                    let tile_origin_x = area_origin_x + col as f64 * tile_advance_x;
+                    let tile_origin_y = area_origin_y + row as f64 * tile_advance_y;
+                    let subtile_x = (grid_col % subtiles_per_tile) as f64 * subtile_w;
+                    let subtile_y = (grid_row % subtiles_per_tile) as f64 * subtile_h;
+                    let dst_x = tile_origin_x - lx;
+                    let dst_y = tile_origin_y - ly;
+                    if cache_full_tiles {
+                        if !decoded_tiles.contains_key(&tile_no) {
+                            decoded_tiles.insert(tile_no, level_data.decode_tile(path, tile_no)?);
+                        }
+                        let tile = decoded_tiles.get(&tile_no).ok_or_else(|| {
+                            OpenSlideError::Format("Ventana decoded tile cache miss".into())
+                        })?;
+                        blit_decoded_tile_rgba_channels(
+                            tile,
+                            channels,
+                            &mut output,
+                            subtile_x.round() as u32,
+                            subtile_y.round() as u32,
+                            subtile_w.ceil() as u32,
+                            subtile_h.ceil() as u32,
+                            dst_x,
+                            dst_y,
+                        );
+                        continue;
+                    }
+                    if let Some((crop_x, crop_y, crop_w, crop_h, crop_dst_x, crop_dst_y)) =
+                        visible_tile_crop(
+                            subtile_x.round() as u32,
+                            subtile_y.round() as u32,
+                            subtile_w.ceil() as u32,
+                            subtile_h.ceil() as u32,
+                            dst_x,
+                            dst_y,
+                            w,
+                            h,
+                        )
+                    {
+                        if let Some(tile) = level_data
+                            .decode_tile_region(path, tile_no, crop_x, crop_y, crop_w, crop_h)?
+                        {
+                            blit_decoded_tile_rgba_channels(
+                                &tile,
+                                channels,
+                                &mut output,
+                                0,
+                                0,
+                                crop_w,
+                                crop_h,
+                                crop_dst_x,
+                                crop_dst_y,
+                            );
+                            continue;
+                        }
+                    }
+                    let tile = level_data.decode_tile(path, tile_no)?;
+                    blit_decoded_tile_rgba_channels(
+                        &tile,
+                        channels,
+                        &mut output,
+                        subtile_x.round() as u32,
+                        subtile_y.round() as u32,
+                        subtile_w.ceil() as u32,
+                        subtile_h.ceil() as u32,
+                        dst_x,
+                        dst_y,
+                    );
+                }
+            }
         }
 
         Ok(output)
@@ -564,7 +893,9 @@ impl BifTilemap {
 }
 
 impl BifTilemapLevel {
-    fn from_dir(tiff: &TiffFile, dir: &TiffDirectory, bif: &BifInfo) -> Result<Self> {
+    fn from_dir(tiff: &TiffFile, dir: &TiffDirectory) -> Result<Self> {
+        let image_width = required_uint(tiff, dir, TAG_IMAGEWIDTH)?;
+        let image_height = required_uint(tiff, dir, TAG_IMAGELENGTH)?;
         let tile_width = required_uint(tiff, dir, TAG_TILEWIDTH)? as u32;
         let tile_height = required_uint(tiff, dir, TAG_TILELENGTH)? as u32;
         if tile_width == 0 || tile_height == 0 {
@@ -573,16 +904,18 @@ impl BifTilemapLevel {
             ));
         }
 
-        let compression = dir
-            .uint(tiff.endian, TAG_COMPRESSION)
-            .unwrap_or(COMPRESSION_NONE as u64) as u16;
+        let compression = required_uint(tiff, dir, TAG_COMPRESSION)? as u16;
         if !matches!(
             compression,
             COMPRESSION_NONE
+                | COMPRESSION_LZW
                 | COMPRESSION_JPEG
                 | COMPRESSION_ADOBE_DEFLATE
                 | COMPRESSION_DEFLATE
                 | COMPRESSION_PACKBITS
+                | COMPRESSION_JP2K_YCBCR
+                | COMPRESSION_JP2K_RGB
+                | COMPRESSION_JP2K
         ) {
             return Err(OpenSlideError::UnsupportedFormat(format!(
                 "Unsupported Ventana BIF TIFF compression {}",
@@ -590,9 +923,7 @@ impl BifTilemapLevel {
             )));
         }
 
-        let photometric = dir
-            .uint(tiff.endian, TAG_PHOTOMETRIC)
-            .unwrap_or(PHOTOMETRIC_RGB as u64) as u16;
+        let photometric = required_uint(tiff, dir, TAG_PHOTOMETRIC)? as u16;
         if !matches!(
             photometric,
             PHOTOMETRIC_BLACK_IS_ZERO | PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR
@@ -602,9 +933,7 @@ impl BifTilemapLevel {
                 photometric
             )));
         }
-        let planar_config = dir
-            .uint(tiff.endian, TAG_PLANARCONFIG)
-            .unwrap_or(PLANARCONFIG_CONTIG as u64) as u16;
+        let planar_config = required_uint(tiff, dir, TAG_PLANARCONFIG)? as u16;
         if !matches!(planar_config, PLANARCONFIG_CONTIG | PLANARCONFIG_SEPARATE) {
             return Err(OpenSlideError::UnsupportedFormat(format!(
                 "Unsupported Ventana BIF planar configuration {}",
@@ -612,16 +941,16 @@ impl BifTilemapLevel {
             )));
         }
 
-        let samples_per_pixel = dir.uint(tiff.endian, TAG_SAMPLESPERPIXEL).unwrap_or(
-            if matches!(photometric, PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR) {
-                3
-            } else {
-                1
-            },
-        ) as u16;
+        let samples_per_pixel = required_uint(tiff, dir, TAG_SAMPLESPERPIXEL)? as u16;
+        let predictor = dir.uint(tiff.endian, TAG_PREDICTOR).unwrap_or(1) as u16;
         let bits_per_sample = dir
             .uints(tiff.endian, TAG_BITSPERSAMPLE)
-            .unwrap_or_else(|| vec![8])
+            .ok_or_else(|| {
+                OpenSlideError::Format(format!(
+                    "Missing required Ventana BIF TIFF tag {}",
+                    TAG_BITSPERSAMPLE
+                ))
+            })?
             .into_iter()
             .map(|v| v as u16)
             .collect::<Vec<_>>();
@@ -639,11 +968,12 @@ impl BifTilemapLevel {
 
         let tile_offsets = required_uints(tiff, dir, TAG_TILEOFFSETS)?;
         let tile_byte_counts = required_uints(tiff, dir, TAG_TILEBYTECOUNTS)?;
-        let tiles_per_plane = bif.areas.iter().try_fold(0usize, |total, area| {
-            total
-                .checked_add(area_tile_count(area)?)
-                .ok_or_else(|| OpenSlideError::Format("Ventana BIF tile count overflow".into()))
-        })?;
+        let tiles_across = image_width.div_ceil(u64::from(tile_width));
+        let tiles_down = image_height.div_ceil(u64::from(tile_height));
+        let tiles_per_plane = tiles_across
+            .checked_mul(tiles_down)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| OpenSlideError::Format("Ventana BIF tile count overflow".into()))?;
         let expected_tiles = if planar_config == PLANARCONFIG_SEPARATE {
             tiles_per_plane
                 .checked_mul(usize::from(samples_per_pixel))
@@ -663,6 +993,8 @@ impl BifTilemapLevel {
         }
 
         Ok(Self {
+            dir_index: dir.index,
+            tiles_across,
             tile_width,
             tile_height,
             tile_offsets,
@@ -672,6 +1004,7 @@ impl BifTilemapLevel {
             samples_per_pixel,
             bits_per_sample,
             planar_config,
+            predictor,
             endian: tiff.endian,
             tiles_per_plane,
             jpeg_tables: dir.entry(TAG_JPEGTABLES).map(|entry| entry.raw.clone()),
@@ -690,11 +1023,68 @@ impl BifTilemapLevel {
                 rgb: vec![0; self.tile_width as usize * self.tile_height as usize * 3],
             });
         }
+        if (self.predictor != 1
+            && matches!(
+                self.compression,
+                COMPRESSION_PACKBITS | COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE
+            ))
+            || self.compression == COMPRESSION_LZW
+        {
+            return read_bif_tile_with_tiff_crate(
+                path,
+                self.dir_index,
+                tile_no,
+                self.tile_width,
+                self.tile_height,
+            );
+        }
         let raw = read_file_range(path, self.tile_offsets[tile_no], byte_count)?;
         match self.compression {
             COMPRESSION_JPEG => {
-                let jpeg = merge_jpeg_tables(&raw, self.jpeg_tables.as_deref())?;
-                let (rgb, width, height) = decode::decode_rgb(ImageFormat::Jpeg, &jpeg)?;
+                let (rgb, width, height) = decode::decode_tiff_bgra_rgb_region(
+                    ImageFormat::Jpeg,
+                    &raw,
+                    self.jpeg_tables.as_deref(),
+                    0,
+                    0,
+                    self.tile_width,
+                    self.tile_height,
+                    self.jpeg_color_space(),
+                )?;
+                Ok(DecodedTile { width, height, rgb })
+            }
+            COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+                let colorspace = match self.compression {
+                    COMPRESSION_JP2K_YCBCR => "YCbCr",
+                    COMPRESSION_JP2K_RGB => "RGB",
+                    _ => "unspecified",
+                };
+                let context = format!(
+                    "Ventana BIF JPEG 2000 ({colorspace}) TIFF directory {} tile compression {} photometric {} samples {} expected {}x{} RGB",
+                    self.dir_index,
+                    self.compression,
+                    self.photometric,
+                    self.samples_per_pixel,
+                    self.tile_width,
+                    self.tile_height
+                );
+                let (rgb, width, height) = decode::default_decoder_api().decode_jpeg2000_rgb(
+                    &raw,
+                    decode::jpeg2000::Jpeg2000DecodeOptions::new(
+                        self.tile_width,
+                        self.tile_height,
+                        self.channel_count() as u16,
+                        decode::jpeg2000::Jpeg2000OutputFormat::Rgb,
+                        &context,
+                    )
+                    .with_source(decode::jpeg2000::Jpeg2000DecodeSource::TiffTile)
+                    .with_tile(decode::jpeg2000::Jpeg2000TileContext {
+                        tile_x: (tile_no % self.tiles_across as usize) as u32,
+                        tile_y: (tile_no / self.tiles_across as usize) as u32,
+                        tile_width: self.tile_width,
+                        tile_height: self.tile_height,
+                    }),
+                )?;
                 Ok(DecodedTile { width, height, rgb })
             }
             COMPRESSION_NONE => self.decode_uncompressed_tile(&raw),
@@ -710,6 +1100,54 @@ impl BifTilemapLevel {
                 "Unsupported Ventana BIF TIFF compression {}",
                 other
             ))),
+        }
+    }
+
+    fn decode_tile_region(
+        &self,
+        path: &Path,
+        tile_no: usize,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Option<DecodedTile>> {
+        if self.planar_config != PLANARCONFIG_CONTIG || self.compression != COMPRESSION_JPEG {
+            return Ok(None);
+        }
+        let byte_count = self.tile_byte_counts[tile_no];
+        if byte_count == 0 {
+            return Ok(Some(DecodedTile {
+                width: w,
+                height: h,
+                rgb: vec![0; w as usize * h as usize * 3],
+            }));
+        }
+        let raw = read_file_range(path, self.tile_offsets[tile_no], byte_count)?;
+        let (rgb, width, height) = decode::decode_tiff_bgra_rgb_region(
+            ImageFormat::Jpeg,
+            &raw,
+            self.jpeg_tables.as_deref(),
+            x,
+            y,
+            w,
+            h,
+            self.jpeg_color_space(),
+        )?;
+        Ok(Some(DecodedTile { width, height, rgb }))
+    }
+
+    fn channel_count(&self) -> u32 {
+        match self.photometric {
+            PHOTOMETRIC_BLACK_IS_ZERO => 1,
+            _ => u32::from(self.samples_per_pixel.min(3)),
+        }
+    }
+
+    fn jpeg_color_space(&self) -> i32 {
+        match self.photometric {
+            PHOTOMETRIC_YCBCR => 2,
+            _ => 1,
         }
     }
 
@@ -782,6 +1220,14 @@ impl BifTilemapLevel {
     }
 
     fn decode_separate_tile(&self, path: &Path, tile_no: usize) -> Result<DecodedTile> {
+        if self.compression == COMPRESSION_LZW
+            || matches!(
+                self.compression,
+                COMPRESSION_PACKBITS | COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE
+            ) && self.predictor != 1
+        {
+            return self.read_planar_tile_with_tiff_crate(path, tile_no);
+        }
         if self.compression == COMPRESSION_JPEG {
             return Err(OpenSlideError::UnsupportedFormat(
                 "Planar separate Ventana BIF JPEG TIFF tiles are not supported".into(),
@@ -862,6 +1308,61 @@ impl BifTilemapLevel {
             }
         }
 
+        Ok(DecodedTile {
+            width: self.tile_width,
+            height: self.tile_height,
+            rgb,
+        })
+    }
+
+    fn read_planar_tile_with_tiff_crate(&self, path: &Path, tile_no: usize) -> Result<DecodedTile> {
+        let mut decoder = ::tiff::decoder::Decoder::new(File::open(path)?)
+            .map_err(|err| OpenSlideError::Decode(format!("TIFF decoder setup failed: {err}")))?;
+        decoder
+            .seek_to_image(self.dir_index)
+            .map_err(|err| OpenSlideError::Decode(format!("TIFF directory seek failed: {err}")))?;
+        let bits_per_sample = self.bits_per_sample[0];
+        if bits_per_sample != 8 && bits_per_sample != 16 {
+            return Err(OpenSlideError::Decode(
+                "Unsupported planar Ventana BIF TIFF sample depth".into(),
+            ));
+        }
+        let pixel_count = self.tile_width as usize * self.tile_height as usize;
+        let mut rgb = vec![0; pixel_count * 3];
+        for sample in 0..usize::from(self.samples_per_pixel.min(3)) {
+            let chunk_index_u64 = sample as u64 * self.tiles_per_plane as u64 + tile_no as u64;
+            if self.tile_byte_counts[chunk_index_u64 as usize] == 0 {
+                continue;
+            }
+            let chunk_index = u32::try_from(chunk_index_u64)
+                .map_err(|_| OpenSlideError::Format("Ventana BIF tile index too large".into()))?;
+            let image = decoder.read_chunk(chunk_index).map_err(|err| {
+                OpenSlideError::Decode(format!("TIFF planar chunk decode failed: {err}"))
+            })?;
+            match &image {
+                ::tiff::decoder::DecodingResult::U8(data) if data.len() < pixel_count => {
+                    return Err(OpenSlideError::Decode(
+                        "Decoded Ventana BIF planar TIFF chunk is truncated".into(),
+                    ));
+                }
+                ::tiff::decoder::DecodingResult::U16(data) if data.len() < pixel_count => {
+                    return Err(OpenSlideError::Decode(
+                        "Decoded Ventana BIF planar TIFF chunk is truncated".into(),
+                    ));
+                }
+                ::tiff::decoder::DecodingResult::U8(_)
+                | ::tiff::decoder::DecodingResult::U16(_) => {}
+                other => {
+                    return Err(OpenSlideError::Decode(format!(
+                        "Unsupported Ventana BIF planar TIFF sample type from tiff crate: {:?}",
+                        other
+                    )))
+                }
+            }
+            for pixel in 0..pixel_count {
+                rgb[pixel * 3 + sample] = tiff_decoded_sample_u8(&image, pixel);
+            }
+        }
         Ok(DecodedTile {
             width: self.tile_width,
             height: self.tile_height,
@@ -954,59 +1455,142 @@ fn clamp_u8(value: f32) -> u8 {
     value.round().clamp(0.0, 255.0) as u8
 }
 
-fn area_tile_count(area: &BifArea) -> Result<usize> {
-    area.tiles_across
-        .checked_mul(area.tiles_down)
-        .and_then(|count| usize::try_from(count).ok())
-        .ok_or_else(|| OpenSlideError::Format("Ventana BIF tile count overflow".into()))
-}
-
-fn bif_scan_tile_index(area: &BifArea, col: i64, row: i64) -> Result<usize> {
-    if col < 0 || col >= area.tiles_across || row < 0 || row >= area.tiles_down {
-        return Err(OpenSlideError::Format(format!(
-            "Ventana BIF tile coordinate out of bounds: {col},{row}"
-        )));
+fn overlapping_index_range(
+    origin: f64,
+    advance: f64,
+    item_size: f64,
+    query_start: f64,
+    query_size: u32,
+    count: i64,
+) -> std::ops::Range<i64> {
+    if count <= 0 || query_size == 0 || advance <= 0.0 || item_size <= 0.0 {
+        return 0..0;
     }
-    let scan_row = area.tiles_down - row - 1;
-    let scan_col = if scan_row % 2 != 0 {
-        area.tiles_across - col - 1
+
+    let query_end = query_start + query_size as f64;
+    let start = ((query_start - origin - item_size) / advance).floor() as i64 + 1;
+    let end = ((query_end - origin) / advance).ceil() as i64;
+    let start = start.clamp(0, count);
+    let end = end.clamp(0, count);
+    if start >= end {
+        0..0
     } else {
-        col
-    };
-    let tile = scan_row
-        .checked_mul(area.tiles_across)
-        .and_then(|base| base.checked_add(scan_col))
-        .and_then(|tile| usize::try_from(tile).ok())
-        .ok_or_else(|| OpenSlideError::Format("Ventana BIF tile index overflow".into()))?;
-    Ok(tile)
+        start..end
+    }
 }
 
 fn blit_decoded_tile_channel(
     src: &DecodedTile,
     channel: u32,
     dst: &mut GrayImage,
+    src_x: u32,
+    src_y: u32,
+    src_w: u32,
+    src_h: u32,
     dst_x: f64,
     dst_y: f64,
 ) {
     let dx0 = dst_x.round() as i64;
     let dy0 = dst_y.round() as i64;
     let ch = channel.min(2) as usize;
+    let src_x = src_x.min(src.width);
+    let src_y = src_y.min(src.height);
+    let src_w = src_w.min(src.width - src_x);
+    let src_h = src_h.min(src.height - src_y);
 
-    for row in 0..src.height as i64 {
+    for row in 0..src_h as i64 {
         let dy = dy0 + row;
         if dy < 0 || dy >= dst.height as i64 {
             continue;
         }
-        for col in 0..src.width as i64 {
+        for col in 0..src_w as i64 {
             let dx = dx0 + col;
             if dx < 0 || dx >= dst.width as i64 {
                 continue;
             }
-            let src_idx = (row as usize * src.width as usize + col as usize) * 3 + ch;
+            let src_col = src_x as i64 + col;
+            let src_row = src_y as i64 + row;
+            let src_idx = (src_row as usize * src.width as usize + src_col as usize) * 3 + ch;
             let dst_idx = dy as usize * dst.width as usize + dx as usize;
             dst.data[dst_idx] = src.rgb[src_idx];
         }
     }
+}
+
+fn blit_decoded_tile_rgba_channels(
+    src: &DecodedTile,
+    channels: [Option<u32>; 4],
+    dst: &mut RgbaImage,
+    src_x: u32,
+    src_y: u32,
+    src_w: u32,
+    src_h: u32,
+    dst_x: f64,
+    dst_y: f64,
+) {
+    let dx0 = dst_x.round() as i64;
+    let dy0 = dst_y.round() as i64;
+    let src_x = src_x.min(src.width);
+    let src_y = src_y.min(src.height);
+    let src_w = src_w.min(src.width - src_x);
+    let src_h = src_h.min(src.height - src_y);
+
+    for row in 0..src_h as i64 {
+        let dy = dy0 + row;
+        if dy < 0 || dy >= dst.height as i64 {
+            continue;
+        }
+        for col in 0..src_w as i64 {
+            let dx = dx0 + col;
+            if dx < 0 || dx >= dst.width as i64 {
+                continue;
+            }
+            let src_col = src_x as i64 + col;
+            let src_row = src_y as i64 + row;
+            let src_idx = (src_row as usize * src.width as usize + src_col as usize) * 3;
+            let dst_idx = (dy as usize * dst.width as usize + dx as usize) * 4;
+            for (out_idx, channel) in channels.iter().enumerate() {
+                if let Some(channel) = channel {
+                    dst.data[dst_idx + out_idx] = src.rgb[src_idx + (*channel).min(2) as usize];
+                }
+            }
+        }
+    }
+}
+
+fn visible_tile_crop(
+    src_x: u32,
+    src_y: u32,
+    src_w: u32,
+    src_h: u32,
+    dst_x: f64,
+    dst_y: f64,
+    dst_w: u32,
+    dst_h: u32,
+) -> Option<(u32, u32, u32, u32, f64, f64)> {
+    let dx0 = dst_x.round() as i64;
+    let dy0 = dst_y.round() as i64;
+    let dx1 = dx0.checked_add(i64::from(src_w))?;
+    let dy1 = dy0.checked_add(i64::from(src_h))?;
+    let out_x0 = dx0.max(0);
+    let out_y0 = dy0.max(0);
+    let out_x1 = dx1.min(i64::from(dst_w));
+    let out_y1 = dy1.min(i64::from(dst_h));
+    if out_x1 <= out_x0 || out_y1 <= out_y0 {
+        return None;
+    }
+    let crop_left = u32::try_from(out_x0 - dx0).ok()?;
+    let crop_top = u32::try_from(out_y0 - dy0).ok()?;
+    let crop_w = u32::try_from(out_x1 - out_x0).ok()?;
+    let crop_h = u32::try_from(out_y1 - out_y0).ok()?;
+    Some((
+        src_x.checked_add(crop_left)?,
+        src_y.checked_add(crop_top)?,
+        crop_w,
+        crop_h,
+        out_x0 as f64,
+        out_y0 as f64,
+    ))
 }
 
 fn read_file_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
@@ -1090,93 +1674,6 @@ fn unpack_packbits(raw: &[u8], expected_len: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn merge_jpeg_tables(tile: &[u8], tables: Option<&[u8]>) -> Result<Vec<u8>> {
-    if !starts_with_soi(tile) {
-        return Err(OpenSlideError::Decode(
-            "Ventana BIF JPEG data does not contain an interchange JPEG stream".into(),
-        ));
-    }
-    let Some(tables) = tables else {
-        return Ok(tile.to_vec());
-    };
-    if tables.is_empty() || has_jpeg_quantization_table(tile) && has_jpeg_huffman_table(tile) {
-        return Ok(tile.to_vec());
-    }
-    let Some(payload) = jpeg_tables_payload(tables) else {
-        return Ok(tile.to_vec());
-    };
-    if payload.is_empty()
-        || (!has_jpeg_quantization_table(payload) && !has_jpeg_huffman_table(payload))
-    {
-        return Ok(tile.to_vec());
-    }
-
-    let mut merged = Vec::with_capacity(tile.len() + payload.len());
-    merged.extend_from_slice(&tile[..2]);
-    merged.extend_from_slice(payload);
-    merged.extend_from_slice(&tile[2..]);
-    Ok(merged)
-}
-
-fn starts_with_soi(data: &[u8]) -> bool {
-    data.len() >= 2 && data[0] == 0xff && data[1] == 0xd8
-}
-
-fn jpeg_tables_payload(data: &[u8]) -> Option<&[u8]> {
-    if !starts_with_soi(data) {
-        return None;
-    }
-    let mut end = data.len();
-    if end >= 4 && data[end - 2] == 0xff && data[end - 1] == 0xd9 {
-        end -= 2;
-    }
-    Some(&data[2..end])
-}
-
-fn has_jpeg_quantization_table(data: &[u8]) -> bool {
-    has_jpeg_marker(data, 0xdb)
-}
-
-fn has_jpeg_huffman_table(data: &[u8]) -> bool {
-    has_jpeg_marker(data, 0xc4)
-}
-
-fn has_jpeg_marker(data: &[u8], wanted: u8) -> bool {
-    let mut idx = if starts_with_soi(data) { 2 } else { 0 };
-    while idx + 4 <= data.len() {
-        if data[idx] != 0xff {
-            idx += 1;
-            continue;
-        }
-        while idx < data.len() && data[idx] == 0xff {
-            idx += 1;
-        }
-        if idx >= data.len() {
-            return false;
-        }
-        let marker = data[idx];
-        idx += 1;
-        if marker == 0xda || marker == 0xd9 {
-            return false;
-        }
-        if marker == wanted {
-            return true;
-        }
-        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
-            continue;
-        }
-        if idx + 2 > data.len() {
-            return false;
-        }
-        let segment_len = u16::from_be_bytes([data[idx], data[idx + 1]]) as usize;
-        if segment_len < 2 || idx + segment_len > data.len() {
-            return false;
-        }
-        idx += segment_len;
-    }
-    false
-}
-
 fn delegate_matches(delegate: &dyn SlideBackend, levels: &[Level]) -> bool {
     if delegate.level_count() != levels.len() as u32 {
         return false;
@@ -1255,19 +1752,19 @@ fn add_region_properties(
     for (i, area) in bif.areas.iter().enumerate() {
         props.insert(
             format!("openslide.region[{i}].x"),
-            format_float(bif.tile_advance_x * area.start_col as f64),
+            ((bif.tile_advance_x * area.start_col as f64) as i64).to_string(),
         );
         props.insert(
             format!("openslide.region[{i}].y"),
-            format_float(bif.tile_advance_y * area.start_row as f64),
+            ((bif.tile_advance_y * area.start_row as f64) as i64).to_string(),
         );
         props.insert(
             format!("openslide.region[{i}].width"),
-            format_float(bif.region_width(area, tile_width)),
+            (bif.region_width(area, tile_width).ceil() as i64).to_string(),
         );
         props.insert(
             format!("openslide.region[{i}].height"),
-            format_float(bif.region_height(area, tile_height)),
+            (bif.region_height(area, tile_height).ceil() as i64).to_string(),
         );
     }
 }
@@ -1337,6 +1834,72 @@ fn detect_associated_image_format(data: &[u8]) -> Option<ImageFormat> {
         Some(ImageFormat::Bmp)
     } else {
         None
+    }
+}
+
+fn read_associated_tiled_with_internal_decoder(
+    path: &Path,
+    dir_index: usize,
+    width: u32,
+    height: u32,
+) -> Result<RgbaImage> {
+    let tiff = TiffFile::open(path)?;
+    let dir = tiff.directory(dir_index).ok_or_else(|| {
+        OpenSlideError::Format(format!("Missing Ventana TIFF directory {dir_index}"))
+    })?;
+    let level = BifTilemapLevel::from_dir(&tiff, dir)?;
+    let tiles_across = u64::from(width).div_ceil(u64::from(level.tile_width));
+    let tiles_down = u64::from(height).div_ceil(u64::from(level.tile_height));
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    for row in 0..tiles_down {
+        for col in 0..tiles_across {
+            let tile_no = row
+                .checked_mul(level.tiles_across)
+                .and_then(|base| base.checked_add(col))
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    OpenSlideError::Format("Ventana associated tile index overflow".into())
+                })?;
+            let tile = level.decode_tile(path, tile_no)?;
+            let visible_w = (u64::from(width) - col * u64::from(level.tile_width))
+                .min(u64::from(level.tile_width)) as u32;
+            let visible_h = (u64::from(height) - row * u64::from(level.tile_height))
+                .min(u64::from(level.tile_height)) as u32;
+            blit_decoded_tile_rgba(
+                &tile,
+                &mut rgba,
+                width,
+                col as u32 * level.tile_width,
+                row as u32 * level.tile_height,
+                visible_w,
+                visible_h,
+            );
+        }
+    }
+    Ok(RgbaImage {
+        width,
+        height,
+        data: rgba,
+    })
+}
+
+fn blit_decoded_tile_rgba(
+    tile: &DecodedTile,
+    dst: &mut [u8],
+    dst_width: u32,
+    dst_x: u32,
+    dst_y: u32,
+    visible_w: u32,
+    visible_h: u32,
+) {
+    for row in 0..visible_h.min(tile.height) {
+        for col in 0..visible_w.min(tile.width) {
+            let src_idx = (row as usize * tile.width as usize + col as usize) * 3;
+            let dst_idx =
+                ((dst_y + row) as usize * dst_width as usize + (dst_x + col) as usize) * 4;
+            dst[dst_idx..dst_idx + 3].copy_from_slice(&tile.rgb[src_idx..src_idx + 3]);
+            dst[dst_idx + 3] = 255;
+        }
     }
 }
 
@@ -1463,6 +2026,104 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
     RgbaImage::from_rgba(width, height, rgba)
 }
 
+fn read_bif_tile_with_tiff_crate(
+    path: &Path,
+    dir_index: usize,
+    tile_no: usize,
+    width: u32,
+    height: u32,
+) -> Result<DecodedTile> {
+    let file = File::open(path)?;
+    let mut decoder = ::tiff::decoder::Decoder::new(file)
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF decoder setup failed: {err}")))?;
+    decoder
+        .seek_to_image(dir_index)
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF directory seek failed: {err}")))?;
+    let color_type = decoder
+        .colortype()
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF color type read failed: {err}")))?;
+    let chunk_index = u32::try_from(tile_no)
+        .map_err(|_| OpenSlideError::Format("Ventana BIF tile index too large".into()))?;
+    let image = decoder
+        .read_chunk(chunk_index)
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF chunk decode failed: {err}")))?;
+    decoded_tiff_chunk_to_bif_tile(image, color_type, width, height)
+}
+
+fn decoded_tiff_chunk_to_bif_tile(
+    image: ::tiff::decoder::DecodingResult,
+    color_type: ::tiff::ColorType,
+    width: u32,
+    height: u32,
+) -> Result<DecodedTile> {
+    let stride = match color_type {
+        ::tiff::ColorType::Gray(8) | ::tiff::ColorType::Gray(16) => 1,
+        ::tiff::ColorType::GrayA(8) | ::tiff::ColorType::GrayA(16) => 2,
+        ::tiff::ColorType::RGB(8) | ::tiff::ColorType::RGB(16) | ::tiff::ColorType::YCbCr(8) => 3,
+        ::tiff::ColorType::RGBA(8) | ::tiff::ColorType::RGBA(16) => 4,
+        other => {
+            return Err(OpenSlideError::Decode(format!(
+                "Unsupported Ventana BIF TIFF color type from tiff crate: {:?}",
+                other
+            )))
+        }
+    };
+    let pixel_count = width as usize * height as usize;
+    match &image {
+        ::tiff::decoder::DecodingResult::U8(data)
+            if data.len() < pixel_count.saturating_mul(stride) =>
+        {
+            return Err(OpenSlideError::Decode(
+                "Decoded Ventana BIF TIFF chunk is truncated".into(),
+            ));
+        }
+        ::tiff::decoder::DecodingResult::U16(data)
+            if data.len() < pixel_count.saturating_mul(stride) =>
+        {
+            return Err(OpenSlideError::Decode(
+                "Decoded Ventana BIF TIFF chunk is truncated".into(),
+            ));
+        }
+        ::tiff::decoder::DecodingResult::U8(_) | ::tiff::decoder::DecodingResult::U16(_) => {}
+        other => {
+            return Err(OpenSlideError::Decode(format!(
+                "Unsupported Ventana BIF TIFF sample type from tiff crate: {:?}",
+                other
+            )))
+        }
+    }
+
+    let mut rgb = vec![0; pixel_count * 3];
+    for pixel in 0..pixel_count {
+        let src = pixel * stride;
+        let dst = pixel * 3;
+        match color_type {
+            ::tiff::ColorType::Gray(8)
+            | ::tiff::ColorType::Gray(16)
+            | ::tiff::ColorType::GrayA(8)
+            | ::tiff::ColorType::GrayA(16) => {
+                let value = tiff_decoded_sample_u8(&image, src);
+                rgb[dst..dst + 3].copy_from_slice(&[value, value, value]);
+            }
+            _ => {
+                rgb[dst] = tiff_decoded_sample_u8(&image, src);
+                rgb[dst + 1] = tiff_decoded_sample_u8(&image, src + 1);
+                rgb[dst + 2] = tiff_decoded_sample_u8(&image, src + 2);
+            }
+        }
+    }
+
+    Ok(DecodedTile { width, height, rgb })
+}
+
+fn tiff_decoded_sample_u8(image: &::tiff::decoder::DecodingResult, index: usize) -> u8 {
+    match image {
+        ::tiff::decoder::DecodingResult::U8(data) => data[index],
+        ::tiff::decoder::DecodingResult::U16(data) => downscale_u16_to_u8(data[index]),
+        _ => unreachable!(),
+    }
+}
+
 fn parse_level_info(description: &str) -> Result<(i64, f64)> {
     let mut level = None;
     let mut magnification = None;
@@ -1493,7 +2154,18 @@ fn parse_level_info(description: &str) -> Result<(i64, f64)> {
 }
 
 fn parse_iscan_attributes(xml: &str) -> Option<HashMap<String, String>> {
-    find_start_tag(xml, "iScan").map(|tag| parse_attributes(tag))
+    let xml = xml.trim_start_matches('\u{feff}').trim_start();
+    if let Some(tag) = leading_start_tag(xml, "iScan") {
+        return Some(parse_attributes(tag));
+    }
+
+    let metadata_tag = leading_start_tag(xml, "Metadata")?;
+    let metadata_end = xml.find('>')?;
+    if metadata_tag.trim_end().ends_with('/') {
+        return None;
+    }
+    let metadata_content = xml[metadata_end + 1..].trim_start();
+    leading_start_tag(metadata_content, "iScan").map(parse_attributes)
 }
 
 #[derive(Debug, Clone)]
@@ -1534,8 +2206,16 @@ impl BifInfo {
 }
 
 fn parse_bif_info(xml: &str, tile_width: u64, tile_height: u64) -> Result<BifInfo> {
-    let image_infos = find_elements(xml, "ImageInfo");
-    let origins = find_origin_attributes(xml);
+    let encode_info = root_element(xml, "EncodeInfo")
+        .ok_or_else(|| OpenSlideError::Format("Missing Ventana BIF EncodeInfo root".into()))?;
+    let slide_stitch = find_direct_elements(&encode_info.content, "SlideStitchInfo")
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            OpenSlideError::Format("Missing Ventana BIF SlideStitchInfo element".into())
+        })?;
+    let image_infos = find_direct_elements(&slide_stitch.content, "ImageInfo");
+    let origins = find_aoi_origin_attributes(&encode_info.content);
     if image_infos.is_empty() || image_infos.len() != origins.len() {
         return Err(OpenSlideError::Format(
             "Missing or inconsistent Ventana BIF region metadata".into(),
@@ -1583,7 +2263,7 @@ fn parse_bif_info(xml: &str, tile_width: u64, tile_height: u64) -> Result<BifInf
             tiles_down,
         };
 
-        for joint in find_elements(&element.content, "TileJointInfo") {
+        for joint in find_direct_elements(&element.content, "TileJointInfo") {
             let tile1 =
                 tile_coordinates(&area, tile_count, parse_i64_attr(&joint.attrs, "Tile1")?)?;
             let tile2 =
@@ -1683,89 +2363,148 @@ struct XmlElement {
     content: String,
 }
 
-fn find_elements(xml: &str, name: &str) -> Vec<XmlElement> {
+fn root_element(xml: &str, name: &str) -> Option<XmlElement> {
+    let mut xml = xml.trim_start_matches('\u{feff}').trim_start();
+    while xml.starts_with("<?") {
+        let end = xml.find("?>")?;
+        xml = xml[end + 2..].trim_start();
+    }
+    let (element, offset) = read_element_at(xml, 0, name)?;
+    let rest = xml[offset..].trim_matches('\0').trim();
+    rest.is_empty().then_some(element)
+}
+
+fn find_direct_elements(xml: &str, name: &str) -> Vec<XmlElement> {
     let mut elements = Vec::new();
     let mut offset = 0;
-    while let Some(start_rel) = xml[offset..].find(&format!("<{name}")) {
-        let start = offset + start_rel;
-        let Some(tag_end_rel) = xml[start..].find('>') else {
+    while offset < xml.len() {
+        let Some(start_rel) = xml[offset..].find('<') else {
             break;
         };
-        let tag_end = start + tag_end_rel;
-        let tag = &xml[start + 1 + name.len()..tag_end];
-        let attrs = parse_attributes(tag);
-        let self_closing = tag.trim_end().ends_with('/');
-        let (content, next_offset) = if self_closing {
-            (String::new(), tag_end + 1)
-        } else if let Some(close_rel) = xml[tag_end + 1..].find(&format!("</{name}>")) {
-            let content_start = tag_end + 1;
-            let content_end = content_start + close_rel;
-            (
-                xml[content_start..content_end].to_string(),
-                content_end + name.len() + 3,
-            )
-        } else {
-            (String::new(), tag_end + 1)
+        let start = offset + start_rel;
+        if xml[start..].starts_with("</") {
+            break;
+        }
+        let Some(tag_name) = element_name_at(xml, start) else {
+            break;
         };
-        elements.push(XmlElement { attrs, content });
-        offset = next_offset;
+        if tag_name == name {
+            let Some((element, next_offset)) = read_element_at(xml, start, name) else {
+                break;
+            };
+            elements.push(element);
+            offset = next_offset;
+        } else {
+            let Some(next_offset) = skip_element_at(xml, start, tag_name) else {
+                break;
+            };
+            offset = next_offset;
+        }
     }
     elements
 }
 
-fn find_origin_attributes(xml: &str) -> Vec<HashMap<String, String>> {
-    let Some(start) = xml.find("<AoiOrigin") else {
+fn find_aoi_origin_attributes(xml: &str) -> Vec<HashMap<String, String>> {
+    let Some(origin) = find_direct_elements(xml, "AoiOrigin").into_iter().next() else {
         return Vec::new();
     };
-    let Some(start_end_rel) = xml[start..].find('>') else {
-        return Vec::new();
-    };
-    let content_start = start + start_end_rel + 1;
-    let Some(end_rel) = xml[content_start..].find("</AoiOrigin>") else {
-        return Vec::new();
-    };
-    let content = &xml[content_start..content_start + end_rel];
     let mut origins = Vec::new();
     let mut offset = 0;
-    while let Some(start_rel) = content[offset..].find('<') {
-        let start = offset + start_rel;
-        if content[start..].starts_with("</") {
-            break;
-        }
-        let Some(tag_end_rel) = content[start..].find('>') else {
+    while offset < origin.content.len() {
+        let Some(start_rel) = origin.content[offset..].find('<') else {
             break;
         };
-        let tag_end = start + tag_end_rel;
-        let raw = &content[start + 1..tag_end];
-        let attrs = parse_attributes(
-            raw.split_once(char::is_whitespace)
-                .map_or("", |(_, rest)| rest),
-        );
-        if attrs.contains_key("OriginX") && attrs.contains_key("OriginY") {
-            origins.push(attrs);
+        let start = offset + start_rel;
+        if origin.content[start..].starts_with("</") {
+            break;
         }
-        offset = tag_end + 1;
+        let Some(tag_name) = element_name_at(&origin.content, start) else {
+            break;
+        };
+        let Some((element, next_offset)) = read_element_at(&origin.content, start, tag_name) else {
+            break;
+        };
+        if element.attrs.contains_key("OriginX") && element.attrs.contains_key("OriginY") {
+            origins.push(element.attrs);
+        }
+        offset = next_offset;
     }
     origins
 }
 
-fn find_start_tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+fn read_element_at(xml: &str, start: usize, name: &str) -> Option<(XmlElement, usize)> {
     let needle = format!("<{name}");
-    let mut offset = 0;
-    while let Some(start_rel) = xml[offset..].find(&needle) {
-        let start = offset + start_rel;
-        let after_name = start + needle.len();
-        if xml[after_name..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
-        {
-            let end = xml[after_name..].find('>')? + after_name;
-            return Some(&xml[after_name..end]);
-        }
-        offset = after_name;
+    if !xml[start..].starts_with(&needle) {
+        return None;
     }
-    None
+    let after_name = start + needle.len();
+    if !xml[after_name..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
+    {
+        return None;
+    }
+    let tag_end = xml[after_name..].find('>')? + after_name;
+    let tag = &xml[after_name..tag_end];
+    let attrs = parse_attributes(tag);
+    if tag.trim_end().ends_with('/') {
+        return Some((
+            XmlElement {
+                attrs,
+                content: String::new(),
+            },
+            tag_end + 1,
+        ));
+    }
+    let content_start = tag_end + 1;
+    let close = format!("</{name}>");
+    let close_rel = xml[content_start..].find(&close)?;
+    let content_end = content_start + close_rel;
+    Some((
+        XmlElement {
+            attrs,
+            content: xml[content_start..content_end].to_string(),
+        },
+        content_end + close.len(),
+    ))
+}
+
+fn skip_element_at(xml: &str, start: usize, name: &str) -> Option<usize> {
+    read_element_at(xml, start, name)
+        .map(|(_, offset)| offset)
+        .or_else(|| {
+            let tag_end = xml[start..].find('>')? + start;
+            Some(tag_end + 1)
+        })
+}
+
+fn element_name_at<'a>(xml: &'a str, start: usize) -> Option<&'a str> {
+    if !xml[start..].starts_with('<') || xml[start..].starts_with("</") {
+        return None;
+    }
+    let name_start = start + 1;
+    let name_end = xml[name_start..]
+        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .map(|end| name_start + end)?;
+    Some(&xml[name_start..name_end])
+}
+
+fn leading_start_tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("<{name}");
+    let after_name = needle.len();
+    if !xml.starts_with(&needle) {
+        return None;
+    }
+    if !xml[after_name..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
+    {
+        return None;
+    }
+    let end = xml[after_name..].find('>')? + after_name;
+    Some(&xml[after_name..end])
 }
 
 fn parse_attributes(raw: &str) -> HashMap<String, String> {
@@ -1827,8 +2566,7 @@ fn parse_i64_attr(attrs: &HashMap<String, String>, key: &str) -> Result<i64> {
     attrs
         .get(key)
         .ok_or_else(|| OpenSlideError::Format(format!("Missing Ventana XML attribute {key}")))?
-        .parse::<f64>()
-        .map(|value| value as i64)
+        .parse::<i64>()
         .map_err(|_| OpenSlideError::Format(format!("Invalid Ventana XML attribute {key}")))
 }
 
@@ -1859,8 +2597,7 @@ fn required_uints(tiff: &TiffFile, dir: &TiffDirectory, tag: u16) -> Result<Vec<
 }
 
 fn format_float(value: f64) -> String {
-    let s = format!("{value:.12}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    tiff::format_float(value)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2170,6 +2907,15 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn overlapping_index_range_uses_half_open_intervals() {
+        assert_eq!(overlapping_index_range(0.0, 10.0, 10.0, 10.0, 10, 5), 1..2);
+        assert_eq!(overlapping_index_range(0.0, 10.0, 10.0, 25.0, 5, 5), 2..3);
+        assert_eq!(overlapping_index_range(0.0, 10.0, 10.0, 50.0, 10, 5), 0..0);
+        assert_eq!(overlapping_index_range(0.0, 8.0, 10.0, 9.0, 2, 5), 0..2);
+        assert_eq!(overlapping_index_range(100.0, 10.0, 10.0, 0.0, 10, 5), 0..0);
+    }
+
+    #[test]
     fn detects_and_reads_simple_ventana_tiff() {
         let path = temp_path("simple.bif");
         fs::write(&path, make_simple_ventana_tiff()).unwrap();
@@ -2191,11 +2937,150 @@ mod tests {
             slide.properties().get(properties::PROPERTY_MPP_X),
             Some(&"0.25".to_string())
         );
+        assert_eq!(
+            slide.properties().get("openslide.comment"),
+            Some(&"level=0 mag=20".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("tiff.ImageDescription"),
+            Some(&"level=0 mag=20".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("tiff.ResolutionUnit"),
+            Some(&"inch".to_string())
+        );
+        assert!(slide
+            .properties()
+            .get(properties::PROPERTY_QUICKHASH1)
+            .is_some());
 
         let red = slide.read_region(0, 0, 0, 0, 4, 2).unwrap();
         assert_eq!(red.data, vec![10, 40, 1, 4, 70, 100, 7, 10]);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn exposes_level0_icc_profile() {
+        let path = temp_path("icc.bif");
+        let profile = b"ventana icc profile".to_vec();
+        fs::write(&path, make_ventana_tiff_with_icc(&profile)).unwrap();
+
+        let slide = OpenSlide::open(&path).unwrap();
+
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_ICC_SIZE),
+            Some(&profile.len().to_string())
+        );
+        assert_eq!(slide.icc_profile().unwrap(), Some(profile));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn detects_only_upstream_iscan_xml_shapes() {
+        for (name, xml, expected) in [
+            (
+                "metadata-direct.bif",
+                br#"<Metadata><iScan Magnification="20" ScanRes="0.25"/></Metadata>"#.as_slice(),
+                true,
+            ),
+            (
+                "wrong-root.bif",
+                br#"<Foo><iScan Magnification="20" ScanRes="0.25"/></Foo>"#.as_slice(),
+                false,
+            ),
+            (
+                "metadata-nested.bif",
+                br#"<Metadata><Foo><iScan Magnification="20" ScanRes="0.25"/></Foo></Metadata>"#
+                    .as_slice(),
+                false,
+            ),
+        ] {
+            let path = temp_path(name);
+            fs::write(&path, make_ventana_tiff_with_xml(xml)).unwrap();
+
+            assert_eq!(detect(&path), expected, "{name}");
+
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn rejects_ventana_levels_out_of_tiff_order() {
+        let path = temp_path("levels-out-of-order.bif");
+        fs::write(
+            &path,
+            make_ventana_tiff_with_level_specs(&[
+                LevelSpec::new(b"level=1 mag=10\0", 2, 2),
+                LevelSpec::new(b"level=0 mag=20\0", 2, 2),
+            ]),
+        )
+        .unwrap();
+
+        let err = open_error(&path);
+        assert!(format!("{err}").contains("Unexpected encounter with Ventana level 1"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_ventana_non_decreasing_level_magnification() {
+        let path = temp_path("levels-bad-mag.bif");
+        fs::write(
+            &path,
+            make_ventana_tiff_with_level_specs(&[
+                LevelSpec::new(b"level=0 mag=20\0", 2, 2),
+                LevelSpec::new(b"level=1 mag=20\0", 2, 2),
+            ]),
+        )
+        .unwrap();
+
+        let err = open_error(&path);
+        assert!(format!("{err}").contains("Unexpected Ventana magnification in level 1"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_ventana_inconsistent_level_tile_sizes() {
+        let path = temp_path("levels-bad-tile-size.bif");
+        fs::write(
+            &path,
+            make_ventana_tiff_with_level_specs(&[
+                LevelSpec::new(b"level=0 mag=20\0", 2, 2),
+                LevelSpec::new(b"level=1 mag=10\0", 4, 2),
+            ]),
+        )
+        .unwrap();
+
+        let err = open_error(&path);
+        assert!(format!("{err}").contains("Inconsistent Ventana TIFF tile sizes"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_invalid_level0_xmlpacket_instead_of_ignoring_it() {
+        let path = temp_path("invalid-level0-xmlpacket.bif");
+        fs::write(&path, make_invalid_level0_xmlpacket_tiff()).unwrap();
+
+        let err = open_error(&path);
+        assert!(format!("{err}").contains("Missing Ventana BIF EncodeInfo root"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bif_xml_root_accepts_declaration_and_nul_padding() {
+        let bif = parse_bif_info(
+            "<?xml version=\"1.0\"?>\n<EncodeInfo><SlideStitchInfo><ImageInfo AOIScanned=\"1\" Width=\"2\" Height=\"2\" NumRows=\"1\" NumCols=\"1\" Pos-X=\"0\" Pos-Y=\"0\"/></SlideStitchInfo><AoiOrigin><AOI OriginX=\"0\" OriginY=\"0\"/></AoiOrigin></EncodeInfo>\0",
+            2,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(bif.areas.len(), 1);
     }
 
     #[test]
@@ -2210,6 +3095,20 @@ mod tests {
         assert_eq!(macro_image.height, 2);
         assert_eq!(macro_image.pixel(0, 0), [10, 20, 30, 255]);
         assert_eq!(macro_image.pixel(3, 1), [10, 11, 12, 255]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn duplicate_associated_images_are_last_wins() {
+        let path = temp_path("associated-last-wins.bif");
+        fs::write(&path, make_ventana_tiff_with_duplicate_macro()).unwrap();
+
+        let slide = OpenSlide::open(&path).unwrap();
+        let macro_image = slide.read_associated_image("macro").unwrap();
+        assert_eq!(macro_image.width, 2);
+        assert_eq!(macro_image.height, 1);
+        assert_eq!(macro_image.pixel(0, 0), [0xff, 0x00, 0x00, 0xff]);
 
         let _ = fs::remove_file(path);
     }
@@ -2251,6 +3150,66 @@ mod tests {
 
         let red = slide.read_region(0, 0, 0, 0, 3, 2).unwrap();
         assert_eq!(red.data, vec![10, 1, 4, 70, 7, 10]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_bif_aoi_tilemap_using_tiff_grid_coordinates() {
+        let path = temp_path("tilemap-offset.bif");
+        fs::write(&path, make_offset_bif_tilemap_tiff()).unwrap();
+
+        let slide = OpenSlide::open(&path).unwrap();
+        assert_eq!(slide.level_dimensions(0), Some((2, 2)));
+        assert_eq!(slide.debug_grid_tile_count(0, 0), 4);
+
+        let red = slide.read_region(0, 0, 0, 0, 2, 2).unwrap();
+        assert_eq!(red.data, vec![200, 201, 202, 203]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_fractional_bif_integer_attributes() {
+        let path = temp_path("tilemap-fractional-int.bif");
+        fs::write(&path, make_fractional_integer_bif_tilemap_tiff()).unwrap();
+
+        let err = open_error(&path);
+        assert!(format!("{err}").contains("Invalid Ventana XML attribute NumCols"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_bif_image_info_outside_slide_stitch_info() {
+        let path = temp_path("tilemap-wrong-imageinfo-parent.bif");
+        fs::write(
+            &path,
+            make_custom_bif_tilemap_tiff(
+                br#"<EncodeInfo><ImageInfo AOIScanned="1" Width="2" Height="2" NumRows="1" NumCols="2" Pos-X="0" Pos-Y="0"/><AoiOrigin><AOI OriginX="0" OriginY="0"/></AoiOrigin></EncodeInfo>"#,
+            ),
+        )
+        .unwrap();
+
+        let err = open_error(&path);
+        assert!(format!("{err}").contains("Missing Ventana BIF SlideStitchInfo element"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_bif_origin_outside_aoi_origin() {
+        let path = temp_path("tilemap-wrong-origin-parent.bif");
+        fs::write(
+            &path,
+            make_custom_bif_tilemap_tiff(
+                br#"<EncodeInfo><SlideStitchInfo><ImageInfo AOIScanned="1" Width="2" Height="2" NumRows="1" NumCols="2" Pos-X="0" Pos-Y="0"/></SlideStitchInfo><AOI OriginX="0" OriginY="0"/></EncodeInfo>"#,
+            ),
+        )
+        .unwrap();
+
+        let err = open_error(&path);
+        assert!(format!("{err}").contains("Missing or inconsistent Ventana BIF region metadata"));
 
         let _ = fs::remove_file(path);
     }
@@ -2302,6 +3261,112 @@ mod tests {
     }
 
     #[test]
+    fn bif_tiff_crate_decode_handles_deflate_predictor() {
+        use tiff_crate::encoder::{colortype, Compression, DeflateLevel, Predictor, TiffEncoder};
+
+        let path = temp_path("bif-deflate-predictor.tif");
+        {
+            let file = File::create(&path).unwrap();
+            let mut encoder = TiffEncoder::new(file)
+                .unwrap()
+                .with_compression(Compression::Deflate(DeflateLevel::default()))
+                .with_predictor(Predictor::Horizontal);
+            let image = encoder.new_image::<colortype::RGB8>(2, 2).unwrap();
+            image
+                .write_data(&[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120])
+                .unwrap();
+        }
+
+        let tile = read_bif_tile_with_tiff_crate(&path, 0, 0, 2, 2).unwrap();
+        assert_eq!(
+            tile.rgb,
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bif_tilemap_level_routes_contiguous_lzw_to_tiff_decoder() {
+        use tiff_crate::encoder::{colortype, Compression, TiffEncoder};
+
+        let path = temp_path("bif-lzw-tile.tif");
+        {
+            let file = File::create(&path).unwrap();
+            let mut encoder = TiffEncoder::new(file)
+                .unwrap()
+                .with_compression(Compression::Lzw);
+            let image = encoder.new_image::<colortype::RGB8>(2, 2).unwrap();
+            image
+                .write_data(&[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120])
+                .unwrap();
+        }
+
+        let level = BifTilemapLevel {
+            dir_index: 0,
+            tiles_across: 1,
+            tile_width: 2,
+            tile_height: 2,
+            tile_offsets: vec![1],
+            tile_byte_counts: vec![1],
+            compression: COMPRESSION_LZW,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
+            endian: Endian::Little,
+            tiles_per_plane: 1,
+            jpeg_tables: None,
+        };
+
+        let tile = level.decode_tile(&path, 0).unwrap();
+        assert_eq!(
+            tile.rgb,
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bif_tilemap_level_decodes_contiguous_jpeg2000() {
+        let path = temp_path("bif-jp2k-tile.bin");
+        let jp2k = encoded_jpeg2000_codestream(
+            &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120],
+            2,
+            2,
+            3,
+        );
+        fs::write(&path, &jp2k).unwrap();
+        let level = BifTilemapLevel {
+            dir_index: 0,
+            tiles_across: 1,
+            tile_width: 2,
+            tile_height: 2,
+            tile_offsets: vec![0],
+            tile_byte_counts: vec![jp2k.len() as u64],
+            compression: COMPRESSION_JP2K_RGB,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
+            endian: Endian::Little,
+            tiles_per_plane: 1,
+            jpeg_tables: None,
+        };
+
+        let tile = level.decode_tile(&path, 0).unwrap();
+        assert_eq!(
+            tile.rgb,
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn parses_magnification_with_x_suffix() {
         let mut props = HashMap::from([("ventana.Magnification".to_string(), "20X".to_string())]);
         duplicate_objective_property(
@@ -2345,7 +3410,7 @@ mod tests {
         assert_eq!(slide.level_downsample(1), Some(2.0));
 
         let red = slide.read_region(0, 0, 0, 1, 2, 1).unwrap();
-        assert_eq!(red.data, vec![10, 1]);
+        assert_eq!(red.data, vec![10, 40]);
 
         let _ = fs::remove_file(path);
     }
@@ -2364,6 +3429,8 @@ mod tests {
         )
         .unwrap();
         let level = BifTilemapLevel {
+            dir_index: 0,
+            tiles_across: 1,
             tile_width: 2,
             tile_height: 2,
             tile_offsets: vec![0, 4, 8],
@@ -2373,6 +3440,7 @@ mod tests {
             samples_per_pixel: 3,
             bits_per_sample: vec![8, 8, 8],
             planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
             endian: Endian::Little,
             tiles_per_plane: 1,
             jpeg_tables: None,
@@ -2394,6 +3462,8 @@ mod tests {
             raw.extend_from_slice(&(value << 8).to_le_bytes());
         }
         let level = BifTilemapLevel {
+            dir_index: 0,
+            tiles_across: 1,
             tile_width: 2,
             tile_height: 2,
             tile_offsets: vec![0],
@@ -2403,6 +3473,7 @@ mod tests {
             samples_per_pixel: 3,
             bits_per_sample: vec![16, 16, 16],
             planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
             endian: Endian::Little,
             tiles_per_plane: 1,
             jpeg_tables: None,
@@ -2416,6 +3487,8 @@ mod tests {
     fn decodes_rgb_bif_tile_with_single_bits_per_sample_value() {
         let raw = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
         let level = BifTilemapLevel {
+            dir_index: 0,
+            tiles_across: 1,
             tile_width: 2,
             tile_height: 2,
             tile_offsets: vec![0],
@@ -2425,6 +3498,7 @@ mod tests {
             samples_per_pixel: 3,
             bits_per_sample: vec![8],
             planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
             endian: Endian::Little,
             tiles_per_plane: 1,
             jpeg_tables: None,
@@ -2449,11 +3523,64 @@ mod tests {
         path
     }
 
+    fn open_error(path: &Path) -> OpenSlideError {
+        match OpenSlide::open(path) {
+            Ok(_) => panic!("expected Ventana open failure"),
+            Err(err) => err,
+        }
+    }
+
     fn make_simple_ventana_tiff() -> Vec<u8> {
         let mut builder = TiffBuilder::new();
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
+        builder.add_dir(b"level=0 mag=20\0", None, Some(tile_data()), 4, 2);
+        builder.finish()
+    }
+
+    fn make_ventana_tiff_with_icc(icc_profile: &[u8]) -> Vec<u8> {
+        let mut builder = TiffBuilder::new();
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
+        builder.add_dir_with_icc(b"level=0 mag=20\0", Some(tile_data()), 4, 2, icc_profile);
+        builder.finish()
+    }
+
+    fn make_ventana_tiff_with_xml(xml: &[u8]) -> Vec<u8> {
+        let mut builder = TiffBuilder::new();
+        builder.add_dir(b"level=0 mag=20\0", Some(xml), Some(tile_data()), 4, 2);
+        builder.finish()
+    }
+
+    fn make_ventana_tiff_with_level_specs(specs: &[LevelSpec]) -> Vec<u8> {
+        let mut builder = TiffBuilder::new();
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
+        for spec in specs {
+            builder.add_dir_with_tile_size(
+                spec.description,
+                None,
+                Some(tile_data()),
+                4,
+                2,
+                spec.tile_width,
+                spec.tile_height,
+            );
+        }
+        builder.finish()
+    }
+
+    fn make_ventana_tiff_with_macro() -> Vec<u8> {
+        let mut builder = TiffBuilder::new();
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
+        builder.add_dir(b"level=0 mag=20\0", None, Some(tile_data()), 4, 2);
+        builder.add_dir(b"Label Image\0", None, Some(tile_data()), 4, 2);
+        builder.finish()
+    }
+
+    fn make_invalid_level0_xmlpacket_tiff() -> Vec<u8> {
+        let mut builder = TiffBuilder::new();
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
         builder.add_dir(
             b"level=0 mag=20\0",
-            Some(br#"<iScan Magnification="20" ScanRes="0.25"/>"#),
+            Some(br#"<NotEncodeInfo/>"#),
             Some(tile_data()),
             4,
             2,
@@ -2461,16 +3588,12 @@ mod tests {
         builder.finish()
     }
 
-    fn make_ventana_tiff_with_macro() -> Vec<u8> {
+    fn make_ventana_tiff_with_duplicate_macro() -> Vec<u8> {
         let mut builder = TiffBuilder::new();
-        builder.add_dir(
-            b"level=0 mag=20\0",
-            Some(br#"<iScan Magnification="20" ScanRes="0.25"/>"#),
-            Some(tile_data()),
-            4,
-            2,
-        );
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
+        builder.add_dir(b"level=0 mag=20\0", None, Some(tile_data()), 4, 2);
         builder.add_dir(b"Label Image\0", None, Some(tile_data()), 4, 2);
+        builder.add_associated_payload_dir(b"Label Image\0", make_bmp24_2x1());
         builder.finish()
     }
 
@@ -2504,28 +3627,46 @@ mod tests {
         builder.finish()
     }
 
-    fn make_ventana_tiff_with_associated_payload() -> Vec<u8> {
+    fn make_offset_bif_tilemap_tiff() -> Vec<u8> {
         let mut builder = TiffBuilder::new();
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
         builder.add_dir(
             b"level=0 mag=20\0",
-            Some(br#"<iScan Magnification="20" ScanRes="0.25"/>"#),
-            Some(tile_data()),
+            Some(
+                br#"<EncodeInfo><SlideStitchInfo><ImageInfo AOIScanned="1" Width="2" Height="2" NumRows="1" NumCols="1" Pos-X="0" Pos-Y="0"/></SlideStitchInfo><AoiOrigin><AOI OriginX="2" OriginY="0"/></AoiOrigin></EncodeInfo>"#,
+            ),
+            Some(offset_tile_data()),
             4,
-            2,
+            4,
         );
+        builder.finish()
+    }
+
+    fn make_fractional_integer_bif_tilemap_tiff() -> Vec<u8> {
+        make_custom_bif_tilemap_tiff(
+            br#"<EncodeInfo><SlideStitchInfo><ImageInfo AOIScanned="1" Width="2" Height="2" NumRows="1" NumCols="2.5" Pos-X="0" Pos-Y="0"/></SlideStitchInfo><AoiOrigin><AOI OriginX="0" OriginY="0"/></AoiOrigin></EncodeInfo>"#,
+        )
+    }
+
+    fn make_custom_bif_tilemap_tiff(xml: &[u8]) -> Vec<u8> {
+        let mut builder = TiffBuilder::new();
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
+        builder.add_dir(b"level=0 mag=20\0", Some(xml), Some(tile_data()), 4, 2);
+        builder.finish()
+    }
+
+    fn make_ventana_tiff_with_associated_payload() -> Vec<u8> {
+        let mut builder = TiffBuilder::new();
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
+        builder.add_dir(b"level=0 mag=20\0", None, Some(tile_data()), 4, 2);
         builder.add_associated_payload_dir(b"Label Image\0", make_bmp24_2x1());
         builder.finish()
     }
 
     fn make_ventana_tiff_with_associated_variants() -> Vec<u8> {
         let mut builder = TiffBuilder::new();
-        builder.add_dir(
-            b"level=0 mag=20\0",
-            Some(br#"<iScan Magnification="20" ScanRes="0.25"/>"#),
-            Some(tile_data()),
-            4,
-            2,
-        );
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
+        builder.add_dir(b"level=0 mag=20\0", None, Some(tile_data()), 4, 2);
         builder.add_associated_payload_dir(b"SlideLabel\0", make_bmp24_2x1());
         builder.add_associated_payload_dir(b"Thumb image\0", make_bmp24_2x1());
         builder.add_associated_payload_dir(b"Slide Preview\0", make_bmp24_2x1());
@@ -2554,8 +3695,38 @@ mod tests {
         [tile0.as_slice(), tile1.as_slice()].concat()
     }
 
+    fn offset_tile_data() -> Vec<u8> {
+        let tile0 = [10, 0, 0, 11, 0, 0, 12, 0, 0, 13, 0, 0];
+        let tile1 = [200, 0, 0, 201, 0, 0, 202, 0, 0, 203, 0, 0];
+        let tile2 = [30, 0, 0, 31, 0, 0, 32, 0, 0, 33, 0, 0];
+        let tile3 = [40, 0, 0, 41, 0, 0, 42, 0, 0, 43, 0, 0];
+        [
+            tile0.as_slice(),
+            tile1.as_slice(),
+            tile2.as_slice(),
+            tile3.as_slice(),
+        ]
+        .concat()
+    }
+
     struct TiffBuilder {
         dirs: Vec<DirSpec>,
+    }
+
+    struct LevelSpec {
+        description: &'static [u8],
+        tile_width: u32,
+        tile_height: u32,
+    }
+
+    impl LevelSpec {
+        fn new(description: &'static [u8], tile_width: u32, tile_height: u32) -> Self {
+            Self {
+                description,
+                tile_width,
+                tile_height,
+            }
+        }
     }
 
     struct DirSpec {
@@ -2563,8 +3734,11 @@ mod tests {
         xml: Option<Vec<u8>>,
         tiles: Option<Vec<u8>>,
         associated_payload: Option<Vec<u8>>,
+        icc_profile: Option<Vec<u8>>,
         width: u32,
         height: u32,
+        tile_width: u32,
+        tile_height: u32,
     }
 
     impl TiffBuilder {
@@ -2578,8 +3752,11 @@ mod tests {
                 xml: Some(nul_terminated(xml)),
                 tiles: None,
                 associated_payload: None,
+                icc_profile: None,
                 width: 1,
                 height: 1,
+                tile_width: 1,
+                tile_height: 1,
             });
         }
 
@@ -2591,13 +3768,50 @@ mod tests {
             width: u32,
             height: u32,
         ) {
+            self.add_dir_with_tile_size(description, xml, tiles, width, height, 2, 2);
+        }
+
+        fn add_dir_with_tile_size(
+            &mut self,
+            description: &[u8],
+            xml: Option<&[u8]>,
+            tiles: Option<Vec<u8>>,
+            width: u32,
+            height: u32,
+            tile_width: u32,
+            tile_height: u32,
+        ) {
             self.dirs.push(DirSpec {
                 description: Some(description.to_vec()),
                 xml: xml.map(nul_terminated),
                 tiles,
                 associated_payload: None,
+                icc_profile: None,
                 width,
                 height,
+                tile_width,
+                tile_height,
+            });
+        }
+
+        fn add_dir_with_icc(
+            &mut self,
+            description: &[u8],
+            tiles: Option<Vec<u8>>,
+            width: u32,
+            height: u32,
+            icc_profile: &[u8],
+        ) {
+            self.dirs.push(DirSpec {
+                description: Some(description.to_vec()),
+                xml: None,
+                tiles,
+                associated_payload: None,
+                icc_profile: Some(icc_profile.to_vec()),
+                width,
+                height,
+                tile_width: 2,
+                tile_height: 2,
             });
         }
 
@@ -2607,8 +3821,11 @@ mod tests {
                 xml: None,
                 tiles: None,
                 associated_payload: Some(payload),
+                icc_profile: None,
                 width: 2,
                 height: 1,
+                tile_width: 2,
+                tile_height: 1,
             });
         }
 
@@ -2629,6 +3846,9 @@ mod tests {
                 }
                 if spec.associated_payload.is_some() {
                     entry_count += 2;
+                }
+                if spec.icc_profile.is_some() {
+                    entry_count += 1;
                 }
                 let ifd_len = 2 + entry_count * 12 + 4;
                 let base = next_ifd_offset + ifd_len;
@@ -2658,38 +3878,43 @@ mod tests {
                     );
                 }
                 if let Some(tiles) = spec.tiles {
+                    let tile_chunks = tiles.chunks_exact(12).collect::<Vec<_>>();
+                    assert_eq!(tile_chunks.len() * 12, tiles.len());
                     let bits_offset = add_extra(&mut extra, base, &[8, 0, 8, 0, 8, 0]);
-                    let tile0_offset = add_extra(&mut extra, base, &tiles[..12]);
-                    let tile1_offset = add_extra(&mut extra, base, &tiles[12..]);
-                    let tile_offsets_offset = add_extra(
-                        &mut extra,
-                        base,
-                        &[tile0_offset.to_le_bytes(), tile1_offset.to_le_bytes()].concat(),
-                    );
-                    let tile_byte_counts_offset = add_extra(
-                        &mut extra,
-                        base,
-                        &[12u32.to_le_bytes(), 12u32.to_le_bytes()].concat(),
-                    );
+                    let tile_offsets = tile_chunks
+                        .iter()
+                        .map(|tile| add_extra(&mut extra, base, tile))
+                        .collect::<Vec<_>>();
+                    let tile_offsets_bytes = tile_offsets
+                        .iter()
+                        .flat_map(|offset| offset.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    let tile_byte_counts_bytes = vec![12u32; tile_chunks.len()]
+                        .iter()
+                        .flat_map(|count| count.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    let tile_offsets_offset = add_extra(&mut extra, base, &tile_offsets_bytes);
+                    let tile_byte_counts_offset =
+                        add_extra(&mut extra, base, &tile_byte_counts_bytes);
                     push_entry(&mut entries, 258, TYPE_SHORT, 3, bits_offset);
                     push_entry(&mut entries, 259, TYPE_SHORT, 1, 1);
                     push_entry(&mut entries, 262, TYPE_SHORT, 1, 2);
                     push_entry(&mut entries, 277, TYPE_SHORT, 1, 3);
                     push_entry(&mut entries, 284, TYPE_SHORT, 1, 1);
-                    push_entry(&mut entries, TAG_TILEWIDTH, TYPE_LONG, 1, 2);
-                    push_entry(&mut entries, TAG_TILELENGTH, TYPE_LONG, 1, 2);
+                    push_entry(&mut entries, TAG_TILEWIDTH, TYPE_LONG, 1, spec.tile_width);
+                    push_entry(&mut entries, TAG_TILELENGTH, TYPE_LONG, 1, spec.tile_height);
                     push_entry(
                         &mut entries,
                         TAG_TILEOFFSETS,
                         TYPE_LONG,
-                        2,
+                        tile_chunks.len() as u32,
                         tile_offsets_offset,
                     );
                     push_entry(
                         &mut entries,
                         TAG_TILEBYTECOUNTS,
                         TYPE_LONG,
-                        2,
+                        tile_chunks.len() as u32,
                         tile_byte_counts_offset,
                     );
                 }
@@ -2698,6 +3923,16 @@ mod tests {
                     let payload_offset = add_extra(&mut extra, base, &payload);
                     push_entry(&mut entries, TAG_STRIPOFFSETS, TYPE_LONG, 1, payload_offset);
                     push_entry(&mut entries, TAG_STRIPBYTECOUNTS, TYPE_LONG, 1, payload_len);
+                }
+                if let Some(icc_profile) = spec.icc_profile {
+                    let offset = add_extra(&mut extra, base, &icc_profile);
+                    push_entry(
+                        &mut entries,
+                        TAG_ICCPROFILE,
+                        TYPE_UNDEFINED,
+                        icc_profile.len() as u32,
+                        offset,
+                    );
                 }
                 entries.sort_by_key(|entry| u16::from_le_bytes([entry[0], entry[1]]));
 
@@ -2788,5 +4023,19 @@ mod tests {
             0x00, 0xff, 0x00, // green
         ]);
         data
+    }
+
+    fn encoded_jpeg2000_codestream(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        components: u8,
+    ) -> Vec<u8> {
+        let options = dicom_toolkit_jpeg2000::EncodeOptions {
+            num_decomposition_levels: 0,
+            ..dicom_toolkit_jpeg2000::EncodeOptions::default()
+        };
+        dicom_toolkit_jpeg2000::encode(pixels, width, height, components, 8, false, &options)
+            .unwrap()
     }
 }
