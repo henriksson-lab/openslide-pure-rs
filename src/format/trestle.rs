@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::raw::{c_char, c_int, c_uint};
 use std::path::{Path, PathBuf};
 
 use flate2::read::{DeflateDecoder, ZlibDecoder};
@@ -12,6 +13,31 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::SlideBackend;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+
+extern "C" {
+    fn osr_cairo_blit_rgb_to_rgba(
+        src_rgb: *const u8,
+        src_width: c_uint,
+        src_height: c_uint,
+        valid_width: c_uint,
+        valid_height: c_uint,
+        src_x: f64,
+        src_y: f64,
+        src_w: c_uint,
+        src_h: c_uint,
+        channel_r: c_int,
+        channel_g: c_int,
+        channel_b: c_int,
+        channel_a: c_int,
+        dst_rgba: *mut u8,
+        dst_width: c_uint,
+        dst_height: c_uint,
+        dst_x: f64,
+        dst_y: f64,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+}
 
 const TRESTLE_SOFTWARE: &str = "MedScan";
 
@@ -1138,9 +1164,15 @@ impl SlideBackend for TrestleSlide {
         let lx = x as f64 / level_data.downsample;
         let ly = y as f64 / level_data.downsample;
         let mut output = RgbaImage::new(w, h);
+        let use_cairo_rgb = channels[0].is_some()
+            && channels[1].is_some()
+            && channels[2].is_some()
+            && trestle_level_needs_cairo_composition(level_data);
         if channels[3].is_none() {
-            for pixel in output.data.chunks_exact_mut(4) {
-                pixel[3] = 255;
+            if !use_cairo_rgb {
+                for pixel in output.data.chunks_exact_mut(4) {
+                    pixel[3] = 255;
+                }
             }
         }
 
@@ -1157,28 +1189,66 @@ impl SlideBackend for TrestleSlide {
             .ceil()
             .min(level_data.tiles_down as f64) as i64;
 
-        for row in row_start..row_end {
-            for col in col_start..col_end {
-                let tile_no = row as u64 * level_data.tiles_across + col as u64;
-                let decoded = self.decode_tile(level, tile_no)?;
-                let tile_origin_x = col as f64 * level_data.tile_advance_x;
-                let tile_origin_y = row as f64 * level_data.tile_advance_y;
-                let visible_w = (level_data.stored_width
-                    - col as u64 * level_data.tile_width as u64)
-                    .min(level_data.tile_width as u64) as u32;
-                let visible_h = (level_data.stored_height
-                    - row as u64 * level_data.tile_height as u64)
-                    .min(level_data.tile_height as u64) as u32;
+        if use_cairo_rgb {
+            for row in (row_start..row_end).rev() {
+                for col in (col_start..col_end).rev() {
+                    let tile_no = row as u64 * level_data.tiles_across + col as u64;
+                    let decoded = self.decode_tile(level, tile_no)?;
+                    let tile_origin_x = col as f64 * level_data.tile_advance_x;
+                    let tile_origin_y = row as f64 * level_data.tile_advance_y;
+                    let visible_w =
+                        (level_data.stored_width - col as u64 * level_data.tile_width as u64)
+                            .min(level_data.tile_width as u64) as u32;
+                    let visible_h =
+                        (level_data.stored_height - row as u64 * level_data.tile_height as u64)
+                            .min(level_data.tile_height as u64) as u32;
 
-                blit_rgb_rgba(
-                    &decoded,
-                    channels,
-                    visible_w,
-                    visible_h,
-                    &mut output,
-                    tile_origin_x - lx,
-                    tile_origin_y - ly,
-                );
+                    cairo_blit_rgb_rgba(
+                        &decoded,
+                        channels,
+                        visible_w,
+                        visible_h,
+                        &mut output,
+                        tile_origin_x - lx,
+                        tile_origin_y - ly,
+                    )?;
+                }
+            }
+        } else {
+            for row in row_start..row_end {
+                for col in col_start..col_end {
+                    let tile_no = row as u64 * level_data.tiles_across + col as u64;
+                    let decoded = self.decode_tile(level, tile_no)?;
+                    let tile_origin_x = col as f64 * level_data.tile_advance_x;
+                    let tile_origin_y = row as f64 * level_data.tile_advance_y;
+                    let visible_w =
+                        (level_data.stored_width - col as u64 * level_data.tile_width as u64)
+                            .min(level_data.tile_width as u64) as u32;
+                    let visible_h =
+                        (level_data.stored_height - row as u64 * level_data.tile_height as u64)
+                            .min(level_data.tile_height as u64) as u32;
+
+                    blit_rgb_rgba(
+                        &decoded,
+                        channels,
+                        visible_w,
+                        visible_h,
+                        &mut output,
+                        tile_origin_x - lx,
+                        tile_origin_y - ly,
+                    );
+                }
+            }
+        }
+
+        if use_cairo_rgb {
+            unpremultiply_rgba(&mut output);
+            if channels[3].is_none() {
+                for pixel in output.data.chunks_exact_mut(4) {
+                    if pixel[3] != 0 {
+                        pixel[3] = 255;
+                    }
+                }
             }
         }
 
@@ -2259,6 +2329,69 @@ fn blit_rgb_rgba(
                     dst.data[dst_base + out_idx] = src.rgb[src_base + *channel as usize];
                 }
             }
+        }
+    }
+}
+
+fn cairo_blit_rgb_rgba(
+    src: &CachedTile,
+    channels: [Option<u32>; 4],
+    visible_w: u32,
+    visible_h: u32,
+    dst: &mut RgbaImage,
+    dst_x: f64,
+    dst_y: f64,
+) -> Result<()> {
+    let channel = |idx: usize| -> c_int { channels[idx].map_or(-1, |channel| channel as c_int) };
+    let mut err = vec![0i8; 256];
+    let ok = unsafe {
+        osr_cairo_blit_rgb_to_rgba(
+            src.rgb.as_ptr(),
+            src.width,
+            src.height,
+            visible_w.min(src.width),
+            visible_h.min(src.height),
+            0.0,
+            0.0,
+            visible_w.min(src.width),
+            visible_h.min(src.height),
+            channel(0),
+            channel(1),
+            channel(2),
+            channel(3),
+            dst.data.as_mut_ptr(),
+            dst.width,
+            dst.height,
+            dst_x,
+            dst_y,
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok == 0 {
+        let nul = err.iter().position(|&ch| ch == 0).unwrap_or(err.len());
+        let bytes: Vec<u8> = err[..nul].iter().map(|&ch| ch as u8).collect();
+        return Err(OpenSlideError::Decode(format!(
+            "Trestle Cairo tile blit failed: {}",
+            String::from_utf8_lossy(&bytes)
+        )));
+    }
+    Ok(())
+}
+
+fn trestle_level_needs_cairo_composition(level: &TrestleLevel) -> bool {
+    (level.downsample - level.downsample.round()).abs() > 1e-9
+}
+
+fn unpremultiply_rgba(image: &mut RgbaImage) {
+    for pixel in image.data.chunks_exact_mut(4) {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 0 || alpha == 255 {
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            let value = (u32::from(*channel) * 255) / alpha;
+            *channel = value.min(255) as u8;
         }
     }
 }

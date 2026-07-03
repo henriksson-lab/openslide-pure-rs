@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::raw::{c_char, c_int, c_uint};
 use std::path::{Path, PathBuf};
 
 use crate::decode;
@@ -11,6 +12,41 @@ use crate::format::SlideBackend;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
+
+extern "C" {
+    fn osr_cairo_blit_rgb_to_rgba(
+        src_rgb: *const u8,
+        src_width: c_uint,
+        src_height: c_uint,
+        valid_width: c_uint,
+        valid_height: c_uint,
+        src_x: f64,
+        src_y: f64,
+        src_w: c_uint,
+        src_h: c_uint,
+        channel_r: c_int,
+        channel_g: c_int,
+        channel_b: c_int,
+        channel_a: c_int,
+        dst_rgba: *mut u8,
+        dst_width: c_uint,
+        dst_height: c_uint,
+        dst_x: f64,
+        dst_y: f64,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn osr_openjpeg_decode_rgb(
+        data: *const u8,
+        len: usize,
+        width: c_uint,
+        height: c_uint,
+        ycbcr: c_int,
+        out: *mut u8,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+}
 
 const TIFFTAG_IMAGE_WIDTH: u16 = 256;
 const TIFFTAG_IMAGE_LENGTH: u16 = 257;
@@ -537,7 +573,11 @@ impl SlideBackend for AperioSlide {
         if w == 0 || h == 0 {
             return Ok(output);
         }
-        if channels[3].is_none() {
+        let use_cairo_rgb = channels[0].is_some()
+            && channels[1].is_some()
+            && channels[2].is_some()
+            && channels[3].is_none();
+        if channels[3].is_none() && !use_cairo_rgb {
             for pixel in output.data.chunks_exact_mut(4) {
                 pixel[3] = 255;
             }
@@ -555,8 +595,8 @@ impl SlideBackend for AperioSlide {
             .min(level.tiles_down as i64) as u64;
 
         let mut file = File::open(&self.path)?;
-        for row in start_row..end_row {
-            for col in start_col..end_col {
+        for row in (start_row..end_row).rev() {
+            for col in (start_col..end_col).rev() {
                 let tile_index = row
                     .checked_mul(level.tiles_across)
                     .and_then(|v| v.checked_add(col))
@@ -565,7 +605,11 @@ impl SlideBackend for AperioSlide {
                 let dst_x = col as f64 * level.tile_w as f64 - lx;
                 let dst_y = row as f64 * level.tile_h as f64 - ly;
                 if let Some(tile) = self.read_tile_rgb(&mut file, level_index, level, tile_index)? {
-                    blit_rgb_rgba(&tile, channels, &mut output, dst_x, dst_y);
+                    if use_cairo_rgb {
+                        cairo_blit_rgb_rgba(&tile, channels, &mut output, dst_x, dst_y)?;
+                    } else {
+                        blit_rgb_rgba(&tile, channels, &mut output, dst_x, dst_y);
+                    }
                 } else {
                     for (out_idx, ch_opt) in channels.iter().enumerate() {
                         if let Some(channel) = ch_opt {
@@ -580,6 +624,14 @@ impl SlideBackend for AperioSlide {
                             blit_gray_into_rgba(&gray, out_idx, &mut output, dst_x, dst_y);
                         }
                     }
+                }
+            }
+        }
+        if channels[3].is_none() && use_cairo_rgb {
+            unpremultiply_rgba(&mut output);
+            for pixel in output.data.chunks_exact_mut(4) {
+                if pixel[3] != 0 {
+                    pixel[3] = 255;
                 }
             }
         }
@@ -654,36 +706,44 @@ impl AperioSlide {
             }
             COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB => {
                 let colorspace = aperio_jpeg2000_colorspace(level.compression);
-                let context = format!(
-                    "Aperio JPEG 2000 ({colorspace}) TIFF directory {} tile compression {} photometric {} samples {} expected {}x{} RGB",
-                    level.dir_index,
-                    level.compression,
-                    level.photometric,
-                    level.samples_per_pixel,
-                    level.tile_w,
-                    level.tile_h
-                );
-                let (rgb, width, height) = decode::default_decoder_api().decode_jpeg2000_rgb(
-                    &data,
-                    decode::jpeg2000::Jpeg2000DecodeOptions::new(
-                        level.tile_w,
-                        level.tile_h,
-                        level.samples_per_pixel.min(3),
-                        decode::jpeg2000::Jpeg2000OutputFormat::Rgb,
-                        &context,
-                    )
-                    .with_source(decode::jpeg2000::Jpeg2000DecodeSource::TiffTile)
-                    .with_component_color_space(aperio_jpeg2000_component_color_space(
+                if let Some(rgb) = decode_aperio_jpeg2000_rgb_openjpeg(&data, level)? {
+                    Ok(Some(RgbTile {
+                        width: level.tile_w,
+                        height: level.tile_h,
+                        rgb,
+                    }))
+                } else {
+                    let context = format!(
+                        "Aperio JPEG 2000 ({colorspace}) TIFF directory {} tile compression {} photometric {} samples {} expected {}x{} RGB",
+                        level.dir_index,
                         level.compression,
-                    ))
-                    .with_tile(decode::jpeg2000::Jpeg2000TileContext {
-                        tile_x: (tile_index as u64 % level.tiles_across) as u32,
-                        tile_y: (tile_index as u64 / level.tiles_across) as u32,
-                        tile_width: level.tile_w,
-                        tile_height: level.tile_h,
-                    }),
-                )?;
-                Ok(Some(RgbTile { width, height, rgb }))
+                        level.photometric,
+                        level.samples_per_pixel,
+                        level.tile_w,
+                        level.tile_h
+                    );
+                    let (rgb, width, height) = decode::default_decoder_api().decode_jpeg2000_rgb(
+                        &data,
+                        decode::jpeg2000::Jpeg2000DecodeOptions::new(
+                            level.tile_w,
+                            level.tile_h,
+                            level.samples_per_pixel.min(3),
+                            decode::jpeg2000::Jpeg2000OutputFormat::Rgb,
+                            &context,
+                        )
+                        .with_source(decode::jpeg2000::Jpeg2000DecodeSource::TiffTile)
+                        .with_component_color_space(aperio_jpeg2000_component_color_space(
+                            level.compression,
+                        ))
+                        .with_tile(decode::jpeg2000::Jpeg2000TileContext {
+                            tile_x: (tile_index as u64 % level.tiles_across) as u32,
+                            tile_y: (tile_index as u64 / level.tiles_across) as u32,
+                            tile_width: level.tile_w,
+                            tile_height: level.tile_h,
+                        }),
+                    )?;
+                    Ok(Some(RgbTile { width, height, rgb }))
+                }
             }
             _ => Ok(None),
         }
@@ -2555,6 +2615,99 @@ fn blit_rgb_rgba(
                     dst.data[dst_base + out_idx] = src.rgb[src_base + *channel as usize];
                 }
             }
+        }
+    }
+}
+
+fn cairo_blit_rgb_rgba(
+    src: &RgbTile,
+    channels: [Option<u32>; 4],
+    dst: &mut RgbaImage,
+    dst_x: f64,
+    dst_y: f64,
+) -> Result<()> {
+    let channel = |idx: usize| -> c_int { channels[idx].map_or(-1, |channel| channel as c_int) };
+    let mut err = vec![0i8; 256];
+    let ok = unsafe {
+        osr_cairo_blit_rgb_to_rgba(
+            src.rgb.as_ptr(),
+            src.width,
+            src.height,
+            src.width,
+            src.height,
+            0.0,
+            0.0,
+            src.width,
+            src.height,
+            channel(0),
+            channel(1),
+            channel(2),
+            channel(3),
+            dst.data.as_mut_ptr(),
+            dst.width,
+            dst.height,
+            dst_x,
+            dst_y,
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok == 0 {
+        let nul = err.iter().position(|&ch| ch == 0).unwrap_or(err.len());
+        let bytes: Vec<u8> = err[..nul].iter().map(|&ch| ch as u8).collect();
+        return Err(OpenSlideError::Decode(format!(
+            "Aperio Cairo tile blit failed: {}",
+            String::from_utf8_lossy(&bytes)
+        )));
+    }
+    Ok(())
+}
+
+fn decode_aperio_jpeg2000_rgb_openjpeg(
+    data: &[u8],
+    level: &AperioLevel,
+) -> Result<Option<Vec<u8>>> {
+    if !matches!(
+        level.compression,
+        COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB
+    ) || level.samples_per_pixel < 3
+    {
+        return Ok(None);
+    }
+    let mut rgb = vec![0; level.tile_w as usize * level.tile_h as usize * 3];
+    let mut err = vec![0i8; 256];
+    let ok = unsafe {
+        osr_openjpeg_decode_rgb(
+            data.as_ptr(),
+            data.len(),
+            level.tile_w,
+            level.tile_h,
+            (level.compression == COMPRESSION_JP2K_YCBCR) as c_int,
+            rgb.as_mut_ptr(),
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok == 0 {
+        let nul = err.iter().position(|&ch| ch == 0).unwrap_or(err.len());
+        let bytes: Vec<u8> = err[..nul].iter().map(|&ch| ch as u8).collect();
+        return Err(OpenSlideError::Decode(format!(
+            "Aperio OpenJPEG tile decode failed: {}",
+            String::from_utf8_lossy(&bytes)
+        )));
+    }
+    Ok(Some(rgb))
+}
+
+fn unpremultiply_rgba(image: &mut RgbaImage) {
+    for pixel in image.data.chunks_exact_mut(4) {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 0 || alpha == 255 {
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            let value = (u32::from(*channel) * 255) / alpha;
+            *channel = value.min(255) as u8;
         }
     }
 }

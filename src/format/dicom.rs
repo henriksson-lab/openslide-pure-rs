@@ -1510,13 +1510,26 @@ impl DicomSlide {
                 else {
                     continue;
                 };
-                let decoded = self.decode_frame(frame_index)?;
                 let tile_origin_x = col * tile_w;
                 let tile_origin_y = row * tile_h;
                 let visible_w = (level_data.width - col as u64 * level_data.tile_width as u64)
                     .min(level_data.tile_width as u64) as u32;
                 let visible_h = (level_data.height - row as u64 * level_data.tile_height as u64)
                     .min(level_data.tile_height as u64) as u32;
+                if self.try_blit_native_rgb_frame(
+                    frame_index,
+                    level_data,
+                    visible_w,
+                    visible_h,
+                    &mut output,
+                    w,
+                    h,
+                    tile_origin_x - x,
+                    tile_origin_y - y,
+                )? {
+                    continue;
+                }
+                let decoded = self.decode_frame(frame_index)?;
                 blit_rgb(
                     &decoded,
                     visible_w,
@@ -1532,6 +1545,178 @@ impl DicomSlide {
 
         Ok(output)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_blit_native_rgb_frame(
+        &self,
+        frame_index: u64,
+        level_data: &DicomLevel,
+        visible_w: u32,
+        visible_h: u32,
+        dst: &mut [u8],
+        dst_width: u32,
+        dst_height: u32,
+        dst_x: i64,
+        dst_y: i64,
+    ) -> Result<bool> {
+        if !self.can_fast_copy_native_rgb() {
+            return Ok(false);
+        }
+
+        let (path, frame_offset, frame_bytes) = match &self.pixel_data {
+            Some(PixelData::Native {
+                offset,
+                len,
+                frame_bytes,
+            }) if matches!(
+                self.transfer_syntax.as_str(),
+                TS_IMPLICIT_VR_LE | TS_EXPLICIT_VR_LE | TS_EXPLICIT_VR_BE
+            ) =>
+            {
+                if frame_index
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(*frame_bytes))
+                    .is_none_or(|end| end > *len)
+                {
+                    return Err(OpenSlideError::Format(format!(
+                        "DICOM PixelData is too short for frame {frame_index}"
+                    )));
+                }
+                let frame_offset = offset
+                    .checked_add(frame_index.checked_mul(*frame_bytes).ok_or_else(|| {
+                        OpenSlideError::Format("DICOM frame offset overflows".into())
+                    })?)
+                    .ok_or_else(|| OpenSlideError::Format("DICOM frame offset overflows".into()))?;
+                (self.path.as_path(), frame_offset, *frame_bytes)
+            }
+            Some(PixelData::NativeConcatenated {
+                frames,
+                frame_bytes,
+            }) if matches!(
+                self.transfer_syntax.as_str(),
+                TS_IMPLICIT_VR_LE | TS_EXPLICIT_VR_LE | TS_EXPLICIT_VR_BE
+            ) =>
+            {
+                let frame = frames.get(frame_index as usize).ok_or_else(|| {
+                    OpenSlideError::Format(format!(
+                        "DICOM concatenated frame {frame_index} missing"
+                    ))
+                })?;
+                (frame.path.as_path(), frame.offset, *frame_bytes)
+            }
+            _ => return Ok(false),
+        };
+
+        blit_native_rgb_frame_region(
+            path,
+            frame_offset,
+            frame_bytes,
+            level_data.tile_width,
+            level_data.tile_height,
+            visible_w,
+            visible_h,
+            dst,
+            dst_width,
+            dst_height,
+            dst_x,
+            dst_y,
+        )?;
+        Ok(true)
+    }
+
+    fn can_fast_copy_native_rgb(&self) -> bool {
+        self.samples_per_pixel == 3
+            && self.planar_configuration == 0
+            && self.bits_allocated == 8
+            && self.bits_stored == 8
+            && self.high_bit == 7
+            && self.pixel_representation == 0
+            && self.photometric == "RGB"
+            && self.intensity.rescale_slope == 1.0
+            && self.intensity.rescale_intercept == 0.0
+            && self.intensity.window_center.is_none()
+            && self.intensity.window_width.is_none()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blit_native_rgb_frame_region(
+    path: &Path,
+    frame_offset: u64,
+    frame_bytes: u64,
+    tile_width: u32,
+    tile_height: u32,
+    visible_w: u32,
+    visible_h: u32,
+    dst: &mut [u8],
+    dst_width: u32,
+    dst_height: u32,
+    dst_x: i64,
+    dst_y: i64,
+) -> Result<()> {
+    let src_x0 = (-dst_x).max(0) as u32;
+    let src_y0 = (-dst_y).max(0) as u32;
+    let dst_x0 = dst_x.max(0) as u32;
+    let dst_y0 = dst_y.max(0) as u32;
+    if src_x0 >= visible_w || src_y0 >= visible_h || dst_x0 >= dst_width || dst_y0 >= dst_height {
+        return Ok(());
+    }
+
+    let copy_w = (visible_w - src_x0).min(dst_width - dst_x0);
+    let copy_h = (visible_h - src_y0).min(dst_height - dst_y0);
+    if copy_w == 0 || copy_h == 0 {
+        return Ok(());
+    }
+
+    let expected_frame_bytes = u64::from(tile_width)
+        .checked_mul(u64::from(tile_height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| OpenSlideError::Format("DICOM RGB frame size overflows".into()))?;
+    if frame_bytes < expected_frame_bytes {
+        return Err(OpenSlideError::Format(format!(
+            "DICOM RGB frame has {frame_bytes} bytes, expected at least {expected_frame_bytes}"
+        )));
+    }
+
+    let row_stride = u64::from(tile_width)
+        .checked_mul(3)
+        .ok_or_else(|| OpenSlideError::Format("DICOM RGB row size overflows".into()))?;
+    let copy_bytes = usize::try_from(
+        u64::from(copy_w)
+            .checked_mul(3)
+            .ok_or_else(|| OpenSlideError::Format("DICOM RGB copy size overflows".into()))?,
+    )
+    .map_err(|_| OpenSlideError::Format("DICOM RGB copy size overflows".into()))?;
+
+    let mut file = File::open(path)?;
+    let mut row_buf = vec![0; copy_bytes];
+    for row in 0..copy_h {
+        let src_y = src_y0 + row;
+        let src_offset = frame_offset
+            .checked_add(
+                u64::from(src_y)
+                    .checked_mul(row_stride)
+                    .and_then(|offset| offset.checked_add(u64::from(src_x0) * 3))
+                    .ok_or_else(|| {
+                        OpenSlideError::Format("DICOM RGB source offset overflows".into())
+                    })?,
+            )
+            .ok_or_else(|| OpenSlideError::Format("DICOM RGB source offset overflows".into()))?;
+        file.seek(SeekFrom::Start(src_offset))?;
+        file.read_exact(&mut row_buf)?;
+
+        let dst_idx = ((dst_y0 + row) as usize * dst_width as usize + dst_x0 as usize) * 3;
+        let dst_end = dst_idx
+            .checked_add(copy_bytes)
+            .ok_or_else(|| OpenSlideError::Format("DICOM RGB destination overflows".into()))?;
+        if dst_end > dst.len() {
+            return Err(OpenSlideError::Format(
+                "DICOM RGB destination is truncated".into(),
+            ));
+        }
+        dst[dst_idx..dst_end].copy_from_slice(&row_buf);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1600,6 +1785,46 @@ impl SlideBackend for DicomSlide {
         }
 
         Ok(output)
+    }
+
+    fn read_region_rgba(
+        &self,
+        channels: [Option<u32>; 4],
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<RgbaImage> {
+        for channel in channels.iter().flatten() {
+            if *channel >= self.channel_count() {
+                return Err(OpenSlideError::InvalidArgument(format!(
+                    "Invalid channel {channel} for DICOM slide with {} channels",
+                    self.channel_count()
+                )));
+            }
+        }
+
+        let rgb = self.read_region_rgb(x, y, level, w, h)?;
+        let size = w as usize * h as usize;
+        let mut rgba = vec![0u8; size * 4];
+        if channels[3].is_none() {
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+        }
+
+        for i in 0..size.min(rgb.len() / 3) {
+            let rgb_idx = i * 3;
+            let rgba_idx = i * 4;
+            for (out_idx, channel) in channels.iter().enumerate() {
+                if let Some(channel) = channel {
+                    rgba[rgba_idx + out_idx] = rgb[rgb_idx + *channel as usize];
+                }
+            }
+        }
+
+        RgbaImage::from_rgba(w, h, rgba)
     }
 
     fn properties(&self) -> &HashMap<String, String> {
@@ -4270,8 +4495,8 @@ mod tests {
 
         let mut pixels = Vec::new();
         for red in [10, 20, 30, 40] {
-            for _ in 0..4 {
-                pixels.extend_from_slice(&[red, 0, 0]);
+            for index in 0..4 {
+                pixels.extend_from_slice(&[red, red + index, red + 100 + index]);
             }
         }
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &pixels);
@@ -4282,6 +4507,22 @@ mod tests {
         assert_eq!(red.width, 3);
         assert_eq!(red.height, 3);
         assert_eq!(red.data, vec![10, 20, 20, 30, 40, 40, 30, 40, 40]);
+        let green = slide.read_region(1, 1, 1, 0, 3, 3).unwrap();
+        assert_eq!(green.data, vec![13, 22, 23, 31, 40, 41, 33, 42, 43]);
+        let blue = slide.read_region(2, 1, 1, 0, 3, 3).unwrap();
+        assert_eq!(blue.data, vec![113, 122, 123, 131, 140, 141, 133, 142, 143]);
+        let rgba = slide
+            .read_region_rgba([Some(0), Some(1), Some(2), None], 1, 1, 0, 3, 3)
+            .unwrap();
+        assert_eq!(rgba.width, 3);
+        assert_eq!(rgba.height, 3);
+        assert_eq!(
+            rgba.data,
+            vec![
+                10, 13, 113, 255, 20, 22, 122, 255, 20, 23, 123, 255, 30, 31, 131, 255, 40, 40,
+                140, 255, 40, 41, 141, 255, 30, 33, 133, 255, 40, 42, 142, 255, 40, 43, 143, 255,
+            ]
+        );
         let _ = fs::remove_file(path);
     }
 

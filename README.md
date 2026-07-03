@@ -6,7 +6,7 @@ Includes full **Mirax (.mrxs)** support from 3DHISTECH scanners; format reverse 
 trying to [address long-standing problems with this format](https://www.openmicroscopy.org/2016/01/06/format-support.html).
 Fix yet to be contributed upstream (more testing needed)
 
-* 2026-06-02: Audit on real data from https://openslide.cs.cmu.edu/download/openslide-testdata/ ongoing
+* 2026-06-03: Audit on real data from https://openslide.cs.cmu.edu/download/openslide-testdata/ ; benchmarking
 * 2026-05-30: Further audits. **This crate is still experimental**
 * 2026-05-28: Blind-translated a large number of non-MRXS formats. **These need real data to be tested**; please provide files if you find bugs and I will make them work!
 
@@ -50,6 +50,33 @@ experimental until exercised on representative vendor slides.
 
 Source for the original OpenSlide format list:
 [Virtual slide formats understood by OpenSlide](https://openslide.org/formats/).
+
+## Real-data parity and benchmark snapshot
+
+The table below compares this crate with the installed original OpenSlide stack
+used during the audit (`openslide-python 1.4.3` with `libopenslide 3.4.1`).
+The command was `scripts/bench-realdata.py --region-size 128
+--regions-per-level 1`; read time excludes open time, RSS is maximum resident
+set size from `/usr/bin/time -v`, and parity means matching `levels`,
+`regions`, `pixels`, full checksum, and `rgb_checksum`.
+
+| Reader | Real-data status | Parity vs original | Rust read_s / RSS KiB | Original read_s / RSS KiB | Speed vs original | RSS vs original |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| Aperio | `/big/henriksson/ome_images/SVS/77917.svs` | Exact | `0.083952 / 9872` | `0.085273 / 31868` | `1.02x` | `0.31x` |
+| Hamamatsu NDPI | `/big/henriksson/ome_images/Hamamatsu-NDPI/openslide/CMU-1/CMU-1.ndpi` | Exact | `0.018808 / 11012` | `0.041345 / 35188` | `2.20x` | `0.31x` |
+| Hamamatsu VMS | `/big/henriksson/ome_images/Hamamatsu-VMS/openslide/CMU-1/CMU-1-40x - 2010-01-12 13.24.05.vms` | Exact | `0.053581 / 9192` | `0.061253 / 36800` | `1.14x` | `0.25x` |
+| Leica | `/big/henriksson/ome_images/Leica-SCN/openslide/Leica-1/Leica-1.scn` | Exact | `0.005123 / 7296` | `0.017077 / 30400` | `3.33x` | `0.24x` |
+| Trestle | `/big/henriksson/ome_images/Trestle/openslide/CMU-1/CMU-1.tif` | Exact | `0.047703 / 23360` | `0.044271 / 39040` | `0.93x` | `0.60x` |
+| Ventana | `/big/henriksson/ome_images/Ventana/openslide/OS-1.bif` | Exact | `0.181807 / 32060` | `0.190205 / 88016` | `1.05x` | `0.36x` |
+| DICOM | 3 reference-readable single-level members under `/big/henriksson/ome_images/DICOM` | Exact on readable members | `0.000358-0.000471 / 6720` | `0.006836-0.008807 / 32320-34560` | `18-19x` | `0.19-0.21x` |
+| Zeiss CZI | 128 CZI files checked under `/big/henriksson/ome_images/Zeiss-CZI` | Blocked: original OpenSlide could not open these fixtures | n/a | n/a | n/a | n/a |
+| Generic TIFF | 132 TIFF files checked under `/big/henriksson/ome_images/TIFF` | Blocked: no original-open fixture found in this data root | n/a | n/a | n/a | n/a |
+| MIRAX / 3DHISTECH | No `.mrxs` fixture under `/big/henriksson/ome_images` | Not measured in this audit data root | n/a | n/a | n/a | n/a |
+| Philips | No obvious Philips/PTIF fixture under `/big/henriksson/ome_images` | Not measured in this audit data root | n/a | n/a | n/a | n/a |
+| Sakura | No `.svslide` fixture under `/big/henriksson/ome_images` | Not measured in this audit data root | n/a | n/a | n/a | n/a |
+
+Full notes, rejected trial measurements, and fixture caveats are tracked in
+`TOAUDIT.md`.
 
 | Format / backend | Extensions | Original OpenSlide | This crate | Notes |
 |------------------|------------|--------------------|------------|-------|

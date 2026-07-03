@@ -1,6 +1,8 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::raw::{c_char, c_int, c_uint};
 use std::path::{Path, PathBuf};
 
 use flate2::read::{DeflateDecoder, ZlibDecoder};
@@ -10,6 +12,55 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+
+extern "C" {
+    fn osr_cairo_blit_rgb_to_rgba(
+        src_rgb: *const u8,
+        src_width: c_uint,
+        src_height: c_uint,
+        valid_width: c_uint,
+        valid_height: c_uint,
+        src_x: f64,
+        src_y: f64,
+        src_w: c_uint,
+        src_h: c_uint,
+        channel_r: c_int,
+        channel_g: c_int,
+        channel_b: c_int,
+        channel_a: c_int,
+        dst_rgba: *mut u8,
+        dst_width: c_uint,
+        dst_height: c_uint,
+        dst_x: f64,
+        dst_y: f64,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+
+    fn osr_cairo_blit_rgb_to_rgba_many_same_src(
+        src_rgb: *const u8,
+        src_width: c_uint,
+        src_height: c_uint,
+        valid_width: c_uint,
+        valid_height: c_uint,
+        src_xs: *const f64,
+        src_ys: *const f64,
+        src_w: c_uint,
+        src_h: c_uint,
+        channel_r: c_int,
+        channel_g: c_int,
+        channel_b: c_int,
+        channel_a: c_int,
+        dst_rgba: *mut u8,
+        dst_width: c_uint,
+        dst_height: c_uint,
+        dst_xs: *const f64,
+        dst_ys: *const f64,
+        count: usize,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+}
 
 const TIFF_MAGIC_CLASSIC: u16 = 42;
 const TIFF_MAGIC_BIG: u16 = 43;
@@ -510,6 +561,8 @@ struct BifTilemap {
 #[derive(Debug, Clone)]
 struct BifTilemapLevel {
     dir_index: usize,
+    image_width: u64,
+    image_height: u64,
     tiles_across: u64,
     tile_width: u32,
     tile_height: u32,
@@ -531,6 +584,17 @@ struct DecodedTile {
     width: u32,
     height: u32,
     rgb: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct BifBlitOp {
+    tile_no: usize,
+    tile_col: u64,
+    tile_row: u64,
+    src_x: f64,
+    src_y: f64,
+    dst_x: f64,
+    dst_y: f64,
 }
 
 impl BifTilemap {
@@ -650,9 +714,11 @@ impl BifTilemap {
                 h,
                 area.tiles_down,
             );
+            let cols: Vec<i64> = cols.collect();
+            let rows: Vec<i64> = rows.collect();
 
-            for row in rows {
-                for col in cols.clone() {
+            for &row in rows.iter().rev() {
+                for &col in cols.iter().rev() {
                     let grid_col = area.start_col + col;
                     let grid_row = area.start_row + row;
                     if grid_col < 0 || grid_row < 0 {
@@ -750,12 +816,8 @@ impl BifTilemap {
         let subtile_h = level_data.tile_height as f64 / subtiles_per_tile as f64;
         let mut output = RgbaImage::new(w, h);
         let cache_full_tiles = true;
+        let mut blit_ops = Vec::new();
         let mut decoded_tiles: HashMap<usize, DecodedTile> = HashMap::new();
-        if channels[3].is_none() {
-            for pixel in output.data.chunks_exact_mut(4) {
-                pixel[3] = 255;
-            }
-        }
 
         for area in &self.areas {
             let area_origin_x = area.x / downsample;
@@ -776,9 +838,11 @@ impl BifTilemap {
                 h,
                 area.tiles_down,
             );
+            let cols: Vec<i64> = cols.collect();
+            let rows: Vec<i64> = rows.collect();
 
-            for row in rows {
-                for col in cols.clone() {
+            for &row in rows.iter().rev() {
+                for &col in cols.iter().rev() {
                     let grid_col = area.start_col + col;
                     let grid_row = area.start_row + row;
                     if grid_col < 0 || grid_row < 0 {
@@ -815,71 +879,108 @@ impl BifTilemap {
                     let subtile_y = (grid_row % subtiles_per_tile) as f64 * subtile_h;
                     let dst_x = tile_origin_x - lx;
                     let dst_y = tile_origin_y - ly;
-                    if cache_full_tiles {
-                        if !decoded_tiles.contains_key(&tile_no) {
-                            decoded_tiles.insert(tile_no, level_data.decode_tile(path, tile_no)?);
-                        }
-                        let tile = decoded_tiles.get(&tile_no).ok_or_else(|| {
-                            OpenSlideError::Format("Ventana decoded tile cache miss".into())
-                        })?;
-                        blit_decoded_tile_rgba_channels(
-                            tile,
-                            channels,
-                            &mut output,
-                            subtile_x.round() as u32,
-                            subtile_y.round() as u32,
-                            subtile_w.ceil() as u32,
-                            subtile_h.ceil() as u32,
-                            dst_x,
-                            dst_y,
-                        );
-                        continue;
-                    }
-                    if let Some((crop_x, crop_y, crop_w, crop_h, crop_dst_x, crop_dst_y)) =
-                        visible_tile_crop(
-                            subtile_x.round() as u32,
-                            subtile_y.round() as u32,
-                            subtile_w.ceil() as u32,
-                            subtile_h.ceil() as u32,
-                            dst_x,
-                            dst_y,
-                            w,
-                            h,
-                        )
-                    {
-                        if let Some(tile) = level_data
-                            .decode_tile_region(path, tile_no, crop_x, crop_y, crop_w, crop_h)?
-                        {
-                            blit_decoded_tile_rgba_channels(
-                                &tile,
-                                channels,
-                                &mut output,
-                                0,
-                                0,
-                                crop_w,
-                                crop_h,
-                                crop_dst_x,
-                                crop_dst_y,
-                            );
-                            continue;
-                        }
-                    }
-                    let tile = level_data.decode_tile(path, tile_no)?;
-                    blit_decoded_tile_rgba_channels(
-                        &tile,
-                        channels,
-                        &mut output,
-                        subtile_x.round() as u32,
-                        subtile_y.round() as u32,
-                        subtile_w.ceil() as u32,
-                        subtile_h.ceil() as u32,
+                    blit_ops.push(BifBlitOp {
+                        tile_no,
+                        tile_col: tile_col as u64,
+                        tile_row: tile_row as u64,
+                        src_x: subtile_x,
+                        src_y: subtile_y,
                         dst_x,
                         dst_y,
-                    );
+                    });
                 }
             }
         }
 
+        if cache_full_tiles
+            && try_cairo_blit_single_tile_batch(
+                level_data,
+                path,
+                channels,
+                &mut output,
+                &blit_ops,
+                subtile_w.ceil() as u32,
+                subtile_h.ceil() as u32,
+            )?
+        {
+            unpremultiply_rgba(&mut output);
+            return Ok(output);
+        }
+
+        for op in blit_ops {
+            let tile_no = op.tile_no;
+            let tile_col = op.tile_col;
+            let tile_row = op.tile_row;
+            let subtile_x = op.src_x;
+            let subtile_y = op.src_y;
+            let dst_x = op.dst_x;
+            let dst_y = op.dst_y;
+            if cache_full_tiles {
+                let tile = match decoded_tiles.entry(tile_no) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(level_data.decode_tile(path, tile_no)?),
+                };
+                cairo_blit_decoded_tile_rgba_channels(
+                    tile,
+                    channels,
+                    &mut output,
+                    level_data.valid_tile_width(tile_col),
+                    level_data.valid_tile_height(tile_row),
+                    subtile_x,
+                    subtile_y,
+                    subtile_w.ceil() as u32,
+                    subtile_h.ceil() as u32,
+                    dst_x,
+                    dst_y,
+                )?;
+                continue;
+            }
+            if let Some((crop_x, crop_y, crop_w, crop_h, crop_dst_x, crop_dst_y)) =
+                visible_tile_crop(
+                    subtile_x.round() as u32,
+                    subtile_y.round() as u32,
+                    subtile_w.ceil() as u32,
+                    subtile_h.ceil() as u32,
+                    dst_x,
+                    dst_y,
+                    w,
+                    h,
+                )
+            {
+                if let Some(tile) =
+                    level_data.decode_tile_region(path, tile_no, crop_x, crop_y, crop_w, crop_h)?
+                {
+                    blit_decoded_tile_rgba_channels(
+                        &tile,
+                        channels,
+                        &mut output,
+                        0,
+                        0,
+                        crop_w,
+                        crop_h,
+                        crop_dst_x,
+                        crop_dst_y,
+                    );
+                    continue;
+                }
+            }
+            let tile = level_data.decode_tile(path, tile_no)?;
+            cairo_blit_decoded_tile_rgba_channels(
+                &tile,
+                channels,
+                &mut output,
+                level_data.valid_tile_width(tile_col),
+                level_data.valid_tile_height(tile_row),
+                subtile_x,
+                subtile_y,
+                subtile_w.ceil() as u32,
+                subtile_h.ceil() as u32,
+                dst_x,
+                dst_y,
+            )?;
+        }
+
+        unpremultiply_rgba(&mut output);
         Ok(output)
     }
 
@@ -893,6 +994,20 @@ impl BifTilemap {
 }
 
 impl BifTilemapLevel {
+    fn valid_tile_width(&self, tile_col: u64) -> u32 {
+        let tile_x = tile_col.saturating_mul(u64::from(self.tile_width));
+        self.image_width
+            .saturating_sub(tile_x)
+            .min(u64::from(self.tile_width)) as u32
+    }
+
+    fn valid_tile_height(&self, tile_row: u64) -> u32 {
+        let tile_y = tile_row.saturating_mul(u64::from(self.tile_height));
+        self.image_height
+            .saturating_sub(tile_y)
+            .min(u64::from(self.tile_height)) as u32
+    }
+
     fn from_dir(tiff: &TiffFile, dir: &TiffDirectory) -> Result<Self> {
         let image_width = required_uint(tiff, dir, TAG_IMAGEWIDTH)?;
         let image_height = required_uint(tiff, dir, TAG_IMAGELENGTH)?;
@@ -994,6 +1109,8 @@ impl BifTilemapLevel {
 
         Ok(Self {
             dir_index: dir.index,
+            image_width,
+            image_height,
             tiles_across,
             tile_width,
             tile_height,
@@ -1553,6 +1670,143 @@ fn blit_decoded_tile_rgba_channels(
                 if let Some(channel) = channel {
                     dst.data[dst_idx + out_idx] = src.rgb[src_idx + (*channel).min(2) as usize];
                 }
+            }
+        }
+    }
+}
+
+fn cairo_blit_decoded_tile_rgba_channels(
+    src: &DecodedTile,
+    channels: [Option<u32>; 4],
+    dst: &mut RgbaImage,
+    valid_width: u32,
+    valid_height: u32,
+    src_x: f64,
+    src_y: f64,
+    src_w: u32,
+    src_h: u32,
+    dst_x: f64,
+    dst_y: f64,
+) -> Result<()> {
+    let channel_arg =
+        |channel: Option<u32>| -> c_int { channel.map(|ch| ch.min(2) as c_int).unwrap_or(-1) };
+    let mut err = [0i8; 256];
+    let ok = unsafe {
+        osr_cairo_blit_rgb_to_rgba(
+            src.rgb.as_ptr(),
+            src.width,
+            src.height,
+            valid_width,
+            valid_height,
+            src_x,
+            src_y,
+            src_w,
+            src_h,
+            channel_arg(channels[0]),
+            channel_arg(channels[1]),
+            channel_arg(channels[2]),
+            channel_arg(channels[3]),
+            dst.data.as_mut_ptr(),
+            dst.width,
+            dst.height,
+            dst_x,
+            dst_y,
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok == 0 {
+        return Err(OpenSlideError::Decode(format!(
+            "Ventana Cairo tile blit failed: {}",
+            c_error_message(&err)
+        )));
+    }
+    Ok(())
+}
+
+fn try_cairo_blit_single_tile_batch(
+    level: &BifTilemapLevel,
+    path: &Path,
+    channels: [Option<u32>; 4],
+    dst: &mut RgbaImage,
+    ops: &[BifBlitOp],
+    src_w: u32,
+    src_h: u32,
+) -> Result<bool> {
+    if ops.len() < 2 {
+        return Ok(false);
+    }
+    let tile_no = ops[0].tile_no;
+    if ops.iter().any(|op| op.tile_no != tile_no) {
+        return Ok(false);
+    }
+
+    let tile = level.decode_tile(path, tile_no)?;
+    let src_xs = ops.iter().map(|op| op.src_x).collect::<Vec<_>>();
+    let src_ys = ops.iter().map(|op| op.src_y).collect::<Vec<_>>();
+    let dst_xs = ops.iter().map(|op| op.dst_x).collect::<Vec<_>>();
+    let dst_ys = ops.iter().map(|op| op.dst_y).collect::<Vec<_>>();
+    let channel_arg =
+        |channel: Option<u32>| -> c_int { channel.map(|ch| ch.min(2) as c_int).unwrap_or(-1) };
+    let mut err = [0i8; 256];
+    let ok = unsafe {
+        osr_cairo_blit_rgb_to_rgba_many_same_src(
+            tile.rgb.as_ptr(),
+            tile.width,
+            tile.height,
+            level.valid_tile_width(ops[0].tile_col),
+            level.valid_tile_height(ops[0].tile_row),
+            src_xs.as_ptr(),
+            src_ys.as_ptr(),
+            src_w,
+            src_h,
+            channel_arg(channels[0]),
+            channel_arg(channels[1]),
+            channel_arg(channels[2]),
+            channel_arg(channels[3]),
+            dst.data.as_mut_ptr(),
+            dst.width,
+            dst.height,
+            dst_xs.as_ptr(),
+            dst_ys.as_ptr(),
+            ops.len(),
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok == 0 {
+        return Err(OpenSlideError::Decode(format!(
+            "Ventana Cairo batch tile blit failed: {}",
+            c_error_message(&err)
+        )));
+    }
+    Ok(true)
+}
+
+fn c_error_message(err: &[i8]) -> String {
+    let bytes: Vec<u8> = err
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| byte as u8)
+        .collect();
+    if bytes.is_empty() {
+        "unknown Cairo error".into()
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+fn unpremultiply_rgba(image: &mut RgbaImage) {
+    for pixel in image.data.chunks_exact_mut(4) {
+        let alpha = pixel[3];
+        if alpha == 0 {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+        } else if alpha < 255 {
+            for channel in &mut pixel[..3] {
+                let value = (u16::from(*channel) * 255) / u16::from(alpha);
+                *channel = value.min(255) as u8;
             }
         }
     }
@@ -3149,7 +3403,7 @@ mod tests {
         );
 
         let red = slide.read_region(0, 0, 0, 0, 3, 2).unwrap();
-        assert_eq!(red.data, vec![10, 1, 4, 70, 7, 10]);
+        assert_eq!(red.data, vec![10, 40, 4, 70, 100, 10]);
 
         let _ = fs::remove_file(path);
     }
@@ -3304,6 +3558,8 @@ mod tests {
 
         let level = BifTilemapLevel {
             dir_index: 0,
+            image_width: 2,
+            image_height: 2,
             tiles_across: 1,
             tile_width: 2,
             tile_height: 2,
@@ -3341,6 +3597,8 @@ mod tests {
         fs::write(&path, &jp2k).unwrap();
         let level = BifTilemapLevel {
             dir_index: 0,
+            image_width: 2,
+            image_height: 2,
             tiles_across: 1,
             tile_width: 2,
             tile_height: 2,
@@ -3430,6 +3688,8 @@ mod tests {
         .unwrap();
         let level = BifTilemapLevel {
             dir_index: 0,
+            image_width: 2,
+            image_height: 2,
             tiles_across: 1,
             tile_width: 2,
             tile_height: 2,
@@ -3463,6 +3723,8 @@ mod tests {
         }
         let level = BifTilemapLevel {
             dir_index: 0,
+            image_width: 2,
+            image_height: 2,
             tiles_across: 1,
             tile_width: 2,
             tile_height: 2,
@@ -3488,6 +3750,8 @@ mod tests {
         let raw = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
         let level = BifTilemapLevel {
             dir_index: 0,
+            image_width: 2,
+            image_height: 2,
             tiles_across: 1,
             tile_width: 2,
             tile_height: 2,

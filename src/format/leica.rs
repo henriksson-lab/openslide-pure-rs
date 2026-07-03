@@ -815,6 +815,74 @@ impl SlideBackend for LeicaSlide {
         Ok(output)
     }
 
+    fn read_region_rgba(
+        &self,
+        channels: [Option<u32>; 4],
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<RgbaImage> {
+        for channel in channels.iter().flatten() {
+            if *channel >= 3 {
+                return Err(OpenSlideError::InvalidArgument(format!(
+                    "Invalid channel {} (Leica SCN slides expose RGB channels 0-2)",
+                    channel
+                )));
+            }
+        }
+
+        let level_data = self
+            .levels
+            .get(level as usize)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {}", level)))?;
+        let lx = x as f64 / level_data.downsample;
+        let ly = y as f64 / level_data.downsample;
+        let mut output = RgbaImage::new(w, h);
+        let default_opaque_alpha = channels[3].is_none();
+
+        for area in &level_data.areas {
+            let area_lx = lx - area.offset_x as f64;
+            let area_ly = ly - area.offset_y as f64;
+            let col_start = (area_lx / area.tile_width as f64).floor() as i64;
+            let col_end = ((area_lx + w as f64) / area.tile_width as f64).ceil() as i64;
+            let row_start = (area_ly / area.tile_height as f64).floor() as i64;
+            let row_end = ((area_ly + h as f64) / area.tile_height as f64).ceil() as i64;
+
+            let col_start = col_start.clamp(0, area.tiles_across as i64);
+            let col_end = col_end.clamp(0, area.tiles_across as i64);
+            let row_start = row_start.clamp(0, area.tiles_down as i64);
+            let row_end = row_end.clamp(0, area.tiles_down as i64);
+
+            for row in row_start..row_end {
+                for col in col_start..col_end {
+                    let tile_no = row as u64 * area.tiles_across + col as u64;
+                    let decoded = decode_area_tile(&self.path, area, tile_no)?;
+                    let tile_origin_x = col as f64 * area.tile_width as f64;
+                    let tile_origin_y = row as f64 * area.tile_height as f64;
+                    let visible_w = (area.width - col as u64 * area.tile_width as u64)
+                        .min(area.tile_width as u64) as u32;
+                    let visible_h = (area.height - row as u64 * area.tile_height as u64)
+                        .min(area.tile_height as u64) as u32;
+
+                    blit_rgb_rgba_channels(
+                        &decoded,
+                        channels,
+                        default_opaque_alpha,
+                        visible_w,
+                        visible_h,
+                        &mut output,
+                        area.offset_x as f64 + tile_origin_x - lx,
+                        area.offset_y as f64 + tile_origin_y - ly,
+                    );
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
     fn properties(&self) -> &HashMap<String, String> {
         &self.properties
     }
@@ -2687,6 +2755,46 @@ fn blit_rgb_to_rgba(
     }
 }
 
+fn blit_rgb_rgba_channels(
+    src: &LeicaTile,
+    channels: [Option<u32>; 4],
+    default_opaque_alpha: bool,
+    visible_w: u32,
+    visible_h: u32,
+    dst: &mut RgbaImage,
+    dst_x: f64,
+    dst_y: f64,
+) {
+    let sw = visible_w.min(src.width) as i64;
+    let sh = visible_h.min(src.height) as i64;
+    let dx0 = dst_x.round() as i64;
+    let dy0 = dst_y.round() as i64;
+
+    for row in 0..sh {
+        let dy = dy0 + row;
+        if dy < 0 || dy >= dst.height as i64 {
+            continue;
+        }
+        for col in 0..sw {
+            let dx = dx0 + col;
+            if dx < 0 || dx >= dst.width as i64 {
+                continue;
+            }
+
+            let src_idx = (row as usize * src.width as usize + col as usize) * 3;
+            let dst_idx = (dy as usize * dst.width as usize + dx as usize) * 4;
+            for (out_idx, channel) in channels.iter().enumerate() {
+                if let Some(channel) = channel {
+                    dst.data[dst_idx + out_idx] = src.rgb[src_idx + (*channel).min(2) as usize];
+                }
+            }
+            if default_opaque_alpha {
+                dst.data[dst_idx + 3] = 255;
+            }
+        }
+    }
+}
+
 fn next_tag(xml: &str, from: usize) -> Option<(usize, usize, &str)> {
     let start = xml[from..].find('<')? + from;
     let end = xml[start..].find('>')? + start;
@@ -3106,6 +3214,14 @@ mod tests {
 
         let left_of_area = slide.read_region(2, -1, 0, 0, 3, 1).unwrap();
         assert_eq!(left_of_area.data, vec![0, 10, 10]);
+
+        let rgba = slide
+            .read_region_rgba([Some(0), Some(1), Some(2), None], -1, 0, 0, 3, 1)
+            .unwrap();
+        assert_eq!(
+            rgba.data,
+            vec![0, 0, 0, 0, 10, 10, 10, 255, 10, 10, 10, 255]
+        );
 
         let _ = fs::remove_file(path);
     }
