@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 
 use flate2::read::{DeflateDecoder, ZlibDecoder};
@@ -11,6 +12,31 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::SlideBackend;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+
+extern "C" {
+    fn osr_cairo_blit_rgb_to_rgba(
+        src_rgb: *const u8,
+        src_w: u32,
+        src_h: u32,
+        visible_w: u32,
+        visible_h: u32,
+        src_x: f64,
+        src_y: f64,
+        src_region_w: u32,
+        src_region_h: u32,
+        r_channel: c_int,
+        g_channel: c_int,
+        b_channel: c_int,
+        a_channel: c_int,
+        dst_rgba: *mut u8,
+        dst_w: u32,
+        dst_h: u32,
+        dst_x: f64,
+        dst_y: f64,
+        err: *mut i8,
+        err_len: usize,
+    ) -> c_int;
+}
 
 const TIFF_MAGIC_CLASSIC: u16 = 42;
 const TIFF_MAGIC_BIG: u16 = 43;
@@ -1002,7 +1028,7 @@ impl GenericTiffSlide {
         for level in &mut levels {
             let downsample_x = base_width / level.width as f64;
             let downsample_y = base_height / level.height as f64;
-            level.downsample = downsample_x.max(downsample_y);
+            level.downsample = (downsample_x + downsample_y) / 2.0;
         }
 
         let channel_count = levels[0].channel_count();
@@ -1059,7 +1085,22 @@ impl GenericTiffSlide {
                 match level.compression {
                     COMPRESSION_JPEG => {
                         let jpeg = merge_jpeg_tables(&raw, level.jpeg_tables.as_deref())?;
-                        let (rgb, width, height) = decode::decode_rgb(ImageFormat::Jpeg, &jpeg)?;
+                        let (rgb, width, height) = if level.jpeg_tables.is_some() {
+                            decode::decode_tiff_bgra_rgb_region(
+                                ImageFormat::Jpeg,
+                                &raw,
+                                level.jpeg_tables.as_deref(),
+                                0,
+                                0,
+                                actual_w,
+                                actual_h,
+                                jpeg_color_space(level.photometric),
+                            )?
+                        } else if level.photometric == PHOTOMETRIC_YCBCR {
+                            decode::decode_tiff_ycbcr_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
+                        } else {
+                            decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
+                        };
                         CachedTile { width, height, rgb }
                     }
                     COMPRESSION_NONE => decode_uncompressed_tile(level, actual_w, actual_h, &raw)?,
@@ -1154,6 +1195,13 @@ fn should_use_tiff_decoder_for_planar(level: &TiffLevel) -> bool {
     )
 }
 
+fn jpeg_color_space(photometric: u16) -> i32 {
+    match photometric {
+        PHOTOMETRIC_YCBCR => 3, // JCS_YCbCr
+        _ => 2,                 // JCS_RGB
+    }
+}
+
 impl SlideBackend for GenericTiffSlide {
     fn vendor(&self) -> &'static str {
         "generic-tiff"
@@ -1233,6 +1281,111 @@ impl SlideBackend for GenericTiffSlide {
                     tile_origin_x - lx,
                     tile_origin_y - ly,
                 );
+            }
+        }
+
+        Ok(output)
+    }
+
+    fn read_region_rgba(
+        &self,
+        channels: [Option<u32>; 4],
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<RgbaImage> {
+        for channel in channels.into_iter().flatten() {
+            if channel >= self.channel_count {
+                return Err(OpenSlideError::InvalidArgument(format!(
+                    "Invalid channel {} (slide has {} channels)",
+                    channel, self.channel_count
+                )));
+            }
+        }
+
+        let level_data = self.level(level)?;
+        let lx = x as f64 / level_data.downsample;
+        let ly = y as f64 / level_data.downsample;
+        let mut output = RgbaImage::new(w, h);
+        let use_cairo_rgb = channels[0].is_some()
+            && channels[1].is_some()
+            && channels[2].is_some()
+            && tiff_level_needs_cairo_composition(level_data);
+        if channels[3].is_none() && !use_cairo_rgb {
+            for pixel in output.data.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+        }
+
+        let col_start = (lx / level_data.tile_width as f64).floor() as i64;
+        let col_end = ((lx + w as f64) / level_data.tile_width as f64).ceil() as i64;
+        let row_start = (ly / level_data.tile_height as f64).floor() as i64;
+        let row_end = ((ly + h as f64) / level_data.tile_height as f64).ceil() as i64;
+
+        let col_start = col_start.clamp(0, level_data.tiles_across as i64);
+        let col_end = col_end.clamp(0, level_data.tiles_across as i64);
+        let row_start = row_start.clamp(0, level_data.tiles_down as i64);
+        let row_end = row_end.clamp(0, level_data.tiles_down as i64);
+
+        if use_cairo_rgb {
+            for row in (row_start..row_end).rev() {
+                for col in (col_start..col_end).rev() {
+                    let tile_no = row as u64 * level_data.tiles_across + col as u64;
+                    let decoded = self.decode_tile(level, tile_no)?;
+                    let tile_origin_x = col as f64 * level_data.tile_width as f64;
+                    let tile_origin_y = row as f64 * level_data.tile_height as f64;
+                    let visible_w = (level_data.width - col as u64 * level_data.tile_width as u64)
+                        .min(level_data.tile_width as u64)
+                        as u32;
+                    let visible_h = (level_data.height - row as u64 * level_data.tile_height as u64)
+                        .min(level_data.tile_height as u64)
+                        as u32;
+
+                    cairo_blit_rgb_rgba(
+                        &decoded,
+                        channels,
+                        visible_w,
+                        visible_h,
+                        &mut output,
+                        tile_origin_x - lx,
+                        tile_origin_y - ly,
+                    )?;
+                }
+            }
+            unpremultiply_rgba(&mut output);
+            if channels[3].is_none() {
+                for pixel in output.data.chunks_exact_mut(4) {
+                    if pixel[3] != 0 {
+                        pixel[3] = 255;
+                    }
+                }
+            }
+        } else {
+            for row in row_start..row_end {
+                for col in col_start..col_end {
+                    let tile_no = row as u64 * level_data.tiles_across + col as u64;
+                    let decoded = self.decode_tile(level, tile_no)?;
+                    let tile_origin_x = col as f64 * level_data.tile_width as f64;
+                    let tile_origin_y = row as f64 * level_data.tile_height as f64;
+                    let visible_w = (level_data.width - col as u64 * level_data.tile_width as u64)
+                        .min(level_data.tile_width as u64)
+                        as u32;
+                    let visible_h = (level_data.height - row as u64 * level_data.tile_height as u64)
+                        .min(level_data.tile_height as u64)
+                        as u32;
+
+                    blit_rgb_rgba(
+                        &decoded,
+                        channels,
+                        visible_w,
+                        visible_h,
+                        &mut output,
+                        tile_origin_x - lx,
+                        tile_origin_y - ly,
+                    );
+                }
             }
         }
 
@@ -2377,6 +2530,105 @@ fn blit_rgb_channel(
             let src_idx = (row as usize * src.width as usize + col as usize) * 3 + ch;
             let dst_idx = dy as usize * dst.width as usize + dx as usize;
             dst.data[dst_idx] = src.rgb[src_idx];
+        }
+    }
+}
+
+fn blit_rgb_rgba(
+    src: &CachedTile,
+    channels: [Option<u32>; 4],
+    visible_w: u32,
+    visible_h: u32,
+    dst: &mut RgbaImage,
+    dst_x: f64,
+    dst_y: f64,
+) {
+    let sw = visible_w.min(src.width) as i64;
+    let sh = visible_h.min(src.height) as i64;
+    let dx0 = dst_x.round() as i64;
+    let dy0 = dst_y.round() as i64;
+
+    for row in 0..sh {
+        let dy = dy0 + row;
+        if dy < 0 || dy >= dst.height as i64 {
+            continue;
+        }
+        for col in 0..sw {
+            let dx = dx0 + col;
+            if dx < 0 || dx >= dst.width as i64 {
+                continue;
+            }
+
+            let src_base = (row as usize * src.width as usize + col as usize) * 3;
+            let dst_base = (dy as usize * dst.width as usize + dx as usize) * 4;
+            for (out_idx, channel) in channels.iter().enumerate() {
+                if let Some(channel) = channel {
+                    dst.data[dst_base + out_idx] = src.rgb[src_base + *channel as usize];
+                }
+            }
+        }
+    }
+}
+
+fn cairo_blit_rgb_rgba(
+    src: &CachedTile,
+    channels: [Option<u32>; 4],
+    visible_w: u32,
+    visible_h: u32,
+    dst: &mut RgbaImage,
+    dst_x: f64,
+    dst_y: f64,
+) -> Result<()> {
+    let channel = |idx: usize| -> c_int { channels[idx].map_or(-1, |channel| channel as c_int) };
+    let mut err = vec![0i8; 256];
+    let ok = unsafe {
+        osr_cairo_blit_rgb_to_rgba(
+            src.rgb.as_ptr(),
+            src.width,
+            src.height,
+            visible_w.min(src.width),
+            visible_h.min(src.height),
+            0.0,
+            0.0,
+            visible_w.min(src.width),
+            visible_h.min(src.height),
+            channel(0),
+            channel(1),
+            channel(2),
+            channel(3),
+            dst.data.as_mut_ptr(),
+            dst.width,
+            dst.height,
+            dst_x,
+            dst_y,
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok == 0 {
+        let nul = err.iter().position(|&ch| ch == 0).unwrap_or(err.len());
+        let bytes: Vec<u8> = err[..nul].iter().map(|&ch| ch as u8).collect();
+        return Err(OpenSlideError::Decode(format!(
+            "TIFF Cairo tile blit failed: {}",
+            String::from_utf8_lossy(&bytes)
+        )));
+    }
+    Ok(())
+}
+
+fn tiff_level_needs_cairo_composition(level: &TiffLevel) -> bool {
+    (level.downsample - level.downsample.round()).abs() > 1e-9
+}
+
+fn unpremultiply_rgba(image: &mut RgbaImage) {
+    for pixel in image.data.chunks_exact_mut(4) {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 0 || alpha == 255 {
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            let value = (u32::from(*channel) * 255) / alpha;
+            *channel = value.min(255) as u8;
         }
     }
 }

@@ -69,14 +69,20 @@ set size from `/usr/bin/time -v`, and parity means matching `levels`,
 | Trestle | `/big/henriksson/ome_images/Trestle/openslide/CMU-1/CMU-1.tif` | Exact | `0.047703 / 23360` | `0.044271 / 39040` | `0.93x` | `0.60x` |
 | Ventana | `/big/henriksson/ome_images/Ventana/openslide/OS-1.bif` | Exact | `0.181807 / 32060` | `0.190205 / 88016` | `1.05x` | `0.36x` |
 | DICOM | 3 reference-readable single-level members under `/big/henriksson/ome_images/DICOM` | Exact on readable members | `0.000358-0.000471 / 6720` | `0.006836-0.008807 / 32320-34560` | `18-19x` | `0.19-0.21x` |
-| Zeiss CZI | 128 CZI files checked under `/big/henriksson/ome_images/Zeiss-CZI` | Blocked: original OpenSlide could not open these fixtures | n/a | n/a | n/a | n/a |
-| Generic TIFF | 132 TIFF files checked under `/big/henriksson/ome_images/TIFF` | Blocked: no original-open fixture found in this data root | n/a | n/a | n/a | n/a |
-| MIRAX / 3DHISTECH | No `.mrxs` fixture under `/big/henriksson/ome_images` | Not measured in this audit data root | n/a | n/a | n/a | n/a |
-| Philips | No obvious Philips/PTIF fixture under `/big/henriksson/ome_images` | Not measured in this audit data root | n/a | n/a | n/a | n/a |
-| Sakura | No `.svslide` fixture under `/big/henriksson/ome_images` | Not measured in this audit data root | n/a | n/a | n/a | n/a |
+| Zeiss CZI | 128 CZI files checked under `/big/henriksson/ome_images/Zeiss-CZI`; OpenSlide testdata `Zeiss-5-JXR`, `Zeiss-5-SlidePreview-Zstd0`, and `Zeiss-5-SlidePreview-Zstd1-HiLo` downloaded | Blocked locally: original OpenSlide could not open `/big` CZI files or the public JXR/Zstd CZI fixtures; Rust also lacks JPEG XR pixel decode for the JXR fixture and reports a Zstd frame-size gap on the Zstd1 preview | n/a | n/a | n/a | n/a |
+| Generic TIFF | OpenSlide testdata `Generic-TIFF/CMU-1.tiff`; no original-open fixture found under `/big/henriksson/ome_images/TIFF` | Drift: `levels`, `regions`, and `pixels` match; `rgb_checksum` `107346196` vs original `107346319` | `0.026716 / 10880` | `0.053274 / 32320` | `1.99x` | `0.34x` |
+| MIRAX / 3DHISTECH | OpenSlide testdata `Mirax/CMU-1-Saved-1_16.zip`; `Mirax/Mirax2-Fluorescence-2.zip`; no `.mrxs` fixture under `/big/henriksson/ome_images` | Drift on both public fixtures: RGB `3856031` vs `4005168`; RGB `138490` vs `164350` | `0.244397 / 20600`; `0.018207 / 11500` | `0.029044 / 31360`; `0.034746 / 29440` | `0.12x`; `1.91x` | `0.66x`; `0.39x` |
+| Philips | OpenSlide testdata `Philips-TIFF/Philips-1.tiff`; no obvious Philips/PTIF fixture under `/big/henriksson/ome_images` | Exact | `0.033697 / 14484` | `0.057009 / 37440` | `1.69x` | `0.39x` |
+| Sakura | No `.svslide` fixture under `/big/henriksson/ome_images`; no Sakura entry in OpenSlide `index.json` | No public OpenSlide testdata fixture found | n/a | n/a | n/a | n/a |
 
 Full notes, rejected trial measurements, and fixture caveats are tracked in
 `TOAUDIT.md`.
+
+Downloadable follow-up fixtures from OpenSlide testdata:
+
+```sh
+scripts/download-openslide-testdata.py --format mirax --format philips --format zeiss --format generic-tiff --extract --allow-distributable
+```
 
 | Format / backend | Extensions | Original OpenSlide | This crate | Notes |
 |------------------|------------|--------------------|------------|-------|

@@ -971,6 +971,76 @@ impl SlideBackend for MiraxSlide {
         Ok(output)
     }
 
+    fn read_region_rgba(
+        &self,
+        channels: [Option<u32>; 4],
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<RgbaImage> {
+        for channel in channels.into_iter().flatten() {
+            if channel as usize >= self.channels.len() {
+                return Err(OpenSlideError::InvalidArgument(format!(
+                    "Invalid channel {} (slide has {} channels)",
+                    channel,
+                    self.channels.len()
+                )));
+            }
+        }
+
+        let mut output = RgbaImage::new(w, h);
+        for (out_idx, channel) in channels.iter().enumerate() {
+            let Some(channel) = channel else {
+                continue;
+            };
+            let mapping = &self.channels[*channel as usize];
+            let levels = self
+                .filter_level_grids
+                .get(mapping.filter_level_idx)
+                .ok_or_else(|| {
+                    OpenSlideError::Format(format!(
+                        "Filter level {} not found for channel {}",
+                        mapping.filter_level_idx, channel
+                    ))
+                })?;
+            let level_data = levels.get(level as usize).ok_or_else(|| {
+                OpenSlideError::InvalidArgument(format!("Invalid level {}", level))
+            })?;
+
+            let downsample = level_data.level.downsample;
+            let lx = x as f64 / downsample;
+            let ly = y as f64 / downsample;
+            let tiles = level_data.grid.tiles_in_region(lx, ly, w as f64, h as f64);
+            for (col, row, entry) in tiles {
+                let decoded = self.decode_tile_channel(
+                    &entry.tile,
+                    mapping.filter_level_idx,
+                    level,
+                    level_data.level.image_format,
+                    mapping.rgb_channel,
+                )?;
+                let tile_origin_x = col as f64 * level_data.grid.tile_advance_x + entry.offset_x;
+                let tile_origin_y = row as f64 * level_data.grid.tile_advance_y + entry.offset_y;
+                blit_gray_into_rgba(
+                    &decoded,
+                    entry.tile.src_x,
+                    entry.tile.src_y,
+                    entry.w,
+                    entry.h,
+                    &mut output,
+                    out_idx,
+                    tile_origin_x - lx,
+                    tile_origin_y - ly,
+                    channels[3].is_none(),
+                );
+            }
+        }
+
+        Ok(output)
+    }
+
     fn properties(&self) -> &HashMap<String, String> {
         &self.properties
     }
@@ -1083,6 +1153,52 @@ fn blit_gray(
             let dst_idx = dy as usize * dst.width as usize + dx as usize;
 
             dst.data[dst_idx] = src.data[src_idx];
+        }
+    }
+}
+
+fn blit_gray_into_rgba(
+    src: &GrayImage,
+    src_x: f64,
+    src_y: f64,
+    src_w: f64,
+    src_h: f64,
+    dst: &mut RgbaImage,
+    out_channel: usize,
+    dst_x: f64,
+    dst_y: f64,
+    default_opaque_alpha: bool,
+) {
+    let sx0 = src_x.round() as i64;
+    let sy0 = src_y.round() as i64;
+    let sw = src_w.ceil() as i64;
+    let sh = src_h.ceil() as i64;
+    let dx0 = dst_x.round() as i64;
+    let dy0 = dst_y.round() as i64;
+
+    for row in 0..sh {
+        let sy = sy0 + row;
+        let dy = dy0 + row;
+
+        if sy < 0 || sy >= src.height as i64 || dy < 0 || dy >= dst.height as i64 {
+            continue;
+        }
+
+        for col in 0..sw {
+            let sx = sx0 + col;
+            let dx = dx0 + col;
+
+            if sx < 0 || sx >= src.width as i64 || dx < 0 || dx >= dst.width as i64 {
+                continue;
+            }
+
+            let src_idx = sy as usize * src.width as usize + sx as usize;
+            let dst_idx = (dy as usize * dst.width as usize + dx as usize) * 4;
+
+            dst.data[dst_idx + out_channel] = src.data[src_idx];
+            if default_opaque_alpha {
+                dst.data[dst_idx + 3] = 255;
+            }
         }
     }
 }
