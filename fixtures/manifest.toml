@@ -1,0 +1,313 @@
+schema_version = 1
+
+[[fixture]]
+id = "aperio-local-77917"
+reader = "aperio"
+path = "/big/henriksson/ome_images/SVS/77917.svs"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "Representative local Aperio SVS fixture used for the README benchmark snapshot."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-cmu-1"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/openslide/CMU-1/CMU-1.ndpi"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "Representative local NDPI fixture."
+
+[[fixture]]
+id = "hamamatsu-vms-local-cmu-1"
+reader = "hamamatsu-vms"
+path = "/big/henriksson/ome_images/Hamamatsu-VMS/openslide/CMU-1/CMU-1-40x - 2010-01-12 13.24.05.vms"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "Representative local VMS fixture with companion files."
+
+[[fixture]]
+id = "hamamatsu-vms-local-cmu-2"
+reader = "hamamatsu-vms"
+path = "/big/henriksson/ome_images/Hamamatsu-VMS/openslide/CMU-2/CMU-2-40x - 2010-01-12 13.38.58.vms"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "Additional local VMS fixture with exact sampled checksum parity."
+
+[[fixture]]
+id = "hamamatsu-vms-local-cmu-3"
+reader = "hamamatsu-vms"
+path = "/big/henriksson/ome_images/Hamamatsu-VMS/openslide/CMU-3/CMU-3-40x - 2010-01-12 13.57.09.vms"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "Additional local VMS fixture with exact sampled checksum parity."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-cmu-2"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/openslide/CMU-2/CMU-2.ndpi"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "DNL/zero-width JPEG fixture now reads RGBA and single-channel regions through recorded MCU restart offsets with exact sampled checksum parity."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-cmu-3"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/openslide/CMU-3/CMU-3.ndpi"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "DNL/zero-width JPEG fixture now reads RGBA and single-channel regions through recorded MCU restart offsets with exact sampled checksum parity and OpenSlide-matching synthetic levels."
+
+[[fixture]]
+id = "hamamatsu-vmu-ngr-missing"
+reader = "hamamatsu-vmu-ngr"
+path = ""
+source = "OpenSlide testdata index and local audit search"
+access = "missing"
+license = "unknown"
+status = "missing-fixture"
+notes = "No VMU or NGR real-data fixture has been found under /big/henriksson/ome_images or in https://openslide.cs.cmu.edu/download/openslide-testdata/index.json as of 2026-07-03."
+
+[[fixture]]
+id = "leica-local-leica-1"
+reader = "leica"
+path = "/big/henriksson/ome_images/Leica-SCN/openslide/Leica-1/Leica-1.scn"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "Representative local Leica SCN fixture."
+
+[[fixture]]
+id = "leica-local-leica-2"
+reader = "leica"
+path = "/big/henriksson/ome_images/Leica-SCN/openslide/Leica-2/Leica-2.scn"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "Additional local multi-area SCN fixture. Exact metadata, downsample, aggregate, and per-level sampled pixel parity after matching OpenSlide area-local coordinate truncation."
+
+[[fixture]]
+id = "leica-local-leica-3"
+reader = "leica"
+path = "/big/henriksson/ome_images/Leica-SCN/openslide/Leica-3/Leica-3.scn"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "blocked"
+notes = "Reference OpenSlide could not open this local SCN fixture in the audit environment."
+
+[[fixture]]
+id = "trestle-local-cmu-1"
+reader = "trestle"
+path = "/big/henriksson/ome_images/Trestle/openslide/CMU-1/CMU-1.tif"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "Representative local Trestle TIFF fixture."
+
+[[fixture]]
+id = "ventana-local-os-1"
+reader = "ventana"
+path = "/big/henriksson/ome_images/Ventana/openslide/OS-1.bif"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "Representative local Ventana BIF fixture."
+
+[[fixture]]
+id = "ventana-local-os-2"
+reader = "ventana"
+path = "/big/henriksson/ome_images/Ventana/openslide/OS-2.bif"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact"
+notes = "Additional local BIF fixture with subpixel AOI origins and exact sampled checksum parity."
+
+[[fixture]]
+id = "ventana-local-ventana-1"
+reader = "ventana"
+path = "/big/henriksson/ome_images/Ventana/openslide/Ventana-1.bif"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "blocked"
+notes = "Reference OpenSlide could not open this local Ventana fixture in the audit environment."
+
+[[fixture]]
+id = "dicom-local-readable-single-level"
+reader = "dicom"
+path = "/big/henriksson/ome_images/DICOM"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "exact-limited"
+notes = "Three reference-readable single-level members matched; fixture breadth is not sufficient for promotion."
+
+[[fixture]]
+id = "generic-tiff-public-cmu-1"
+reader = "generic-tiff"
+path = "Generic-TIFF/CMU-1.tiff"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "exact"
+download = "scripts/download-openslide-testdata.py --format generic-tiff"
+notes = "Public Generic TIFF fixture with exact sampled checksum parity."
+
+[[fixture]]
+id = "aperio-public-cmu-1-small-region"
+reader = "aperio"
+path = "Aperio/CMU-1-Small-Region.svs"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "exact"
+download = "scripts/download-openslide-testdata.py --format aperio"
+notes = "Exact sampled checksum parity after forcing RGB-tagged TIFF JPEG tiles through libjpeg with JCS_RGB."
+
+[[fixture]]
+id = "dicom-public-leica-4"
+reader = "dicom"
+path = "extracted/DICOM/Leica-4"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "blocked"
+download = "scripts/download-openslide-testdata.py --format dicom --extract"
+notes = "Installed reference OpenSlide 3.4.1 could not open the six public Leica-4 DICOM members, while Rust opened them."
+
+[[fixture]]
+id = "hamamatsu-ndpi-public-cmu-1"
+reader = "hamamatsu-ndpi"
+path = "Hamamatsu/CMU-1.ndpi"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "exact"
+download = "scripts/download-openslide-testdata.py --format hamamatsu"
+notes = "Public NDPI fixture with exact sampled checksum parity."
+
+[[fixture]]
+id = "hamamatsu-vms-public-cmu-1"
+reader = "hamamatsu-vms"
+path = "extracted/Hamamatsu-vms/CMU-1"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "exact"
+download = "scripts/download-openslide-testdata.py --format hamamatsu-vms --extract"
+notes = "Public VMS fixture with exact sampled checksum parity. Extraction preserves the source path to avoid CMU-1.zip collisions."
+
+[[fixture]]
+id = "leica-public-fluorescence-1"
+reader = "leica"
+path = "Leica/Leica-Fluorescence-1.scn"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "blocked"
+download = "scripts/download-openslide-testdata.py --format leica"
+notes = "Installed reference OpenSlide 3.4.1 could not open this public Leica fluorescence fixture: Can't find main image."
+
+[[fixture]]
+id = "mirax-public-cmu-1-saved-1-16"
+reader = "mirax"
+path = "Mirax/CMU-1-Saved-1_16.zip; extracted/Mirax/CMU-1-Saved-1_16"
+source = "OpenSlide testdata"
+access = "public"
+license = "distributable"
+status = "exact"
+download = "scripts/download-openslide-testdata.py --format mirax --extract --allow-distributable"
+notes = "Brightfield MRXS fixture with exact sampled aggregate and per-level checksum parity."
+
+[[fixture]]
+id = "mirax-public-fluorescence-2"
+reader = "mirax"
+path = "Mirax/Mirax2-Fluorescence-2.zip; extracted/Mirax/Mirax2-Fluorescence-2"
+source = "OpenSlide testdata"
+access = "public"
+license = "distributable"
+status = "exact"
+download = "scripts/download-openslide-testdata.py --format mirax --extract --allow-distributable"
+notes = "Fluorescence MRXS fixture with exact sampled checksum parity."
+
+[[fixture]]
+id = "philips-public-philips-1"
+reader = "philips"
+path = "Philips-TIFF/Philips-1.tiff"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "exact"
+download = "scripts/download-openslide-testdata.py --format philips"
+notes = "Public Philips TIFF fixture with exact parity in the audit snapshot."
+
+[[fixture]]
+id = "trestle-public-cmu-1"
+reader = "trestle"
+path = "extracted/Trestle/CMU-1/CMU-1.tif"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "exact"
+download = "scripts/download-openslide-testdata.py --format trestle --extract"
+notes = "Public Trestle fixture with exact checksum parity."
+
+[[fixture]]
+id = "ventana-public-ventana-1"
+reader = "ventana"
+path = "Ventana/Ventana-1.bif"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "blocked"
+download = "scripts/download-openslide-testdata.py --format ventana"
+notes = "Installed reference OpenSlide 3.4.1 could not open this public Ventana fixture: Bad direction attribute LEFT."
+
+[[fixture]]
+id = "zeiss-public-jxr-and-zstd"
+reader = "zeiss"
+path = "Zeiss/Zeiss-5-JXR.czi; Zeiss/Zeiss-5-SlidePreview-JXR.czi; Zeiss/Zeiss-5-SlidePreview-Zstd0.czi; Zeiss/Zeiss-5-SlidePreview-Zstd1-HiLo.czi"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "blocked"
+download = "scripts/download-openslide-testdata.py --format zeiss"
+notes = "Reference OpenSlide could not open audited public/local CZI fixtures; Rust reads public Zstd0/Zstd1 preview regions and the JXR slide-preview fixture with --features jpegxr. Full-slide Bgr24 JXR is wired through the optional backend but still needs isolated validation after a native jxrlib crash probe."
+
+[[fixture]]
+id = "sakura-missing"
+reader = "sakura"
+path = ""
+source = "OpenSlide testdata index and local audit search"
+access = "missing"
+license = "unknown"
+status = "missing"
+notes = "No .svslide fixture found locally and no Sakura entry found in https://openslide.cs.cmu.edu/download/openslide-testdata/index.json as of 2026-07-03."
+
+[[fixture]]
+id = "generic-tiff-local-zackthecat"
+reader = "generic-tiff"
+path = "/big/henriksson/ome_images/TIFF/libtiff/zackthecat.tif"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "blocked"
+notes = "Installed reference OpenSlide could not open this local old-JPEG TIFF; Rust opens it as a compression-6 smoke fixture, so it is not comparable parity evidence."

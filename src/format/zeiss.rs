@@ -1,41 +1,130 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::collections::{BTreeSet, HashMap};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
-use crate::format::SlideBackend;
+use crate::format::{tiff::OpenslideHash, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
 
-/// Decompress a complete Zstandard frame into a freshly allocated buffer.
+/// Decompress a complete Zstandard CZI subblock into a freshly allocated buffer.
 ///
-/// Uses the pure-Rust `zstd-pure-rs` decoder. The frame must declare its
-/// content size (CZI Zstd subblocks always do); frames with an unknown size
-/// are rejected rather than streamed.
-fn zstd_decode_all(src: &[u8]) -> Result<Vec<u8>> {
+/// CZI directory metadata tells us the expected uncompressed byte count, so
+/// decoding does not depend on the optional Zstd frame content-size field.
+fn zstd_decode_all(block: &CziSubBlock, src: &[u8]) -> Result<Vec<u8>> {
     use zstd_pure_rs::prelude::{
         ZSTD_decompress, ZSTD_getFrameContentSize, ZSTD_isError, ZSTD_CONTENTSIZE_ERROR,
-        ZSTD_CONTENTSIZE_UNKNOWN,
     };
 
-    let content_size = ZSTD_getFrameContentSize(src);
-    if content_size == ZSTD_CONTENTSIZE_ERROR || content_size == ZSTD_CONTENTSIZE_UNKNOWN {
+    let payload = czi_zstd_payload(block.compression, src)?;
+    let content_size = ZSTD_getFrameContentSize(payload.data);
+    if content_size == ZSTD_CONTENTSIZE_ERROR {
         return Err(OpenSlideError::Decode(
-            "Failed to decode Zeiss CZI Zstd subblock: missing frame content size".to_string(),
+            "Failed to decode Zeiss CZI Zstd subblock: invalid frame header".to_string(),
         ));
     }
 
-    let mut decoded = vec![0u8; content_size as usize];
-    let written = ZSTD_decompress(&mut decoded, src);
+    let expected = czi_uncompressed_size(block)?;
+    let mut decoded = vec![0u8; expected];
+    let written = ZSTD_decompress(&mut decoded, payload.data);
     if ZSTD_isError(written) {
         return Err(OpenSlideError::Decode(format!(
             "Failed to decode Zeiss CZI Zstd subblock: decode error code {written}"
         )));
     }
+    if written != expected {
+        return Err(OpenSlideError::Decode(format!(
+            "Failed to decode Zeiss CZI Zstd subblock: expected {expected} bytes, got {written}"
+        )));
+    }
     decoded.truncate(written);
+    if payload.hilo {
+        decoded = czi_unhilo_zstd1(block, &decoded)?;
+    }
     Ok(decoded)
+}
+
+#[derive(Clone, Copy)]
+struct CziZstdPayload<'a> {
+    data: &'a [u8],
+    hilo: bool,
+}
+
+impl AsRef<[u8]> for CziZstdPayload<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.data
+    }
+}
+
+fn czi_zstd_payload(compression: i32, src: &[u8]) -> Result<CziZstdPayload<'_>> {
+    const ZSTD_MAGIC: &[u8; 4] = b"\x28\xb5\x2f\xfd";
+    if compression == CZI_COMPRESSION_ZSTD1 {
+        if src.is_empty() {
+            return Err(OpenSlideError::Decode(
+                "Failed to decode Zeiss CZI Zstd subblock: image data too small for zstd header"
+                    .to_string(),
+            ));
+        }
+        let header_len = src[0] as usize;
+        if src.len() < header_len {
+            return Err(OpenSlideError::Decode(format!(
+                "Failed to decode Zeiss CZI Zstd subblock: image data length {} too small for zstd header",
+                src.len()
+            )));
+        }
+        let hilo = match header_len {
+            1 => false,
+            3 => {
+                if src[1] != 1 {
+                    return Err(OpenSlideError::Decode(format!(
+                        "Failed to decode Zeiss CZI Zstd subblock: unexpected zstd chunk type: {}",
+                        src[1]
+                    )));
+                }
+                src[2] & 1 != 0
+            }
+            other => {
+                return Err(OpenSlideError::Decode(format!(
+                    "Failed to decode Zeiss CZI Zstd subblock: unexpected zstd header length: {other}"
+                )));
+            }
+        };
+        let data = &src[header_len..];
+        if data.starts_with(ZSTD_MAGIC) {
+            return Ok(CziZstdPayload { data, hilo });
+        }
+    } else if src.starts_with(ZSTD_MAGIC) {
+        return Ok(CziZstdPayload {
+            data: src,
+            hilo: false,
+        });
+    }
+    Err(OpenSlideError::Decode(
+        "Failed to decode Zeiss CZI Zstd subblock: invalid frame header".to_string(),
+    ))
+}
+
+fn czi_unhilo_zstd1(block: &CziSubBlock, src: &[u8]) -> Result<Vec<u8>> {
+    let expected = czi_uncompressed_size(block)?;
+    if src.len() != expected {
+        return Err(OpenSlideError::Decode(format!(
+            "Failed to decode Zeiss CZI Zstd subblock: expected {expected} bytes before HiLo unpacking, got {}",
+            src.len()
+        )));
+    }
+    if expected % 2 != 0 {
+        return Err(OpenSlideError::Decode(format!(
+            "Failed to decode Zeiss CZI Zstd subblock: can't perform HiLo unpacking with an odd number of bytes {expected}"
+        )));
+    }
+    let half = expected / 2;
+    let mut out = Vec::with_capacity(expected);
+    for i in 0..half {
+        out.push(src[i]);
+        out.push(src[half + i]);
+    }
+    Ok(out)
 }
 
 const SID_ZISRAWATTDIR: &[u8] = b"ZISRAWATTDIR";
@@ -75,6 +164,58 @@ const CZI_PIXEL_BGR_COMPLEX_FLOAT: i32 = 11;
 const CZI_PIXEL_GRAY32: i32 = 12;
 const CZI_PIXEL_GRAY_DOUBLE: i32 = 13;
 
+fn czi_compression_name(compression: i32) -> Option<&'static str> {
+    match compression {
+        0 => Some("uncompressed"),
+        1 => Some("JPEG"),
+        2 => Some("LZW"),
+        3 => Some("type 3"),
+        4 => Some("JPEG XR"),
+        5 => Some("zstd v0"),
+        6 => Some("zstd v1"),
+        7 => Some("unknown"),
+        _ => None,
+    }
+}
+
+fn czi_pixel_type_name(pixel_type: i32) -> Option<&'static str> {
+    match pixel_type {
+        0 => Some("GRAY8"),
+        1 => Some("GRAY16"),
+        2 => Some("GRAY32FLOAT"),
+        3 => Some("BGR24"),
+        4 => Some("BGR48"),
+        5 => Some("5"),
+        6 => Some("6"),
+        7 => Some("7"),
+        8 => Some("BGR96FLOAT"),
+        9 => Some("BGRA32"),
+        10 => Some("GRAY64COMPLEX"),
+        11 => Some("BGR192COMPLEX"),
+        12 => Some("GRAY32"),
+        13 => Some("GRAY64"),
+        _ => None,
+    }
+}
+
+fn unsupported_zeiss_compression_error(compression: i32) -> OpenSlideError {
+    let message = if let Some(name) = czi_compression_name(compression) {
+        format!("{name} compression is not supported")
+    } else {
+        format!("Compression {compression} is not supported")
+    };
+    OpenSlideError::UnsupportedFormat(message)
+}
+
+fn unsupported_zeiss_pixel_type_error(pixel_type: i32) -> OpenSlideError {
+    let message = if let Some(name) = czi_pixel_type_name(pixel_type) {
+        format!("Pixel type {name} is not supported")
+    } else {
+        format!("Pixel type {pixel_type} is not supported")
+    };
+    OpenSlideError::UnsupportedFormat(message)
+}
+
 #[derive(Debug, Clone)]
 struct CziHeader {
     primary_file_guid: [u8; 16],
@@ -111,24 +252,10 @@ struct CziSubBlock {
 #[derive(Debug, Clone)]
 struct CziAttachment {
     name: &'static str,
-    czi_name: String,
     content_file_type: String,
     file_position: u64,
-    file_part: i32,
-    data_size: u64,
-}
-
-#[derive(Debug, Clone)]
-enum ExternalPartState {
-    Resolved(PathBuf),
-    Missing,
-    Ambiguous(Vec<PathBuf>),
-}
-
-#[derive(Debug, Clone, Default)]
-struct ExternalPartResolution {
-    states: BTreeMap<i32, ExternalPartState>,
-    resolved: HashMap<i32, PathBuf>,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -145,15 +272,14 @@ struct ZeissSlide {
     properties: HashMap<String, String>,
     channel_names: Vec<String>,
     associated_images: Vec<CziAttachment>,
-    external_part_states: BTreeMap<i32, ExternalPartState>,
 }
 
 pub fn detect(path: &Path) -> bool {
-    let Ok(mut file) = File::open(path) else {
+    let Ok(mut file) = crate::util::_openslide_fopen(path) else {
         return false;
     };
     let mut sid = [0; 16];
-    file.read_exact(&mut sid)
+    crate::util::_openslide_fread_exact(&mut file, &mut sid)
         .is_ok_and(|_| sid_matches(&sid, SID_ZISRAWFILE))
 }
 
@@ -169,7 +295,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
 
 impl ZeissSlide {
     fn open(path: &Path) -> Result<Self> {
-        let mut file = File::open(path)?;
+        let mut file = crate::util::_openslide_fopen(path)?;
         let header = read_czi_header(&mut file, 0)?;
         let mut subblocks = read_subblock_directory(&mut file, &header)?;
         normalize_origin(&mut subblocks);
@@ -180,9 +306,8 @@ impl ZeissSlide {
             ));
         }
 
-        let metadata_xml = read_metadata_xml(&mut file, &header).unwrap_or_default();
-        let (base_width, base_height) = parse_xml_dimensions(&metadata_xml)
-            .unwrap_or_else(|| dimensions_from_subblocks(&subblocks));
+        let metadata_xml = read_metadata_xml(&mut file, &header)?;
+        let (base_width, base_height) = parse_xml_dimensions(&metadata_xml)?;
         if base_width == 0 || base_height == 0 {
             return Err(OpenSlideError::Format(
                 "Zeiss CZI dimensions could not be determined".into(),
@@ -200,7 +325,9 @@ impl ZeissSlide {
                 "Zeiss CZI contains no usable pyramid levels".into(),
             ));
         }
-        let common_max_downsample = common_scene_max_downsample(&subblocks);
+        let scene_count = parse_scene_count(&metadata_xml)?;
+        let scene_summary = summarize_scenes(&subblocks, scene_count)?;
+        let common_max_downsample = scene_summary.common_max_downsample;
 
         let levels = downsamples
             .into_iter()
@@ -212,13 +339,8 @@ impl ZeissSlide {
             })
             .collect();
 
-        let mut associated_images = read_attachments(&mut file, &header).unwrap_or_default();
-        let external_part_resolution =
-            resolve_external_file_parts(path, &header, &subblocks, &associated_images);
-        update_external_attachment_sizes(
-            &mut associated_images,
-            &external_part_resolution.resolved,
-        );
+        let mut associated_images = read_attachments(&mut file, path, &header)?;
+        validate_associated_images(path, &mut associated_images)?;
         let channel_count = infer_channel_count(&subblocks);
         let channel_names = parse_channel_names(&metadata_xml, channel_count)
             .unwrap_or_else(|| default_channel_names(channel_count));
@@ -230,62 +352,19 @@ impl ZeissSlide {
             format_guid(&header.primary_file_guid),
         );
         properties.insert("zeiss.FileGuid".into(), format_guid(&header.file_guid));
-        properties.insert("zeiss.SizeX".into(), base_width.to_string());
-        properties.insert("zeiss.SizeY".into(), base_height.to_string());
-        if let Some(size_s) = parse_simple_xml_u64(&metadata_xml, "SizeS") {
-            properties.insert("zeiss.SizeS".into(), size_s.to_string());
-        }
-        insert_inferred_dimension_properties(&mut properties, &subblocks, &metadata_xml);
         add_xml_props_from_metadata(&mut properties, &metadata_xml);
         if let Some(mpp_x) = parse_scaling_mpp(&metadata_xml, "X") {
-            properties.insert(properties::PROPERTY_MPP_X.into(), mpp_x.to_string());
+            properties.insert(properties::PROPERTY_MPP_X.into(), format_float(mpp_x));
         }
         if let Some(mpp_y) = parse_scaling_mpp(&metadata_xml, "Y") {
-            properties.insert(properties::PROPERTY_MPP_Y.into(), mpp_y.to_string());
+            properties.insert(properties::PROPERTY_MPP_Y.into(), format_float(mpp_y));
         }
-        if let Some(objective_power) = parse_simple_xml_text(&metadata_xml, "NominalMagnification")
-            .map(|value| normalize_nominal_magnification(&value))
-        {
-            properties.insert(properties::PROPERTY_OBJECTIVE_POWER.into(), objective_power);
-        }
-        insert_metadata_properties(&mut properties, &metadata_xml);
-        insert_dimension_range_properties(&mut properties, &subblocks);
-        insert_scene_region_properties(&mut properties, &subblocks);
-        properties.insert("zeiss.SubBlockCount".into(), subblocks.len().to_string());
-        properties.insert("zeiss.ChannelCount".into(), channel_count.to_string());
-        for attachment in &associated_images {
-            properties.insert(
-                format!("zeiss.Attachment.{}.Name", attachment.name),
-                attachment.czi_name.clone(),
-            );
-            properties.insert(
-                format!("zeiss.Attachment.{}.FileType", attachment.name),
-                attachment.content_file_type.clone(),
-            );
-            properties.insert(
-                format!("zeiss.Attachment.{}.DataSize", attachment.name),
-                attachment.data_size.to_string(),
-            );
-        }
-        insert_file_part_properties(
-            &mut properties,
-            &subblocks,
-            &associated_images,
-            &external_part_resolution,
+        duplicate_referenced_objective_power(&mut properties);
+        properties.insert(
+            properties::PROPERTY_QUICKHASH1.into(),
+            zeiss_quickhash1(&header, &metadata_xml),
         );
-        insert_jpeg_xr_properties(&mut properties, &subblocks);
-        for (pixel_type, compression) in unsupported_pixel_modes(&subblocks) {
-            properties.insert(
-                format!("zeiss.UnsupportedPixelMode.{pixel_type}.{compression}"),
-                "present".into(),
-            );
-        }
-        for compression in unsupported_compressions(&subblocks) {
-            properties.insert(
-                format!("zeiss.UnsupportedCompression.{compression}"),
-                zeiss_compression_name(compression).into(),
-            );
-        }
+        insert_scene_region_properties(&mut properties, &scene_summary);
         Ok(Self {
             path: path.to_path_buf(),
             levels,
@@ -293,58 +372,22 @@ impl ZeissSlide {
             properties,
             channel_names,
             associated_images,
-            external_part_states: external_part_resolution.states,
         })
     }
 
     fn read_subblock_channel(&self, block: &CziSubBlock, channel: u32) -> Result<GrayImage> {
-        let mut file = self.open_part_file(block.file_part)?;
-        let raw = read_subblock_data(&mut file, block)?;
+        let raw = read_subblock_data_from_path(&self.path, block)?;
         match block.compression {
             CZI_COMPRESSION_UNCOMPRESSED => {
                 decode_uncompressed_subblock_channel(block, &raw, channel)
             }
             CZI_COMPRESSION_JPEG => decode::decode_channel(ImageFormat::Jpeg, &raw, channel),
-            CZI_COMPRESSION_JPEG_XR => {
-                let context = format!(
-                    "Zeiss CZI JPEG XR subblock file_part {} pixel_type {} compression {} expected {}x{} gray channel {}",
-                    block.file_part,
-                    block.pixel_type,
-                    block.compression,
-                    block.width,
-                    block.height,
-                    channel
-                );
-                decode::default_decoder_api().decode_jpegxr_gray_channel(
-                    decode::jpegxr::JpegXrDecodeRequest {
-                        data: &raw,
-                        options: jpeg_xr_decode_options(block)?,
-                        context: &context,
-                    },
-                    channel,
-                )
-            }
+            CZI_COMPRESSION_JPEG_XR => decode_jpeg_xr_subblock_channel(block, &raw, channel),
             CZI_COMPRESSION_ZSTD0 | CZI_COMPRESSION_ZSTD1 => {
-                let decoded = zstd_decode_all(&raw)?;
+                let decoded = zstd_decode_all(block, &raw)?;
                 decode_uncompressed_subblock_channel(block, &decoded, channel)
             }
-            other => Err(OpenSlideError::UnsupportedFormat(format!(
-                "Unsupported Zeiss CZI compression: {other} for pixel type {}",
-                block.pixel_type
-            ))),
-        }
-    }
-
-    fn open_part_file(&self, file_part: i32) -> Result<File> {
-        if file_part == 0 {
-            return Ok(File::open(&self.path)?);
-        }
-        match self.external_part_states.get(&file_part) {
-            Some(ExternalPartState::Resolved(path)) => Ok(File::open(path)?),
-            Some(ExternalPartState::Ambiguous(paths)) => {
-                Err(ambiguous_external_part(file_part, paths))
-            }
-            Some(ExternalPartState::Missing) | None => Err(missing_external_part(file_part)),
+            other => Err(unsupported_zeiss_compression_error(other)),
         }
     }
 }
@@ -425,7 +468,7 @@ impl SlideBackend for ZeissSlide {
         if !touched {
             return Err(OpenSlideError::UnsupportedFormat(format!(
                 "Zeiss CZI has no readable subblocks for level {level}, channel {channel}; \
-                 default view requires Z/T/S/B/V/I/H/R at index 0{}",
+                 default view requires Z/T/B/V/I/H/R at index 0{}",
                 non_default_dimension_summary(&self.subblocks)
             )));
         }
@@ -438,10 +481,21 @@ impl SlideBackend for ZeissSlide {
     }
 
     fn associated_image_names(&self) -> Vec<&str> {
-        self.associated_images
+        let mut names = self
+            .associated_images
             .iter()
             .map(|attachment| attachment.name)
-            .collect()
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    fn associated_image_dimensions(&self, name: &str) -> Option<(u64, u64)> {
+        let attachment = self
+            .associated_images
+            .iter()
+            .find(|attachment| attachment.name == name)?;
+        Some((u64::from(attachment.width), u64::from(attachment.height)))
     }
 
     fn read_associated_image(&self, name: &str) -> Result<RgbaImage> {
@@ -452,15 +506,12 @@ impl SlideBackend for ZeissSlide {
             .ok_or_else(|| {
                 OpenSlideError::InvalidArgument(format!("Unknown Zeiss associated image: {name}"))
             })?;
-        let mut file = self.open_part_file(attachment.file_part)?;
-        let data = read_attachment_data(&mut file, attachment)?;
-        let format = detect_attachment_image_format(&data).ok_or_else(|| {
-            OpenSlideError::UnsupportedFormat(format!(
-                "Unsupported Zeiss CZI attachment image format: {}",
-                attachment.content_file_type
-            ))
-        })?;
-        decode::decode_to_rgba(format, &data)
+        let data = read_attachment_data(&self.path, attachment)?;
+        match attachment.content_file_type.as_str() {
+            "JPG" => decode::decode_to_rgba(ImageFormat::Jpeg, &data),
+            "CZI" => read_embedded_czi_associated_image(&data, attachment.name),
+            other => Err(unrecognized_attachment_type_error(attachment.name, other)),
+        }
     }
 
     fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize {
@@ -487,7 +538,42 @@ impl SlideBackend for ZeissSlide {
     }
 }
 
-fn read_czi_header(file: &mut File, offset: u64) -> Result<CziHeader> {
+fn zeiss_quickhash1(header: &CziHeader, metadata_xml: &str) -> String {
+    let mut quickhash1 = OpenslideHash::openslide_hash_quickhash1_create();
+    quickhash1.openslide_hash_data(&header.primary_file_guid);
+    quickhash1.openslide_hash_data(&header.file_guid);
+    quickhash1.openslide_hash_string(Some(metadata_xml));
+    quickhash1.openslide_hash_get_string().unwrap_or_default()
+}
+
+trait ZeissReadAt {
+    fn zeiss_read_exact_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>>;
+}
+
+impl ZeissReadAt for crate::util::OpenSlideFile {
+    fn zeiss_read_exact_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let offset = i64::try_from(offset).map_err(|_| {
+            OpenSlideError::Format(format!(
+                "Zeiss file offset does not fit OpenSlide seek: {offset}"
+            ))
+        })?;
+        crate::util::_openslide_fseek(self, offset, crate::util::OpenSlideSeekWhence::Set)?;
+        let mut buf = vec![0; len];
+        crate::util::_openslide_fread_exact(self, &mut buf)?;
+        Ok(buf)
+    }
+}
+
+impl ZeissReadAt for Cursor<&[u8]> {
+    fn zeiss_read_exact_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0; len];
+        self.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+fn read_czi_header(file: &mut impl ZeissReadAt, offset: u64) -> Result<CziHeader> {
     let buf = read_exact_at(file, offset, ZISRAW_FILE_HDR_LEN as usize)?;
     if !sid_matches(&buf[0..16], SID_ZISRAWFILE) {
         return Err(OpenSlideError::UnsupportedFormat(
@@ -504,7 +590,10 @@ fn read_czi_header(file: &mut File, offset: u64) -> Result<CziHeader> {
     })
 }
 
-fn read_subblock_directory(file: &mut File, header: &CziHeader) -> Result<Vec<CziSubBlock>> {
+fn read_subblock_directory(
+    file: &mut impl ZeissReadAt,
+    header: &CziHeader,
+) -> Result<Vec<CziSubBlock>> {
     let hdr = read_exact_at(
         file,
         header.subblk_dir_pos,
@@ -521,10 +610,18 @@ fn read_subblock_directory(file: &mut File, header: &CziHeader) -> Result<Vec<Cz
             "Zeiss CZI has negative subblock count".into(),
         ));
     }
+    let declared_payload_size = read_u64(&hdr, 24)?
+        .checked_sub(ZISRAW_SUBBLK_DIR_HDR_LEN - ZISRAW_SEGMENT_HDR_LEN)
+        .ok_or_else(|| OpenSlideError::Format("Invalid Zeiss subblock directory size".into()))?;
 
     let mut offset = header.subblk_dir_pos + ZISRAW_SUBBLK_DIR_HDR_LEN;
+    let payload_start = offset;
+    let payload_end = payload_start
+        .checked_add(declared_payload_size)
+        .ok_or_else(|| OpenSlideError::Format("Invalid Zeiss subblock directory size".into()))?;
     let mut subblocks = Vec::with_capacity(entry_count as usize);
     for _ in 0..entry_count {
+        ensure_subblock_directory_available(offset, 32, payload_end, "directory entry")?;
         let entry = read_exact_at(file, offset, 32)?;
         offset += 32;
         let schema = &entry[0..2];
@@ -572,12 +669,15 @@ fn read_subblock_directory(file: &mut File, header: &CziHeader) -> Result<Vec<Cz
             )));
         }
         for _ in 0..ndim {
+            ensure_subblock_directory_available(offset, 20, payload_end, "dimension")?;
             let dim = read_exact_at(file, offset, 20)?;
             offset += 20;
             apply_dimension(&mut block, &dim)?;
         }
         if sid_matches(schema, SCHEMA_DE) {
-            offset += 256 - 32 - ndim as u64 * ZISRAW_DIM_ENTRY_DV_LEN;
+            let padding = 256 - 32 - ndim as u64 * ZISRAW_DIM_ENTRY_DV_LEN;
+            ensure_subblock_directory_available(offset, padding, payload_end, "dimension")?;
+            offset += padding;
         }
         if block.width == 0 || block.height == 0 {
             return Err(OpenSlideError::Format(
@@ -586,8 +686,32 @@ fn read_subblock_directory(file: &mut File, header: &CziHeader) -> Result<Vec<Cz
         }
         subblocks.push(block);
     }
+    let consumed = offset - payload_start;
+    if consumed != declared_payload_size {
+        return Err(OpenSlideError::Format(format!(
+            "Found {} trailing bytes after subblock directory",
+            declared_payload_size.saturating_sub(consumed)
+        )));
+    }
 
     Ok(subblocks)
+}
+
+fn ensure_subblock_directory_available(
+    offset: u64,
+    len: u64,
+    payload_end: u64,
+    what: &str,
+) -> Result<()> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| OpenSlideError::Format("Invalid Zeiss subblock directory size".into()))?;
+    if end > payload_end {
+        return Err(OpenSlideError::Format(format!(
+            "Premature end of directory when reading {what}"
+        )));
+    }
+    Ok(())
 }
 
 fn apply_dimension(block: &mut CziSubBlock, dim: &[u8]) -> Result<()> {
@@ -615,7 +739,11 @@ fn apply_dimension(block: &mut CziSubBlock, dim: &[u8]) -> Result<()> {
         "H" => block.phase = start,
         "R" => block.rotation = start,
         "M" => block.mosaic = start,
-        _ => {}
+        _ => {
+            return Err(OpenSlideError::Format(format!(
+                "Unrecognized subblock dimension \"{name}\""
+            )))
+        }
     }
     Ok(())
 }
@@ -629,9 +757,11 @@ fn normalize_origin(subblocks: &mut [CziSubBlock]) {
     }
 }
 
-fn read_metadata_xml(file: &mut File, header: &CziHeader) -> Result<String> {
+fn read_metadata_xml(file: &mut impl ZeissReadAt, header: &CziHeader) -> Result<String> {
     if header.meta_pos == 0 {
-        return Ok(String::new());
+        return Err(OpenSlideError::Format(
+            "Missing Zeiss ZISRAWMETADATA segment".into(),
+        ));
     }
     let hdr = read_exact_at(file, header.meta_pos, ZISRAW_META_HDR_LEN as usize)?;
     if !sid_matches(&hdr[0..16], SID_ZISRAWMETADATA) {
@@ -653,17 +783,25 @@ fn read_metadata_xml(file: &mut File, header: &CziHeader) -> Result<String> {
     Ok(String::from_utf8_lossy(&xml).into_owned())
 }
 
-fn read_attachments(file: &mut File, header: &CziHeader) -> Result<Vec<CziAttachment>> {
+fn read_attachments(
+    file: &mut impl ZeissReadAt,
+    path: &Path,
+    header: &CziHeader,
+) -> Result<Vec<CziAttachment>> {
     if header.att_dir_pos == 0 {
         return Ok(Vec::new());
     }
     let hdr = read_exact_at(file, header.att_dir_pos, ZISRAW_ATT_DIR_HDR_LEN as usize)?;
     if !sid_matches(&hdr[0..16], SID_ZISRAWATTDIR) {
-        return Ok(Vec::new());
+        return Err(OpenSlideError::Format(
+            "Missing Zeiss ZISRAWATTDIR segment".into(),
+        ));
     }
     let entry_count = read_i32(&hdr, 32)?;
     if !(0..=1024).contains(&entry_count) {
-        return Ok(Vec::new());
+        return Err(OpenSlideError::Format(format!(
+            "Unreasonable Zeiss attachment count: {entry_count}"
+        )));
     }
 
     let mut names = Vec::new();
@@ -673,101 +811,111 @@ fn read_attachments(file: &mut File, header: &CziHeader) -> Result<Vec<CziAttach
         let entry = read_exact_at(file, offset, ZISRAW_ATT_ENTRY_A1_LEN as usize)?;
         offset += ZISRAW_ATT_ENTRY_A1_LEN;
         if !sid_matches(&entry[0..2], SCHEMA_A1) {
-            continue;
+            return Err(OpenSlideError::Format(
+                "Unsupported Zeiss attachment entry schema".into(),
+            ));
         }
         let file_position = read_u64(&entry, 12)?;
-        let file_part = read_i32(&entry, 20)?;
+        let _file_part = read_i32(&entry, 20)?;
         let content_file_type = trim_nul_ascii(&entry[40..48]);
         let czi_name = trim_nul_ascii(&entry[48..128]);
         let osr_name = map_attachment_name(&czi_name);
         if let Some(name) = osr_name.filter(|name| seen_osr_names.insert(*name)) {
-            let data_size = if file_part == 0 {
-                read_attachment_data_size(file, file_position).unwrap_or(0)
-            } else {
-                0
-            };
+            read_attachment_data_size(path, file_position)?;
             names.push(CziAttachment {
                 name,
-                czi_name,
                 content_file_type,
                 file_position,
-                file_part,
-                data_size,
+                width: 0,
+                height: 0,
             });
         }
     }
     Ok(names)
 }
 
+fn validate_associated_images(path: &Path, attachments: &mut [CziAttachment]) -> Result<()> {
+    for attachment in attachments.iter() {
+        match attachment.content_file_type.as_str() {
+            "JPG" | "CZI" => {}
+            other => return Err(unrecognized_attachment_type_error(attachment.name, other)),
+        }
+    }
+
+    for attachment in attachments.iter_mut() {
+        let (width, height) = validate_associated_image_payload(path, attachment)?;
+        attachment.width = width;
+        attachment.height = height;
+    }
+    Ok(())
+}
+
+fn validate_associated_image_payload(
+    path: &Path,
+    attachment: &CziAttachment,
+) -> Result<(u32, u32)> {
+    let data = read_attachment_data(path, attachment)?;
+    match attachment.content_file_type.as_str() {
+        "JPG" => {
+            if data.starts_with(&[0xff, 0xd8, 0xff]) {
+                decode::jpeg::decode_jpeg_dimensions(&data).map_err(|err| {
+                    OpenSlideError::Format(format!(
+                        "Reading JPEG header for associated image \"{}\": {err}",
+                        attachment.name
+                    ))
+                })
+            } else {
+                Err(OpenSlideError::Format(format!(
+                    "Reading JPEG header for associated image \"{}\": missing JPEG SOI marker",
+                    attachment.name
+                )))
+            }
+        }
+        "CZI" => validate_embedded_czi_associated_image(&data, attachment.name),
+        other => Err(unrecognized_attachment_type_error(attachment.name, other)),
+    }
+}
+
+fn unrecognized_attachment_type_error(name: &str, file_type: &str) -> OpenSlideError {
+    OpenSlideError::UnsupportedFormat(format!(
+        "Associated image \"{name}\" has unrecognized type \"{file_type}\""
+    ))
+}
+
 fn map_attachment_name(czi_name: &str) -> Option<&'static str> {
-    let normalized = czi_name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect::<String>();
-    match normalized.as_str() {
-        "label"
-        | "slidelabel"
-        | "labelimage"
-        | "slidelabelimage"
-        | "barcode"
-        | "barcodeimage"
-        | "slidebarcode"
-        | "slidebarcodeimage"
-        | "slideid"
-        | "slideidimage"
-        | "slideidentifier"
-        | "slideidentifierimage" => Some("label"),
-        "slidepreview" | "preview" | "previewimage" | "macro" | "macroimage" | "overview"
-        | "overviewimage" | "slideoverview" | "slideoverviewimage" | "localization"
-        | "localizationimage" | "localizer" | "localizerimage" | "localiser" | "localiserimage"
-        | "navigation" | "navigationimage" | "navimage" | "navigator" | "navigatorimage"
-        | "reference" | "referenceimage" | "referencemap" | "referencemapimage" | "map"
-        | "mapimage" => Some("macro"),
-        "thumbnail"
-        | "thumb"
-        | "thumbimage"
-        | "thumbnailimage"
-        | "previewthumbnail"
-        | "overviewthumbnail"
-        | "slideoverviewthumb"
-        | "slideoverviewthumbnail"
-        | "slidepreviewthumb"
-        | "slidethumbnail"
-        | "slidethumbnailimage" => Some("thumbnail"),
+    match czi_name {
+        "Label" => Some("label"),
+        "SlidePreview" => Some("macro"),
+        "Thumbnail" => Some("thumbnail"),
         _ => None,
     }
 }
 
-fn read_attachment_data_size(file: &mut File, offset: u64) -> Result<u64> {
+fn read_attachment_data_size(path: &Path, offset: u64) -> Result<u64> {
     if offset == 0 {
         return Ok(0);
     }
-    let hdr = read_exact_at(file, offset, ZISRAW_SEGMENT_HDR_LEN as usize)?;
+    let hdr = crate::util::read_file_range(path, offset, ZISRAW_SEGMENT_HDR_LEN)?;
     if !sid_matches(&hdr[0..16], b"ZISRAWATTACH") {
         return Err(OpenSlideError::Format(
             "Missing Zeiss ZISRAWATTACH segment".into(),
         ));
     }
-    let fixed = read_exact_at(file, offset + ZISRAW_SEGMENT_HDR_LEN, 16)?;
+    let fixed = crate::util::read_file_range(path, offset + ZISRAW_SEGMENT_HDR_LEN, 16)?;
     read_u64(&fixed, 0)
 }
 
-fn read_attachment_data(file: &mut File, attachment: &CziAttachment) -> Result<Vec<u8>> {
-    let hdr = read_exact_at(
-        file,
-        attachment.file_position,
-        ZISRAW_SEGMENT_HDR_LEN as usize,
-    )?;
+fn read_attachment_data(path: &Path, attachment: &CziAttachment) -> Result<Vec<u8>> {
+    let hdr = crate::util::read_file_range(path, attachment.file_position, ZISRAW_SEGMENT_HDR_LEN)?;
     if !sid_matches(&hdr[0..16], b"ZISRAWATTACH") {
         return Err(OpenSlideError::Format(
             "Missing Zeiss ZISRAWATTACH segment".into(),
         ));
     }
-    let fixed = read_exact_at(
-        file,
+    let fixed = crate::util::read_file_range(
+        path,
         attachment.file_position + ZISRAW_SEGMENT_HDR_LEN,
-        ZISRAW_ATT_DIR_HDR_LEN as usize - ZISRAW_SEGMENT_HDR_LEN as usize,
+        ZISRAW_ATT_DIR_HDR_LEN - ZISRAW_SEGMENT_HDR_LEN,
     )?;
     let data_size = read_u64(&fixed, 0)?;
     let data_offset = attachment
@@ -775,120 +923,115 @@ fn read_attachment_data(file: &mut File, attachment: &CziAttachment) -> Result<V
         .checked_add(ZISRAW_SEGMENT_HDR_LEN)
         .and_then(|value| value.checked_add(256))
         .ok_or_else(|| OpenSlideError::Format("Zeiss attachment data offset overflow".into()))?;
-    read_exact_at(
-        file,
-        data_offset,
-        usize::try_from(data_size).map_err(|_| {
-            OpenSlideError::Format(format!("Zeiss attachment data is too large: {data_size}"))
-        })?,
-    )
+    crate::util::read_file_range(path, data_offset, data_size)
 }
 
-fn resolve_external_file_parts(
-    path: &Path,
-    header: &CziHeader,
-    subblocks: &[CziSubBlock],
-    attachments: &[CziAttachment],
-) -> ExternalPartResolution {
-    let subblock_parts = subblocks
-        .iter()
-        .filter_map(|block| (block.file_part != 0).then_some(block.file_part));
-    let attachment_parts = attachments
-        .iter()
-        .filter_map(|attachment| (attachment.file_part != 0).then_some(attachment.file_part));
-    let mut resolution = ExternalPartResolution::default();
-    for part in subblock_parts
-        .chain(attachment_parts)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
+fn read_embedded_czi_associated_image(data: &[u8], name: &str) -> Result<RgbaImage> {
+    validate_embedded_czi_associated_image(data, name)?;
+    let mut cursor = Cursor::new(data);
+    let header = read_czi_header(&mut cursor, 0).map_err(|err| {
+        OpenSlideError::Format(format!(
+            "Reading embedded CZI associated image '{name}': {err}"
+        ))
+    })?;
+    let subblocks = read_subblock_directory(&mut cursor, &header).map_err(|err| {
+        OpenSlideError::Format(format!(
+            "Reading embedded CZI associated image '{name}': {err}"
+        ))
+    })?;
+    if subblocks.len() != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Embedded Zeiss CZI associated image '{name}' has {} subblocks, expected one",
+            subblocks.len()
+        )));
+    }
+    let block = &subblocks[0];
+    validate_embedded_associated_subblock(block, name)?;
+    let red = read_embedded_subblock_channel(&mut cursor, block, 0)?;
+    let green = read_embedded_subblock_channel(&mut cursor, block, 1)?;
+    let blue = read_embedded_subblock_channel(&mut cursor, block, 2)?;
+    let mut rgba = RgbaImage::new(block.width, block.height);
+    for pixel in 0..(block.width as usize * block.height as usize) {
+        let dst = pixel * 4;
+        rgba.data[dst] = red.data[pixel];
+        rgba.data[dst + 1] = green.data[pixel];
+        rgba.data[dst + 2] = blue.data[pixel];
+        rgba.data[dst + 3] = 255;
+    }
+    Ok(rgba)
+}
+
+fn validate_embedded_czi_associated_image(data: &[u8], name: &str) -> Result<(u32, u32)> {
+    let mut cursor = Cursor::new(data);
+    let header = read_czi_header(&mut cursor, 0).map_err(|err| {
+        OpenSlideError::Format(format!(
+            "Reading embedded CZI associated image '{name}': {err}"
+        ))
+    })?;
+    let subblocks = read_subblock_directory(&mut cursor, &header).map_err(|err| {
+        OpenSlideError::Format(format!(
+            "Reading embedded CZI associated image '{name}': {err}"
+        ))
+    })?;
+    if subblocks.len() != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Embedded Zeiss CZI associated image '{name}' has {} subblocks, expected one",
+            subblocks.len()
+        )));
+    }
+    let block = &subblocks[0];
+    validate_embedded_associated_subblock(block, name)?;
+    Ok((block.width, block.height))
+}
+
+fn validate_embedded_associated_subblock(block: &CziSubBlock, name: &str) -> Result<()> {
+    if !matches!(block.pixel_type, CZI_PIXEL_BGR24 | CZI_PIXEL_BGR48) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Embedded Zeiss CZI associated image '{name}' has unsupported pixel type {}",
+            block.pixel_type
+        )));
+    }
+    if block.compression == CZI_COMPRESSION_JPEG_XR
+        && !jpeg_xr_backend_supports_pixel_type(block.pixel_type)
     {
-        let state = resolve_external_file_part(path, header, part);
-        if let ExternalPartState::Resolved(path) = &state {
-            resolution.resolved.insert(part, path.clone());
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Embedded Zeiss CZI associated image '{name}' has unsupported JPEG XR pixel type {}",
+            block.pixel_type
+        )));
+    }
+    if !matches!(
+        block.compression,
+        CZI_COMPRESSION_UNCOMPRESSED
+            | CZI_COMPRESSION_JPEG
+            | CZI_COMPRESSION_JPEG_XR
+            | CZI_COMPRESSION_ZSTD0
+            | CZI_COMPRESSION_ZSTD1
+    ) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Embedded Zeiss CZI associated image '{name}' has unsupported compression {}",
+            block.compression
+        )));
+    }
+    Ok(())
+}
+
+fn read_embedded_subblock_channel(
+    file: &mut Cursor<&[u8]>,
+    block: &CziSubBlock,
+    channel: u32,
+) -> Result<GrayImage> {
+    let raw = read_subblock_data_from_reader(file, block)?;
+    match block.compression {
+        CZI_COMPRESSION_UNCOMPRESSED => decode_uncompressed_subblock_channel(block, &raw, channel),
+        CZI_COMPRESSION_JPEG => decode::decode_channel(ImageFormat::Jpeg, &raw, channel),
+        CZI_COMPRESSION_JPEG_XR => decode_jpeg_xr_subblock_channel(block, &raw, channel),
+        CZI_COMPRESSION_ZSTD0 | CZI_COMPRESSION_ZSTD1 => {
+            let decoded = zstd_decode_all(block, &raw)?;
+            decode_uncompressed_subblock_channel(block, &decoded, channel)
         }
-        resolution.states.insert(part, state);
-    }
-    resolution
-}
-
-fn update_external_attachment_sizes(
-    attachments: &mut [CziAttachment],
-    external_parts: &HashMap<i32, PathBuf>,
-) {
-    for attachment in attachments
-        .iter_mut()
-        .filter(|attachment| attachment.file_part != 0)
-    {
-        let Some(path) = external_parts.get(&attachment.file_part) else {
-            continue;
-        };
-        let Ok(mut file) = File::open(path) else {
-            continue;
-        };
-        attachment.data_size =
-            read_attachment_data_size(&mut file, attachment.file_position).unwrap_or(0);
-    }
-}
-
-fn resolve_external_file_part(
-    path: &Path,
-    header: &CziHeader,
-    file_part: i32,
-) -> ExternalPartState {
-    let candidates = external_part_candidates(path, file_part);
-    let resolved = candidates
-        .into_iter()
-        .filter(|candidate| candidate != path)
-        .filter_map(|candidate| {
-            let mut file = File::open(&candidate).ok()?;
-            let candidate_header = read_czi_header(&mut file, 0).ok()?;
-            (candidate_header.primary_file_guid == header.primary_file_guid).then_some(candidate)
-        })
-        .collect::<Vec<_>>();
-    match resolved.len() {
-        0 => ExternalPartState::Missing,
-        1 => ExternalPartState::Resolved(resolved.into_iter().next().unwrap()),
-        _ => ExternalPartState::Ambiguous(resolved),
-    }
-}
-
-fn external_part_candidates(path: &Path, file_part: i32) -> Vec<PathBuf> {
-    let Some(parent) = path.parent() else {
-        return Vec::new();
-    };
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Vec::new();
-    };
-    let stem = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or(file_name);
-    let ext = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("czi");
-    [
-        format!("{stem} ({file_part}).{ext}"),
-        format!("{stem}_{file_part}.{ext}"),
-        format!("{stem}-{file_part}.{ext}"),
-        format!("{stem}.{file_part}.{ext}"),
-        format!("{file_name}.{file_part}"),
-        format!("{file_name}.part{file_part}"),
-    ]
-    .into_iter()
-    .map(|name| parent.join(name))
-    .collect()
-}
-
-fn detect_attachment_image_format(data: &[u8]) -> Option<ImageFormat> {
-    if data.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some(ImageFormat::Jpeg)
-    } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some(ImageFormat::Png)
-    } else if data.starts_with(b"BM") {
-        Some(ImageFormat::Bmp)
-    } else {
-        None
+        other => Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported embedded Zeiss CZI associated-image compression: {other}"
+        ))),
     }
 }
 
@@ -1014,7 +1157,7 @@ fn find_xml_attribute_value_start(tag: &str, attr: &str) -> Option<usize> {
         while bytes.get(pos).is_some_and(|b| b.is_ascii_whitespace()) {
             pos += 1;
         }
-        if name.eq_ignore_ascii_case(attr) {
+        if name == attr {
             return Some(pos);
         }
     }
@@ -1032,15 +1175,24 @@ fn block_matches_channel(block: &CziSubBlock, channel: u32) -> bool {
     }
 }
 
-fn parse_xml_dimensions(xml: &str) -> Option<(u64, u64)> {
-    Some((
-        parse_simple_xml_u64(xml, "SizeX")?,
-        parse_simple_xml_u64(xml, "SizeY")?,
-    ))
+fn parse_xml_dimensions(xml: &str) -> Result<(u64, u64)> {
+    let size_x = parse_zeiss_image_text_exact(xml, "SizeX")
+        .ok_or_else(|| OpenSlideError::Format("Couldn't read image dimensions".into()))?;
+    let size_y = parse_zeiss_image_text_exact(xml, "SizeY")
+        .ok_or_else(|| OpenSlideError::Format("Couldn't read image dimensions".into()))?;
+    let width = crate::util::_openslide_parse_int64(&size_x)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| OpenSlideError::Format("Couldn't parse image dimensions".into()))?;
+    let height = crate::util::_openslide_parse_int64(&size_y)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| OpenSlideError::Format("Couldn't parse image dimensions".into()))?;
+    Ok((width, height))
 }
 
-fn parse_simple_xml_u64(xml: &str, tag: &str) -> Option<u64> {
-    parse_simple_xml_text(xml, tag)?.parse().ok()
+fn parse_zeiss_image_text_exact(xml: &str, tag: &str) -> Option<String> {
+    let information = find_xml_element(xml, "Information")?;
+    let image = find_xml_element(information.body, "Image")?;
+    parse_simple_xml_text_exact(image.body, tag)
 }
 
 fn parse_simple_xml_text(xml: &str, tag: &str) -> Option<String> {
@@ -1050,6 +1202,15 @@ fn parse_simple_xml_text(xml: &str, tag: &str) -> Option<String> {
     let end = find_xml_end_tag(&xml[start..], tag)? + start;
     let value = xml[start..end].trim();
     (!value.is_empty()).then(|| unescape_xml(value))
+}
+
+fn parse_simple_xml_text_exact(xml: &str, tag: &str) -> Option<String> {
+    let tag_start = find_xml_start_tag(xml, tag)?;
+    let open_end = xml[tag_start..].find('>')? + tag_start;
+    let start = open_end + 1;
+    let end = find_xml_end_tag(&xml[start..], tag)? + start;
+    let value = &xml[start..end];
+    (!value.trim().is_empty()).then(|| unescape_xml(value))
 }
 
 fn find_xml_start_tag(xml: &str, tag: &str) -> Option<usize> {
@@ -1082,8 +1243,7 @@ fn find_xml_end_tag(xml: &str, tag: &str) -> Option<usize> {
 }
 
 fn xml_name_matches(name: &str, tag: &str) -> bool {
-    let local_name = name.rsplit_once(':').map_or(name, |(_, local)| local);
-    local_name.eq_ignore_ascii_case(tag)
+    name == tag
 }
 
 fn parse_scaling_mpp(xml: &str, axis: &str) -> Option<f64> {
@@ -1096,23 +1256,34 @@ fn parse_scaling_mpp(xml: &str, axis: &str) -> Option<f64> {
         let after_open = &candidate[open_end + 1..];
         if parse_xml_attribute(open_tag, "Id")
             .as_deref()
-            .is_some_and(|id| id.eq_ignore_ascii_case(axis))
+            .is_some_and(|id| id == axis)
         {
             break parse_simple_xml_text(after_open, "Value")?;
         }
         rest = after_open;
     };
-    let meters_per_pixel: f64 = value.parse().ok()?;
+    let meters_per_pixel = crate::util::_openslide_parse_double(&value)?;
     Some(meters_per_pixel * 1_000_000.0)
 }
 
-fn normalize_nominal_magnification(value: &str) -> String {
-    let trimmed = value.trim();
-    let without_suffix = trimmed.strip_suffix(['x', 'X']).unwrap_or(trimmed).trim();
-    match without_suffix.parse::<u32>() {
-        Ok(power) if (1..=200).contains(&power) => power.to_string(),
-        _ => value.to_string(),
-    }
+fn duplicate_referenced_objective_power(properties: &mut HashMap<String, String>) {
+    let Some(objective_id) = properties
+        .get("zeiss.Information.Image.ObjectiveSettings.ObjectiveRef.Id")
+        .cloned()
+    else {
+        return;
+    };
+    let objective_key =
+        format!("zeiss.Information.Instrument.Objectives.{objective_id}.NominalMagnification");
+    crate::util::_openslide_duplicate_double_prop(
+        properties,
+        &objective_key,
+        properties::PROPERTY_OBJECTIVE_POWER,
+    );
+}
+
+fn format_float(value: f64) -> String {
+    crate::util::_openslide_format_double(value)
 }
 
 fn unescape_xml(value: &str) -> String {
@@ -1211,9 +1382,8 @@ fn add_xml_props(
 
     let children = direct_xml_children(element.body);
     if children.is_empty() {
-        let value = element.body.trim();
-        if !value.is_empty() {
-            properties.insert(path.join("."), unescape_xml(value));
+        if !element.body.trim().is_empty() {
+            properties.insert(path.join("."), unescape_xml(element.body));
         }
         path.pop();
         return;
@@ -1352,10 +1522,7 @@ fn xml_element_name(open_tag: &str) -> Option<&str> {
     {
         end += 1;
     }
-    (end > 1).then(|| {
-        let name = &open_tag[1..end];
-        name.rsplit_once(':').map_or(name, |(_, local)| local)
-    })
+    (end > 1).then(|| &open_tag[1..end])
 }
 
 fn xml_attributes(open_tag: &str) -> Vec<(String, String)> {
@@ -1386,10 +1553,7 @@ fn xml_attributes(open_tag: &str) -> Vec<(String, String)> {
             pos += 1;
             continue;
         }
-        let name = open_tag[name_start..pos]
-            .rsplit_once(':')
-            .map_or(&open_tag[name_start..pos], |(_, local)| local)
-            .to_string();
+        let name = open_tag[name_start..pos].to_string();
         while bytes.get(pos).is_some_and(|b| b.is_ascii_whitespace()) {
             pos += 1;
         }
@@ -1412,124 +1576,75 @@ fn xml_attributes(open_tag: &str) -> Vec<(String, String)> {
             break;
         };
         let value_end = value_start + value_len;
-        attrs.push((name, unescape_xml(open_tag[value_start..value_end].trim())));
+        attrs.push((name, unescape_xml(&open_tag[value_start..value_end])));
         pos = value_end + 1;
     }
     attrs
 }
 
-fn insert_metadata_properties(properties: &mut HashMap<String, String>, metadata_xml: &str) {
-    let metadata_tags = [
-        ("zeiss.Metadata.Name", "Name"),
-        ("zeiss.Metadata.Title", "Title"),
-        ("zeiss.Metadata.Description", "Description"),
-        ("zeiss.Metadata.CreationDate", "CreationDate"),
-        ("zeiss.Metadata.AcquisitionDate", "AcquisitionDate"),
-        ("zeiss.Metadata.UserName", "UserName"),
-        ("zeiss.Metadata.ObjectiveName", "ObjectiveName"),
-        ("zeiss.Metadata.ObjectiveImmersion", "Immersion"),
-        ("zeiss.Metadata.ObjectiveLensNA", "LensNA"),
-        ("zeiss.Metadata.ObjectiveWorkingDistance", "WorkingDistance"),
-    ];
-
-    for (property, tag) in metadata_tags {
-        if let Some(value) = parse_simple_xml_text(metadata_xml, tag) {
-            properties.entry(property.into()).or_insert(value);
-        }
-    }
+#[derive(Debug, Clone)]
+struct SceneSummary {
+    regions: Vec<(i64, i64, i64, i64)>,
+    common_max_downsample: u64,
 }
 
-fn insert_inferred_dimension_properties(
-    properties: &mut HashMap<String, String>,
-    subblocks: &[CziSubBlock],
-    metadata_xml: &str,
-) {
-    let dimensions: [(&str, &str, fn(&CziSubBlock) -> i32); 10] = [
-        ("SizeZ", "zeiss.SizeZ", |b: &CziSubBlock| b.z),
-        ("SizeT", "zeiss.SizeT", |b: &CziSubBlock| b.t),
-        ("SizeC", "zeiss.SizeC", |b: &CziSubBlock| b.channel),
-        ("SizeS", "zeiss.SizeS", |b: &CziSubBlock| b.scene),
-        ("SizeB", "zeiss.SizeB", |b: &CziSubBlock| b.acquisition),
-        ("SizeV", "zeiss.SizeV", |b: &CziSubBlock| b.angle),
-        ("SizeI", "zeiss.SizeI", |b: &CziSubBlock| b.illumination),
-        ("SizeH", "zeiss.SizeH", |b: &CziSubBlock| b.phase),
-        ("SizeR", "zeiss.SizeR", |b: &CziSubBlock| b.rotation),
-        ("SizeM", "zeiss.SizeM", |b: &CziSubBlock| b.mosaic),
-    ];
+fn parse_scene_count(metadata_xml: &str) -> Result<usize> {
+    let Some(size_s) = parse_zeiss_image_text_exact(metadata_xml, "SizeS") else {
+        return Ok(1);
+    };
+    crate::util::_openslide_parse_int64(&size_s)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| OpenSlideError::Format("Couldn't parse image scene dimension".into()))
+}
 
-    for (xml_tag, property, getter) in dimensions {
-        if properties.contains_key(property) {
+fn summarize_scenes(subblocks: &[CziSubBlock], scene_count: usize) -> Result<SceneSummary> {
+    let mut bounds = vec![(i64::MAX, i64::MAX, i64::MIN, i64::MIN); scene_count];
+    let mut max_downsample = vec![0u64; scene_count];
+    for (idx, block) in subblocks.iter().enumerate() {
+        if block.scene < 0 || block.scene as usize >= scene_count {
+            return Err(OpenSlideError::Format(format!(
+                "Subblock {idx} specifies out-of-range scene {}",
+                block.scene
+            )));
+        }
+        let scene = block.scene as usize;
+        max_downsample[scene] = max_downsample[scene].max(block.downsample);
+        if block.downsample != 1 {
             continue;
         }
-        if let Some(value) = parse_simple_xml_u64(metadata_xml, xml_tag)
-            .or_else(|| infer_indexed_dimension_size(subblocks, getter))
-        {
-            properties.insert(property.into(), value.to_string());
-        }
-    }
-}
-
-fn insert_dimension_range_properties(
-    properties: &mut HashMap<String, String>,
-    subblocks: &[CziSubBlock],
-) {
-    for dim in dimension_specs() {
-        let values = subblocks.iter().map(dim.getter).collect::<BTreeSet<_>>();
-        if let (Some(min), Some(max)) = (values.first(), values.last()) {
-            properties.insert(format!("zeiss.Dimension.{}.Min", dim.name), min.to_string());
-            properties.insert(format!("zeiss.Dimension.{}.Max", dim.name), max.to_string());
-            properties.insert(
-                format!("zeiss.Dimension.{}.Count", dim.name),
-                values.len().to_string(),
-            );
-        }
-    }
-}
-
-fn insert_scene_region_properties(
-    properties: &mut HashMap<String, String>,
-    subblocks: &[CziSubBlock],
-) {
-    let mut bounds: BTreeMap<i32, (i64, i64, i64, i64)> = BTreeMap::new();
-    for block in subblocks.iter().filter(|block| block.downsample == 1) {
         let x0 = i64::from(block.x);
         let y0 = i64::from(block.y);
         let x1 = x0 + i64::from(block.width);
         let y1 = y0 + i64::from(block.height);
-        bounds
-            .entry(block.scene)
-            .and_modify(|bounds| {
-                bounds.0 = bounds.0.min(x0);
-                bounds.1 = bounds.1.min(y0);
-                bounds.2 = bounds.2.max(x1);
-                bounds.3 = bounds.3.max(y1);
-            })
-            .or_insert((x0, y0, x1, y1));
+        let region = &mut bounds[scene];
+        region.0 = region.0.min(x0);
+        region.1 = region.1.min(y0);
+        region.2 = region.2.max(x1);
+        region.3 = region.3.max(y1);
     }
 
-    for (idx, (_scene, (x0, y0, x1, y1))) in bounds.into_iter().enumerate() {
-        properties.insert(format!("openslide.region[{idx}].x"), x0.to_string());
-        properties.insert(format!("openslide.region[{idx}].y"), y0.to_string());
-        properties.insert(
-            format!("openslide.region[{idx}].width"),
-            (x1 - x0).to_string(),
-        );
-        properties.insert(
-            format!("openslide.region[{idx}].height"),
-            (y1 - y0).to_string(),
-        );
+    for (idx, downsample) in max_downsample.iter().enumerate() {
+        if *downsample == 0 {
+            return Err(OpenSlideError::Format(format!(
+                "No subblocks for scene {idx}"
+            )));
+        }
     }
+
+    let common_max_downsample = max_downsample.into_iter().min().unwrap_or(1);
+    Ok(SceneSummary {
+        regions: bounds,
+        common_max_downsample,
+    })
 }
 
-fn common_scene_max_downsample(subblocks: &[CziSubBlock]) -> u64 {
-    let mut max_by_scene: BTreeMap<i32, u64> = BTreeMap::new();
-    for block in subblocks.iter().filter(|block| block.downsample > 0) {
-        max_by_scene
-            .entry(block.scene)
-            .and_modify(|max_downsample| *max_downsample = (*max_downsample).max(block.downsample))
-            .or_insert(block.downsample);
+fn insert_scene_region_properties(properties: &mut HashMap<String, String>, scenes: &SceneSummary) {
+    for (idx, (x0, y0, x1, y1)) in scenes.regions.iter().copied().enumerate() {
+        properties.insert(properties::region_x(idx), x0.to_string());
+        properties.insert(properties::region_y(idx), y0.to_string());
+        properties.insert(properties::region_width(idx), (x1 - x0).to_string());
+        properties.insert(properties::region_height(idx), (y1 - y0).to_string());
     }
-    max_by_scene.values().copied().min().unwrap_or(1)
 }
 
 fn non_default_dimension_summary(subblocks: &[CziSubBlock]) -> String {
@@ -1575,7 +1690,7 @@ fn dimension_specs() -> [DimensionSpec; 10] {
         DimensionSpec {
             name: "S",
             getter: |b: &CziSubBlock| b.scene,
-            default_view_filter: true,
+            default_view_filter: false,
         },
         DimensionSpec {
             name: "B",
@@ -1610,82 +1725,39 @@ fn dimension_specs() -> [DimensionSpec; 10] {
     ]
 }
 
-fn infer_indexed_dimension_size<F>(subblocks: &[CziSubBlock], getter: F) -> Option<u64>
-where
-    F: Fn(&CziSubBlock) -> i32,
-{
-    let max = subblocks.iter().map(getter).max()?;
-    (max > 0).then_some(max as u64 + 1)
-}
-
-fn dimensions_from_subblocks(subblocks: &[CziSubBlock]) -> (u64, u64) {
-    let width = subblocks
-        .iter()
-        .filter(|b| b.downsample == 1)
-        .map(|b| b.x.max(0) as u64 + b.width as u64)
-        .max()
-        .unwrap_or(0);
-    let height = subblocks
-        .iter()
-        .filter(|b| b.downsample == 1)
-        .map(|b| b.y.max(0) as u64 + b.height as u64)
-        .max()
-        .unwrap_or(0);
-    if width == 0 || height == 0 {
-        let width = subblocks
-            .iter()
-            .map(|b| (b.x.max(0) as u64 + b.width as u64) * b.downsample)
-            .max()
-            .unwrap_or(0);
-        let height = subblocks
-            .iter()
-            .map(|b| (b.y.max(0) as u64 + b.height as u64) * b.downsample)
-            .max()
-            .unwrap_or(0);
-        (width, height)
-    } else {
-        (width, height)
-    }
-}
-
+#[cfg(all(test, feature = "jpegxr"))]
 fn unsupported_pixel_modes(subblocks: &[CziSubBlock]) -> BTreeSet<(i32, i32)> {
     subblocks
         .iter()
         .filter(|b| {
-            !matches!(
-                b.pixel_type,
-                CZI_PIXEL_GRAY8
-                    | CZI_PIXEL_GRAY16
-                    | CZI_PIXEL_GRAY_FLOAT
-                    | CZI_PIXEL_BGR24
-                    | CZI_PIXEL_BGR48
-                    | CZI_PIXEL_BGR_FLOAT
-                    | CZI_PIXEL_BGRA32
-                    | CZI_PIXEL_GRAY32
-                    | CZI_PIXEL_GRAY_DOUBLE
-            ) || !matches!(
-                b.compression,
-                CZI_COMPRESSION_UNCOMPRESSED
-                    | CZI_COMPRESSION_JPEG
-                    | CZI_COMPRESSION_JPEG_XR
-                    | CZI_COMPRESSION_ZSTD0
-                    | CZI_COMPRESSION_ZSTD1
-            )
+            !is_supported_pixel_mode(b.pixel_type, b.compression)
+                || !matches!(
+                    b.compression,
+                    CZI_COMPRESSION_UNCOMPRESSED
+                        | CZI_COMPRESSION_JPEG
+                        | CZI_COMPRESSION_JPEG_XR
+                        | CZI_COMPRESSION_ZSTD0
+                        | CZI_COMPRESSION_ZSTD1
+                )
         })
         .map(|b| (b.pixel_type, b.compression))
         .collect()
 }
 
+#[cfg(test)]
 fn unsupported_compressions(subblocks: &[CziSubBlock]) -> BTreeSet<i32> {
     subblocks
         .iter()
         .filter_map(|b| match b.compression {
-            CZI_COMPRESSION_JPEG_XR => Some(b.compression),
+            CZI_COMPRESSION_JPEG_XR if !jpeg_xr_backend_supports_pixel_type(b.pixel_type) => {
+                Some(b.compression)
+            }
             other
                 if !matches!(
                     other,
                     CZI_COMPRESSION_UNCOMPRESSED
                         | CZI_COMPRESSION_JPEG
+                        | CZI_COMPRESSION_JPEG_XR
                         | CZI_COMPRESSION_ZSTD0
                         | CZI_COMPRESSION_ZSTD1
                 ) =>
@@ -1697,176 +1769,53 @@ fn unsupported_compressions(subblocks: &[CziSubBlock]) -> BTreeSet<i32> {
         .collect()
 }
 
-fn insert_file_part_properties(
-    properties: &mut HashMap<String, String>,
-    subblocks: &[CziSubBlock],
-    attachments: &[CziAttachment],
-    external_part_resolution: &ExternalPartResolution,
-) {
-    let mut part_counts: BTreeMap<i32, (usize, usize)> = BTreeMap::new();
-    for block in subblocks.iter().filter(|block| block.file_part != 0) {
-        part_counts.entry(block.file_part).or_default().0 += 1;
-    }
-    for attachment in attachments
-        .iter()
-        .filter(|attachment| attachment.file_part != 0)
-    {
-        part_counts.entry(attachment.file_part).or_default().1 += 1;
-    }
-    if part_counts.is_empty() {
-        return;
-    }
-
-    properties.insert(
-        "zeiss.ExternalFilePart.Count".into(),
-        part_counts.len().to_string(),
-    );
-    properties.insert(
-        "zeiss.ExternalFilePart.List".into(),
-        format_i32_list(part_counts.keys().copied()),
-    );
-    let mut resolved_count = 0usize;
-    let mut missing_count = 0usize;
-    let mut ambiguous_count = 0usize;
-    for (part, (subblock_count, attachment_count)) in part_counts {
-        properties.insert(
-            format!("zeiss.ExternalFilePart.{part}.SubBlockCount"),
-            subblock_count.to_string(),
-        );
-        properties.insert(
-            format!("zeiss.ExternalFilePart.{part}.AttachmentCount"),
-            attachment_count.to_string(),
-        );
-        match external_part_resolution.states.get(&part) {
-            Some(ExternalPartState::Resolved(path)) => {
-                resolved_count += 1;
-                properties.insert(
-                    format!("zeiss.ExternalFilePart.{part}.Status"),
-                    "resolved".into(),
-                );
-                properties.insert(
-                    format!("zeiss.ExternalFilePart.{part}.MatchingCandidateCount"),
-                    "1".into(),
-                );
-                properties.insert(
-                    format!("zeiss.ExternalFilePart.{part}.ResolvedPath"),
-                    path.to_string_lossy().into_owned(),
-                );
-            }
-            Some(ExternalPartState::Ambiguous(paths)) => {
-                ambiguous_count += 1;
-                properties.insert(
-                    format!("zeiss.ExternalFilePart.{part}.Status"),
-                    "ambiguous".into(),
-                );
-                properties.insert(
-                    format!("zeiss.ExternalFilePart.{part}.MatchingCandidateCount"),
-                    paths.len().to_string(),
-                );
-                properties.insert(
-                    format!("zeiss.ExternalFilePart.{part}.AmbiguousPaths"),
-                    format_path_list(paths.iter()),
-                );
-            }
-            Some(ExternalPartState::Missing) | None => {
-                missing_count += 1;
-                properties.insert(
-                    format!("zeiss.ExternalFilePart.{part}.Status"),
-                    "missing".into(),
-                );
-                properties.insert(
-                    format!("zeiss.ExternalFilePart.{part}.MatchingCandidateCount"),
-                    "0".into(),
-                );
-            }
-        }
-    }
-    properties.insert(
-        "zeiss.ExternalFilePart.ResolvedCount".into(),
-        resolved_count.to_string(),
-    );
-    properties.insert(
-        "zeiss.ExternalFilePart.MissingCount".into(),
-        missing_count.to_string(),
-    );
-    properties.insert(
-        "zeiss.ExternalFilePart.AmbiguousCount".into(),
-        ambiguous_count.to_string(),
-    );
-}
-
-fn insert_jpeg_xr_properties(properties: &mut HashMap<String, String>, subblocks: &[CziSubBlock]) {
-    let jpeg_xr_blocks = subblocks
-        .iter()
-        .filter(|block| block.compression == CZI_COMPRESSION_JPEG_XR)
-        .collect::<Vec<_>>();
-    if jpeg_xr_blocks.is_empty() {
-        return;
-    }
-
-    let pixel_types = jpeg_xr_blocks
-        .iter()
-        .map(|block| block.pixel_type)
-        .collect::<BTreeSet<_>>();
-    let file_parts = jpeg_xr_blocks
-        .iter()
-        .map(|block| block.file_part)
-        .collect::<BTreeSet<_>>();
-    properties.insert(
-        "zeiss.JpegXr.SubBlockCount".into(),
-        jpeg_xr_blocks.len().to_string(),
-    );
-    properties.insert(
-        "zeiss.JpegXr.PixelTypes".into(),
-        format_i32_list(pixel_types.into_iter()),
-    );
-    properties.insert(
-        "zeiss.JpegXr.FileParts".into(),
-        format_i32_list(file_parts.into_iter()),
-    );
-    properties.insert(
-        format!(
-            "zeiss.UnsupportedCompression.{}.Count",
-            CZI_COMPRESSION_JPEG_XR
-        ),
-        jpeg_xr_blocks.len().to_string(),
-    );
-}
-
-fn format_i32_list(values: impl Iterator<Item = i32>) -> String {
-    values
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn format_path_list<'a>(values: impl Iterator<Item = &'a PathBuf>) -> String {
-    values
-        .map(|value| value.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn zeiss_compression_name(compression: i32) -> &'static str {
+#[cfg(all(test, feature = "jpegxr"))]
+fn is_supported_pixel_mode(pixel_type: i32, compression: i32) -> bool {
     match compression {
-        CZI_COMPRESSION_JPEG_XR => "jpeg-xr",
-        _ => "unknown",
+        CZI_COMPRESSION_JPEG_XR => jpeg_xr_backend_supports_pixel_type(pixel_type),
+        CZI_COMPRESSION_UNCOMPRESSED
+        | CZI_COMPRESSION_JPEG
+        | CZI_COMPRESSION_ZSTD0
+        | CZI_COMPRESSION_ZSTD1 => matches!(
+            pixel_type,
+            CZI_PIXEL_GRAY8
+                | CZI_PIXEL_GRAY16
+                | CZI_PIXEL_GRAY_FLOAT
+                | CZI_PIXEL_BGR24
+                | CZI_PIXEL_BGR48
+                | CZI_PIXEL_BGR_FLOAT
+                | CZI_PIXEL_BGRA32
+                | CZI_PIXEL_GRAY32
+                | CZI_PIXEL_GRAY_DOUBLE
+        ),
+        _ => false,
     }
 }
 
-fn missing_external_part(file_part: i32) -> OpenSlideError {
-    OpenSlideError::UnsupportedFormat(format!(
-        "Zeiss CZI references external file part {file_part}, but no sibling CZI part with \
-         matching primary file GUID was found"
-    ))
+fn jpeg_xr_backend_supports_pixel_type(pixel_type: i32) -> bool {
+    let Ok(pixel_format) = jpeg_xr_pixel_format(pixel_type) else {
+        return false;
+    };
+    decode::default_decoder_api().supports_jpegxr_pixel_format(pixel_format)
 }
 
-fn ambiguous_external_part(file_part: i32, paths: &[PathBuf]) -> OpenSlideError {
-    OpenSlideError::UnsupportedFormat(format!(
-        "Zeiss CZI references external file part {file_part}, but multiple sibling CZI parts with \
-         matching primary file GUID were found: {}",
-        format_path_list(paths.iter())
-    ))
+fn decode_jpeg_xr_subblock_channel(
+    block: &CziSubBlock,
+    raw: &[u8],
+    channel: u32,
+) -> Result<GrayImage> {
+    let context = format!(
+        "Zeiss CZI JPEG XR subblock file_part {} pixel_type {} compression {} expected {}x{} gray channel {}",
+        block.file_part, block.pixel_type, block.compression, block.width, block.height, channel
+    );
+    decode::default_decoder_api().decode_jpegxr_gray_channel(
+        decode::jpegxr::JpegXrDecodeRequest {
+            data: raw,
+            options: jpeg_xr_decode_options(block)?,
+            context: &context,
+        },
+        channel,
+    )
 }
 
 fn jpeg_xr_decode_options(block: &CziSubBlock) -> Result<decode::jpegxr::JpegXrDecodeOptions> {
@@ -1899,20 +1848,9 @@ fn jpeg_xr_pixel_format(pixel_type: i32) -> Result<decode::jpegxr::JpegXrPixelFo
     }
 }
 
-fn read_subblock_data(file: &mut File, block: &CziSubBlock) -> Result<Vec<u8>> {
-    let hdr = read_exact_at(file, block.file_position, ZISRAW_SEGMENT_HDR_LEN as usize)?;
-    if !sid_matches(&hdr[0..16], b"ZISRAWSUBBLOCK") {
-        return Err(OpenSlideError::Format(
-            "Missing Zeiss ZISRAWSUBBLOCK segment".into(),
-        ));
-    }
-    let prefix = read_exact_at(
-        file,
-        block.file_position + ZISRAW_SEGMENT_HDR_LEN,
-        ZISRAW_SUBBLK_MIN_DATA_LEN as usize,
-    )?;
-    let metadata_size = read_u32(&prefix, 0)? as u64;
-    let data_size = read_u64(&prefix, 8)?;
+fn zeiss_subblock_data_offset_and_size(prefix: &[u8], block: &CziSubBlock) -> Result<(u64, u64)> {
+    let metadata_size = read_u32(prefix, 0)? as u64;
+    let data_size = read_u64(prefix, 8)?;
     let schema = &prefix[16..18];
     if !sid_matches(schema, SCHEMA_DV) && !sid_matches(schema, SCHEMA_DE) {
         return Err(OpenSlideError::UnsupportedFormat(
@@ -1936,6 +1874,41 @@ fn read_subblock_data(file: &mut File, block: &CziSubBlock) -> Result<Vec<u8>> {
         .and_then(|value| value.checked_add(dynamic_header_size))
         .and_then(|value| value.checked_add(metadata_size))
         .ok_or_else(|| OpenSlideError::Format("Zeiss subblock data offset overflow".into()))?;
+    Ok((data_offset, data_size))
+}
+
+fn read_subblock_data_from_path(path: &Path, block: &CziSubBlock) -> Result<Vec<u8>> {
+    let hdr = crate::util::read_file_range(path, block.file_position, ZISRAW_SEGMENT_HDR_LEN)?;
+    if !sid_matches(&hdr[0..16], b"ZISRAWSUBBLOCK") {
+        return Err(OpenSlideError::Format(
+            "Missing Zeiss ZISRAWSUBBLOCK segment".into(),
+        ));
+    }
+    let prefix = crate::util::read_file_range(
+        path,
+        block.file_position + ZISRAW_SEGMENT_HDR_LEN,
+        ZISRAW_SUBBLK_MIN_DATA_LEN,
+    )?;
+    let (data_offset, data_size) = zeiss_subblock_data_offset_and_size(&prefix, block)?;
+    crate::util::read_file_range(path, data_offset, data_size)
+}
+
+fn read_subblock_data_from_reader(
+    file: &mut impl ZeissReadAt,
+    block: &CziSubBlock,
+) -> Result<Vec<u8>> {
+    let hdr = read_exact_at(file, block.file_position, ZISRAW_SEGMENT_HDR_LEN as usize)?;
+    if !sid_matches(&hdr[0..16], b"ZISRAWSUBBLOCK") {
+        return Err(OpenSlideError::Format(
+            "Missing Zeiss ZISRAWSUBBLOCK segment".into(),
+        ));
+    }
+    let prefix = read_exact_at(
+        file,
+        block.file_position + ZISRAW_SEGMENT_HDR_LEN,
+        ZISRAW_SUBBLK_MIN_DATA_LEN as usize,
+    )?;
+    let (data_offset, data_size) = zeiss_subblock_data_offset_and_size(&prefix, block)?;
     read_exact_at(
         file,
         data_offset,
@@ -1960,8 +1933,7 @@ fn decode_uncompressed_subblock_channel(
         )));
     }
 
-    let expected =
-        block.width as usize * block.height as usize * czi_bytes_per_pixel(block.pixel_type)?;
+    let expected = czi_uncompressed_size(block)?;
     if raw.len() < expected {
         return Err(OpenSlideError::Decode(format!(
             "Zeiss CZI uncompressed subblock is truncated: expected {expected}, got {}",
@@ -1995,15 +1967,24 @@ fn decode_uncompressed_subblock_channel(
                 }
                 CZI_PIXEL_GRAY32 => raw[pixel * 4 + 3],
                 CZI_PIXEL_GRAY_DOUBLE => f64_sample_to_u8(&raw[pixel * 8..pixel * 8 + 8]),
-                other => {
-                    return Err(OpenSlideError::UnsupportedFormat(format!(
-                        "Unsupported Zeiss CZI pixel type: {other}"
-                    )))
-                }
+                other => return Err(unsupported_zeiss_pixel_type_error(other)),
             };
         }
     }
     Ok(out)
+}
+
+fn czi_uncompressed_size(block: &CziSubBlock) -> Result<usize> {
+    let bytes_per_pixel = czi_bytes_per_pixel(block.pixel_type)?;
+    (block.width as usize)
+        .checked_mul(block.height as usize)
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+        .ok_or_else(|| {
+            OpenSlideError::Format(format!(
+                "Zeiss CZI subblock byte size overflows usize: {}x{} pixel type {}",
+                block.width, block.height, block.pixel_type
+            ))
+        })
 }
 
 fn czi_bytes_per_pixel(pixel_type: i32) -> Result<usize> {
@@ -2017,9 +1998,7 @@ fn czi_bytes_per_pixel(pixel_type: i32) -> Result<usize> {
         CZI_PIXEL_BGRA32 => Ok(4),
         CZI_PIXEL_GRAY32 => Ok(4),
         CZI_PIXEL_GRAY_DOUBLE => Ok(8),
-        other => Err(OpenSlideError::UnsupportedFormat(format!(
-            "Unsupported Zeiss CZI pixel type: {other}"
-        ))),
+        other => Err(unsupported_zeiss_pixel_type_error(other)),
     }
 }
 
@@ -2074,11 +2053,8 @@ fn blit_gray_tile(src: &GrayImage, dst: &mut GrayImage, offset_x: i64, offset_y:
     }
 }
 
-fn read_exact_at(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0; len];
-    file.read_exact(&mut buf)?;
-    Ok(buf)
+fn read_exact_at(file: &mut impl ZeissReadAt, offset: u64, len: usize) -> Result<Vec<u8>> {
+    file.zeiss_read_exact_at(offset, len)
 }
 
 fn sid_matches(found: &[u8], expected: &[u8]) -> bool {
@@ -2154,7 +2130,7 @@ fn checked_i64_to_u64(value: i64, name: &str) -> Result<u64> {
 
 fn trim_nul_ascii(buf: &[u8]) -> String {
     let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).trim().to_string()
+    String::from_utf8_lossy(&buf[..end]).to_string()
 }
 
 fn div_round_closest(n: i32, d: i32) -> i32 {
@@ -2180,6 +2156,12 @@ fn format_guid(guid: &[u8; 16]) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn formats_zeiss_properties_through_shared_openslide_formatter() {
+        assert_eq!(format_float(1.0 / 3.0), "0.33333333333333331");
+        assert_eq!(format_float(123456789012345670.0), "1.2345678901234566e+17");
+    }
 
     #[test]
     fn detects_czi_header_sid() {
@@ -2230,7 +2212,11 @@ mod tests {
             "openslide_rs_composes_subblocks_from_all_scenes_{}",
             std::process::id()
         ));
-        fs::write(&path, make_two_scene_czi()).unwrap();
+        fs::write(
+            &path,
+            add_test_metadata(make_two_scene_czi(), &minimal_test_metadata_xml(2, 1, 2)),
+        )
+        .unwrap();
 
         let slide = ZeissSlide::open(&path).unwrap();
         assert_eq!(slide.level_dimensions(0), Some((2, 1)));
@@ -2260,7 +2246,160 @@ mod tests {
             minimal_zeiss_block(1, 2),
         ];
 
-        assert_eq!(common_scene_max_downsample(&blocks), 2);
+        let summary = summarize_scenes(&blocks, 2).unwrap();
+        assert_eq!(summary.common_max_downsample, 2);
+    }
+
+    #[test]
+    fn scene_summary_rejects_out_of_range_scene_ids() {
+        let blocks = vec![minimal_zeiss_block(2, 1)];
+
+        let err = summarize_scenes(&blocks, 2).unwrap_err();
+
+        assert!(format!("{err}").contains("out-of-range scene 2"));
+    }
+
+    #[test]
+    fn scene_summary_requires_every_declared_scene() {
+        let blocks = vec![minimal_zeiss_block(1, 1)];
+
+        let err = summarize_scenes(&blocks, 2).unwrap_err();
+
+        assert!(format!("{err}").contains("No subblocks for scene 0"));
+    }
+
+    #[test]
+    fn scene_summary_keeps_region_indices_equal_to_scene_ids() {
+        let mut blocks = vec![minimal_zeiss_block(0, 1), minimal_zeiss_block(1, 1)];
+        blocks[0].x = 3;
+        blocks[1].x = 9;
+        let summary = summarize_scenes(&blocks, 2).unwrap();
+        let mut properties = HashMap::new();
+
+        insert_scene_region_properties(&mut properties, &summary);
+
+        assert_eq!(
+            properties.get("openslide.region[0].x"),
+            Some(&"3".to_string())
+        );
+        assert_eq!(
+            properties.get("openslide.region[1].x"),
+            Some(&"9".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_zeiss_scene_count_like_upstream() {
+        assert_eq!(parse_scene_count("").unwrap(), 1);
+        assert_eq!(
+            parse_scene_count(&minimal_test_metadata_xml(1, 1, 2)).unwrap(),
+            2
+        );
+        assert!(parse_scene_count(
+            "<Metadata><Information><Image><SizeS>two</SizeS></Image></Information></Metadata>"
+        )
+        .is_err());
+        assert_eq!(
+            parse_scene_count(
+                "<Metadata><Information><Image><SizeS> \t+2</SizeS></Image></Information></Metadata>"
+            )
+            .unwrap(),
+            2
+        );
+        assert!(parse_scene_count(
+            "<Metadata><Information><Image><SizeS>2 </SizeS></Image></Information></Metadata>"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn main_czi_requires_metadata_segment_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_zeiss_requires_metadata_{}",
+            std::process::id()
+        ));
+        let mut czi = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        write_i64(&mut czi, 92, 0);
+        fs::write(&path, czi).unwrap();
+
+        let err = match ZeissSlide::open(&path) {
+            Ok(_) => panic!("expected metadata-free CZI to fail"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("ZISRAWMETADATA"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn computes_quickhash_from_guids_and_metadata_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_zeiss_quickhash_{}",
+            std::process::id()
+        ));
+        let xml = minimal_test_metadata_xml(1, 1, 1);
+        fs::write(
+            &path,
+            add_test_metadata(
+                make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]),
+                &xml,
+            ),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        let mut expected = OpenslideHash::openslide_hash_quickhash1_create();
+        expected.openslide_hash_data(&[0; 16]);
+        expected.openslide_hash_data(&[0; 16]);
+        expected.openslide_hash_string(Some(&xml));
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_QUICKHASH1),
+            expected.openslide_hash_get_string().as_ref()
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn subblock_directory_rejects_trailing_bytes_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_zeiss_rejects_trailing_directory_bytes_{}",
+            std::process::id()
+        ));
+        let mut czi = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        let dir_pos = read_i64(&czi, 84).unwrap() as usize;
+        let used_size = read_u64(&czi, dir_pos + 24).unwrap();
+        write_u64(&mut czi, dir_pos + 24, used_size + 4);
+        fs::write(&path, czi).unwrap();
+
+        let err = match ZeissSlide::open(&path) {
+            Ok(_) => panic!("expected trailing subblock-directory bytes to fail"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("trailing bytes after subblock directory"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn subblock_directory_rejects_short_declared_size_before_reading_past_it() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_zeiss_rejects_short_directory_size_{}",
+            std::process::id()
+        ));
+        let mut czi = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        let dir_pos = read_i64(&czi, 84).unwrap() as usize;
+        let used_size = read_u64(&czi, dir_pos + 24).unwrap();
+        write_u64(&mut czi, dir_pos + 24, used_size - 1);
+        fs::write(&path, czi).unwrap();
+
+        let err = match ZeissSlide::open(&path) {
+            Ok(_) => panic!("expected short subblock-directory size to fail"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("Premature end of directory"));
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -2276,24 +2415,20 @@ mod tests {
         .unwrap();
 
         let slide = ZeissSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("zeiss.JpegXr.SubBlockCount"),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            slide.properties().get("zeiss.JpegXr.PixelTypes"),
-            Some(&CZI_PIXEL_BGR24.to_string())
-        );
-        assert_eq!(
-            slide.properties().get("zeiss.JpegXr.FileParts"),
-            Some(&"0".to_string())
-        );
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.UnsupportedCompression.4.Count"),
-            Some(&"1".to_string())
-        );
+        assert!(slide
+            .properties()
+            .get("zeiss.JpegXr.SubBlockCount")
+            .is_none());
+        assert!(slide
+            .properties()
+            .get("zeiss.UnsupportedCompression.4.Count")
+            .is_none());
+        assert!(slide
+            .properties()
+            .get(&format!(
+                "zeiss.UnsupportedPixelMode.{CZI_PIXEL_BGR24}.{CZI_COMPRESSION_JPEG_XR}"
+            ))
+            .is_none());
         let err = slide.read_region(0, 0, 0, 0, 1, 1).unwrap_err();
         let message = format!("{err}");
         assert!(message.contains("JPEG XR"));
@@ -2303,6 +2438,69 @@ mod tests {
         assert!(message.contains("expected 1x1 gray channel 0"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[cfg(feature = "jpegxr")]
+    #[test]
+    fn feature_backend_does_not_mark_supported_jpeg_xr_layouts_as_unsupported() {
+        let blocks = vec![
+            CziSubBlock {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                dimension_count: 3,
+                downsample: 1,
+                channel: 0,
+                z: 0,
+                t: 0,
+                scene: 0,
+                acquisition: 0,
+                angle: 0,
+                illumination: 0,
+                phase: 0,
+                rotation: 0,
+                mosaic: 0,
+                pixel_type: CZI_PIXEL_GRAY8,
+                compression: CZI_COMPRESSION_JPEG_XR,
+                file_position: 0,
+                file_part: 0,
+            },
+            CziSubBlock {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 1,
+                dimension_count: 3,
+                downsample: 1,
+                channel: 0,
+                z: 0,
+                t: 0,
+                scene: 0,
+                acquisition: 0,
+                angle: 0,
+                illumination: 0,
+                phase: 0,
+                rotation: 0,
+                mosaic: 0,
+                pixel_type: CZI_PIXEL_BGR24,
+                compression: CZI_COMPRESSION_JPEG_XR,
+                file_position: 0,
+                file_part: 0,
+            },
+        ];
+
+        assert!(unsupported_compressions(&blocks).is_empty());
+        assert!(unsupported_pixel_modes(&blocks).is_empty());
+
+        assert!(
+            jpeg_xr_backend_supports_pixel_type(CZI_PIXEL_GRAY8),
+            "supported JPEG XR layouts must be accepted by capability checks"
+        );
+        assert!(
+            jpeg_xr_backend_supports_pixel_type(CZI_PIXEL_BGR24),
+            "translated Bgr24 JPEG XR layout must be accepted by capability checks"
+        );
     }
 
     #[test]
@@ -2338,9 +2536,212 @@ mod tests {
     }
 
     #[test]
-    fn reads_separate_gray_channel_subblocks() {
+    fn reads_zstd_compressed_region_without_frame_content_size() {
         let path = std::env::temp_dir().join(format!(
-            "openslide_rs_reads_separate_gray_channel_subblocks_{}",
+            "openslide_rs_reads_zstd_without_frame_content_size_{}",
+            std::process::id()
+        ));
+        let pixels = vec![3, 2, 1, 6, 5, 4];
+        let compressed = {
+            use zstd_pure_rs::prelude::{
+                ZSTD_CCtx, ZSTD_CCtx_setParameter, ZSTD_cParameter, ZSTD_compress2,
+                ZSTD_compressBound, ZSTD_getFrameContentSize, ZSTD_isError,
+                ZSTD_CONTENTSIZE_UNKNOWN,
+            };
+            let mut cctx = ZSTD_CCtx::default();
+            let rc = ZSTD_CCtx_setParameter(&mut cctx, ZSTD_cParameter::ZSTD_c_contentSizeFlag, 0);
+            assert!(!ZSTD_isError(rc), "zstd parameter failed: {rc}");
+            let mut buf = vec![0u8; ZSTD_compressBound(pixels.len())];
+            let written = ZSTD_compress2(&mut cctx, &mut buf, &pixels);
+            assert!(!ZSTD_isError(written), "zstd compression failed: {written}");
+            buf.truncate(written);
+            assert_eq!(ZSTD_getFrameContentSize(&buf), ZSTD_CONTENTSIZE_UNKNOWN);
+            buf
+        };
+        fs::write(
+            &path,
+            make_test_czi(2, 1, CZI_PIXEL_BGR24, CZI_COMPRESSION_ZSTD0, &compressed),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
+        assert_eq!(red.data, vec![1, 4]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_zstd1_prefixed_compressed_region() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_reads_zstd1_prefixed_region_{}",
+            std::process::id()
+        ));
+        let pixels = vec![3, 2, 1, 6, 5, 4];
+        let mut compressed = {
+            use zstd_pure_rs::prelude::{ZSTD_compress, ZSTD_compressBound, ZSTD_isError};
+            let mut buf = vec![0u8; ZSTD_compressBound(pixels.len())];
+            let written = ZSTD_compress(&mut buf, &pixels, 0);
+            assert!(!ZSTD_isError(written), "zstd compression failed: {written}");
+            buf.truncate(written);
+            buf
+        };
+        let mut prefixed = vec![3, 1, 0];
+        prefixed.append(&mut compressed);
+        fs::write(
+            &path,
+            make_test_czi(2, 1, CZI_PIXEL_BGR24, CZI_COMPRESSION_ZSTD1, &prefixed),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        let blue = slide.read_region(2, 0, 0, 0, 2, 1).unwrap();
+        assert_eq!(blue.data, vec![3, 6]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_zstd1_hilo_compressed_bgr48_region_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_reads_zstd1_hilo_bgr48_region_{}",
+            std::process::id()
+        ));
+        let unpacked = vec![0, 30, 0, 20, 0, 10, 0, 60, 0, 50, 0, 40];
+        let mut hilo = Vec::new();
+        hilo.extend(unpacked.iter().step_by(2));
+        hilo.extend(unpacked.iter().skip(1).step_by(2));
+        let mut compressed = {
+            use zstd_pure_rs::prelude::{ZSTD_compress, ZSTD_compressBound, ZSTD_isError};
+            let mut buf = vec![0u8; ZSTD_compressBound(hilo.len())];
+            let written = ZSTD_compress(&mut buf, &hilo, 0);
+            assert!(!ZSTD_isError(written), "zstd compression failed: {written}");
+            buf.truncate(written);
+            buf
+        };
+        let mut prefixed = vec![3, 1, 1];
+        prefixed.append(&mut compressed);
+        fs::write(
+            &path,
+            make_test_czi(2, 1, CZI_PIXEL_BGR48, CZI_COMPRESSION_ZSTD1, &prefixed),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
+        assert_eq!(red.data, vec![10, 40]);
+        let green = slide.read_region(1, 0, 0, 0, 2, 1).unwrap();
+        assert_eq!(green.data, vec![20, 50]);
+        let blue = slide.read_region(2, 0, 0, 0, 2, 1).unwrap();
+        assert_eq!(blue.data, vec![30, 60]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_malformed_zstd1_payload_header_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_rejects_bad_zstd1_header_{}",
+            std::process::id()
+        ));
+        let pixels = vec![3, 2, 1];
+        let mut compressed = {
+            use zstd_pure_rs::prelude::{ZSTD_compress, ZSTD_compressBound, ZSTD_isError};
+            let mut buf = vec![0u8; ZSTD_compressBound(pixels.len())];
+            let written = ZSTD_compress(&mut buf, &pixels, 0);
+            assert!(!ZSTD_isError(written), "zstd compression failed: {written}");
+            buf.truncate(written);
+            buf
+        };
+        let mut prefixed = vec![2, 1];
+        prefixed.append(&mut compressed);
+        fs::write(
+            &path,
+            make_test_czi(1, 1, CZI_PIXEL_BGR24, CZI_COMPRESSION_ZSTD1, &prefixed),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        let err = slide.read_region(0, 0, 0, 0, 1, 1).unwrap_err();
+        assert!(format!("{err}").contains("unexpected zstd header length"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn declared_malformed_attachment_directory_is_open_error() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_malformed_attachment_directory_{}",
+            std::process::id()
+        ));
+        let mut czi = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        let att_dir_pos = czi.len();
+        czi.resize(att_dir_pos + ZISRAW_ATT_DIR_HDR_LEN as usize, 0);
+        write_i64(&mut czi, 104, att_dir_pos as i64);
+        write_sid(&mut czi, att_dir_pos, b"NOTRAWATTDIR");
+
+        fs::write(&path, czi).unwrap();
+
+        let err = match ZeissSlide::open(&path) {
+            Ok(_) => panic!("expected malformed attachment directory to fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("ZISRAWATTDIR"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn declared_malformed_attachment_entry_schema_is_open_error() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_malformed_attachment_entry_schema_{}",
+            std::process::id()
+        ));
+        let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        let mut czi = add_test_attachment(base, "Label", "JPG", &[1, 2, 3]);
+        let att_dir_pos = read_i64(&czi, 104).unwrap() as usize;
+        let entry = att_dir_pos + ZISRAW_ATT_DIR_HDR_LEN as usize;
+        czi[entry..entry + 2].copy_from_slice(b"ZZ");
+
+        fs::write(&path, czi).unwrap();
+
+        let err = match ZeissSlide::open(&path) {
+            Ok(_) => panic!("expected malformed attachment entry schema to fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("attachment entry schema"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn declared_malformed_local_attachment_payload_is_open_error() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_malformed_local_attachment_payload_{}",
+            std::process::id()
+        ));
+        let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        let mut czi = add_test_attachment(base, "Label", "JPG", &[1, 2, 3]);
+        let att_dir_pos = read_i64(&czi, 104).unwrap() as usize;
+        let entry = att_dir_pos + ZISRAW_ATT_DIR_HDR_LEN as usize;
+        let attach_pos = read_u64(&czi, entry + 12).unwrap() as usize;
+        write_sid(&mut czi, attach_pos, b"NOTRAWATTACH");
+
+        fs::write(&path, czi).unwrap();
+
+        let err = match ZeissSlide::open(&path) {
+            Ok(_) => panic!("expected malformed local attachment payload to fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("ZISRAWATTACH"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_separate_gray_channel_subblocks_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_reads_separate_gray_czi_channels_{}",
             std::process::id()
         ));
         fs::write(&path, make_two_channel_gray_czi()).unwrap();
@@ -2349,23 +2750,18 @@ mod tests {
         assert_eq!(slide.channel_count(), 2);
         assert_eq!(slide.channel_name(0), Some("red"));
         assert_eq!(slide.channel_name(1), Some("green"));
-        assert_eq!(
-            slide.properties().get("zeiss.SizeC"),
-            Some(&"2".to_string())
-        );
-
-        let ch0 = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(ch0.data, vec![10, 20]);
-        let ch1 = slide.read_region(1, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(ch1.data, vec![30, 40]);
+        let channel0 = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
+        assert_eq!(channel0.data, vec![10, 20]);
+        let channel1 = slide.read_region(1, 0, 0, 0, 2, 1).unwrap();
+        assert_eq!(channel1.data, vec![30, 40]);
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reports_external_file_part_as_explicitly_unsupported() {
+    fn ignores_subblock_file_part_field_like_upstream() {
         let path = std::env::temp_dir().join(format!(
-            "openslide_rs_reports_external_file_part_unsupported_{}",
+            "openslide_rs_ignores_subblock_file_part_{}",
             std::process::id()
         ));
         let mut czi = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
@@ -2373,219 +2769,40 @@ mod tests {
         fs::write(&path, czi).unwrap();
 
         let slide = ZeissSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("zeiss.ExternalFilePart.Count"),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            slide.properties().get("zeiss.ExternalFilePart.List"),
-            Some(&"2".to_string())
-        );
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.2.SubBlockCount"),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.2.AttachmentCount"),
-            Some(&"0".to_string())
-        );
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.MissingCount"),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.ResolvedCount"),
-            Some(&"0".to_string())
-        );
-        assert_eq!(
-            slide.properties().get("zeiss.ExternalFilePart.2.Status"),
-            Some(&"missing".to_string())
-        );
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.2.MatchingCandidateCount"),
-            Some(&"0".to_string())
-        );
-        let err = slide.read_region(0, 0, 0, 0, 1, 1).unwrap_err();
-        assert!(format!("{err}").contains("external file part"));
-        assert!(format!("{err}").contains("2"));
-        assert!(format!("{err}").contains("matching primary file GUID"));
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn reports_ambiguous_external_subblock_part() {
-        let path = std::env::temp_dir().join(format!(
-            "openslide_rs_reports_ambiguous_external_part_{}",
-            std::process::id()
-        ));
-        let candidates = external_part_candidates(&path, 2);
-        let part_a_path = candidates[1].clone();
-        let part_b_path = candidates[2].clone();
-        let mut main = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
-        set_single_block_file_part(&mut main, 2);
-        let part_a = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[42]);
-        let part_b = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[43]);
-        fs::write(&path, main).unwrap();
-        fs::write(&part_a_path, part_a).unwrap();
-        fs::write(&part_b_path, part_b).unwrap();
-
-        let slide = ZeissSlide::open(&path).unwrap();
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.AmbiguousCount"),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            slide.properties().get("zeiss.ExternalFilePart.2.Status"),
-            Some(&"ambiguous".to_string())
-        );
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.2.MatchingCandidateCount"),
-            Some(&"2".to_string())
-        );
-        let ambiguous_paths = slide
-            .properties()
-            .get("zeiss.ExternalFilePart.2.AmbiguousPaths")
-            .unwrap();
-        assert!(ambiguous_paths.contains(&part_a_path.to_string_lossy().to_string()));
-        assert!(ambiguous_paths.contains(&part_b_path.to_string_lossy().to_string()));
-        let err = slide.read_region(0, 0, 0, 0, 1, 1).unwrap_err();
-        assert!(format!("{err}").contains("multiple sibling CZI parts"));
-        assert!(format!("{err}").contains(&part_a_path.to_string_lossy().to_string()));
-        assert!(format!("{err}").contains(&part_b_path.to_string_lossy().to_string()));
-
-        let _ = fs::remove_file(path);
-        let _ = fs::remove_file(part_a_path);
-        let _ = fs::remove_file(part_b_path);
-    }
-
-    #[test]
-    fn reads_resolved_external_subblock_part() {
-        let path = std::env::temp_dir().join(format!(
-            "openslide_rs_reads_resolved_external_subblock_part_{}",
-            std::process::id()
-        ));
-        let part_path = external_part_candidates(&path, 2).remove(1);
-        let mut main = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
-        set_single_block_file_part(&mut main, 2);
-        let part = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[42]);
-        fs::write(&path, main).unwrap();
-        fs::write(&part_path, part).unwrap();
-
-        let slide = ZeissSlide::open(&path).unwrap();
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.2.ResolvedPath"),
-            Some(&part_path.to_string_lossy().into_owned())
-        );
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.ResolvedCount"),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            slide.properties().get("zeiss.ExternalFilePart.2.Status"),
-            Some(&"resolved".to_string())
-        );
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.2.MatchingCandidateCount"),
-            Some(&"1".to_string())
-        );
         let gray = slide.read_region(0, 0, 0, 0, 1, 1).unwrap();
-        assert_eq!(gray.data, vec![42]);
+        assert_eq!(gray.data, vec![7]);
 
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(part_path);
     }
 
     #[test]
-    fn reports_external_attachment_file_part_metadata() {
+    fn ignores_attachment_file_part_field_like_upstream() {
         let path = std::env::temp_dir().join(format!(
-            "openslide_rs_reports_external_attachment_part_{}",
+            "openslide_rs_ignores_attachment_file_part_{}",
             std::process::id()
         ));
+        let embedded = make_test_czi(
+            1,
+            1,
+            CZI_PIXEL_BGR24,
+            CZI_COMPRESSION_UNCOMPRESSED,
+            &[3, 2, 1],
+        );
         let mut czi = add_test_attachment(
             make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]),
-            "Label Image",
-            "BMP",
-            b"BM",
+            "Label",
+            "CZI",
+            &embedded,
         );
         set_single_attachment_file_part(&mut czi, 3);
         fs::write(&path, czi).unwrap();
 
         let slide = ZeissSlide::open(&path).unwrap();
         assert_eq!(slide.associated_image_names(), vec!["label"]);
-        assert_eq!(
-            slide.properties().get("zeiss.ExternalFilePart.List"),
-            Some(&"3".to_string())
-        );
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.3.SubBlockCount"),
-            Some(&"0".to_string())
-        );
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.3.AttachmentCount"),
-            Some(&"1".to_string())
-        );
-        let err = slide.read_associated_image("label").unwrap_err();
-        assert!(format!("{err}").contains("external file part 3"));
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn reads_resolved_external_attachment_part() {
-        let path = std::env::temp_dir().join(format!(
-            "openslide_rs_reads_resolved_external_attachment_part_{}",
-            std::process::id()
-        ));
-        let part_path = external_part_candidates(&path, 3).remove(1);
-        let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
-        let bmp = make_bmp24(1, 1, &[3, 2, 1]);
-        let mut main = add_test_attachment(base.clone(), "Label Image", "BMP", &bmp);
-        set_single_attachment_file_part(&mut main, 3);
-        let part = add_test_attachment(base, "Label Image", "BMP", &bmp);
-        fs::write(&path, main).unwrap();
-        fs::write(&part_path, part).unwrap();
-
-        let slide = ZeissSlide::open(&path).unwrap();
-        assert_eq!(
-            slide
-                .properties()
-                .get("zeiss.ExternalFilePart.3.ResolvedPath"),
-            Some(&part_path.to_string_lossy().into_owned())
-        );
-        assert_eq!(
-            slide.properties().get("zeiss.Attachment.label.DataSize"),
-            Some(&bmp.len().to_string())
-        );
         let label = slide.read_associated_image("label").unwrap();
         assert_eq!(label.data, vec![1, 2, 3, 255]);
 
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(part_path);
     }
 
     #[test]
@@ -2639,39 +2856,189 @@ mod tests {
     }
 
     #[test]
-    fn decodes_bmp_attachment_as_associated_image() {
+    fn accepts_jpg_attachment_type_like_upstream() {
         let path = std::env::temp_dir().join(format!(
-            "openslide_rs_decodes_bmp_attachment_as_associated_image_{}",
+            "openslide_rs_accepts_jpg_attachment_type_{}",
+            std::process::id()
+        ));
+        let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        fs::write(
+            &path,
+            add_test_attachment(base, "Label", "JPG", ONE_PIXEL_JPEG),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        assert_eq!(slide.associated_image_names(), vec!["label"]);
+        assert_eq!(slide.associated_image_dimensions("label"), Some((1, 1)));
+        assert_eq!(slide.associated_image_dimensions("missing"), None);
+        assert!(slide
+            .properties()
+            .get("zeiss.Attachment.label.FileType")
+            .is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_bmp_attachment_type_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_rejects_bmp_attachment_type_{}",
             std::process::id()
         ));
         let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
         let bmp = make_bmp24(1, 1, &[3, 2, 1]);
         fs::write(&path, add_test_attachment(base, "Label", "BMP", &bmp)).unwrap();
 
-        let slide = ZeissSlide::open(&path).unwrap();
-        assert_eq!(slide.associated_image_names(), vec!["label"]);
-        let label = slide.read_associated_image("label").unwrap();
-        assert_eq!((label.width, label.height), (1, 1));
-        assert_eq!(label.data, vec![1, 2, 3, 255]);
-        assert_eq!(
-            slide.properties().get("zeiss.Attachment.label.FileType"),
-            Some(&"BMP".to_string())
-        );
+        let err = match ZeissSlide::open(&path) {
+            Ok(_) => panic!("expected BMP associated image type to fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("unrecognized type \"BMP\""));
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn maps_attachment_name_variants() {
+    fn rejects_lowercase_czi_attachment_type_like_upstream() {
         let path = std::env::temp_dir().join(format!(
-            "openslide_rs_maps_attachment_name_variants_{}",
+            "openslide_rs_rejects_lowercase_czi_attachment_type_{}",
             std::process::id()
         ));
         let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
-        let bmp = make_bmp24(1, 1, &[3, 2, 1]);
+        let embedded = make_test_czi(
+            1,
+            1,
+            CZI_PIXEL_BGR24,
+            CZI_COMPRESSION_UNCOMPRESSED,
+            &[3, 2, 1],
+        );
+        fs::write(&path, add_test_attachment(base, "Label", "czi", &embedded)).unwrap();
+
+        let err = match ZeissSlide::open(&path) {
+            Ok(_) => panic!("expected lowercase CZI associated image type to fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("unrecognized type \"czi\""));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_space_padded_attachment_type_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_rejects_padded_attachment_type_{}",
+            std::process::id()
+        ));
+        let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
         fs::write(
             &path,
-            add_test_attachment(base, "Slide Preview", "BMP", &bmp),
+            add_test_attachment(base, "Label", "JPG ", ONE_PIXEL_JPEG),
+        )
+        .unwrap();
+
+        let err = match ZeissSlide::open(&path) {
+            Ok(_) => panic!("expected padded attachment type to fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("unrecognized type \"JPG \""));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn decodes_embedded_czi_attachment_as_associated_image() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_decodes_embedded_czi_attachment_{}",
+            std::process::id()
+        ));
+        let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        let embedded = make_test_czi(
+            2,
+            1,
+            CZI_PIXEL_BGR24,
+            CZI_COMPRESSION_UNCOMPRESSED,
+            &[3, 2, 1, 6, 5, 4],
+        );
+        fs::write(&path, add_test_attachment(base, "Label", "CZI", &embedded)).unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        assert_eq!(slide.associated_image_names(), vec!["label"]);
+        assert_eq!(slide.associated_image_dimensions("label"), Some((2, 1)));
+        assert_eq!(slide.associated_image_dimensions("missing"), None);
+        assert!(slide
+            .properties()
+            .get("zeiss.Attachment.label.FileType")
+            .is_none());
+        assert!(slide
+            .properties()
+            .get("zeiss.Attachment.label.DataSize")
+            .is_none());
+        let label = slide.read_associated_image("label").unwrap();
+        assert_eq!((label.width, label.height), (2, 1));
+        assert_eq!(label.data, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn embedded_czi_jpeg_attachment_uses_jpeg_decoder() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_embedded_czi_jpeg_attachment_{}",
+            std::process::id()
+        ));
+        let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        let embedded = make_test_czi(1, 1, CZI_PIXEL_BGR24, CZI_COMPRESSION_JPEG, ONE_PIXEL_JPEG);
+        fs::write(&path, add_test_attachment(base, "Label", "CZI", &embedded)).unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        assert_eq!(slide.associated_image_names(), vec!["label"]);
+        let label = slide.read_associated_image("label").unwrap();
+        assert_eq!((label.width, label.height), (1, 1));
+        assert_eq!(label.data.len(), 4);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(feature = "jpegxr")]
+    #[test]
+    fn embedded_czi_jpeg_xr_attachment_uses_decoder_backend() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_embedded_czi_jpeg_xr_attachment_{}",
+            std::process::id()
+        ));
+        let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        let embedded = make_test_czi(1, 1, CZI_PIXEL_BGR24, CZI_COMPRESSION_JPEG_XR, &[0; 8]);
+        fs::write(&path, add_test_attachment(base, "Label", "CZI", &embedded)).unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        assert_eq!(slide.associated_image_names(), vec!["label"]);
+        let err = slide.read_associated_image("label").unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("JPEG XR"));
+        assert!(message.contains(&format!("pixel_type {CZI_PIXEL_BGR24}")));
+        assert!(message.contains("gray channel 0"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn maps_exact_upstream_attachment_names() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_maps_exact_attachment_names_{}",
+            std::process::id()
+        ));
+        let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        let embedded = make_test_czi(
+            1,
+            1,
+            CZI_PIXEL_BGR24,
+            CZI_COMPRESSION_UNCOMPRESSED,
+            &[3, 2, 1],
+        );
+        fs::write(
+            &path,
+            add_test_attachment(base, "SlidePreview", "CZI", &embedded),
         )
         .unwrap();
 
@@ -2684,7 +3051,26 @@ mod tests {
     }
 
     #[test]
-    fn exposes_metadata_and_dimension_range_properties() {
+    fn ignores_space_padded_attachment_name_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_ignores_padded_attachment_name_{}",
+            std::process::id()
+        ));
+        let base = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        fs::write(
+            &path,
+            add_test_attachment(base, "Label ", "JPG", ONE_PIXEL_JPEG),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        assert!(slide.associated_image_names().is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn exposes_metadata_without_dimension_range_diagnostics() {
         let path = std::env::temp_dir().join(format!(
             "openslide_rs_exposes_zeiss_metadata_props_{}",
             std::process::id()
@@ -2694,6 +3080,9 @@ mod tests {
               <Information>
                 <Image>
                   <Name>synthetic czi</Name>
+                  <SizeX>2</SizeX>
+                  <SizeY>1</SizeY>
+                  <SizeS>1</SizeS>
                   <AcquisitionDate>2026-05-28T12:00:00Z</AcquisitionDate>
                   <ObjectiveSettings>
                     <ObjectiveRef Id="Objective:1"/>
@@ -2718,13 +3107,41 @@ mod tests {
               </Scaling>
             </Metadata>
         "#;
-        fs::write(&path, add_test_metadata(make_two_channel_gray_czi(), xml)).unwrap();
+        fs::write(
+            &path,
+            add_test_metadata(
+                make_test_czi(
+                    2,
+                    1,
+                    CZI_PIXEL_GRAY8,
+                    CZI_COMPRESSION_UNCOMPRESSED,
+                    &[10, 20],
+                ),
+                xml,
+            ),
+        )
+        .unwrap();
 
         let slide = ZeissSlide::open(&path).unwrap();
         assert_eq!(
             slide.properties().get("zeiss.Information.Image.Name"),
             Some(&"synthetic czi".to_string())
         );
+        assert_eq!(
+            slide.properties().get("zeiss.Information.Image.SizeX"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("zeiss.Information.Image.SizeY"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("zeiss.Information.Image.SizeS"),
+            Some(&"1".to_string())
+        );
+        assert!(slide.properties().get("zeiss.SizeX").is_none());
+        assert!(slide.properties().get("zeiss.SizeY").is_none());
+        assert!(slide.properties().get("zeiss.SizeS").is_none());
         assert_eq!(
             slide
                 .properties()
@@ -2742,21 +3159,34 @@ mod tests {
             Some(&"2.5e-7".to_string())
         );
         assert_eq!(
-            slide.properties().get("zeiss.Metadata.Name"),
-            Some(&"synthetic czi".to_string())
-        );
-        assert_eq!(
-            slide.properties().get("zeiss.Metadata.AcquisitionDate"),
+            slide
+                .properties()
+                .get("zeiss.Information.Image.AcquisitionDate"),
             Some(&"2026-05-28T12:00:00Z".to_string())
         );
         assert_eq!(
-            slide.properties().get("zeiss.Metadata.ObjectiveName"),
+            slide
+                .properties()
+                .get("zeiss.Information.Instrument.Objectives.Objective:1.ObjectiveName"),
             Some(&"Plan-Apochromat 20x".to_string())
         );
         assert_eq!(
-            slide.properties().get(properties::PROPERTY_OBJECTIVE_POWER),
-            Some(&"20".to_string())
+            slide.properties().get("zeiss.Information.Image.Name"),
+            Some(&"synthetic czi".to_string())
         );
+        assert!(slide.properties().get("zeiss.Metadata.Name").is_none());
+        assert!(slide
+            .properties()
+            .get("zeiss.Metadata.AcquisitionDate")
+            .is_none());
+        assert!(slide
+            .properties()
+            .get("zeiss.Metadata.ObjectiveName")
+            .is_none());
+        assert!(slide
+            .properties()
+            .get(properties::PROPERTY_OBJECTIVE_POWER)
+            .is_none());
         assert_eq!(
             slide.properties().get(properties::PROPERTY_MPP_X),
             Some(&"0.25".to_string())
@@ -2765,68 +3195,77 @@ mod tests {
             slide.properties().get(properties::PROPERTY_MPP_Y),
             Some(&"0.5".to_string())
         );
-        assert_eq!(
-            slide.properties().get("zeiss.Dimension.C.Min"),
-            Some(&"0".to_string())
-        );
-        assert_eq!(
-            slide.properties().get("zeiss.Dimension.C.Max"),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            slide.properties().get("zeiss.Dimension.C.Count"),
-            Some(&"2".to_string())
-        );
+        assert!(slide.properties().get("zeiss.Dimension.C.Min").is_none());
+        assert!(slide.properties().get("zeiss.Dimension.C.Max").is_none());
+        assert!(slide.properties().get("zeiss.Dimension.C.Count").is_none());
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reports_filtered_non_default_dimensions() {
+    fn parses_non_default_time_dimension_and_filters_default_view_like_upstream() {
         let path = std::env::temp_dir().join(format!(
-            "openslide_rs_reports_filtered_zeiss_dims_{}",
+            "openslide_rs_filters_non_default_zeiss_time_{}",
             std::process::id()
         ));
         let mut czi = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
-        rewrite_single_block_third_dimension(&mut czi, b"R", 1);
+        rewrite_single_block_third_dimension(&mut czi, b"T", 1);
         fs::write(&path, czi).unwrap();
 
         let slide = ZeissSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("zeiss.Dimension.R.Max"),
-            Some(&"1".to_string())
-        );
         let err = slide.read_region(0, 0, 0, 0, 1, 1).unwrap_err();
         let message = format!("{err}");
-        assert!(message.contains("default view requires"));
-        assert!(message.contains("R=0..1"));
+        assert!(message.contains("default view requires Z/T/B/V/I/H/R at index 0"));
+        assert!(message.contains("T=0..1"));
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn maps_more_attachment_name_variants_without_file_io() {
-        assert_eq!(map_attachment_name("Label Image"), Some("label"));
-        assert_eq!(map_attachment_name("Slide Label Image"), Some("label"));
-        assert_eq!(map_attachment_name("Slide Barcode Image"), Some("label"));
-        assert_eq!(map_attachment_name("Barcode"), Some("label"));
-        assert_eq!(map_attachment_name("Slide ID"), Some("label"));
-        assert_eq!(map_attachment_name("Slide Identifier Image"), Some("label"));
-        assert_eq!(map_attachment_name("Preview Image"), Some("macro"));
-        assert_eq!(map_attachment_name("OverviewImage"), Some("macro"));
-        assert_eq!(map_attachment_name("Localization Image"), Some("macro"));
-        assert_eq!(map_attachment_name("Localizer Image"), Some("macro"));
-        assert_eq!(map_attachment_name("Localiser Image"), Some("macro"));
-        assert_eq!(map_attachment_name("Navigator Image"), Some("macro"));
-        assert_eq!(map_attachment_name("Nav Image"), Some("macro"));
-        assert_eq!(map_attachment_name("Reference Map Image"), Some("macro"));
-        assert_eq!(map_attachment_name("Map Image"), Some("macro"));
-        assert_eq!(map_attachment_name("Slide Thumbnail"), Some("thumbnail"));
-        assert_eq!(map_attachment_name("Preview Thumbnail"), Some("thumbnail"));
-        assert_eq!(
-            map_attachment_name("Slide Overview Thumbnail"),
-            Some("thumbnail")
-        );
+    fn parses_mosaic_dimension_without_treating_it_as_z_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_reads_nonzero_zeiss_mosaic_{}",
+            std::process::id()
+        ));
+        let mut czi = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        rewrite_single_block_third_dimension(&mut czi, b"M", 5);
+        fs::write(&path, czi).unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        let red = slide.read_region(0, 0, 0, 0, 1, 1).unwrap();
+        assert_eq!(red.data, vec![7]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_unrecognized_subblock_dimension_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_rejects_unrecognized_zeiss_dimension_{}",
+            std::process::id()
+        ));
+        let mut czi = make_test_czi(1, 1, CZI_PIXEL_GRAY8, CZI_COMPRESSION_UNCOMPRESSED, &[7]);
+        rewrite_single_block_third_dimension(&mut czi, b"Q", 1);
+        fs::write(&path, czi).unwrap();
+
+        let err = match ZeissSlide::open(&path) {
+            Ok(_) => panic!("expected unrecognized subblock dimension to fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("Unrecognized subblock dimension \"Q\""));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn maps_only_exact_upstream_attachment_names_without_file_io() {
+        assert_eq!(map_attachment_name("Label"), Some("label"));
+        assert_eq!(map_attachment_name("SlidePreview"), Some("macro"));
+        assert_eq!(map_attachment_name("Thumbnail"), Some("thumbnail"));
+        assert_eq!(map_attachment_name("Label "), None);
+        assert_eq!(map_attachment_name("Label Image"), None);
+        assert_eq!(map_attachment_name("Slide Preview"), None);
+        assert_eq!(map_attachment_name("thumbnail"), None);
         assert_eq!(
             parse_xml_attribute("<Channel Name='DAPI'>", "Name"),
             Some("DAPI".to_string())
@@ -2837,7 +3276,7 @@ mod tests {
         );
         assert_eq!(
             parse_xml_attribute("<Channel name = \"FITC\">", "Name"),
-            Some("FITC".to_string())
+            None
         );
         assert_eq!(
             parse_simple_xml_text("<Name Id='ImageName'>synthetic</Name>", "Name"),
@@ -2845,18 +3284,33 @@ mod tests {
         );
         assert_eq!(
             parse_simple_xml_text("<name Id='ImageName'>case variant</NAME>", "Name"),
-            Some("case variant".to_string())
+            None
         );
         assert_eq!(
             parse_simple_xml_text("<ome:Name Id='ImageName'>namespaced</ome:Name>", "Name"),
-            Some("namespaced".to_string())
+            None
+        );
+        assert!(
+            parse_xml_dimensions(
+                "<Metadata><Information><Image><ome:SizeX>512</ome:SizeX><ome:SizeY>256</ome:SizeY></Image></Information></Metadata>"
+            )
+            .is_err()
         );
         assert_eq!(
             parse_xml_dimensions(
-                "<Metadata><ome:SizeX>512</ome:SizeX><ome:SizeY>256</ome:SizeY></Metadata>"
-            ),
-            Some((512, 256))
+                "<Metadata><Information><Image><SizeX> \t+512</SizeX><SizeY>256</SizeY></Image></Information></Metadata>"
+            )
+            .unwrap(),
+            (512, 256)
         );
+        assert!(parse_xml_dimensions(
+            "<Metadata><Information><Image><SizeX>512 </SizeX><SizeY>256</SizeY></Image></Information></Metadata>"
+        )
+        .is_err());
+        assert!(parse_xml_dimensions(
+            "<Metadata><ome:SizeX>512</ome:SizeX><ome:SizeY>256</ome:SizeY></Metadata>"
+        )
+        .is_err());
         assert_eq!(
             parse_simple_xml_text("<Title>A&amp;B &lt;C&gt;</Title>", "Title"),
             Some("A&B <C>".to_string())
@@ -2867,31 +3321,146 @@ mod tests {
         );
         assert_eq!(
             parse_scaling_mpp("<distance Id='X'><value>0.00000025</value></distance>", "X"),
-            Some(0.25)
+            None
         );
         assert_eq!(
             parse_scaling_mpp("<Distance Id='x'><Value>0.00000025</Value></Distance>", "X"),
+            None
+        );
+        assert_eq!(
+            parse_scaling_mpp("<Distance Id='X'><Value>0.00000025</Value></Distance>", "X"),
             Some(0.25)
         );
-        assert_eq!(normalize_nominal_magnification("20X"), "20");
-        assert_eq!(normalize_nominal_magnification(" 40x "), "40");
         assert_eq!(
-            normalize_nominal_magnification("Plan-Apochromat 20x"),
-            "Plan-Apochromat 20x"
+            parse_scaling_mpp("<Distance Id='X'><Value>0,00000025</Value></Distance>", "X"),
+            Some(0.25)
+        );
+        assert_eq!(
+            parse_scaling_mpp("<Distance Id='X'><Value>1e9999</Value></Distance>", "X"),
+            None
+        );
+        assert_eq!(
+            parse_scaling_mpp("<Distance Id='X'><Value>1e-9999</Value></Distance>", "X"),
+            None
+        );
+        let mut props = HashMap::new();
+        props.insert(
+            "zeiss.Information.Image.ObjectiveSettings.ObjectiveRef.Id".into(),
+            "Objective:1".into(),
+        );
+        props.insert(
+            "zeiss.Information.Instrument.Objectives.Objective:1.NominalMagnification".into(),
+            "40,500".into(),
+        );
+        duplicate_referenced_objective_power(&mut props);
+        assert_eq!(
+            props.get(properties::PROPERTY_OBJECTIVE_POWER),
+            Some(&"40.5".into())
+        );
+        props.insert(
+            "zeiss.Information.Instrument.Objectives.Objective:1.NominalMagnification".into(),
+            " \t+40,500".into(),
+        );
+        props.remove(properties::PROPERTY_OBJECTIVE_POWER);
+        duplicate_referenced_objective_power(&mut props);
+        assert_eq!(
+            props.get(properties::PROPERTY_OBJECTIVE_POWER),
+            Some(&"40.5".into())
+        );
+        props.insert(
+            "zeiss.Information.Instrument.Objectives.Objective:1.NominalMagnification".into(),
+            "40,500 ".into(),
+        );
+        props.remove(properties::PROPERTY_OBJECTIVE_POWER);
+        duplicate_referenced_objective_power(&mut props);
+        assert!(!props.contains_key(properties::PROPERTY_OBJECTIVE_POWER));
+        props.insert(
+            "zeiss.Information.Instrument.Objectives.Objective:1.NominalMagnification".into(),
+            "inf".into(),
+        );
+        duplicate_referenced_objective_power(&mut props);
+        assert_eq!(
+            props.get(properties::PROPERTY_OBJECTIVE_POWER),
+            Some(&"inf".into())
+        );
+        props.insert(
+            "zeiss.Information.Instrument.Objectives.Objective:1.NominalMagnification".into(),
+            "infinity".into(),
+        );
+        props.remove(properties::PROPERTY_OBJECTIVE_POWER);
+        duplicate_referenced_objective_power(&mut props);
+        assert_eq!(
+            props.get(properties::PROPERTY_OBJECTIVE_POWER),
+            Some(&"inf".into())
+        );
+        props.insert(
+            "zeiss.Information.Instrument.Objectives.Objective:1.NominalMagnification".into(),
+            "1e9999".into(),
+        );
+        props.remove(properties::PROPERTY_OBJECTIVE_POWER);
+        duplicate_referenced_objective_power(&mut props);
+        assert!(!props.contains_key(properties::PROPERTY_OBJECTIVE_POWER));
+        props.insert(
+            "zeiss.Information.Instrument.Objectives.Objective:1.NominalMagnification".into(),
+            "NaN".into(),
+        );
+        duplicate_referenced_objective_power(&mut props);
+        assert!(!props.contains_key(properties::PROPERTY_OBJECTIVE_POWER));
+        props.insert(
+            "zeiss.Information.Instrument.Objectives.Objective:1.NominalMagnification".into(),
+            "40X".into(),
+        );
+        duplicate_referenced_objective_power(&mut props);
+        assert!(!props.contains_key(properties::PROPERTY_OBJECTIVE_POWER));
+        props.insert(
+            properties::PROPERTY_OBJECTIVE_POWER.into(),
+            "existing".into(),
+        );
+        props.insert(
+            "zeiss.Information.Instrument.Objectives.Objective:1.NominalMagnification".into(),
+            "40".into(),
+        );
+        duplicate_referenced_objective_power(&mut props);
+        assert_eq!(
+            props.get(properties::PROPERTY_OBJECTIVE_POWER),
+            Some(&"existing".into())
         );
         assert_eq!(
             parse_scaling_mpp(
                 "<ome:Distance Id='X'><ome:Value>0.00000025</ome:Value></ome:Distance>",
                 "X"
             ),
-            Some(0.25)
+            None
         );
         assert_eq!(
             parse_channel_names(
                 "<Channels><channel name='DAPI'></CHANNEL><Channel><shortname>FITC</shortname></Channel></Channels>",
                 2
             ),
+            None
+        );
+        assert_eq!(
+            parse_channel_names(
+                "<Channels><Channel Name='DAPI'></Channel><Channel><ShortName>FITC</ShortName></Channel></Channels>",
+                2
+            ),
             Some(vec!["DAPI".to_string(), "FITC".to_string()])
+        );
+        let mut props = HashMap::new();
+        let mut path = vec!["zeiss".to_string()];
+        let element = find_xml_element(
+            "<Information><Image Name=' scan 1 '><Title>  A&amp;B  </Title></Image></Information>",
+            "Information",
+        )
+        .unwrap();
+        add_xml_props(&mut props, &mut path, &element);
+        assert_eq!(
+            props.get("zeiss.Information.Image.Name"),
+            Some(&" scan 1 ".to_string())
+        );
+        assert_eq!(
+            props.get("zeiss.Information.Image.Title"),
+            Some(&"  A&B  ".to_string())
         );
         let blocks = [CziSubBlock {
             x: 0,
@@ -2915,11 +3484,41 @@ mod tests {
             file_position: 0,
             file_part: 0,
         }];
+        #[cfg(not(feature = "jpegxr"))]
         assert_eq!(
             unsupported_compressions(&blocks),
             BTreeSet::from([CZI_COMPRESSION_JPEG_XR])
         );
-        assert_eq!(zeiss_compression_name(CZI_COMPRESSION_JPEG_XR), "jpeg-xr");
+        #[cfg(feature = "jpegxr")]
+        assert!(unsupported_compressions(&blocks).is_empty());
+    }
+
+    #[test]
+    fn czi_unsupported_diagnostics_use_upstream_names() {
+        assert_eq!(czi_compression_name(4), Some("JPEG XR"));
+        assert_eq!(czi_compression_name(7), Some("unknown"));
+        assert_eq!(czi_compression_name(99), None);
+        assert_eq!(czi_pixel_type_name(8), Some("BGR96FLOAT"));
+        assert_eq!(czi_pixel_type_name(10), Some("GRAY64COMPLEX"));
+        assert_eq!(czi_pixel_type_name(13), Some("GRAY64"));
+        assert_eq!(czi_pixel_type_name(99), None);
+
+        assert_eq!(
+            format!("{}", unsupported_zeiss_compression_error(4)),
+            "Unsupported format: JPEG XR compression is not supported"
+        );
+        assert_eq!(
+            format!("{}", unsupported_zeiss_compression_error(99)),
+            "Unsupported format: Compression 99 is not supported"
+        );
+        assert_eq!(
+            format!("{}", unsupported_zeiss_pixel_type_error(10)),
+            "Unsupported format: Pixel type GRAY64COMPLEX is not supported"
+        );
+        assert_eq!(
+            format!("{}", unsupported_zeiss_pixel_type_error(99)),
+            "Unsupported format: Pixel type 99 is not supported"
+        );
     }
 
     fn make_test_czi(
@@ -2992,7 +3591,7 @@ mod tests {
             height,
         );
         czi[data_pos..data_pos + data.len()].copy_from_slice(data);
-        czi
+        add_test_metadata(czi, &minimal_test_metadata_xml(width, height, 1))
     }
 
     fn minimal_zeiss_block(scene: i32, downsample: u64) -> CziSubBlock {
@@ -3207,7 +3806,7 @@ mod tests {
         );
         czi[prefix + 16..prefix + 18].copy_from_slice(SCHEMA_DE);
         czi[data_pos..data_pos + data.len()].copy_from_slice(data);
-        czi
+        add_test_metadata(czi, &minimal_test_metadata_xml(width, height, 1))
     }
 
     fn make_two_channel_gray_czi() -> Vec<u8> {
@@ -3279,7 +3878,7 @@ mod tests {
             1,
             &[30, 40],
         );
-        czi
+        add_test_metadata(czi, &minimal_test_metadata_xml(2, 1, 1))
     }
 
     fn add_test_attachment(
@@ -3347,6 +3946,12 @@ mod tests {
         let xml_pos = meta_pos + ZISRAW_META_HDR_LEN as usize;
         czi[xml_pos..xml_pos + xml_bytes.len()].copy_from_slice(xml_bytes);
         czi
+    }
+
+    fn minimal_test_metadata_xml(width: u32, height: u32, scenes: u32) -> String {
+        format!(
+            "<ImageDocument><Metadata><Information><Image><SizeX>{width}</SizeX><SizeY>{height}</SizeY><SizeS>{scenes}</SizeS></Image></Information></Metadata></ImageDocument>"
+        )
     }
 
     fn write_directory_entry(
@@ -3531,6 +4136,20 @@ mod tests {
         }
         data
     }
+
+    const ONE_PIXEL_JPEG: &[u8] = &[
+        0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07,
+        0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b, 0x0c, 0x19, 0x12,
+        0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20, 0x24, 0x2e, 0x27,
+        0x20, 0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31, 0x34, 0x34, 0x34,
+        0x1f, 0x27, 0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff, 0xc0, 0x00, 0x11,
+        0x08, 0x00, 0x01, 0x00, 0x01, 0x03, 0x52, 0x11, 0x00, 0x47, 0x11, 0x00, 0x42, 0x11, 0x00,
+        0xff, 0xc4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+        0xda, 0x00, 0x0c, 0x03, 0x52, 0x00, 0x47, 0x00, 0x42, 0x00, 0x00, 0x3f, 0x00, 0x7f, 0x3f,
+        0x9f, 0xdf, 0xff, 0xd9,
+    ];
 
     fn write_i32(data: &mut [u8], offset: usize, value: i32) {
         data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());

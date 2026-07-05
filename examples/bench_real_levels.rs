@@ -91,6 +91,7 @@ fn main() {
         let mut pixels = 0u64;
         let mut checksum = 0u64;
         let mut rgb_checksum = 0u64;
+        let mut samples = Vec::new();
         for (lx, ly) in sample_regions(lw, lh, region_size, regions_per_level) {
             let x0 = (lx as f64 * downsample).round() as i64;
             let y0 = (ly as f64 * downsample).round() as i64;
@@ -114,21 +115,27 @@ fn main() {
                     eprintln!("read failed at level {level} ({x0},{y0}) {w}x{h}: {err}");
                     std::process::exit(1);
                 });
-            checksum = image
+            let sample_checksum = image
                 .data
                 .iter()
-                .fold(checksum, |acc, &byte| acc.wrapping_add(u64::from(byte)));
-            rgb_checksum = image.data.chunks_exact(4).fold(rgb_checksum, |acc, pixel| {
+                .fold(0u64, |acc, &byte| acc.wrapping_add(u64::from(byte)));
+            let sample_rgb_checksum = image.data.chunks_exact(4).fold(0u64, |acc, pixel| {
                 pixel[..3]
                     .iter()
                     .fold(acc, |acc, &byte| acc.wrapping_add(u64::from(byte)))
             });
+            checksum = checksum.wrapping_add(sample_checksum);
+            rgb_checksum = rgb_checksum.wrapping_add(sample_rgb_checksum);
+            samples.push(format!(
+                "{{\"level_x\":{},\"level_y\":{},\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"checksum\":{},\"rgb_checksum\":{}}}",
+                lx, ly, x0, y0, w, h, sample_checksum, sample_rgb_checksum
+            ));
             regions += 1;
             pixels += u64::from(image.width) * u64::from(image.height);
         }
         let read_secs = read_start.elapsed().as_secs_f64();
         println!(
-            "{{\"path\":\"{}\",\"level\":{},\"width\":{},\"height\":{},\"downsample\":{},\"regions\":{},\"pixels\":{},\"read_secs\":{:.6},\"checksum\":{},\"rgb_checksum\":{}}}",
+            "{{\"path\":\"{}\",\"level\":{},\"width\":{},\"height\":{},\"downsample\":{},\"regions\":{},\"pixels\":{},\"read_secs\":{:.6},\"checksum\":{},\"rgb_checksum\":{},\"samples\":[{}]}}",
             json_escape(&path),
             level,
             lw,
@@ -138,7 +145,8 @@ fn main() {
             pixels,
             read_secs,
             checksum,
-            rgb_checksum
+            rgb_checksum,
+            samples.join(",")
         );
     }
 }

@@ -46,6 +46,9 @@ PROFILES = {
         "Trestle/CMU-1.zip",
         "Ventana/Ventana-1.bif",
         "Zeiss/Zeiss-5-JXR.czi",
+        "Zeiss/Zeiss-5-SlidePreview-JXR.czi",
+        "Zeiss/Zeiss-5-SlidePreview-Zstd0.czi",
+        "Zeiss/Zeiss-5-SlidePreview-Zstd1-HiLo.czi",
     ],
     "nonmirax-coverage": [
         "Aperio/CMU-1-Small-Region.svs",
@@ -58,6 +61,9 @@ PROFILES = {
         "Trestle/CMU-1.zip",
         "Ventana/Ventana-1.bif",
         "Zeiss/Zeiss-5-JXR.czi",
+        "Zeiss/Zeiss-5-SlidePreview-JXR.czi",
+        "Zeiss/Zeiss-5-SlidePreview-Zstd0.czi",
+        "Zeiss/Zeiss-5-SlidePreview-Zstd1-HiLo.czi",
     ],
 }
 
@@ -73,7 +79,12 @@ FORMAT_TO_PROFILE_PATHS = {
     "philips": ["Philips-TIFF/Philips-1.tiff"],
     "trestle": ["Trestle/CMU-1.zip"],
     "ventana": ["Ventana/Ventana-1.bif"],
-    "zeiss": ["Zeiss/Zeiss-5-JXR.czi"],
+    "zeiss": [
+        "Zeiss/Zeiss-5-JXR.czi",
+        "Zeiss/Zeiss-5-SlidePreview-JXR.czi",
+        "Zeiss/Zeiss-5-SlidePreview-Zstd0.czi",
+        "Zeiss/Zeiss-5-SlidePreview-Zstd1-HiLo.czi",
+    ],
 }
 
 
@@ -124,7 +135,11 @@ def download_file(url: str, dest: Path, expected_size: int) -> None:
 
 
 def extract_zip(path: Path, output_dir: Path) -> None:
-    extract_dir = output_dir / "extracted" / path.with_suffix("").name
+    try:
+        relative = path.relative_to(output_dir)
+    except ValueError:
+        relative = Path(path.name)
+    extract_dir = output_dir / "extracted" / relative.with_suffix("")
     extract_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path) as archive:
         archive.extractall(extract_dir)
@@ -167,7 +182,10 @@ def list_entries(index: dict[str, dict]) -> None:
     for name, paths in PROFILES.items():
         total = sum(int(index[path]["size"]) for path in paths if path in index)
         print(f"  {name}: {len(paths)} files, {format_bytes(total)}")
-    print("  coverage intentionally excludes Sakura: no Sakura sample is listed in index.json")
+    print(
+        "  coverage intentionally excludes Sakura and Hamamatsu VMU/NGR: "
+        "no matching samples were listed in index.json on 2026-07-03"
+    )
 
 
 def main() -> int:

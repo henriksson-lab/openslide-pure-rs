@@ -30,22 +30,48 @@ pub mod slidedat;
 pub mod tile;
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
+use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cache::{CachedTile, TileCache};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
-use crate::format::tiff::{format_float, OpenslideHash};
+use crate::format::tiff::OpenslideHash;
 use crate::format::SlideBackend;
 use crate::grid::TileGrid;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
 
-use self::index::IndexFile;
+use self::index::{HierEntry, IndexFile};
 use self::slidedat::SlideDat;
 use self::tile::{compute_base_dimensions, compute_zoom_level_params, Image, MiraxLevel, Tile};
+
+extern "C" {
+    fn osr_cairo_blit_rgb_to_rgba(
+        src_rgb: *const u8,
+        src_width: u32,
+        src_height: u32,
+        valid_width: u32,
+        valid_height: u32,
+        src_x: f64,
+        src_y: f64,
+        src_w: u32,
+        src_h: u32,
+        channel_r: c_int,
+        channel_g: c_int,
+        channel_b: c_int,
+        channel_a: c_int,
+        dst_rgba: *mut u8,
+        dst_width: u32,
+        dst_height: u32,
+        dst_x: f64,
+        dst_y: f64,
+        err: *mut i8,
+        err_len: usize,
+    ) -> c_int;
+}
 
 /// Check whether a path looks like a Mirax .mrxs slide.
 pub fn detect(path: &Path) -> bool {
@@ -100,7 +126,8 @@ struct MiraxSlide {
     properties: HashMap<String, String>,
     datafile_paths: Vec<PathBuf>,
     associated_images: HashMap<String, AssociatedImageInfo>,
-    cache: TileCache,
+    cache: Arc<TileCache>,
+    cache_binding_id: u64,
 }
 
 struct MiraxLevelData {
@@ -112,6 +139,19 @@ struct AssociatedImageInfo {
     fileno: i32,
     offset: i32,
     size: i32,
+    width: u32,
+    height: u32,
+}
+
+fn mirax_hier_entries_or_extension_end<T>(
+    result: Result<T>,
+    is_primary_hierarchy: bool,
+) -> Result<Option<T>> {
+    match result {
+        Ok(entries) => Ok(Some(entries)),
+        Err(err) if is_primary_hierarchy => Err(err),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Read the slide position buffer from raw data.
@@ -120,9 +160,7 @@ struct AssociatedImageInfo {
 fn read_slide_position_buffer(data: &[u8], level_0_image_concat: i32) -> Result<Vec<i32>> {
     const RECORD_SIZE: usize = 9;
     if !data.len().is_multiple_of(RECORD_SIZE) {
-        return Err(OpenSlideError::Format(
-            "Unexpected slide position buffer size".into(),
-        ));
+        return Err(OpenSlideError::Format("Unexpected buffer size".into()));
     }
 
     let count = data.len() / RECORD_SIZE;
@@ -133,8 +171,7 @@ fn read_slide_position_buffer(data: &[u8], level_0_image_concat: i32) -> Result<
         let flag = data[base];
         if flag & 0xfe != 0 {
             return Err(OpenSlideError::Format(format!(
-                "Unexpected flag value in position buffer: {}",
-                flag
+                "Unexpected flag value ({flag})"
             )));
         }
 
@@ -167,11 +204,7 @@ fn read_record_data(path: &Path, offset: i64, size: i64) -> Result<Vec<u8>> {
         )));
     }
 
-    let mut f = std::fs::File::open(path)?;
-    f.seek(SeekFrom::Start(offset as u64))?;
-    let mut buf = vec![0u8; size as usize];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
+    crate::util::read_file_range(path, offset as u64, size as u64)
 }
 
 fn read_record_data_to_end(path: &Path, offset: i64) -> Result<Vec<u8>> {
@@ -182,11 +215,15 @@ fn read_record_data_to_end(path: &Path, offset: i64) -> Result<Vec<u8>> {
         )));
     }
 
-    let mut f = std::fs::File::open(path)?;
-    f.seek(SeekFrom::Start(offset as u64))?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok(buf)
+    let mut file = crate::util::_openslide_fopen(path)?;
+    let file_len = crate::util::_openslide_fsize(&mut file)?;
+    let len = file_len.checked_sub(offset).ok_or_else(|| {
+        OpenSlideError::Format(format!(
+            "Record offset extends outside file: offset={}, file_len={}",
+            offset, file_len
+        ))
+    })?;
+    crate::util::read_file_range(path, offset as u64, len as u64)
 }
 
 fn validate_datafile_index(fileno: i32, datafile_count: usize, context: &str) -> Result<i32> {
@@ -196,6 +233,34 @@ fn validate_datafile_index(fileno: i32, datafile_count: usize, context: &str) ->
         )));
     }
     Ok(fileno)
+}
+
+fn mirax_quickhash1_with_slidedat(dirname: &Path) -> Result<OpenslideHash> {
+    let mut quickhash1 = OpenslideHash::openslide_hash_quickhash1_create();
+    let slidedat_path = dirname.join("Slidedat.ini");
+    let mut slidedat_file = crate::util::_openslide_fopen(&slidedat_path)?;
+    let slidedat_len = u64::try_from(crate::util::_openslide_fsize(&mut slidedat_file)?)
+        .map_err(|_| OpenSlideError::Format("Negative Slidedat.ini size".into()))?;
+    quickhash1.openslide_hash_file_part(&slidedat_path, 0, slidedat_len)?;
+    Ok(quickhash1)
+}
+
+fn mirax_quickhash1_add_tile(
+    quickhash1: &mut OpenslideHash,
+    datafile_paths: &[PathBuf],
+    entry: &HierEntry,
+) -> Result<()> {
+    let fileno = validate_datafile_index(entry.fileno, datafile_paths.len(), "quickhash tile")?;
+    if entry.offset < 0 || entry.length < 0 {
+        return Err(OpenSlideError::Format(
+            "Negative Mirax quickhash tile offset/length".into(),
+        ));
+    }
+    quickhash1.openslide_hash_file_part(
+        &datafile_paths[fileno as usize],
+        entry.offset as u64,
+        entry.length as u64,
+    )
 }
 
 impl MiraxSlide {
@@ -209,8 +274,8 @@ impl MiraxSlide {
         let zoom_level_count = sd.hierarchical.zoom_levels;
 
         // Open Index.dat
-        let index_path = dirname.join(sd.hierarchical.index_filename.trim());
-        let mut index = IndexFile::open(&index_path, sd.general.slide_id.trim())?;
+        let index_path = dirname.join(&sd.hierarchical.index_filename);
+        let mut index = IndexFile::open(&index_path, &sd.general.slide_id)?;
 
         // Compute zoom level params
         let concat_exponents: Vec<i32> = sd.zoom_levels.iter().map(|z| z.concat_exponent).collect();
@@ -234,13 +299,7 @@ impl MiraxSlide {
             has_overlaps,
         )?;
 
-        let mut quickhash1 = OpenslideHash::openslide_hash_quickhash1_create();
-        let slidedat_path = dirname.join("Slidedat.ini");
-        quickhash1.openslide_hash_file_part(
-            &slidedat_path,
-            0,
-            std::fs::metadata(&slidedat_path)?.len(),
-        )?;
+        let mut quickhash1 = mirax_quickhash1_with_slidedat(dirname)?;
 
         // Compute base dimensions
         let (base_w, base_h) = compute_base_dimensions(
@@ -304,7 +363,7 @@ impl MiraxSlide {
         // Collect unique FilterLevel names in order, map to block offsets
         let mut filter_level_names: Vec<String> = Vec::new();
         for fc in &sd.filter_channels {
-            let fl = fc.filter_level_name.trim().to_string();
+            let fl = fc.filter_level_name.clone();
             if !filter_level_names.contains(&fl) {
                 filter_level_names.push(fl);
             }
@@ -322,7 +381,7 @@ impl MiraxSlide {
         let mut filter_channels = sd.filter_channels.clone();
         for fc in &mut filter_channels {
             fc.hier_offset = filter_level_to_offset
-                .get(fc.filter_level_name.trim())
+                .get(&fc.filter_level_name)
                 .copied()
                 .unwrap_or(0);
         }
@@ -376,10 +435,12 @@ impl MiraxSlide {
             for zoom_level in 0..zoom_level_count as usize {
                 let record_offset = hier_base_offset + zoom_level as i32;
                 let is_primary = hier_base_offset == 0;
-                let entries = match index.read_hier_record_at_offset(record_offset) {
-                    Ok(e) => e,
-                    Err(err) if is_primary => return Err(err),
-                    Err(_) => break, // no more zoom levels at this extension filter level
+                let entries = match mirax_hier_entries_or_extension_end(
+                    index.read_hier_record_at_offset(record_offset),
+                    is_primary,
+                )? {
+                    Some(entries) => entries,
+                    None => break, // no more zoom levels at this extension filter level
                 };
 
                 let lp = &zoom_params[zoom_level];
@@ -410,11 +471,7 @@ impl MiraxSlide {
                         return Err(OpenSlideError::Format("Invalid fileno".into()));
                     }
                     if is_primary && zoom_level == zoom_level_count as usize - 1 {
-                        quickhash1.openslide_hash_file_part(
-                            &sd.datafile_paths[entry.fileno as usize],
-                            entry.offset as u64,
-                            entry.length as u64,
-                        )?;
+                        mirax_quickhash1_add_tile(&mut quickhash1, &sd.datafile_paths, entry)?;
                     }
 
                     let image = Arc::new(Image {
@@ -548,7 +605,7 @@ impl MiraxSlide {
                         if let Ok(data) =
                             read_record_data(path, entry.offset as i64, entry.length as i64)
                         {
-                            let format = detect_image_format(&data);
+                            let format = sd.zoom_levels[0].image_format;
                             if let Ok((rgb, _, _)) = decode::decode_rgb(format, &data) {
                                 // Sum each channel
                                 let mut sums = [0u64; 3];
@@ -558,7 +615,6 @@ impl MiraxSlide {
                                     sums[2] += pixel[2] as u64;
                                 }
                                 let best = if sums[0] == 0 && sums[1] == 0 && sums[2] == 0 {
-                                    eprintln!("Warning: all RGB channels zero in sample tile for filter level at offset {}; defaulting to B channel", offset);
                                     2 // All zeros: default to B (YCbCr luminance mapping)
                                 } else if sums[0] >= sums[1] && sums[0] >= sums[2] {
                                     0
@@ -644,7 +700,7 @@ impl MiraxSlide {
         let fill = sd.zoom_levels[0].fill_rgb;
         props.insert(
             properties::PROPERTY_BACKGROUND_COLOR.into(),
-            format!("{:06X}", fill),
+            format_mirax_background_color(fill),
         );
         if let Some(quickhash1) = quickhash1.openslide_hash_get_string() {
             props.insert(properties::PROPERTY_QUICKHASH1.into(), quickhash1);
@@ -660,22 +716,7 @@ impl MiraxSlide {
             .and_then(|levels| levels.first())
             .and_then(|l0| l0.grid.bounds())
         {
-            props.insert(
-                properties::PROPERTY_BOUNDS_X.into(),
-                (bx.floor() as i64).to_string(),
-            );
-            props.insert(
-                properties::PROPERTY_BOUNDS_Y.into(),
-                (by.floor() as i64).to_string(),
-            );
-            props.insert(
-                properties::PROPERTY_BOUNDS_WIDTH.into(),
-                (((bx + bw).ceil() - bx.floor()) as i64).to_string(),
-            );
-            props.insert(
-                properties::PROPERTY_BOUNDS_HEIGHT.into(),
-                (((by + bh).ceil() - by.floor()) as i64).to_string(),
-            );
+            crate::util::_openslide_set_bounds_props_from_grid_bounds(&mut props, (bx, by, bw, bh));
         }
 
         // Associated images info
@@ -700,16 +741,15 @@ impl MiraxSlide {
                     record.offset as i64,
                     record.size as i64,
                 )?;
-                let format = detect_image_format(&data);
-                let decoded = decode::decode_to_rgba(format, &data).map_err(|err| {
+                let decoded = decode::decode_to_rgba(ImageFormat::Jpeg, &data).map_err(|err| {
                     OpenSlideError::Format(format!("Cannot read {name} associated image: {err}"))
                 })?;
                 props.insert(
-                    format!("openslide.associated.{name}.width"),
+                    properties::associated_width(name),
                     decoded.width.to_string(),
                 );
                 props.insert(
-                    format!("openslide.associated.{name}.height"),
+                    properties::associated_height(name),
                     decoded.height.to_string(),
                 );
                 associated_images.insert(
@@ -718,10 +758,15 @@ impl MiraxSlide {
                         fileno,
                         offset: record.offset,
                         size: record.size,
+                        width: decoded.width,
+                        height: decoded.height,
                     },
                 );
             }
         }
+
+        let cache = Arc::new(TileCache::new());
+        let cache_binding_id = cache.next_binding_id();
 
         Ok(MiraxSlide {
             filter_level_grids,
@@ -729,7 +774,8 @@ impl MiraxSlide {
             properties: props,
             datafile_paths: sd.datafile_paths,
             associated_images,
-            cache: TileCache::new(),
+            cache,
+            cache_binding_id,
         })
     }
 
@@ -824,30 +870,7 @@ impl MiraxSlide {
         image_format: ImageFormat,
         channel: u32,
     ) -> Result<GrayImage> {
-        // Check cache for the full RGB decode
-        let imageno = tile.image.imageno;
-        let cached = self.cache.get(filter_level_idx, level, imageno);
-
-        let rgb_tile = match cached {
-            Some(t) => t,
-            None => {
-                // Decode the full tile to RGB
-                let fileno = tile.image.fileno;
-                if fileno < 0 || fileno as usize >= self.datafile_paths.len() {
-                    return Err(OpenSlideError::Format(format!(
-                        "Invalid data file number {}",
-                        fileno
-                    )));
-                }
-                let datafile_path = &self.datafile_paths[fileno as usize];
-                let data = read_record_data_to_end(datafile_path, tile.image.offset as i64)?;
-                let (rgb, width, height) = decode::decode_rgb(image_format, &data)?;
-                let tile = CachedTile { width, height, rgb };
-                self.cache
-                    .put(filter_level_idx, level, imageno, tile.clone());
-                tile
-            }
-        };
+        let rgb_tile = self.decode_tile_rgb(tile, filter_level_idx, level, image_format)?;
 
         // Extract the requested channel
         let pixel_count = rgb_tile.width as usize * rgb_tile.height as usize;
@@ -861,6 +884,44 @@ impl MiraxSlide {
             height: rgb_tile.height,
             data: gray,
         })
+    }
+
+    fn decode_tile_rgb(
+        &self,
+        tile: &Tile,
+        filter_level_idx: usize,
+        level: u32,
+        image_format: ImageFormat,
+    ) -> Result<CachedTile> {
+        let imageno = tile.image.imageno;
+        if let Some(cached) = self.cache.get(
+            self.cache_binding_id,
+            filter_level_idx,
+            level,
+            i64::from(imageno),
+        ) {
+            return Ok(cached);
+        }
+
+        let fileno = tile.image.fileno;
+        if fileno < 0 || fileno as usize >= self.datafile_paths.len() {
+            return Err(OpenSlideError::Format(format!(
+                "Invalid data file number {}",
+                fileno
+            )));
+        }
+        let datafile_path = &self.datafile_paths[fileno as usize];
+        let data = read_record_data_to_end(datafile_path, tile.image.offset as i64)?;
+        let (rgb, width, height) = decode::decode_rgb_libjpeg(image_format, &data)?;
+        let cached = CachedTile { width, height, rgb };
+        self.cache.put(
+            self.cache_binding_id,
+            filter_level_idx,
+            level,
+            i64::from(imageno),
+            cached.clone(),
+        );
+        Ok(cached)
     }
 }
 
@@ -891,6 +952,14 @@ impl SlideBackend for MiraxSlide {
             .first()?
             .get(level as usize)
             .map(|l| (l.level.width as u64, l.level.height as u64))
+    }
+
+    fn level_tile_dimensions(&self, level: u32) -> Option<(u64, u64)> {
+        let level = self.filter_level_grids.first()?.get(level as usize)?;
+        Some((
+            level.level.tile_w.ceil() as u64,
+            level.level.tile_h.ceil() as u64,
+        ))
     }
 
     fn level_downsample(&self, level: u32) -> Option<f64> {
@@ -990,6 +1059,50 @@ impl SlideBackend for MiraxSlide {
             }
         }
 
+        if let Some((filter_level_idx, cairo_channels)) =
+            self.same_filter_level_cairo_channels(channels)
+        {
+            let levels = self
+                .filter_level_grids
+                .get(filter_level_idx)
+                .ok_or_else(|| {
+                    OpenSlideError::Format(format!("Filter level {filter_level_idx} not found"))
+                })?;
+            let level_data = levels.get(level as usize).ok_or_else(|| {
+                OpenSlideError::InvalidArgument(format!("Invalid level {}", level))
+            })?;
+
+            let downsample = level_data.level.downsample;
+            let lx = x as f64 / downsample;
+            let ly = y as f64 / downsample;
+            let mut output = RgbaImage::new(w, h);
+            let mut tiles = level_data.grid.tiles_in_region(lx, ly, w as f64, h as f64);
+            tiles.reverse();
+            for (col, row, entry) in tiles {
+                let decoded = self.decode_tile_rgb(
+                    &entry.tile,
+                    filter_level_idx,
+                    level,
+                    level_data.level.image_format,
+                )?;
+                let tile_origin_x = col as f64 * level_data.grid.tile_advance_x + entry.offset_x;
+                let tile_origin_y = row as f64 * level_data.grid.tile_advance_y + entry.offset_y;
+                cairo_blit_rgb_rgba(
+                    &decoded,
+                    cairo_channels,
+                    entry.tile.src_x,
+                    entry.tile.src_y,
+                    entry.w,
+                    entry.h,
+                    &mut output,
+                    tile_origin_x - lx,
+                    tile_origin_y - ly,
+                )?;
+            }
+            unpremultiply_rgba(&mut output);
+            return Ok(output);
+        }
+
         let mut output = RgbaImage::new(w, h);
         for (out_idx, channel) in channels.iter().enumerate() {
             let Some(channel) = channel else {
@@ -1046,7 +1159,18 @@ impl SlideBackend for MiraxSlide {
     }
 
     fn associated_image_names(&self) -> Vec<&str> {
-        self.associated_images.keys().map(|s| s.as_str()).collect()
+        let mut names = self
+            .associated_images
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    fn associated_image_dimensions(&self, name: &str) -> Option<(u64, u64)> {
+        let info = self.associated_images.get(name)?;
+        Some((u64::from(info.width), u64::from(info.height)))
     }
 
     fn read_associated_image(&self, name: &str) -> Result<RgbaImage> {
@@ -1062,8 +1186,12 @@ impl SlideBackend for MiraxSlide {
         }
         let path = &self.datafile_paths[info.fileno as usize];
         let data = read_record_data(path, info.offset as i64, info.size as i64)?;
-        let format = detect_image_format(&data);
-        decode::decode_to_rgba(format, &data)
+        decode::decode_to_rgba(ImageFormat::Jpeg, &data)
+    }
+
+    fn set_cache(&mut self, cache: Arc<TileCache>) {
+        self.cache_binding_id = cache.next_binding_id();
+        self.cache = cache;
     }
 
     fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize {
@@ -1081,38 +1209,50 @@ impl SlideBackend for MiraxSlide {
     }
 }
 
+impl MiraxSlide {
+    fn same_filter_level_cairo_channels(
+        &self,
+        channels: [Option<u32>; 4],
+    ) -> Option<(usize, [Option<u32>; 4])> {
+        if channels[0].is_none() || channels[1].is_none() || channels[2].is_none() {
+            return None;
+        }
+
+        let mut filter_level_idx = None;
+        let mut rgb_channels = [None; 4];
+        for (out_idx, channel) in channels.iter().enumerate() {
+            let Some(channel) = channel else {
+                continue;
+            };
+            let mapping = self.channels.get(*channel as usize)?;
+            match filter_level_idx {
+                Some(filter_level_idx) if filter_level_idx != mapping.filter_level_idx => {
+                    return None;
+                }
+                None => filter_level_idx = Some(mapping.filter_level_idx),
+                _ => {}
+            }
+            rgb_channels[out_idx] = Some(mapping.rgb_channel);
+        }
+        filter_level_idx.map(|idx| (idx, rgb_channels))
+    }
+}
+
 fn add_level_properties(props: &mut HashMap<String, String>, levels: Option<&[MiraxLevelData]>) {
     let Some(levels) = levels else {
         return;
     };
-    props.insert("openslide.level-count".into(), levels.len().to_string());
+    props.insert(
+        properties::PROPERTY_LEVEL_COUNT.into(),
+        levels.len().to_string(),
+    );
     for (i, level) in levels.iter().enumerate() {
+        props.insert(properties::level_width(i), level.level.width.to_string());
+        props.insert(properties::level_height(i), level.level.height.to_string());
         props.insert(
-            format!("openslide.level[{i}].width"),
-            level.level.width.to_string(),
-        );
-        props.insert(
-            format!("openslide.level[{i}].height"),
-            level.level.height.to_string(),
-        );
-        props.insert(
-            format!("openslide.level[{i}].downsample"),
+            properties::level_downsample(i),
             format_float(level.level.downsample),
         );
-    }
-}
-
-/// Blit (copy) a sub-rectangle of a grayscale source tile into the destination image.
-/// Detect image format from magic bytes.
-fn detect_image_format(data: &[u8]) -> ImageFormat {
-    if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
-        ImageFormat::Jpeg
-    } else if data.len() >= 4 && &data[0..4] == b"\x89PNG" {
-        ImageFormat::Png
-    } else if data.len() >= 2 && data[0] == b'B' && data[1] == b'M' {
-        ImageFormat::Bmp
-    } else {
-        ImageFormat::Jpeg // fallback
     }
 }
 
@@ -1200,5 +1340,370 @@ fn blit_gray_into_rgba(
                 dst.data[dst_idx + 3] = 255;
             }
         }
+    }
+}
+
+fn cairo_blit_rgb_rgba(
+    src: &CachedTile,
+    channels: [Option<u32>; 4],
+    src_x: f64,
+    src_y: f64,
+    src_w: f64,
+    src_h: f64,
+    dst: &mut RgbaImage,
+    dst_x: f64,
+    dst_y: f64,
+) -> Result<()> {
+    let channel = |idx: usize| -> c_int { channels[idx].map_or(-1, |channel| channel as c_int) };
+    let mut err = vec![0i8; 256];
+    let ok = unsafe {
+        osr_cairo_blit_rgb_to_rgba(
+            src.rgb.as_ptr(),
+            src.width,
+            src.height,
+            src.width,
+            src.height,
+            src_x,
+            src_y,
+            src_w.ceil() as u32,
+            src_h.ceil() as u32,
+            channel(0),
+            channel(1),
+            channel(2),
+            channel(3),
+            dst.data.as_mut_ptr(),
+            dst.width,
+            dst.height,
+            dst_x,
+            dst_y,
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok == 0 {
+        let nul = err.iter().position(|&ch| ch == 0).unwrap_or(err.len());
+        let bytes: Vec<u8> = err[..nul].iter().map(|&ch| ch as u8).collect();
+        return Err(OpenSlideError::Decode(format!(
+            "Mirax Cairo tile blit failed: {}",
+            String::from_utf8_lossy(&bytes)
+        )));
+    }
+    Ok(())
+}
+
+fn unpremultiply_rgba(image: &mut RgbaImage) {
+    for pixel in image.data.chunks_exact_mut(4) {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 0 || alpha == 255 {
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            let value = (u32::from(*channel) * 255) / alpha;
+            *channel = value.min(255) as u8;
+        }
+    }
+}
+
+fn format_float(value: f64) -> String {
+    crate::util::_openslide_format_double(value)
+}
+
+fn format_mirax_background_color(fill: u32) -> String {
+    format!("{fill:06X}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_mirax_properties_through_shared_openslide_formatter() {
+        assert_eq!(format_float(1.0 / 3.0), "0.33333333333333331");
+        assert_eq!(format_float(123456789012345670.0), "1.2345678901234566e+17");
+    }
+
+    #[test]
+    fn formats_mirax_background_color_as_uppercase_rgb_hex() {
+        assert_eq!(format_mirax_background_color(0), "000000");
+        assert_eq!(format_mirax_background_color(0x00ab_cdef), "ABCDEF");
+        assert_eq!(format_mirax_background_color(0x0100_0000), "1000000");
+    }
+
+    #[test]
+    fn reads_mirax_slide_position_buffer_like_upstream() {
+        let data = [
+            0x00, 2, 0, 0, 0, 3, 0, 0, 0, 0x01, 0xff, 0xff, 0xff, 0xff, 4, 0, 0, 0,
+        ];
+
+        assert_eq!(
+            read_slide_position_buffer(&data, 5).unwrap(),
+            [10, 15, -5, 20]
+        );
+    }
+
+    #[test]
+    fn rejects_mirax_slide_position_buffer_malformed_like_upstream() {
+        let size_err = read_slide_position_buffer(&[0; 8], 1).unwrap_err();
+        assert!(format!("{size_err}").contains("Unexpected buffer size"));
+
+        let flag_err = read_slide_position_buffer(&[0x02, 0, 0, 0, 0, 0, 0, 0, 0], 1).unwrap_err();
+        assert!(format!("{flag_err}").contains("Unexpected flag value (2)"));
+    }
+
+    #[test]
+    fn reads_mirax_record_data_through_shared_file_helpers() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("openslide-rs-mirax-record-{name}.dat"));
+        fs::write(&path, b"abcdef").unwrap();
+
+        assert_eq!(read_record_data(&path, 2, 3).unwrap(), b"cde");
+        assert_eq!(read_record_data_to_end(&path, 3).unwrap(), b"def");
+        assert!(read_record_data(&path, -1, 1).is_err());
+        assert!(read_record_data(&path, 4, 3).is_err());
+        assert!(read_record_data_to_end(&path, 7).is_err());
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mirax_tile_payload_reads_from_indexed_offset_to_eof() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("openslide-rs-mirax-offset-{name}.dat"));
+        fs::write(&path, b"ignored-junk\xff\xd8payload-through-eof").unwrap();
+
+        assert_eq!(
+            read_record_data_to_end(&path, 12).unwrap(),
+            b"\xff\xd8payload-through-eof"
+        );
+        assert_ne!(
+            read_record_data(&path, 12, 4).unwrap(),
+            read_record_data_to_end(&path, 12).unwrap()
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn primary_hierarchy_errors_propagate_but_extension_hierarchy_errors_end_extension() {
+        let primary = mirax_hier_entries_or_extension_end::<Vec<HierEntry>>(
+            Err(OpenSlideError::Format("primary hierarchy failure".into())),
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{primary}").contains("primary hierarchy failure"));
+
+        let extension = mirax_hier_entries_or_extension_end::<Vec<HierEntry>>(
+            Err(OpenSlideError::Format(
+                "extension hierarchy exhausted".into(),
+            )),
+            false,
+        )
+        .unwrap();
+        assert!(extension.is_none());
+
+        let entries = mirax_hier_entries_or_extension_end(
+            Ok(vec![HierEntry {
+                image_index: 1,
+                offset: 2,
+                length: 3,
+                fileno: 4,
+            }]),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(entries[0].image_index, 1);
+    }
+
+    #[test]
+    fn mirax_associated_image_dimensions_use_open_time_metadata() {
+        let cache = Arc::new(TileCache::new());
+        let mut associated_images = HashMap::new();
+        associated_images.insert(
+            "label".into(),
+            AssociatedImageInfo {
+                fileno: 0,
+                offset: 0,
+                size: 0,
+                width: 17,
+                height: 19,
+            },
+        );
+        let slide = MiraxSlide {
+            filter_level_grids: Vec::new(),
+            channels: Vec::new(),
+            properties: HashMap::new(),
+            datafile_paths: Vec::new(),
+            associated_images,
+            cache_binding_id: cache.next_binding_id(),
+            cache,
+        };
+
+        assert_eq!(slide.associated_image_dimensions("label"), Some((17, 19)));
+        assert_eq!(slide.associated_image_dimensions("missing"), None);
+    }
+
+    #[test]
+    fn mirax_level_tile_dimensions_use_translated_tile_metadata() {
+        let cache = Arc::new(TileCache::new());
+        let slide = MiraxSlide {
+            filter_level_grids: vec![vec![MiraxLevelData {
+                level: MiraxLevel {
+                    width: 1000,
+                    height: 800,
+                    downsample: 1.0,
+                    image_width: 513,
+                    image_height: 257,
+                    tile_w: 256.5,
+                    tile_h: 128.25,
+                    image_format: ImageFormat::Jpeg,
+                    params: tile::ZoomLevelParams {
+                        image_concat: 1,
+                        tile_count_divisor: 1,
+                        tiles_per_image: 2,
+                        positions_per_tile: 1,
+                        tile_advance_x: 256.5,
+                        tile_advance_y: 128.25,
+                    },
+                },
+                grid: TileGrid::new(256.5, 128.25),
+            }]],
+            channels: Vec::new(),
+            properties: HashMap::new(),
+            datafile_paths: Vec::new(),
+            associated_images: HashMap::new(),
+            cache_binding_id: cache.next_binding_id(),
+            cache,
+        };
+
+        assert_eq!(slide.level_tile_dimensions(0), Some((257, 129)));
+        assert_eq!(slide.level_tile_dimensions(1), None);
+    }
+
+    #[test]
+    fn mirax_tile_decode_uses_declared_image_format_without_sniffing() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("openslide-rs-mirax-png-tile-{name}.dat"));
+        let prefix = b"not-image-prefix";
+        let mut payload = prefix.to_vec();
+        payload.extend_from_slice(&one_pixel_png_rgb([12, 34, 56]));
+        fs::write(&path, payload).unwrap();
+
+        let cache = Arc::new(TileCache::new());
+        let slide = MiraxSlide {
+            filter_level_grids: Vec::new(),
+            channels: Vec::new(),
+            properties: HashMap::new(),
+            datafile_paths: vec![path.clone()],
+            associated_images: HashMap::new(),
+            cache_binding_id: cache.next_binding_id(),
+            cache,
+        };
+        let tile = Tile {
+            image: Arc::new(Image {
+                fileno: 0,
+                offset: prefix.len() as i32,
+                length: 0,
+                imageno: 17,
+            }),
+            src_x: 0.0,
+            src_y: 0.0,
+        };
+
+        let decoded = slide
+            .decode_tile_rgb(&tile, 0, 0, ImageFormat::Png)
+            .unwrap();
+        assert_eq!(decoded.width, 1);
+        assert_eq!(decoded.height, 1);
+        assert_eq!(decoded.rgb, vec![12, 34, 56]);
+
+        let err = match slide.decode_tile_rgb(&tile, 1, 0, ImageFormat::Jpeg) {
+            Ok(_) => panic!("expected PNG bytes declared as JPEG to fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("JPEG"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mirax_quickhash_hashes_slidedat_then_indexed_lowest_tiles() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("openslide-rs-mirax-quickhash-{name}"));
+        fs::create_dir_all(&dir).unwrap();
+        let slidedat_path = dir.join("Slidedat.ini");
+        let data_path = dir.join("Data0000.dat");
+        fs::write(&slidedat_path, b"[GENERAL]\nSLIDE_ID=abc\n").unwrap();
+        fs::write(&data_path, b"xxLOWEST-TILE-BYTESyyignored").unwrap();
+
+        let entry = HierEntry {
+            image_index: 0,
+            offset: 2,
+            length: 17,
+            fileno: 0,
+        };
+        let datafile_paths = vec![data_path.clone()];
+        let mut actual = mirax_quickhash1_with_slidedat(&dir).unwrap();
+        mirax_quickhash1_add_tile(&mut actual, &datafile_paths, &entry).unwrap();
+
+        let mut expected = OpenslideHash::openslide_hash_quickhash1_create();
+        expected
+            .openslide_hash_file_part(&slidedat_path, 0, 23)
+            .unwrap();
+        expected
+            .openslide_hash_file_part(&data_path, 2, 17)
+            .unwrap();
+        let expected = expected.openslide_hash_get_string();
+        assert_eq!(actual.openslide_hash_get_string(), expected);
+
+        let mut different_length = mirax_quickhash1_with_slidedat(&dir).unwrap();
+        mirax_quickhash1_add_tile(
+            &mut different_length,
+            &datafile_paths,
+            &HierEntry {
+                length: 16,
+                ..entry
+            },
+        )
+        .unwrap();
+        assert_ne!(different_length.openslide_hash_get_string(), expected);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn one_pixel_png_rgb(rgb: [u8; 3]) -> Vec<u8> {
+        let mut data = Vec::new();
+        {
+            let mut encoder = ::png::Encoder::new(&mut data, 1, 1);
+            encoder.set_color(::png::ColorType::Rgb);
+            encoder.set_depth(::png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&rgb).unwrap();
+        }
+        data
     }
 }

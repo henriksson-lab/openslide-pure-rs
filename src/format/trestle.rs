@@ -1,18 +1,22 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::os::raw::{c_char, c_int, c_uint};
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 
 use crate::cache::{CachedTile, TileCache};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
-use crate::format::SlideBackend;
+use crate::format::{tiff::OpenslideHash, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+use crate::util::read_file_range;
 
 extern "C" {
     fn osr_cairo_blit_rgb_to_rgba(
@@ -87,10 +91,16 @@ const TAG_TILELENGTH: u16 = 323;
 const TAG_TILEOFFSETS: u16 = 324;
 const TAG_TILEBYTECOUNTS: u16 = 325;
 const TAG_JPEGTABLES: u16 = 347;
+const TAG_JPEG_PROC: u16 = 512;
+const TAG_JPEG_RESTART_INTERVAL: u16 = 515;
+const TAG_JPEG_Q_TABLES: u16 = 519;
+const TAG_JPEG_DC_TABLES: u16 = 520;
+const TAG_JPEG_AC_TABLES: u16 = 521;
 const TAG_COPYRIGHT: u16 = 33432;
 
 const COMPRESSION_NONE: u16 = 1;
 const COMPRESSION_LZW: u16 = 5;
+const COMPRESSION_OLD_JPEG: u16 = 6;
 const COMPRESSION_JPEG: u16 = 7;
 const COMPRESSION_ADOBE_DEFLATE: u16 = 8;
 const COMPRESSION_DEFLATE: u16 = 32946;
@@ -196,9 +206,9 @@ enum TiffValue {
 
 impl TiffFile {
     fn open(path: &Path) -> Result<Self> {
-        let mut file = File::open(path)?;
+        let mut file = crate::util::_openslide_fopen(path)?;
         let mut header = [0u8; 16];
-        file.read_exact(&mut header[..8])?;
+        crate::util::_openslide_fread_exact(&mut file, &mut header[..8])?;
 
         let endian = match &header[0..2] {
             b"II" => Endian::Little,
@@ -210,7 +220,7 @@ impl TiffFile {
         let (bigtiff, first_ifd_offset) = match magic {
             TIFF_MAGIC_CLASSIC => (false, endian.read_u32(&header[4..8]) as u64),
             TIFF_MAGIC_BIG => {
-                file.read_exact(&mut header[8..16])?;
+                crate::util::_openslide_fread_exact(&mut file, &mut header[8..16])?;
                 let offset_size = endian.read_u16(&header[4..6]);
                 let reserved = endian.read_u16(&header[6..8]);
                 if offset_size != 8 || reserved != 0 {
@@ -225,7 +235,9 @@ impl TiffFile {
 
         let mut directories = Vec::new();
         let mut next_offset = first_ifd_offset;
-        let file_len = file.metadata()?.len();
+        let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+            OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+        })?;
 
         while next_offset != 0 {
             if next_offset >= file_len {
@@ -264,22 +276,26 @@ impl TiffFile {
     }
 
     fn read_directory(
-        file: &mut File,
+        file: &mut crate::util::OpenSlideFile,
         path: &Path,
         endian: Endian,
         bigtiff: bool,
         offset: u64,
         file_len: u64,
     ) -> Result<(TiffDirectory, u64)> {
-        file.seek(SeekFrom::Start(offset))?;
+        crate::util::_openslide_fseek(
+            file,
+            tiff_seek_offset(offset, "IFD")?,
+            crate::util::OpenSlideSeekWhence::Set,
+        )?;
 
         let entry_count = if bigtiff {
             let mut buf = [0u8; 8];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u64(&buf)
         } else {
             let mut buf = [0u8; 2];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u16(&buf) as u64
         };
 
@@ -296,7 +312,7 @@ impl TiffFile {
 
         for _ in 0..entry_count {
             let mut entry_buf = vec![0u8; entry_size];
-            file.read_exact(&mut entry_buf)?;
+            crate::util::_openslide_fread_exact(file, &mut entry_buf)?;
 
             let tag = endian.read_u16(&entry_buf[0..2]);
             let value_type = endian.read_u16(&entry_buf[2..4]);
@@ -355,11 +371,11 @@ impl TiffFile {
 
         let following_offset = if bigtiff {
             let mut buf = [0u8; 8];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u64(&buf)
         } else {
             let mut buf = [0u8; 4];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u32(&buf) as u64
         };
 
@@ -375,6 +391,14 @@ impl TiffFile {
             .map(|d| d.has(TAG_TILEWIDTH) && d.has(TAG_TILELENGTH))
             .unwrap_or(false)
     }
+}
+
+fn tiff_seek_offset(offset: u64, context: &str) -> Result<i64> {
+    i64::try_from(offset).map_err(|_| {
+        OpenSlideError::Format(format!(
+            "Trestle TIFF {context} offset does not fit OpenSlide seek: offset={offset}"
+        ))
+    })
 }
 
 impl TiffDirectory {
@@ -539,6 +563,16 @@ struct TrestleLevel {
     tile_offsets: Vec<u64>,
     tile_byte_counts: Vec<u64>,
     jpeg_tables: Option<Vec<u8>>,
+    old_jpeg: Option<OldJpegTables>,
+}
+
+#[derive(Debug, Clone)]
+struct OldJpegTables {
+    proc: u16,
+    restart_interval: Option<u16>,
+    q_tables: Vec<u64>,
+    dc_tables: Vec<u64>,
+    ac_tables: Vec<u64>,
 }
 
 impl TrestleLevel {
@@ -586,6 +620,7 @@ impl TrestleLevel {
             compression,
             COMPRESSION_NONE
                 | COMPRESSION_LZW
+                | COMPRESSION_OLD_JPEG
                 | COMPRESSION_JPEG
                 | COMPRESSION_ADOBE_DEFLATE
                 | COMPRESSION_DEFLATE
@@ -636,13 +671,7 @@ impl TrestleLevel {
         if bits_per_sample.is_empty() || bits_per_sample.iter().any(|&bits| bits != 8 && bits != 16)
         {
             return Err(OpenSlideError::UnsupportedFormat(format!(
-                "Only 8-bit or contiguous 16-bit TIFF samples are supported in directory {}",
-                dir_index
-            )));
-        }
-        if planar_config == PLANARCONFIG_SEPARATE && bits_per_sample.iter().any(|&bits| bits != 8) {
-            return Err(OpenSlideError::UnsupportedFormat(format!(
-                "Planar separate non-8-bit Trestle TIFF samples are not supported in directory {}",
+                "Only 8-bit or 16-bit TIFF samples are supported in directory {}",
                 dir_index
             )));
         }
@@ -686,6 +715,12 @@ impl TrestleLevel {
             height = height.saturating_sub((tiles_down - 1) * overlap_y as u64);
         }
 
+        let old_jpeg = if compression == COMPRESSION_OLD_JPEG {
+            Some(parse_old_jpeg_tables(tiff, dir, dir_index)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             width,
             height,
@@ -708,6 +743,7 @@ impl TrestleLevel {
             tile_offsets,
             tile_byte_counts,
             jpeg_tables: dir.entry(TAG_JPEGTABLES).and_then(TiffEntry::raw),
+            old_jpeg,
         })
     }
 
@@ -755,14 +791,91 @@ impl TrestleLevel {
         }
     }
 
+    fn bytes_per_sample_for_sample(&self, sample: usize) -> Result<usize> {
+        if self.bits_per_sample.is_empty() {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "Trestle TIFF has {} BitsPerSample values for {} samples",
+                self.bits_per_sample.len(),
+                self.samples_per_pixel
+            )));
+        }
+        if self.bits_per_sample.len() > 1
+            && self.bits_per_sample.len() < self.samples_per_pixel as usize
+        {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "Trestle TIFF has {} BitsPerSample values for {} samples",
+                self.bits_per_sample.len(),
+                self.samples_per_pixel
+            )));
+        }
+        let bits = self
+            .bits_per_sample
+            .get(sample)
+            .or_else(|| self.bits_per_sample.first())
+            .copied()
+            .unwrap_or(8);
+        match bits {
+            8 => Ok(1),
+            16 => Ok(2),
+            other => Err(OpenSlideError::UnsupportedFormat(format!(
+                "Unsupported Trestle TIFF bits-per-sample {}",
+                other
+            ))),
+        }
+    }
+
+    fn contiguous_sample_bytes(&self) -> Result<Vec<u8>> {
+        if self.bits_per_sample.is_empty() {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "Trestle TIFF has {} BitsPerSample values for {} samples",
+                self.bits_per_sample.len(),
+                self.samples_per_pixel
+            )));
+        }
+        let sample_count = usize::from(self.samples_per_pixel);
+        let mut sample_bytes = Vec::with_capacity(sample_count);
+        for sample in 0..sample_count {
+            let bits = self
+                .bits_per_sample
+                .get(sample)
+                .or_else(|| self.bits_per_sample.first())
+                .copied()
+                .unwrap_or(8);
+            match bits {
+                8 => sample_bytes.push(1),
+                16 => sample_bytes.push(2),
+                other => {
+                    return Err(OpenSlideError::UnsupportedFormat(format!(
+                        "Unsupported Trestle TIFF bits-per-sample {}",
+                        other
+                    )))
+                }
+            }
+        }
+        Ok(sample_bytes)
+    }
+
     fn sample(&self, data: &[u8], pixel_index: usize, sample: usize) -> Result<u8> {
-        let bytes_per_sample = self.bytes_per_sample()?;
-        let offset = pixel_index
-            .checked_mul(usize::from(self.samples_per_pixel))
-            .and_then(|offset| offset.checked_add(sample))
-            .and_then(|offset| offset.checked_mul(bytes_per_sample))
+        let sample_bytes = self.contiguous_sample_bytes()?;
+        let bytes_per_pixel = sample_bytes
+            .iter()
+            .try_fold(0usize, |acc, &bytes| acc.checked_add(usize::from(bytes)))
             .ok_or_else(|| OpenSlideError::Decode("Trestle TIFF sample offset overflow".into()))?;
-        match bytes_per_sample {
+        let sample_offset = sample_bytes
+            .get(..sample)
+            .ok_or_else(|| OpenSlideError::Decode("Trestle TIFF sample index overflow".into()))?
+            .iter()
+            .try_fold(0usize, |acc, &bytes| acc.checked_add(usize::from(bytes)))
+            .ok_or_else(|| OpenSlideError::Decode("Trestle TIFF sample offset overflow".into()))?;
+        let offset = pixel_index
+            .checked_mul(bytes_per_pixel)
+            .and_then(|offset| offset.checked_add(sample_offset))
+            .ok_or_else(|| OpenSlideError::Decode("Trestle TIFF sample offset overflow".into()))?;
+        match sample_bytes
+            .get(sample)
+            .copied()
+            .ok_or_else(|| OpenSlideError::Decode("Trestle TIFF sample index overflow".into()))?
+        {
             1 => data
                 .get(offset)
                 .copied()
@@ -778,6 +891,78 @@ impl TrestleLevel {
             )),
         }
     }
+
+    fn planar_sample(
+        &self,
+        plane: &[u8],
+        pixel_index: usize,
+        bytes_per_sample: usize,
+    ) -> Result<u8> {
+        let offset = pixel_index.checked_mul(bytes_per_sample).ok_or_else(|| {
+            OpenSlideError::Decode("Trestle TIFF planar sample offset overflow".into())
+        })?;
+        match bytes_per_sample {
+            1 => plane.get(offset).copied().ok_or_else(|| {
+                OpenSlideError::Decode("Trestle TIFF planar sample is truncated".into())
+            }),
+            2 => {
+                let sample = plane.get(offset..offset + 2).ok_or_else(|| {
+                    OpenSlideError::Decode("Trestle TIFF planar sample is truncated".into())
+                })?;
+                Ok((self.endian.read_u16(sample) >> 8) as u8)
+            }
+            _ => Err(OpenSlideError::UnsupportedFormat(
+                "Unsupported Trestle TIFF planar sample width".into(),
+            )),
+        }
+    }
+}
+
+fn parse_old_jpeg_tables(
+    tiff: &TiffFile,
+    dir: &TiffDirectory,
+    dir_index: usize,
+) -> Result<OldJpegTables> {
+    let proc = dir.uint(tiff.endian, TAG_JPEG_PROC).unwrap_or(1) as u16;
+    if proc != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Trestle old-JPEG processing mode {} in directory {}",
+            proc, dir_index
+        )));
+    }
+    let q_tables = dir.uints(tiff.endian, TAG_JPEG_Q_TABLES).ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat(format!(
+            "Trestle old-JPEG directory {} has no JPEGQTables tag",
+            dir_index
+        ))
+    })?;
+    let dc_tables = dir.uints(tiff.endian, TAG_JPEG_DC_TABLES).ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat(format!(
+            "Trestle old-JPEG directory {} has no JPEGDCTables tag",
+            dir_index
+        ))
+    })?;
+    let ac_tables = dir.uints(tiff.endian, TAG_JPEG_AC_TABLES).ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat(format!(
+            "Trestle old-JPEG directory {} has no JPEGACTables tag",
+            dir_index
+        ))
+    })?;
+    if q_tables.is_empty() || dc_tables.is_empty() || ac_tables.is_empty() {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Trestle old-JPEG directory {} has empty JPEG table tags",
+            dir_index
+        )));
+    }
+    Ok(OldJpegTables {
+        proc,
+        restart_interval: dir
+            .uint(tiff.endian, TAG_JPEG_RESTART_INTERVAL)
+            .map(|value| value as u16),
+        q_tables,
+        dc_tables,
+        ac_tables,
+    })
 }
 
 fn required_uint(tiff: &TiffFile, dir: &TiffDirectory, tag: u16) -> Result<u64> {
@@ -794,9 +979,11 @@ struct TrestleSlide {
     tiff_path: PathBuf,
     levels: Vec<TrestleLevel>,
     properties: HashMap<String, String>,
-    cache: TileCache,
+    cache: Arc<TileCache>,
+    cache_binding_id: u64,
     channel_count: u32,
     macro_path: Option<PathBuf>,
+    macro_dimensions: Option<(u32, u32)>,
 }
 
 pub fn detect(path: &Path) -> bool {
@@ -889,32 +1076,43 @@ impl TrestleSlide {
             lowest_resolution_level,
             0,
         )?;
-        if let Some(value) = properties.get("tiff.XResolution").cloned() {
-            properties.insert(properties::PROPERTY_MPP_X.into(), value);
-        }
-        if let Some(value) = properties.get("tiff.YResolution").cloned() {
-            properties.insert(properties::PROPERTY_MPP_Y.into(), value);
-        }
+        crate::util::_openslide_duplicate_double_prop(
+            &mut properties,
+            "tiff.XResolution",
+            properties::PROPERTY_MPP_X,
+        );
+        crate::util::_openslide_duplicate_double_prop(
+            &mut properties,
+            "tiff.YResolution",
+            properties::PROPERTY_MPP_Y,
+        );
         add_level_properties(&mut properties, &levels, report_geometry);
-        let macro_path = get_associated_path(&tiff.path).filter(|path| is_jpeg_path(path));
-        if let Some(path) = &macro_path {
-            if let Ok((width, height)) = jpeg_dimensions(path) {
-                properties.insert("openslide.associated.macro.width".into(), width.to_string());
-                properties.insert(
-                    "openslide.associated.macro.height".into(),
-                    height.to_string(),
-                );
-            }
-        }
+        let (macro_path, macro_dimensions) = get_associated_path(&tiff.path)
+            .and_then(|path| match jpeg_dimensions(&path) {
+                Ok((width, height)) => {
+                    properties.insert(properties::associated_width("macro"), width.to_string());
+                    properties.insert(properties::associated_height("macro"), height.to_string());
+                    Some((path, (width, height)))
+                }
+                Err(_) => None,
+            })
+            .map_or((None, None), |(path, dimensions)| {
+                (Some(path), Some(dimensions))
+            });
         let tiff_path = tiff.path;
+
+        let cache = Arc::new(TileCache::new());
+        let cache_binding_id = cache.next_binding_id();
 
         Ok(Self {
             tiff_path,
             levels,
             properties,
-            cache: TileCache::new(),
+            cache,
+            cache_binding_id,
             channel_count,
             macro_path,
+            macro_dimensions,
         })
     }
 
@@ -926,8 +1124,11 @@ impl TrestleSlide {
 
     fn decode_tile(&self, level_index: u32, tile_no: u64) -> Result<CachedTile> {
         let level = self.level(level_index)?;
-        if let Ok(cache_key) = i32::try_from(tile_no) {
-            if let Some(tile) = self.cache.get(0, level_index, cache_key) {
+        if let Ok(cache_key) = i64::try_from(tile_no) {
+            if let Some(tile) = self
+                .cache
+                .get(self.cache_binding_id, 0, level_index, cache_key)
+            {
                 return Ok(tile);
             }
         }
@@ -962,25 +1163,31 @@ impl TrestleSlide {
                         level.tile_height,
                     )?
                 }
-                COMPRESSION_JPEG => {
+                COMPRESSION_OLD_JPEG | COMPRESSION_JPEG => {
                     let offset = level.tile_offsets[tile_no as usize];
                     let raw = read_file_range(&self.tiff_path, offset, byte_count)?;
-                    let (rgb, width, height) = if level.jpeg_tables.is_some() {
-                        decode::decode_tiff_bgra_rgb_region(
-                            ImageFormat::Jpeg,
-                            &raw,
-                            level.jpeg_tables.as_deref(),
-                            0,
-                            0,
-                            level.tile_width,
-                            level.tile_height,
-                            jpeg_color_space(level.photometric),
-                        )?
-                    } else if level.photometric == PHOTOMETRIC_YCBCR {
-                        decode::decode_tiff_ycbcr_rgb_libjpeg(ImageFormat::Jpeg, &raw)?
+                    let jpeg = if level.compression == COMPRESSION_OLD_JPEG {
+                        old_jpeg_interchange_stream(&self.tiff_path, level, &raw)?
                     } else {
-                        decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &raw)?
+                        raw
                     };
+                    let (rgb, width, height) =
+                        if level.jpeg_tables.is_some() && level.compression == COMPRESSION_JPEG {
+                            decode::decode_tiff_bgra_rgb_region(
+                                ImageFormat::Jpeg,
+                                &jpeg,
+                                level.jpeg_tables.as_deref(),
+                                0,
+                                0,
+                                level.tile_width,
+                                level.tile_height,
+                                jpeg_color_space(level.photometric),
+                            )?
+                        } else if level.photometric == PHOTOMETRIC_YCBCR {
+                            decode::decode_tiff_ycbcr_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
+                        } else {
+                            decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
+                        };
                     CachedTile { width, height, rgb }
                 }
                 COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
@@ -1045,8 +1252,14 @@ impl TrestleSlide {
             }
         };
 
-        if let Ok(cache_key) = i32::try_from(tile_no) {
-            self.cache.put(0, level_index, cache_key, tile.clone());
+        if let Ok(cache_key) = i64::try_from(tile_no) {
+            self.cache.put(
+                self.cache_binding_id,
+                0,
+                level_index,
+                cache_key,
+                tile.clone(),
+            );
         }
         Ok(tile)
     }
@@ -1079,6 +1292,12 @@ impl SlideBackend for TrestleSlide {
         self.levels
             .get(level as usize)
             .map(|level| level.downsample)
+    }
+
+    fn level_tile_dimensions(&self, level: u32) -> Option<(u64, u64)> {
+        self.levels
+            .get(level as usize)
+            .map(|level| (u64::from(level.tile_width), u64::from(level.tile_height)))
     }
 
     fn read_region(
@@ -1267,6 +1486,14 @@ impl SlideBackend for TrestleSlide {
         }
     }
 
+    fn associated_image_dimensions(&self, name: &str) -> Option<(u64, u64)> {
+        if name != "macro" {
+            return None;
+        }
+        let (width, height) = self.macro_dimensions?;
+        Some((u64::from(width), u64::from(height)))
+    }
+
     fn read_associated_image(&self, name: &str) -> Result<RgbaImage> {
         if name != "macro" {
             return Err(OpenSlideError::InvalidArgument(format!(
@@ -1278,7 +1505,11 @@ impl SlideBackend for TrestleSlide {
             .macro_path
             .as_ref()
             .ok_or_else(|| OpenSlideError::InvalidArgument("No associated image 'macro'".into()))?;
-        let data = fs::read(path)?;
+        let mut file = crate::util::_openslide_fopen(path)?;
+        let len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+            OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+        })?;
+        let data = read_file_range(path, 0, len)?;
         let format = detect_associated_image_format(&data).ok_or_else(|| {
             OpenSlideError::UnsupportedFormat(format!(
                 "Unsupported Trestle associated image format for '{}'",
@@ -1286,6 +1517,11 @@ impl SlideBackend for TrestleSlide {
             ))
         })?;
         decode::decode_to_rgba(format, &data)
+    }
+
+    fn set_cache(&mut self, cache: Arc<TileCache>) {
+        self.cache_binding_id = cache.next_binding_id();
+        self.cache = cache;
     }
 
     fn debug_grid_tile_count(&self, _channel: u32, level: u32) -> usize {
@@ -1304,23 +1540,17 @@ fn add_properties(description: &str, _tiff: &TiffFile) -> HashMap<String, String
             continue;
         };
         let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
         props.insert(format!("trestle.{}", key), value.trim().to_string());
     }
 
-    if let Some(value) = props.get("trestle.Objective Power").cloned() {
-        if let Some(objective) = objective_power_value(&value) {
-            props.insert(
-                properties::PROPERTY_OBJECTIVE_POWER.into(),
-                objective.to_string(),
-            );
-        }
-    }
+    crate::util::_openslide_duplicate_int_prop(
+        &mut props,
+        "trestle.Objective Power",
+        properties::PROPERTY_OBJECTIVE_POWER,
+    );
 
     if let Some(value) = props.get("trestle.Background Color") {
-        if let Ok(bg) = u64::from_str_radix(value.trim(), 16) {
+        if let Some(bg) = crate::util::_openslide_parse_uint64(value, 16) {
             props.insert(
                 properties::PROPERTY_BACKGROUND_COLOR.into(),
                 format!(
@@ -1346,7 +1576,7 @@ fn parse_trestle_image_description(
         .map(|overlap_str| {
             let values = overlap_str
                 .split(' ')
-                .map(|value| value.parse::<u64>().unwrap_or(0) as i32)
+                .map(|value| crate::util::_openslide_parse_uint64(value, 10).unwrap_or(0) as i32)
                 .collect::<Vec<_>>();
             values
                 .chunks_exact(2)
@@ -1362,69 +1592,73 @@ fn add_level_properties(
     levels: &[TrestleLevel],
     report_geometry: bool,
 ) {
-    props.insert("openslide.level-count".into(), levels.len().to_string());
+    props.insert(
+        properties::PROPERTY_LEVEL_COUNT.into(),
+        levels.len().to_string(),
+    );
     for (i, level) in levels.iter().enumerate() {
+        props.insert(properties::level_width(i), level.width.to_string());
+        props.insert(properties::level_height(i), level.height.to_string());
         props.insert(
-            format!("openslide.level[{i}].width"),
-            level.width.to_string(),
-        );
-        props.insert(
-            format!("openslide.level[{i}].height"),
-            level.height.to_string(),
-        );
-        props.insert(
-            format!("openslide.level[{i}].downsample"),
+            properties::level_downsample(i),
             format_float(level.downsample),
         );
         if report_geometry {
             props.insert(
-                format!("openslide.level[{i}].tile-width"),
+                properties::level_tile_width(i),
                 level.tile_width.to_string(),
             );
             props.insert(
-                format!("openslide.level[{i}].tile-height"),
+                properties::level_tile_height(i),
                 level.tile_height.to_string(),
             );
         }
     }
 }
 
-fn objective_power_value(value: &str) -> Option<&str> {
-    value.parse::<i64>().ok()?;
-    Some(value)
-}
-
 fn get_associated_path(path: &Path) -> Option<PathBuf> {
-    let mut associated = path.to_path_buf();
-    associated.set_extension("Full");
-    Some(associated)
+    Some(PathBuf::from(openslide_string_extension_path(
+        path, ".Full",
+    )))
 }
 
-fn is_jpeg_path(path: &Path) -> bool {
-    let Ok(mut file) = File::open(path) else {
-        return false;
-    };
-    let mut header = [0u8; 3];
-    file.read_exact(&mut header).is_ok() && header == [0xff, 0xd8, 0xff]
+#[cfg(unix)]
+fn openslide_string_extension_path(path: &Path, extension: &str) -> OsString {
+    let mut base = path.as_os_str().as_bytes().to_vec();
+    if let Some(dot) = base.iter().rposition(|byte| *byte == b'.') {
+        base.truncate(dot);
+    }
+    base.extend_from_slice(extension.as_bytes());
+    OsString::from_vec(base)
+}
+
+#[cfg(not(unix))]
+fn openslide_string_extension_path(path: &Path, extension: &str) -> OsString {
+    let mut base = path.as_os_str().to_string_lossy().into_owned();
+    if let Some(dot) = base.rfind('.') {
+        base.truncate(dot);
+    }
+    base.push_str(extension);
+    OsString::from(base)
 }
 
 fn jpeg_dimensions(path: &Path) -> Result<(u32, u32)> {
-    let mut file = File::open(path)?;
+    let mut file = crate::util::_openslide_fopen(path)?;
     let mut soi = [0u8; 2];
-    file.read_exact(&mut soi)?;
+    crate::util::_openslide_fread_exact(&mut file, &mut soi)?;
     if soi != [0xff, 0xd8] {
         return Err(OpenSlideError::UnsupportedFormat("Not a JPEG image".into()));
     }
 
     loop {
         let mut byte = [0u8; 1];
-        file.read_exact(&mut byte)?;
+        crate::util::_openslide_fread_exact(&mut file, &mut byte)?;
         while byte[0] != 0xff {
-            file.read_exact(&mut byte)?;
+            crate::util::_openslide_fread_exact(&mut file, &mut byte)?;
         }
-        file.read_exact(&mut byte)?;
+        crate::util::_openslide_fread_exact(&mut file, &mut byte)?;
         while byte[0] == 0xff {
-            file.read_exact(&mut byte)?;
+            crate::util::_openslide_fread_exact(&mut file, &mut byte)?;
         }
         let marker = byte[0];
         if marker == 0xd9 || marker == 0xda {
@@ -1437,7 +1671,7 @@ fn jpeg_dimensions(path: &Path) -> Result<(u32, u32)> {
         }
 
         let mut len_buf = [0u8; 2];
-        file.read_exact(&mut len_buf)?;
+        crate::util::_openslide_fread_exact(&mut file, &mut len_buf)?;
         let segment_len = u16::from_be_bytes(len_buf);
         if segment_len < 2 {
             return Err(OpenSlideError::Format("Invalid JPEG segment length".into()));
@@ -1461,12 +1695,16 @@ fn jpeg_dimensions(path: &Path) -> Result<(u32, u32)> {
                 return Err(OpenSlideError::Format("Short JPEG SOF segment".into()));
             }
             let mut dims = [0u8; 5];
-            file.read_exact(&mut dims)?;
+            crate::util::_openslide_fread_exact(&mut file, &mut dims)?;
             let height = u16::from_be_bytes([dims[1], dims[2]]) as u32;
             let width = u16::from_be_bytes([dims[3], dims[4]]) as u32;
             return Ok((width, height));
         }
-        file.seek(SeekFrom::Current(i64::from(segment_len - 2)))?;
+        crate::util::_openslide_fseek(
+            &mut file,
+            i64::from(segment_len - 2),
+            crate::util::OpenSlideSeekWhence::Cur,
+        )?;
     }
 }
 
@@ -1475,90 +1713,6 @@ fn detect_associated_image_format(data: &[u8]) -> Option<ImageFormat> {
         Some(ImageFormat::Jpeg)
     } else {
         None
-    }
-}
-
-fn read_file_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
-    let end = offset.checked_add(len).ok_or_else(|| {
-        OpenSlideError::Format(format!(
-            "File range overflows: offset={}, len={}",
-            offset, len
-        ))
-    })?;
-    if end > file_len {
-        return Err(OpenSlideError::Format(format!(
-            "File range extends outside file: offset={}, len={}, file_len={}",
-            offset, len, file_len
-        )));
-    }
-    file.seek(SeekFrom::Start(offset))?;
-    let mut data = vec![0u8; len as usize];
-    file.read_exact(&mut data)?;
-    Ok(data)
-}
-
-struct OpenslideHash {
-    sha256: Sha256,
-    enabled: bool,
-}
-
-impl OpenslideHash {
-    fn openslide_hash_quickhash1_create() -> Self {
-        Self {
-            sha256: Sha256::new(),
-            enabled: true,
-        }
-    }
-
-    fn openslide_hash_data(&mut self, data: &[u8]) {
-        if self.enabled && !data.is_empty() {
-            self.sha256.update(data);
-        }
-    }
-
-    fn openslide_hash_string(&mut self, value: Option<&str>) {
-        self.openslide_hash_data(value.unwrap_or("").as_bytes());
-        self.openslide_hash_data(&[0]);
-    }
-
-    fn openslide_hash_file_part(&mut self, filename: &Path, offset: u64, size: u64) -> Result<()> {
-        if !self.enabled || size == 0 {
-            return Ok(());
-        }
-        let mut file = File::open(filename)?;
-        let file_len = file.metadata()?.len();
-        let end = offset.checked_add(size).ok_or_else(|| {
-            OpenSlideError::Format(format!(
-                "File range overflows: offset={}, len={}",
-                offset, size
-            ))
-        })?;
-        if end > file_len {
-            return Err(OpenSlideError::Format(format!(
-                "File range extends outside file: offset={}, len={}, file_len={}",
-                offset, size, file_len
-            )));
-        }
-        file.seek(SeekFrom::Start(offset))?;
-        let mut bytes_left = size;
-        let mut buf = [0u8; 4096];
-        while bytes_left > 0 {
-            let to_read = buf.len().min(bytes_left as usize);
-            file.read_exact(&mut buf[..to_read])?;
-            self.openslide_hash_data(&buf[..to_read]);
-            bytes_left -= to_read as u64;
-        }
-        Ok(())
-    }
-
-    fn openslide_hash_disable(&mut self) {
-        self.enabled = false;
-    }
-
-    fn openslide_hash_get_string(self) -> Option<String> {
-        self.enabled.then(|| self.sha256.finalize_hex())
     }
 }
 
@@ -1624,7 +1778,13 @@ fn store_and_hash_properties(
     props: &mut HashMap<String, String>,
     quickhash1: &mut OpenslideHash,
 ) {
-    store_string_property(tiff, dir, props, "openslide.comment", TAG_IMAGEDESCRIPTION);
+    store_string_property(
+        tiff,
+        dir,
+        props,
+        properties::PROPERTY_COMMENT,
+        TAG_IMAGEDESCRIPTION,
+    );
     store_and_hash_string_property(
         tiff,
         dir,
@@ -1715,129 +1875,6 @@ fn hash_tiff_level(hash: &mut OpenslideHash, tiff: &TiffFile, dir: usize) -> Res
     Ok(())
 }
 
-struct Sha256 {
-    state: [u32; 8],
-    buffer: [u8; 64],
-    buffer_len: usize,
-    bit_len: u64,
-}
-
-impl Sha256 {
-    fn new() -> Self {
-        Self {
-            state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-                0x5be0cd19,
-            ],
-            buffer: [0; 64],
-            buffer_len: 0,
-            bit_len: 0,
-        }
-    }
-
-    fn update(&mut self, mut data: &[u8]) {
-        self.bit_len = self.bit_len.wrapping_add((data.len() as u64) * 8);
-        if self.buffer_len != 0 {
-            let needed = 64 - self.buffer_len;
-            let take = needed.min(data.len());
-            self.buffer[self.buffer_len..self.buffer_len + take].copy_from_slice(&data[..take]);
-            self.buffer_len += take;
-            data = &data[take..];
-            if self.buffer_len == 64 {
-                let block = self.buffer;
-                self.compress(&block);
-                self.buffer_len = 0;
-            }
-        }
-        while data.len() >= 64 {
-            self.compress(&data[..64]);
-            data = &data[64..];
-        }
-        if !data.is_empty() {
-            self.buffer[..data.len()].copy_from_slice(data);
-            self.buffer_len = data.len();
-        }
-    }
-
-    fn finalize_hex(mut self) -> String {
-        self.buffer[self.buffer_len] = 0x80;
-        self.buffer_len += 1;
-        if self.buffer_len > 56 {
-            self.buffer[self.buffer_len..].fill(0);
-            let block = self.buffer;
-            self.compress(&block);
-            self.buffer_len = 0;
-        }
-        self.buffer[self.buffer_len..56].fill(0);
-        self.buffer[56..64].copy_from_slice(&self.bit_len.to_be_bytes());
-        let block = self.buffer;
-        self.compress(&block);
-
-        let mut out = String::with_capacity(64);
-        for word in self.state {
-            out.push_str(&format!("{word:08x}"));
-        }
-        out
-    }
-
-    fn compress(&mut self, block: &[u8]) {
-        const K: [u32; 64] = [
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-            0xc67178f2,
-        ];
-        let mut w = [0u32; 64];
-        for (i, chunk) in block.chunks_exact(4).take(16).enumerate() {
-            w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        self.state[0] = self.state[0].wrapping_add(a);
-        self.state[1] = self.state[1].wrapping_add(b);
-        self.state[2] = self.state[2].wrapping_add(c);
-        self.state[3] = self.state[3].wrapping_add(d);
-        self.state[4] = self.state[4].wrapping_add(e);
-        self.state[5] = self.state[5].wrapping_add(f);
-        self.state[6] = self.state[6].wrapping_add(g);
-        self.state[7] = self.state[7].wrapping_add(h);
-    }
-}
-
 fn inflate_tiff_deflate(raw: &[u8]) -> Result<Vec<u8>> {
     let mut inflated = Vec::new();
     match ZlibDecoder::new(raw).read_to_end(&mut inflated) {
@@ -1863,7 +1900,7 @@ fn read_trestle_tile_with_tiff_crate(
     width: u32,
     height: u32,
 ) -> Result<CachedTile> {
-    let mut decoder = ::tiff::decoder::Decoder::new(File::open(path)?)
+    let mut decoder = ::tiff::decoder::Decoder::new(crate::util::_openslide_fopen_std(path)?)
         .map_err(|err| OpenSlideError::Decode(format!("TIFF decoder setup failed: {err}")))?;
     decoder
         .seek_to_image(dir_index)
@@ -1951,21 +1988,16 @@ fn read_trestle_planar_tile_with_tiff_crate(
     level: &TrestleLevel,
     tile_no: u64,
 ) -> Result<CachedTile> {
-    let mut decoder = ::tiff::decoder::Decoder::new(File::open(path)?)
+    let mut decoder = ::tiff::decoder::Decoder::new(crate::util::_openslide_fopen_std(path)?)
         .map_err(|err| OpenSlideError::Decode(format!("TIFF decoder setup failed: {err}")))?;
     decoder
         .seek_to_image(dir_index)
         .map_err(|err| OpenSlideError::Decode(format!("TIFF directory seek failed: {err}")))?;
-    let bits_per_sample = level.bits_per_sample[0];
-    if bits_per_sample != 8 && bits_per_sample != 16 {
-        return Err(OpenSlideError::Decode(
-            "Unsupported planar Trestle LZW TIFF sample depth".into(),
-        ));
-    }
     let tiles_per_plane = level.tiles_across * level.tiles_down;
     let pixel_count = level.tile_width as usize * level.tile_height as usize;
     let mut rgb = vec![0; pixel_count * 3];
     for sample in 0..usize::from(level.samples_per_pixel.min(3)) {
+        let bytes_per_sample = level.bytes_per_sample_for_sample(sample)?;
         let chunk_index_u64 = sample as u64 * tiles_per_plane + tile_no;
         if level.tile_byte_counts[chunk_index_u64 as usize] == 0 {
             continue;
@@ -1976,6 +2008,18 @@ fn read_trestle_planar_tile_with_tiff_crate(
             OpenSlideError::Decode(format!("TIFF planar LZW chunk decode failed: {err}"))
         })?;
         match &image {
+            ::tiff::decoder::DecodingResult::U8(_) if bytes_per_sample != 1 => {
+                return Err(OpenSlideError::Decode(format!(
+                    "Trestle planar TIFF sample {} returned 8-bit data for {}-byte samples",
+                    sample, bytes_per_sample
+                )));
+            }
+            ::tiff::decoder::DecodingResult::U16(_) if bytes_per_sample != 2 => {
+                return Err(OpenSlideError::Decode(format!(
+                    "Trestle planar TIFF sample {} returned 16-bit data for {}-byte samples",
+                    sample, bytes_per_sample
+                )));
+            }
             ::tiff::decoder::DecodingResult::U8(data) if data.len() < pixel_count => {
                 return Err(OpenSlideError::Decode(
                     "Decoded Trestle planar TIFF chunk is truncated".into(),
@@ -2017,12 +2061,8 @@ fn decode_uncompressed_tile(level: &TrestleLevel, raw: &[u8]) -> Result<CachedTi
     let width = level.tile_width;
     let height = level.tile_height;
     let samples = usize::from(level.samples_per_pixel);
-    let bytes_per_sample = level.bytes_per_sample()?;
     let pixel_count = width as usize * height as usize;
-    let expected = pixel_count
-        .checked_mul(samples)
-        .and_then(|samples| samples.checked_mul(bytes_per_sample))
-        .ok_or_else(|| OpenSlideError::Decode("TIFF tile byte count overflow".into()))?;
+    let expected = expected_tile_bytes(level)?;
     if raw.len() < expected {
         return Err(OpenSlideError::Decode(format!(
             "TIFF tile data truncated: expected at least {} bytes, got {}",
@@ -2061,18 +2101,17 @@ fn decode_uncompressed_tile(level: &TrestleLevel, raw: &[u8]) -> Result<CachedTi
             }
         }
         PHOTOMETRIC_YCBCR => {
-            if bytes_per_sample != 1 {
-                return Err(OpenSlideError::UnsupportedFormat(
-                    "Trestle 16-bit YCbCr TIFF tiles are not supported".into(),
-                ));
-            }
             if samples < 3 {
                 return Err(OpenSlideError::Decode(
                     "YCbCr TIFF tile has fewer than 3 samples per pixel".into(),
                 ));
             }
-            for pixel in raw[..expected].chunks_exact(samples) {
-                rgb.extend_from_slice(&ycbcr_to_rgb(pixel[0], pixel[1], pixel[2]));
+            for idx in 0..pixel_count {
+                rgb.extend_from_slice(&ycbcr_to_rgb(
+                    level.sample(raw, idx, 0)?,
+                    level.sample(raw, idx, 1)?,
+                    level.sample(raw, idx, 2)?,
+                ));
             }
         }
         other => {
@@ -2100,11 +2139,6 @@ fn decode_separate_tile(
     {
         return read_trestle_planar_tile_with_tiff_crate(path, dir_index, level, tile_no);
     }
-    if level.compression == COMPRESSION_JPEG {
-        return Err(OpenSlideError::UnsupportedFormat(
-            "Planar separate Trestle JPEG TIFF tiles are not supported".into(),
-        ));
-    }
     if level.samples_per_pixel < 3
         && matches!(level.photometric, PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR)
     {
@@ -2117,16 +2151,40 @@ fn decode_separate_tile(
     let tiles_per_plane = level.tiles_across * level.tiles_down;
     let sample_count = usize::from(level.samples_per_pixel);
     let mut planes = Vec::with_capacity(sample_count);
+    let mut plane_bytes_per_sample = Vec::with_capacity(sample_count);
     for sample in 0..sample_count {
+        let bytes_per_sample = level.bytes_per_sample_for_sample(sample)?;
+        if matches!(level.compression, COMPRESSION_OLD_JPEG | COMPRESSION_JPEG)
+            && bytes_per_sample != 1
+        {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "Planar separate Trestle JPEG TIFF sample {} requires 8-bit samples",
+                sample
+            )));
+        }
+        let expected_plane_bytes = pixel_count.checked_mul(bytes_per_sample).ok_or_else(|| {
+            OpenSlideError::Decode("Trestle TIFF plane byte count overflow".into())
+        })?;
         let index = sample as u64 * tiles_per_plane + tile_no;
         let byte_count = level.tile_byte_counts[index as usize];
+        let mut min_plane_bytes = expected_plane_bytes;
+        let mut decoded_bytes_per_sample = bytes_per_sample;
         let plane = if byte_count == 0 {
-            vec![0; pixel_count]
+            vec![0; expected_plane_bytes]
         } else {
             let raw = read_file_range(path, level.tile_offsets[index as usize], byte_count)?;
             match level.compression {
+                COMPRESSION_OLD_JPEG => {
+                    decode_planar_old_jpeg_plane(path, level, &raw, sample, pixel_count)?
+                }
+                COMPRESSION_JPEG => decode_planar_jpeg_plane(level, &raw, sample, pixel_count)?,
+                COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+                    decoded_bytes_per_sample = 1;
+                    min_plane_bytes = pixel_count;
+                    decode_planar_jpeg2000_plane(level, &raw, sample, tile_no, pixel_count)?
+                }
                 COMPRESSION_NONE => raw,
-                COMPRESSION_PACKBITS => unpack_packbits(&raw, pixel_count)?,
+                COMPRESSION_PACKBITS => unpack_packbits(&raw, expected_plane_bytes)?,
                 COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => inflate_tiff_deflate(&raw)?,
                 other => {
                     return Err(OpenSlideError::UnsupportedFormat(format!(
@@ -2136,41 +2194,48 @@ fn decode_separate_tile(
                 }
             }
         };
-        if plane.len() < pixel_count {
+        if plane.len() < min_plane_bytes {
             return Err(OpenSlideError::Decode(format!(
                 "Planar Trestle TIFF tile sample {} truncated: expected at least {} bytes, got {}",
                 sample,
-                pixel_count,
+                min_plane_bytes,
                 plane.len()
             )));
         }
         planes.push(plane);
+        plane_bytes_per_sample.push(decoded_bytes_per_sample);
     }
 
     let mut rgb = Vec::with_capacity(pixel_count * 3);
     match level.photometric {
         PHOTOMETRIC_BLACK_IS_ZERO => {
-            for &gray in planes[0].iter().take(pixel_count) {
+            for idx in 0..pixel_count {
+                let gray = level.planar_sample(&planes[0], idx, plane_bytes_per_sample[0])?;
                 rgb.extend_from_slice(&[gray, gray, gray]);
             }
         }
         PHOTOMETRIC_WHITE_IS_ZERO => {
-            for &gray in planes[0].iter().take(pixel_count) {
+            for idx in 0..pixel_count {
+                let gray = level.planar_sample(&planes[0], idx, plane_bytes_per_sample[0])?;
                 let gray = 255u8.saturating_sub(gray);
                 rgb.extend_from_slice(&[gray, gray, gray]);
             }
         }
         PHOTOMETRIC_RGB => {
             for idx in 0..pixel_count {
-                rgb.extend_from_slice(&[planes[0][idx], planes[1][idx], planes[2][idx]]);
+                rgb.extend_from_slice(&[
+                    level.planar_sample(&planes[0], idx, plane_bytes_per_sample[0])?,
+                    level.planar_sample(&planes[1], idx, plane_bytes_per_sample[1])?,
+                    level.planar_sample(&planes[2], idx, plane_bytes_per_sample[2])?,
+                ]);
             }
         }
         PHOTOMETRIC_YCBCR => {
             for idx in 0..pixel_count {
                 rgb.extend_from_slice(&ycbcr_to_rgb(
-                    planes[0][idx],
-                    planes[1][idx],
-                    planes[2][idx],
+                    level.planar_sample(&planes[0], idx, plane_bytes_per_sample[0])?,
+                    level.planar_sample(&planes[1], idx, plane_bytes_per_sample[1])?,
+                    level.planar_sample(&planes[2], idx, plane_bytes_per_sample[2])?,
                 ));
             }
         }
@@ -2189,13 +2254,203 @@ fn decode_separate_tile(
     })
 }
 
+fn decode_planar_old_jpeg_plane(
+    path: &Path,
+    level: &TrestleLevel,
+    raw: &[u8],
+    sample: usize,
+    expected_samples: usize,
+) -> Result<Vec<u8>> {
+    let jpeg = old_jpeg_planar_interchange_stream(path, level, raw, sample)?;
+    let (rgb, width, height) = decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?;
+    if width as usize * height as usize != expected_samples {
+        return Err(OpenSlideError::Decode(format!(
+            "Planar Trestle old-JPEG sample {} decoded to {}x{}, expected {} samples",
+            sample, width, height, expected_samples
+        )));
+    }
+    let mut plane = Vec::with_capacity(expected_samples);
+    for pixel in rgb.chunks_exact(3).take(expected_samples) {
+        plane.push(pixel[0]);
+    }
+    Ok(plane)
+}
+
+fn old_jpeg_planar_interchange_stream(
+    path: &Path,
+    level: &TrestleLevel,
+    entropy: &[u8],
+    sample: usize,
+) -> Result<Vec<u8>> {
+    if starts_with_soi(entropy) {
+        return Ok(entropy.to_vec());
+    }
+    if level.planar_config != PLANARCONFIG_SEPARATE {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Trestle old-JPEG planar helper requires separate planes".into(),
+        ));
+    }
+    if level.bytes_per_sample()? != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Trestle old-JPEG planar tiles require 8-bit samples".into(),
+        ));
+    }
+    if !matches!(level.photometric, PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Trestle old-JPEG planar photometric interpretation {}",
+            level.photometric
+        )));
+    }
+    let tables = level.old_jpeg.as_ref().ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat("Trestle old-JPEG tables are missing".into())
+    })?;
+    if tables.proc != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Trestle old-JPEG processing mode {}",
+            tables.proc
+        )));
+    }
+    if tables.q_tables.len() <= sample
+        || tables.dc_tables.len() <= sample
+        || tables.ac_tables.len() <= sample
+    {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Trestle old-JPEG planar sample {} has no matching Q/DC/AC table",
+            sample
+        )));
+    }
+
+    let jpeg_width = u16::try_from(level.tile_width).map_err(|_| {
+        OpenSlideError::UnsupportedFormat(
+            "Trestle old-JPEG planar width exceeds JPEG limits".into(),
+        )
+    })?;
+    let jpeg_height = u16::try_from(level.tile_height).map_err(|_| {
+        OpenSlideError::UnsupportedFormat(
+            "Trestle old-JPEG planar height exceeds JPEG limits".into(),
+        )
+    })?;
+
+    let mut jpeg = Vec::with_capacity(entropy.len() + 512);
+    jpeg.extend_from_slice(&[0xff, 0xd8]);
+    let table = read_file_range(path, tables.q_tables[sample], 64)?;
+    write_jpeg_marker_segment(&mut jpeg, 0xdb, 3 + table.len())?;
+    jpeg.push(sample as u8);
+    jpeg.extend_from_slice(&table);
+
+    write_jpeg_marker_segment(&mut jpeg, 0xc0, 11)?;
+    jpeg.push(8);
+    jpeg.extend_from_slice(&jpeg_height.to_be_bytes());
+    jpeg.extend_from_slice(&jpeg_width.to_be_bytes());
+    jpeg.push(1);
+    jpeg.push(1);
+    jpeg.push(0x11);
+    jpeg.push(sample as u8);
+
+    write_old_jpeg_huffman_table(path, &mut jpeg, false, sample, tables.dc_tables[sample])?;
+    write_old_jpeg_huffman_table(path, &mut jpeg, true, sample, tables.ac_tables[sample])?;
+    if let Some(interval) = tables.restart_interval {
+        write_jpeg_marker_segment(&mut jpeg, 0xdd, 4)?;
+        jpeg.extend_from_slice(&interval.to_be_bytes());
+    }
+
+    write_jpeg_marker_segment(&mut jpeg, 0xda, 8)?;
+    jpeg.push(1);
+    jpeg.push(1);
+    jpeg.push(((sample as u8) << 4) | sample as u8);
+    jpeg.extend_from_slice(&[0, 63, 0]);
+    jpeg.extend_from_slice(entropy);
+    if !entropy.ends_with(&[0xff, 0xd9]) {
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+    }
+    Ok(jpeg)
+}
+
+fn decode_planar_jpeg_plane(
+    level: &TrestleLevel,
+    raw: &[u8],
+    sample: usize,
+    expected_samples: usize,
+) -> Result<Vec<u8>> {
+    let (rgb, width, height) = if let Some(tables) = level.jpeg_tables.as_deref() {
+        decode::decode_tiff_bgra_rgb_region(
+            ImageFormat::Jpeg,
+            raw,
+            Some(tables),
+            0,
+            0,
+            level.tile_width,
+            level.tile_height,
+            jpeg_color_space(level.photometric),
+        )?
+    } else {
+        decode::decode_rgb_libjpeg(ImageFormat::Jpeg, raw)?
+    };
+    if width as usize * height as usize != expected_samples {
+        return Err(OpenSlideError::Decode(format!(
+            "Planar Trestle JPEG sample {} decoded to {}x{}, expected {} samples",
+            sample, width, height, expected_samples
+        )));
+    }
+    let mut plane = Vec::with_capacity(expected_samples);
+    for pixel in rgb.chunks_exact(3).take(expected_samples) {
+        plane.push(pixel[0]);
+    }
+    Ok(plane)
+}
+
+fn decode_planar_jpeg2000_plane(
+    level: &TrestleLevel,
+    raw: &[u8],
+    sample: usize,
+    tile_no: u64,
+    expected_samples: usize,
+) -> Result<Vec<u8>> {
+    let colorspace = match level.compression {
+        COMPRESSION_JP2K_YCBCR => "YCbCr",
+        COMPRESSION_JP2K_RGB => "RGB",
+        _ => "unspecified",
+    };
+    let context = format!(
+        "Planar Trestle JPEG 2000 ({colorspace}) sample {sample} compression {} expected {}x{} plane",
+        level.compression, level.tile_width, level.tile_height
+    );
+    let gray = decode::default_decoder_api().decode_jpeg2000_gray(
+        raw,
+        decode::jpeg2000::Jpeg2000DecodeOptions::new(
+            level.tile_width,
+            level.tile_height,
+            1,
+            decode::jpeg2000::Jpeg2000OutputFormat::Gray { channel: 0 },
+            &context,
+        )
+        .with_source(decode::jpeg2000::Jpeg2000DecodeSource::TiffTile)
+        .with_tile(decode::jpeg2000::Jpeg2000TileContext {
+            tile_x: (tile_no % level.tiles_across) as u32,
+            tile_y: (tile_no / level.tiles_across) as u32,
+            tile_width: level.tile_width,
+            tile_height: level.tile_height,
+        }),
+    )?;
+    if gray.width as usize * gray.height as usize != expected_samples {
+        return Err(OpenSlideError::Decode(format!(
+            "Planar Trestle JPEG 2000 sample {} decoded to {}x{}, expected {} samples",
+            sample, gray.width, gray.height, expected_samples
+        )));
+    }
+    Ok(gray.data)
+}
+
 fn expected_tile_bytes(level: &TrestleLevel) -> Result<usize> {
-    let bytes_per_sample = level.bytes_per_sample()?;
+    let bytes_per_pixel = level
+        .contiguous_sample_bytes()?
+        .into_iter()
+        .try_fold(0u32, |acc, bytes| acc.checked_add(u32::from(bytes)))
+        .ok_or_else(|| OpenSlideError::Decode("TIFF tile byte count overflow".into()))?;
     level
         .tile_width
         .checked_mul(level.tile_height)
-        .and_then(|pixels| pixels.checked_mul(u32::from(level.samples_per_pixel)))
-        .and_then(|samples| samples.checked_mul(bytes_per_sample as u32))
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
         .map(|bytes| bytes as usize)
         .ok_or_else(|| OpenSlideError::Decode("TIFF tile byte count overflow".into()))
 }
@@ -2240,6 +2495,130 @@ fn unpack_packbits(raw: &[u8], expected_len: usize) -> Result<Vec<u8>> {
     }
     out.truncate(expected_len);
     Ok(out)
+}
+
+fn old_jpeg_interchange_stream(
+    path: &Path,
+    level: &TrestleLevel,
+    entropy: &[u8],
+) -> Result<Vec<u8>> {
+    if starts_with_soi(entropy) {
+        return Ok(entropy.to_vec());
+    }
+    if level.planar_config != PLANARCONFIG_CONTIG {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Trestle old-JPEG planar separate tiles are not supported".into(),
+        ));
+    }
+    if level.bytes_per_sample()? != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Trestle old-JPEG tiles require 8-bit samples".into(),
+        ));
+    }
+    if !matches!(level.photometric, PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Trestle old-JPEG photometric interpretation {}",
+            level.photometric
+        )));
+    }
+    let tables = level.old_jpeg.as_ref().ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat("Trestle old-JPEG tables are missing".into())
+    })?;
+    if tables.proc != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Trestle old-JPEG processing mode {}",
+            tables.proc
+        )));
+    }
+    let components = usize::from(level.samples_per_pixel.min(3));
+    if components != 3 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Trestle old-JPEG has unsupported SamplesPerPixel {}",
+            level.samples_per_pixel
+        )));
+    }
+    if tables.q_tables.len() < components
+        || tables.dc_tables.len() < components
+        || tables.ac_tables.len() < components
+    {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Trestle old-JPEG table tags have fewer than 3 component tables".into(),
+        ));
+    }
+    let jpeg_width = u16::try_from(level.tile_width).map_err(|_| {
+        OpenSlideError::UnsupportedFormat("Trestle old-JPEG tile width exceeds JPEG limits".into())
+    })?;
+    let jpeg_height = u16::try_from(level.tile_height).map_err(|_| {
+        OpenSlideError::UnsupportedFormat("Trestle old-JPEG tile height exceeds JPEG limits".into())
+    })?;
+
+    let mut jpeg = Vec::with_capacity(entropy.len() + 1024);
+    jpeg.extend_from_slice(&[0xff, 0xd8]);
+    for table_id in 0..components {
+        let table = read_file_range(path, tables.q_tables[table_id], 64)?;
+        write_jpeg_marker_segment(&mut jpeg, 0xdb, 3 + table.len())?;
+        jpeg.push(table_id as u8);
+        jpeg.extend_from_slice(&table);
+    }
+    write_jpeg_marker_segment(&mut jpeg, 0xc0, 8 + 3 * components)?;
+    jpeg.push(8);
+    jpeg.extend_from_slice(&jpeg_height.to_be_bytes());
+    jpeg.extend_from_slice(&jpeg_width.to_be_bytes());
+    jpeg.push(components as u8);
+    for component in 0..components {
+        jpeg.push((component + 1) as u8);
+        jpeg.push(0x11);
+        jpeg.push(component as u8);
+    }
+    for table_id in 0..components {
+        write_old_jpeg_huffman_table(path, &mut jpeg, false, table_id, tables.dc_tables[table_id])?;
+        write_old_jpeg_huffman_table(path, &mut jpeg, true, table_id, tables.ac_tables[table_id])?;
+    }
+    if let Some(interval) = tables.restart_interval {
+        write_jpeg_marker_segment(&mut jpeg, 0xdd, 4)?;
+        jpeg.extend_from_slice(&interval.to_be_bytes());
+    }
+    write_jpeg_marker_segment(&mut jpeg, 0xda, 6 + 2 * components)?;
+    jpeg.push(components as u8);
+    for component in 0..components {
+        jpeg.push((component + 1) as u8);
+        jpeg.push(((component as u8) << 4) | component as u8);
+    }
+    jpeg.extend_from_slice(&[0, 63, 0]);
+    jpeg.extend_from_slice(entropy);
+    if !entropy.ends_with(&[0xff, 0xd9]) {
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+    }
+    Ok(jpeg)
+}
+
+fn write_old_jpeg_huffman_table(
+    path: &Path,
+    jpeg: &mut Vec<u8>,
+    ac: bool,
+    table_id: usize,
+    offset: u64,
+) -> Result<()> {
+    let counts = read_file_range(path, offset, 16)?;
+    let symbol_count: usize = counts.iter().map(|&count| usize::from(count)).sum();
+    let symbols = read_file_range(path, offset + 16, symbol_count as u64)?;
+    write_jpeg_marker_segment(jpeg, 0xc4, 3 + counts.len() + symbols.len())?;
+    jpeg.push((u8::from(ac) << 4) | table_id as u8);
+    jpeg.extend_from_slice(&counts);
+    jpeg.extend_from_slice(&symbols);
+    Ok(())
+}
+
+fn write_jpeg_marker_segment(jpeg: &mut Vec<u8>, marker: u8, len: usize) -> Result<()> {
+    let len = u16::try_from(len)
+        .map_err(|_| OpenSlideError::Format("Trestle JPEG marker segment is too large".into()))?;
+    jpeg.extend_from_slice(&[0xff, marker]);
+    jpeg.extend_from_slice(&len.to_be_bytes());
+    Ok(())
+}
+
+fn starts_with_soi(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == 0xff && data[1] == 0xd8
 }
 
 fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
@@ -2397,87 +2776,7 @@ fn unpremultiply_rgba(image: &mut RgbaImage) {
 }
 
 fn format_float(value: f64) -> String {
-    format_g_ascii_dtostr(value)
-}
-
-fn format_g_ascii_dtostr(value: f64) -> String {
-    const PRECISION: usize = 17;
-
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value.is_sign_negative() {
-            "-inf".to_string()
-        } else {
-            "inf".to_string()
-        };
-    }
-    if value == 0.0 {
-        return if value.is_sign_negative() {
-            "-0".to_string()
-        } else {
-            "0".to_string()
-        };
-    }
-
-    let sign = if value.is_sign_negative() { "-" } else { "" };
-    let scientific = format!("{:.*e}", PRECISION - 1, value.abs());
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("Rust scientific formatting always contains exponent");
-    let exponent: i32 = exponent
-        .parse()
-        .expect("Rust scientific exponent is always numeric");
-    let mut digits: String = mantissa.chars().filter(|ch| *ch != '.').collect();
-    while digits.ends_with('0') {
-        digits.pop();
-    }
-    if digits.is_empty() {
-        digits.push('0');
-    }
-
-    if exponent >= -4 && exponent < PRECISION as i32 {
-        let mut out = String::from(sign);
-        let digits_before = exponent + 1;
-        if digits_before <= 0 {
-            out.push_str("0.");
-            for _ in 0..(-digits_before) {
-                out.push('0');
-            }
-            out.push_str(&digits);
-        } else {
-            let digits_before = digits_before as usize;
-            if digits_before >= digits.len() {
-                out.push_str(&digits);
-                for _ in 0..(digits_before - digits.len()) {
-                    out.push('0');
-                }
-            } else {
-                out.push_str(&digits[..digits_before]);
-                out.push('.');
-                out.push_str(&digits[digits_before..]);
-            }
-        }
-        out
-    } else {
-        let mut out = String::from(sign);
-        let mut chars = digits.chars();
-        out.push(chars.next().unwrap());
-        let rest: String = chars.collect();
-        if !rest.is_empty() {
-            out.push('.');
-            out.push_str(&rest);
-        }
-        out.push('e');
-        if exponent < 0 {
-            out.push('-');
-        } else {
-            out.push('+');
-        }
-        out.push_str(&format!("{:02}", exponent.abs()));
-        out
-    }
+    crate::util::_openslide_format_double(value)
 }
 
 #[cfg(test)]
@@ -2561,13 +2860,13 @@ mod tests {
     }
 
     #[test]
-    fn formats_tiff_floats_like_g_ascii_dtostr() {
+    fn formats_tiff_floats_through_shared_openslide_formatter() {
         assert_eq!(format_float(25.0), "25");
         assert_eq!(format_float(1.0 / 3.0), "0.33333333333333331");
         assert_eq!(format_float(1.2345678901234567), "1.2345678901234567");
         assert_eq!(
             format_float(0.000012345678901234567),
-            "1.2345678901234568e-05"
+            "1.2345678901234568e-5"
         );
         assert_eq!(format_float(123456789012345670.0), "1.2345678901234566e+17");
     }
@@ -2605,7 +2904,7 @@ mod tests {
 
         let path = temp_path("trestle-lzw-tile.tif");
         {
-            let file = File::create(&path).unwrap();
+            let file = std::fs::File::create(&path).unwrap();
             let mut encoder = TiffEncoder::new(file)
                 .unwrap()
                 .with_compression(Compression::Lzw);
@@ -2639,11 +2938,14 @@ mod tests {
                 tile_offsets: vec![1],
                 tile_byte_counts: vec![1],
                 jpeg_tables: None,
+                old_jpeg: None,
             }],
             properties: HashMap::new(),
-            cache: TileCache::new(),
+            cache: Arc::new(TileCache::new()),
+            cache_binding_id: 1,
             channel_count: 3,
             macro_path: None,
+            macro_dimensions: None,
         };
 
         let tile = slide.decode_tile(0, 0).unwrap();
@@ -2661,7 +2963,7 @@ mod tests {
 
         let path = temp_path("trestle-deflate-predictor.tif");
         {
-            let file = File::create(&path).unwrap();
+            let file = std::fs::File::create(&path).unwrap();
             let mut encoder = TiffEncoder::new(file)
                 .unwrap()
                 .with_compression(Compression::Deflate(DeflateLevel::default()))
@@ -2737,6 +3039,8 @@ mod tests {
 
         let slide = open(&path).unwrap();
         assert_eq!(slide.associated_image_names(), vec!["macro"]);
+        assert_eq!(slide.associated_image_dimensions("macro"), Some((2, 1)));
+        assert_eq!(slide.associated_image_dimensions("missing"), None);
         assert_eq!(
             slide.properties().get("openslide.associated.macro.width"),
             Some(&"2".to_string())
@@ -2751,10 +3055,68 @@ mod tests {
     }
 
     #[test]
+    fn reads_macro_sidecar_through_shared_file_helpers() {
+        let path = temp_path("trestle-sidecar-read.tif");
+        fs::write(&path, make_trestle_tiff_with_software("MedScan 2.0")).unwrap();
+        let mut sidecar = path.clone();
+        sidecar.set_extension("Full");
+        fs::write(&sidecar, ONE_PIXEL_JPEG).unwrap();
+
+        let slide = open(&path).unwrap();
+        let image = slide.read_associated_image("macro").unwrap();
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!(image.data.len(), 4);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(sidecar);
+    }
+
+    #[test]
+    fn trestle_macro_path_matches_openslide_last_dot_string_logic() {
+        let plain = PathBuf::from("/tmp/trestle-slide");
+        assert_eq!(
+            get_associated_path(&plain),
+            Some(PathBuf::from("/tmp/trestle-slide.Full"))
+        );
+
+        let dotted_parent = PathBuf::from("/tmp/trestle.dir/slide");
+        assert_eq!(
+            get_associated_path(&dotted_parent),
+            Some(PathBuf::from("/tmp/trestle.Full"))
+        );
+    }
+
+    #[test]
+    fn ignores_macro_sidecar_without_jpeg_dimensions_like_upstream() {
+        let path = temp_path("trestle-sidecar-truncated-jpeg.tif");
+        fs::write(&path, make_trestle_tiff_with_software("MedScan 2.0")).unwrap();
+        let mut sidecar = path.clone();
+        sidecar.set_extension("Full");
+        fs::write(&sidecar, [0xff, 0xd8, 0xff]).unwrap();
+
+        let slide = open(&path).unwrap();
+        assert!(slide.associated_image_names().is_empty());
+        assert!(slide
+            .properties()
+            .get("openslide.associated.macro.width")
+            .is_none());
+        assert!(slide
+            .properties()
+            .get("openslide.associated.macro.height")
+            .is_none());
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(sidecar);
+    }
+
+    #[test]
     fn parses_trestle_overlap_like_c_space_split() {
         let tiff = empty_tiff_file();
         let (_props, overlaps) = parse_trestle_image_description("OverlapsXY=1, 2 3 4", &tiff);
         assert_eq!(overlaps, vec![(0, 2), (3, 4)]);
+
+        let (_props, overlaps) = parse_trestle_image_description("OverlapsXY= +1 -1 3 4 ", &tiff);
+        assert_eq!(overlaps, vec![(1, -1), (3, 4)]);
     }
 
     #[test]
@@ -2788,10 +3150,209 @@ mod tests {
         let props = add_properties("Objective Power=20X;Background Color=00ffee", &tiff);
 
         assert_eq!(props.get(properties::PROPERTY_OBJECTIVE_POWER), None);
-        assert_eq!(objective_power_value("40"), Some("40"));
-        assert_eq!(objective_power_value("40x"), None);
-        assert_eq!(objective_power_value("20.5"), None);
-        assert_eq!(objective_power_value("Plan Apo 20X"), None);
+
+        let mut props = HashMap::new();
+        for (input, expected) in [
+            ("40", Some("40")),
+            ("+040", Some("40")),
+            (" \t+040", Some("40")),
+            ("40 ", None),
+            ("40x", None),
+            ("20.5", None),
+            ("Plan Apo 20X", None),
+        ] {
+            props.clear();
+            props.insert("trestle.Objective Power".into(), input.into());
+            crate::util::_openslide_duplicate_int_prop(
+                &mut props,
+                "trestle.Objective Power",
+                properties::PROPERTY_OBJECTIVE_POWER,
+            );
+            assert_eq!(
+                props
+                    .get(properties::PROPERTY_OBJECTIVE_POWER)
+                    .map(String::as_str),
+                expected,
+                "{input}"
+            );
+        }
+
+        props.insert(
+            properties::PROPERTY_OBJECTIVE_POWER.into(),
+            "existing".into(),
+        );
+        props.insert("trestle.Objective Power".into(), "40".into());
+        crate::util::_openslide_duplicate_int_prop(
+            &mut props,
+            "trestle.Objective Power",
+            properties::PROPERTY_OBJECTIVE_POWER,
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_OBJECTIVE_POWER),
+            Some(&"existing".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_trestle_description_empty_keys_and_background_like_upstream() {
+        let tiff = empty_tiff_file();
+        let props = add_properties(
+            "=orphan; Background Color=10000ffee;Bad;Trailing = value=kept",
+            &tiff,
+        );
+
+        assert_eq!(props.get("trestle."), Some(&"orphan".to_string()));
+        assert_eq!(
+            props.get("trestle.Background Color"),
+            Some(&"10000ffee".to_string())
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_BACKGROUND_COLOR),
+            Some(&"00FFEE".to_string())
+        );
+        assert_eq!(
+            props.get("trestle.Trailing"),
+            Some(&"value=kept".to_string())
+        );
+
+        let signed = add_properties("Background Color= +10000ffee", &tiff);
+        assert_eq!(
+            signed.get(properties::PROPERTY_BACKGROUND_COLOR),
+            Some(&"00FFEE".to_string())
+        );
+        let negative = add_properties("Background Color=-1", &tiff);
+        assert_eq!(
+            negative.get(properties::PROPERTY_BACKGROUND_COLOR),
+            Some(&"FFFFFF".to_string())
+        );
+
+        let invalid = add_properties("Background Color=#00ffee", &tiff);
+        assert_eq!(invalid.get(properties::PROPERTY_BACKGROUND_COLOR), None);
+    }
+
+    #[test]
+    fn duplicates_trestle_tiff_resolution_like_upstream_double_prop() {
+        let mut props = HashMap::from([("tiff.XResolution".to_string(), "0,2500".to_string())]);
+        crate::util::_openslide_duplicate_double_prop(
+            &mut props,
+            "tiff.XResolution",
+            properties::PROPERTY_MPP_X,
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_MPP_X),
+            Some(&"0.25".to_string())
+        );
+
+        props.insert(properties::PROPERTY_MPP_X.into(), "existing".to_string());
+        props.insert("tiff.XResolution".to_string(), " \t+0,5000".to_string());
+        crate::util::_openslide_duplicate_double_prop(
+            &mut props,
+            "tiff.XResolution",
+            properties::PROPERTY_MPP_X,
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_MPP_X),
+            Some(&"existing".to_string())
+        );
+
+        props.remove(properties::PROPERTY_MPP_X);
+        crate::util::_openslide_duplicate_double_prop(
+            &mut props,
+            "tiff.XResolution",
+            properties::PROPERTY_MPP_X,
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_MPP_X),
+            Some(&"0.5".to_string())
+        );
+        props.insert("tiff.XResolution".to_string(), "0,7500 ".to_string());
+        crate::util::_openslide_duplicate_double_prop(
+            &mut props,
+            "tiff.XResolution",
+            properties::PROPERTY_MPP_X,
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_MPP_X),
+            Some(&"0.5".to_string())
+        );
+
+        props.remove(properties::PROPERTY_MPP_X);
+        props.insert("tiff.XResolution".to_string(), "inf".to_string());
+        crate::util::_openslide_duplicate_double_prop(
+            &mut props,
+            "tiff.XResolution",
+            properties::PROPERTY_MPP_X,
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_MPP_X),
+            Some(&"inf".to_string())
+        );
+
+        props.insert("tiff.XResolution".to_string(), "NaN".to_string());
+        crate::util::_openslide_duplicate_double_prop(
+            &mut props,
+            "tiff.XResolution",
+            properties::PROPERTY_MPP_X,
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_MPP_X),
+            Some(&"inf".to_string())
+        );
+
+        props.insert("tiff.XResolution".to_string(), "1e9999".to_string());
+        crate::util::_openslide_duplicate_double_prop(
+            &mut props,
+            "tiff.XResolution",
+            properties::PROPERTY_MPP_X,
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_MPP_X),
+            Some(&"inf".to_string())
+        );
+
+        props.insert("tiff.XResolution".to_string(), "1e-9999".to_string());
+        crate::util::_openslide_duplicate_double_prop(
+            &mut props,
+            "tiff.XResolution",
+            properties::PROPERTY_MPP_X,
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_MPP_X),
+            Some(&"inf".to_string())
+        );
+    }
+
+    #[test]
+    fn decodes_contiguous_mixed_bits_per_sample_tile() {
+        let level = TrestleLevel {
+            width: 2,
+            height: 1,
+            stored_width: 2,
+            stored_height: 1,
+            downsample: 1.0,
+            tile_width: 2,
+            tile_height: 1,
+            tile_advance_x: 2.0,
+            tile_advance_y: 1.0,
+            tiles_across: 1,
+            tiles_down: 1,
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 16, 8],
+            planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
+            endian: Endian::Little,
+            tile_offsets: vec![0],
+            tile_byte_counts: vec![8],
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let tile =
+            decode_uncompressed_tile(&level, &[10, 0x34, 0x12, 30, 40, 0xcd, 0xab, 60]).unwrap();
+
+        assert_eq!(tile.rgb, vec![10, 0x12, 30, 40, 0xab, 60]);
     }
 
     #[test]
@@ -2829,6 +3390,7 @@ mod tests {
             tile_offsets: vec![0, 4, 8],
             tile_byte_counts: vec![4, 4, 4],
             jpeg_tables: None,
+            old_jpeg: None,
         };
 
         let tile = decode_separate_tile(&path, 0, &level, 0).unwrap();
@@ -2837,6 +3399,289 @@ mod tests {
         assert_eq!(&tile.rgb[..6], &[100, 100, 100, 150, 150, 150]);
         assert_eq!(&tile.rgb[6..9], &[237, 13, 13]);
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn decodes_planar_separate_16bit_rgb_tile() {
+        let path = temp_path("planar-trestle-rgb16.bin");
+        fs::write(
+            &path,
+            [
+                u16_sample_payload(&[1, 2, 3, 4]).as_slice(),
+                u16_sample_payload(&[10, 20, 30, 40]).as_slice(),
+                u16_sample_payload(&[100, 110, 120, 130]).as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let level = TrestleLevel {
+            width: 2,
+            height: 2,
+            stored_width: 2,
+            stored_height: 2,
+            downsample: 1.0,
+            tile_width: 2,
+            tile_height: 2,
+            tile_advance_x: 2.0,
+            tile_advance_y: 2.0,
+            tiles_across: 1,
+            tiles_down: 1,
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![16, 16, 16],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            endian: Endian::Little,
+            tile_offsets: vec![0, 8, 16],
+            tile_byte_counts: vec![8, 8, 8],
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let tile = decode_separate_tile(&path, 0, &level, 0).unwrap();
+        assert_eq!(
+            tile.rgb,
+            vec![1, 10, 100, 2, 20, 110, 3, 30, 120, 4, 40, 130]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn decodes_planar_separate_mixed_bits_per_sample_tile() {
+        let path = temp_path("planar-trestle-mixed-bits.bin");
+        fs::write(
+            &path,
+            [
+                &[10, 40][..],
+                u16_sample_payload(&[20, 50]).as_slice(),
+                &[30, 60][..],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let level = TrestleLevel {
+            width: 2,
+            height: 1,
+            stored_width: 2,
+            stored_height: 1,
+            downsample: 1.0,
+            tile_width: 2,
+            tile_height: 1,
+            tile_advance_x: 2.0,
+            tile_advance_y: 1.0,
+            tiles_across: 1,
+            tiles_down: 1,
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 16, 8],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            endian: Endian::Little,
+            tile_offsets: vec![0, 2, 6],
+            tile_byte_counts: vec![2, 4, 2],
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let tile = decode_separate_tile(&path, 0, &level, 0).unwrap();
+        assert_eq!(tile.width, 2);
+        assert_eq!(tile.height, 1);
+        assert_eq!(tile.rgb, vec![10, 20, 30, 40, 50, 60]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn decodes_planar_separate_16bit_ycbcr_tile() {
+        let path = temp_path("planar-trestle-ycbcr16.bin");
+        fs::write(
+            &path,
+            [
+                u16_sample_payload(&[76, 150, 80, 10]).as_slice(),
+                u16_sample_payload(&[85, 128, 128, 128]).as_slice(),
+                u16_sample_payload(&[255, 128, 128, 128]).as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let level = TrestleLevel {
+            width: 2,
+            height: 2,
+            stored_width: 2,
+            stored_height: 2,
+            downsample: 1.0,
+            tile_width: 2,
+            tile_height: 2,
+            tile_advance_x: 2.0,
+            tile_advance_y: 2.0,
+            tiles_across: 1,
+            tiles_down: 1,
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_YCBCR,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![16, 16, 16],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            endian: Endian::Little,
+            tile_offsets: vec![0, 8, 16],
+            tile_byte_counts: vec![8, 8, 8],
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let tile = decode_separate_tile(&path, 0, &level, 0).unwrap();
+        assert_eq!(
+            tile.rgb,
+            vec![254, 0, 0, 150, 150, 150, 80, 80, 80, 10, 10, 10]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn decodes_planar_separate_jpeg_tile() {
+        let path = temp_path("planar-trestle-jpeg.bin");
+        fs::write(
+            &path,
+            [ONE_PIXEL_JPEG, ONE_PIXEL_JPEG, ONE_PIXEL_JPEG].concat(),
+        )
+        .unwrap();
+        let (decoded, _, _) =
+            decode::decode_rgb_libjpeg(ImageFormat::Jpeg, ONE_PIXEL_JPEG).unwrap();
+        let expected = decoded[0];
+        let level = TrestleLevel {
+            width: 1,
+            height: 1,
+            stored_width: 1,
+            stored_height: 1,
+            downsample: 1.0,
+            tile_width: 1,
+            tile_height: 1,
+            tile_advance_x: 1.0,
+            tile_advance_y: 1.0,
+            tiles_across: 1,
+            tiles_down: 1,
+            compression: COMPRESSION_JPEG,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            endian: Endian::Little,
+            tile_offsets: vec![
+                0,
+                ONE_PIXEL_JPEG.len() as u64,
+                (ONE_PIXEL_JPEG.len() * 2) as u64,
+            ],
+            tile_byte_counts: vec![ONE_PIXEL_JPEG.len() as u64; 3],
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let tile = decode_separate_tile(&path, 0, &level, 0).unwrap();
+
+        assert_eq!(tile.width, 1);
+        assert_eq!(tile.height, 1);
+        assert_eq!(tile.rgb, vec![expected, expected, expected]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn decodes_planar_separate_old_jpeg_interchange_tile() {
+        let path = temp_path("planar-trestle-old-jpeg.bin");
+        fs::write(
+            &path,
+            [ONE_PIXEL_JPEG, ONE_PIXEL_JPEG, ONE_PIXEL_JPEG].concat(),
+        )
+        .unwrap();
+        let (decoded, _, _) =
+            decode::decode_rgb_libjpeg(ImageFormat::Jpeg, ONE_PIXEL_JPEG).unwrap();
+        let expected = decoded[0];
+        let level = TrestleLevel {
+            width: 1,
+            height: 1,
+            stored_width: 1,
+            stored_height: 1,
+            downsample: 1.0,
+            tile_width: 1,
+            tile_height: 1,
+            tile_advance_x: 1.0,
+            tile_advance_y: 1.0,
+            tiles_across: 1,
+            tiles_down: 1,
+            compression: COMPRESSION_OLD_JPEG,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            endian: Endian::Little,
+            tile_offsets: vec![
+                0,
+                ONE_PIXEL_JPEG.len() as u64,
+                (ONE_PIXEL_JPEG.len() * 2) as u64,
+            ],
+            tile_byte_counts: vec![ONE_PIXEL_JPEG.len() as u64; 3],
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let tile = decode_separate_tile(&path, 0, &level, 0).unwrap();
+
+        assert_eq!(tile.width, 1);
+        assert_eq!(tile.height, 1);
+        assert_eq!(tile.rgb, vec![expected, expected, expected]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn decodes_planar_separate_jpeg2000_tile() {
+        let path = temp_path("planar-trestle-jp2k.bin");
+        let red = encoded_jpeg2000_codestream(&[10, 40, 70, 100], 2, 2, 1);
+        let green = encoded_jpeg2000_codestream(&[20, 50, 80, 110], 2, 2, 1);
+        let blue = encoded_jpeg2000_codestream(&[30, 60, 90, 120], 2, 2, 1);
+        fs::write(
+            &path,
+            [red.as_slice(), green.as_slice(), blue.as_slice()].concat(),
+        )
+        .unwrap();
+        let level = TrestleLevel {
+            width: 2,
+            height: 2,
+            stored_width: 2,
+            stored_height: 2,
+            downsample: 1.0,
+            tile_width: 2,
+            tile_height: 2,
+            tile_advance_x: 2.0,
+            tile_advance_y: 2.0,
+            tiles_across: 1,
+            tiles_down: 1,
+            compression: COMPRESSION_JP2K_RGB,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            endian: Endian::Little,
+            tile_offsets: vec![0, red.len() as u64, (red.len() + green.len()) as u64],
+            tile_byte_counts: vec![red.len() as u64, green.len() as u64, blue.len() as u64],
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let tile = decode_separate_tile(&path, 0, &level, 0).unwrap();
+
+        assert_eq!(tile.width, 2);
+        assert_eq!(tile.height, 2);
+        assert_eq!(
+            tile.rgb,
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -2868,11 +3713,72 @@ mod tests {
             tile_offsets: vec![0],
             tile_byte_counts: vec![raw.len() as u64],
             jpeg_tables: None,
+            old_jpeg: None,
         };
 
         let tile = decode_uncompressed_tile(&level, &raw).unwrap();
         assert_eq!(tile.rgb, vec![1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15]);
     }
+
+    #[test]
+    fn decodes_contiguous_16bit_ycbcr_tile() {
+        let mut raw = Vec::new();
+        for value in [76u16, 85, 255, 150, 128, 128, 80, 128, 128, 10, 128, 128] {
+            raw.extend_from_slice(&(value << 8).to_le_bytes());
+        }
+        let level = TrestleLevel {
+            width: 2,
+            height: 2,
+            stored_width: 2,
+            stored_height: 2,
+            downsample: 1.0,
+            tile_width: 2,
+            tile_height: 2,
+            tile_advance_x: 2.0,
+            tile_advance_y: 2.0,
+            tiles_across: 1,
+            tiles_down: 1,
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_YCBCR,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![16],
+            planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
+            endian: Endian::Little,
+            tile_offsets: vec![0],
+            tile_byte_counts: vec![raw.len() as u64],
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let tile = decode_uncompressed_tile(&level, &raw).unwrap();
+        assert_eq!(
+            tile.rgb,
+            vec![254, 0, 0, 150, 150, 150, 80, 80, 80, 10, 10, 10]
+        );
+    }
+
+    fn u16_sample_payload(values: &[u16]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for value in values {
+            raw.extend_from_slice(&(*value << 8).to_le_bytes());
+        }
+        raw
+    }
+
+    const ONE_PIXEL_JPEG: &[u8] = &[
+        0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07,
+        0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b, 0x0c, 0x19, 0x12,
+        0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20, 0x24, 0x2e, 0x27,
+        0x20, 0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31, 0x34, 0x34, 0x34,
+        0x1f, 0x27, 0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff, 0xc0, 0x00, 0x11,
+        0x08, 0x00, 0x01, 0x00, 0x01, 0x03, 0x52, 0x11, 0x00, 0x47, 0x11, 0x00, 0x42, 0x11, 0x00,
+        0xff, 0xc4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+        0xda, 0x00, 0x0c, 0x03, 0x52, 0x00, 0x47, 0x00, 0x42, 0x00, 0x00, 0x3f, 0x00, 0x7f, 0x3f,
+        0x9f, 0xdf, 0xff, 0xd9,
+    ];
 
     fn trestle_test_slide(
         path: PathBuf,
@@ -2907,11 +3813,14 @@ mod tests {
                 tile_offsets: vec![0],
                 tile_byte_counts: vec![byte_count],
                 jpeg_tables: None,
+                old_jpeg: None,
             }],
             properties: HashMap::new(),
-            cache: TileCache::new(),
+            cache: Arc::new(TileCache::new()),
+            cache_binding_id: 1,
             channel_count: 3,
             macro_path: None,
+            macro_dimensions: None,
         }
     }
 

@@ -18,13 +18,17 @@ use std::path::Path;
 
 static DEFAULT_JPEG2000_DECODER: jpeg2000::DicomToolkitJpeg2000Decoder =
     jpeg2000::DicomToolkitJpeg2000Decoder;
+#[cfg(feature = "jpegxr")]
+static DEFAULT_JPEGXR_DECODER: jpegxr::NativeJpegXrDecoder = jpegxr::NativeJpegXrDecoder;
+#[cfg(not(feature = "jpegxr"))]
 static DEFAULT_JPEGXR_DECODER: jpegxr::NoJpegXrDecoder = jpegxr::NoJpegXrDecoder;
 
 /// Decoder backend selection used by format handlers.
 ///
 /// This keeps unsupported-but-detected codec paths routed through one API
-/// boundary.  The default instance validates requests and reports that no
-/// JPEG XR backend is linked; JPEG 2000 uses the pure-Rust decoder backend.
+/// boundary.  Default builds validate JPEG XR requests and report that no
+/// backend is linked; `jpegxr` builds route JPEG XR to the native
+/// backend. JPEG 2000 uses the pure-Rust decoder backend.
 #[derive(Clone, Copy)]
 pub struct DecoderApi<'a> {
     jpeg2000: &'a dyn jpeg2000::Jpeg2000DecoderBackend,
@@ -90,6 +94,18 @@ impl<'a> DecoderApi<'a> {
         channel: u32,
     ) -> Result<GrayImage> {
         jpegxr::decode_gray_channel_with_backend(request, channel, self.jpegxr)
+    }
+
+    pub fn supports_jpegxr_pixel_format(&self, pixel_format: jpegxr::JpegXrPixelFormat) -> bool {
+        self.jpegxr.supports_pixel_format(pixel_format)
+    }
+
+    pub fn supports_jpegxr_gray_channel(
+        &self,
+        pixel_format: jpegxr::JpegXrPixelFormat,
+        channel: u32,
+    ) -> bool {
+        self.jpegxr.supports_gray_channel(pixel_format, channel)
     }
 }
 
@@ -303,7 +319,7 @@ pub fn decode_channel_region_from_file(
             jpeg::decode_jpeg_channel_region_from_file(path, offset, channel, x, y, w, h)
         }
         _ => {
-            let data = std::fs::read(path)?;
+            let data = read_file_to_end_from_offset(path, offset)?;
             decode_channel_region(format, &data, channel, x, y, w, h)
         }
     }
@@ -321,7 +337,7 @@ pub fn decode_rgb_region_from_file(
     match format {
         ImageFormat::Jpeg => jpeg::decode_jpeg_rgb_region_from_file(path, offset, x, y, w, h),
         _ => {
-            let data = std::fs::read(path)?;
+            let data = read_file_to_end_from_offset(path, offset)?;
             let (rgb, width, height) = decode_rgb(format, &data)?;
             let mut out = vec![0; w as usize * h as usize * 3];
             for row in 0..h.min(height.saturating_sub(y)) {
@@ -333,6 +349,20 @@ pub fn decode_rgb_region_from_file(
             Ok((out, w, h))
         }
     }
+}
+
+fn read_file_to_end_from_offset(path: &Path, offset: u64) -> Result<Vec<u8>> {
+    let mut file = crate::util::_openslide_fopen(path)?;
+    let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+        crate::error::OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+    })?;
+    let len = file_len.checked_sub(offset).ok_or_else(|| {
+        crate::error::OpenSlideError::Format(format!(
+            "Decode offset extends outside file: offset={}, file_len={}",
+            offset, file_len
+        ))
+    })?;
+    crate::util::read_file_range(path, offset, len)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -393,6 +423,7 @@ pub fn decode_sampled_rgb_region_from_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "jpegxr"))]
     use crate::error::OpenSlideError;
 
     struct StubJpegXrDecoder;
@@ -432,6 +463,7 @@ mod tests {
         assert_eq!(gray.data, vec![30]);
     }
 
+    #[cfg(not(feature = "jpegxr"))]
     #[test]
     fn default_decoder_api_preserves_jpegxr_no_backend_error() {
         let err = default_decoder_api()
@@ -452,5 +484,75 @@ mod tests {
         assert!(
             matches!(err, OpenSlideError::UnsupportedFormat(message) if message.contains("facade default JPEG XR pixel decoding is not available"))
         );
+    }
+
+    #[test]
+    fn non_jpeg_file_region_decoders_honor_byte_offset() {
+        let name = format!(
+            "openslide-rs-decode-offset-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(name);
+        let prefix = b"not-a-bmp-prefix";
+        let mut data = prefix.to_vec();
+        data.extend_from_slice(&one_pixel_bmp24([12, 34, 56]));
+        std::fs::write(&path, data).unwrap();
+
+        let (rgb, width, height) =
+            decode_rgb_region_from_file(ImageFormat::Bmp, &path, prefix.len() as u64, 0, 0, 1, 1)
+                .unwrap();
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(rgb, vec![12, 34, 56]);
+
+        let gray = decode_channel_region_from_file(
+            ImageFormat::Bmp,
+            &path,
+            prefix.len() as u64,
+            1,
+            0,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(gray.data, vec![34]);
+
+        let err = decode_rgb_region_from_file(
+            ImageFormat::Bmp,
+            &path,
+            (prefix.len() + 54 + 4 + 1) as u64,
+            0,
+            0,
+            1,
+            1,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("Decode offset extends outside file"));
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn one_pixel_bmp24(rgb: [u8; 3]) -> Vec<u8> {
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(58u32).to_le_bytes());
+        bmp.extend_from_slice(&[0, 0, 0, 0]);
+        bmp.extend_from_slice(&(54u32).to_le_bytes());
+        bmp.extend_from_slice(&(40u32).to_le_bytes());
+        bmp.extend_from_slice(&(1i32).to_le_bytes());
+        bmp.extend_from_slice(&(1i32).to_le_bytes());
+        bmp.extend_from_slice(&(1u16).to_le_bytes());
+        bmp.extend_from_slice(&(24u16).to_le_bytes());
+        bmp.extend_from_slice(&(0u32).to_le_bytes());
+        bmp.extend_from_slice(&(4u32).to_le_bytes());
+        bmp.extend_from_slice(&(0i32).to_le_bytes());
+        bmp.extend_from_slice(&(0i32).to_le_bytes());
+        bmp.extend_from_slice(&(0u32).to_le_bytes());
+        bmp.extend_from_slice(&(0u32).to_le_bytes());
+        bmp.extend_from_slice(&[rgb[2], rgb[1], rgb[0], 0]);
+        bmp
     }
 }

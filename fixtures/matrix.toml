@@ -1,0 +1,342 @@
+schema_version = 1
+
+[[case]]
+reader = "aperio"
+area = "svs-baseline"
+requirement = "Representative SVS fixture has metadata, pixel, speed, and RSS parity."
+status = "covered"
+fixtures = ["aperio-local-77917"]
+notes = "Representative local SVS fixture is exact; public small-region SVS is tracked as a separate exact public JPEG/RGB case."
+
+[[case]]
+reader = "aperio"
+area = "public-jpeg-rgb"
+requirement = "Public RGB-tagged JPEG SVS variants have exact or documented parity."
+status = "covered"
+fixtures = ["aperio-public-cmu-1-small-region"]
+notes = "Public small-region SVS now has exact sampled checksum parity after forcing TIFF JPEG tiles to honor the RGB photometric colorspace."
+
+[[case]]
+reader = "aperio"
+area = "codec-layout-breadth"
+requirement = "Raw, JPEG, JPEG 2000, TIFF layout variants, and libtiff-divergent unsupported cases are fixture-backed."
+status = "pending"
+fixtures = []
+notes = "Need broader SVS fixtures that isolate raw/JPEG/JPEG2000, planar/contiguous, tiled/stripped, edge-tile, and unsupported layout behavior."
+
+[[case]]
+reader = "aperio"
+area = "metadata-associated-images"
+requirement = "Aperio associated images, ICC/quickhash behavior, and ImageDescription variants are covered by fixtures."
+status = "pending"
+fixtures = []
+notes = "Need fixtures for macro/label/thumbnail names, ICC/profile export, quickhash, and metadata formatting variants before moving beyond fixture-verified."
+
+[[case]]
+reader = "hamamatsu-ndpi"
+area = "cmu-1"
+requirement = "Private and public CMU-1 NDPI fixtures are exact with speed/RSS baselines."
+status = "covered"
+fixtures = ["hamamatsu-ndpi-local-cmu-1", "hamamatsu-ndpi-public-cmu-1"]
+
+[[case]]
+reader = "hamamatsu-ndpi"
+area = "dnl-zero-dimension-jpeg"
+requirement = "DNL/zero-width or zero-height JPEG NDPI fixtures read without full-strip decode and expose OpenSlide-compatible synthetic levels."
+status = "covered"
+fixtures = ["hamamatsu-ndpi-local-cmu-2", "hamamatsu-ndpi-local-cmu-3"]
+notes = "CMU-2 and CMU-3 are exact using TIFF dimension fallbacks plus recorded MCU restart offsets; RGBA and single-channel paths both read."
+
+[[case]]
+reader = "hamamatsu-vms"
+area = "vms-cmu-series"
+requirement = "VMS CMU-1/2/3 fixtures cover companion files, map levels, and restart rows."
+status = "covered"
+fixtures = [
+  "hamamatsu-vms-local-cmu-1",
+  "hamamatsu-vms-local-cmu-2",
+  "hamamatsu-vms-local-cmu-3",
+  "hamamatsu-vms-public-cmu-1",
+]
+
+[[case]]
+reader = "hamamatsu-vms"
+area = "vms-layout-breadth"
+requirement = "Additional VMS sidecar, edge-tile, restart-row, and map-level variants are fixture-backed."
+status = "pending"
+fixtures = []
+notes = "CMU-1/2/3 cover the current verified VMS subset; broader VMS sidecar naming, edge geometry, and restart-row variants need more fixtures before conditional maturity."
+
+[[case]]
+reader = "hamamatsu-vmu-ngr"
+area = "real-fixture"
+requirement = "VMU/NGR real-data fixture exists for parity and benchmark coverage."
+status = "missing-fixture"
+fixtures = ["hamamatsu-vmu-ngr-missing"]
+notes = "No local or public VMU/NGR fixture is available yet; promotion is blocked on locating real data."
+
+[[case]]
+reader = "hamamatsu-ndpi"
+area = "ndpi-layout-breadth"
+requirement = "Stripped/tiled NDPI, edge JPEGs, map levels, planar layouts, and additional recorded-MCU-start cases are fixture-backed."
+status = "pending"
+fixtures = []
+notes = "Need more NDPI fixtures beyond CMU-1/2/3 to cover non-DNL layouts, planar data, map levels, and edge tile behavior."
+
+[[case]]
+reader = "leica"
+area = "scn-baseline"
+requirement = "Representative SCN fixture has exact metadata, pixel, speed, and RSS parity."
+status = "covered"
+fixtures = ["leica-local-leica-1"]
+
+[[case]]
+reader = "leica"
+area = "multi-area-layout"
+requirement = "Additional multi-area SCN fixture has exact metadata, pixel, speed, and RSS parity."
+status = "covered"
+fixtures = ["leica-local-leica-2"]
+notes = "Current local Leica-2 fixture matches metadata, downsamples, aggregate checksums, and per-level sampled pixels after area-local coordinate truncation was aligned."
+
+[[case]]
+reader = "leica"
+area = "reference-blocked-fluorescence"
+requirement = "Reference-openable z-plane, associated-image, and fluorescence SCN cases are covered."
+status = "blocked"
+fixtures = ["leica-local-leica-3", "leica-public-fluorescence-1"]
+notes = "Current local/public blockers are reference-stack failures."
+
+[[case]]
+reader = "leica"
+area = "area-layout-breadth"
+requirement = "Tiled, stripped, planar, multi-area, macro/label, and XML variant SCN layouts are covered by fixtures."
+status = "pending"
+fixtures = []
+notes = "Need reference-readable fixtures for stripped/tiled area combinations, planar data, associated macro/label images, and XML hierarchy/format variants."
+
+[[case]]
+reader = "leica"
+area = "z-plane-non-brightfield"
+requirement = "Z-plane, fluorescence, and non-brightfield Leica behavior is covered by reference-readable fixtures or explicitly excluded."
+status = "pending"
+fixtures = []
+notes = "Current fluorescence and Leica-3 witnesses are reference blocked; need usable fixtures or a documented exclusion policy."
+
+[[case]]
+reader = "mirax"
+area = "fluorescence-public"
+requirement = "Public fluorescence MRXS fixture has exact aggregate and per-level parity."
+status = "covered"
+fixtures = ["mirax-public-fluorescence-2"]
+
+[[case]]
+reader = "mirax"
+area = "brightfield-public"
+requirement = "Public brightfield MRXS fixture has exact aggregate and per-level parity."
+status = "covered"
+fixtures = ["mirax-public-cmu-1-saved-1-16"]
+notes = "Exact after decoding JPEG tiles with libjpeg before Cairo tilemap composition."
+
+[[case]]
+reader = "mirax"
+area = "broader-mrxs-breadth"
+requirement = "Additional MRXS channel maps, grid placements, missing-channel cases, and associated-image behavior are fixture-backed."
+status = "pending"
+fixtures = []
+notes = "Public brightfield and fluorescence fixtures are exact; broader MRXS layouts need additional fixtures before conditional maturity."
+
+[[case]]
+reader = "philips"
+area = "public-baseline"
+requirement = "Public Philips TIFF fixture has exact parity."
+status = "covered"
+fixtures = ["philips-public-philips-1"]
+
+[[case]]
+reader = "philips"
+area = "philips-wsi-breadth"
+requirement = "Larger Philips/PTIF WSI fixtures and XML/base64 associated-image and pixel-spacing metadata variants are covered."
+status = "pending"
+fixtures = []
+notes = "Need more Philips fixtures beyond public Philips-1, including associated-image XML/base64 payloads and objective/pixel-spacing metadata variants."
+
+[[case]]
+reader = "trestle"
+area = "cmu-1"
+requirement = "Private and public CMU-1 Trestle fixtures are exact."
+status = "covered"
+fixtures = ["trestle-local-cmu-1", "trestle-public-cmu-1"]
+
+[[case]]
+reader = "trestle"
+area = "overlap-sidecar-codecs"
+requirement = "Overlap order, .Full sidecars, JPEG 2000, YCbCr, LZW, PackBits, deflate predictor, and edge-tile behavior are fixture-backed."
+status = "pending"
+fixtures = []
+notes = "Need Trestle fixtures that isolate overlap composition, sidecar lookup, codec/layout breadth, and edge-tile behavior."
+
+[[case]]
+reader = "ventana"
+area = "bif-aoi-baseline"
+requirement = "Representative BIF AOI fixtures, including subpixel AOI origins, have exact parity."
+status = "covered"
+fixtures = ["ventana-local-os-1", "ventana-local-os-2"]
+
+[[case]]
+reader = "ventana"
+area = "reference-blocked-ventana-1"
+requirement = "Local/public Ventana-1 fixtures are covered or explicitly reference-stack blocked."
+status = "blocked"
+fixtures = ["ventana-local-ventana-1", "ventana-public-ventana-1"]
+notes = "Local/public Ventana-1 are reference-stack blocked with the installed OpenSlide 3.4.1 stack."
+
+[[case]]
+reader = "ventana"
+area = "non-aoi-associated-codecs"
+requirement = "Non-AOI TIFF/BIF shapes, associated macro/thumbnail variants, JP2K, LZW/deflate predictor, planar YCbCr, and high-downsample AOI levels are fixture-backed."
+status = "pending"
+fixtures = []
+notes = "Need reference-readable Ventana fixtures beyond OS-1/OS-2 to cover non-AOI TIFF paths, associated-image fallback order, codec breadth, and high-downsample AOI stress."
+
+[[case]]
+reader = "dicom"
+area = "single-level-readable"
+requirement = "Reference-readable single-level DICOM members are exact."
+status = "covered"
+fixtures = ["dicom-local-readable-single-level"]
+notes = "Reference opens these as generic-tiff; this is not full DICOM WSI maturity."
+
+[[case]]
+reader = "dicom"
+area = "full-pyramid-wsi"
+requirement = "Full-pyramid DICOM WSI fixture opens and reads in the reference stack."
+status = "blocked"
+fixtures = ["dicom-public-leica-4"]
+notes = "Installed reference OpenSlide 3.4.1 cannot open the public Leica-4 DICOM set, so full-pyramid DICOM parity is still unproven."
+
+[[case]]
+reader = "dicom"
+area = "native-rgb-monochrome-palette"
+requirement = "Native RGB, MONOCHROME1/MONOCHROME2, and PALETTE COLOR DICOM WSI variants have fixture-backed metadata and pixel parity."
+status = "pending"
+fixtures = []
+notes = "Need reference-readable WSI fixtures for native RGB, monochrome with window/rescale behavior, and palette-color data; current readable local witnesses are single-level generic-tiff paths."
+
+[[case]]
+reader = "dicom"
+area = "encapsulated-codecs"
+requirement = "Encapsulated JPEG and JPEG 2000 DICOM WSI frames have exact or documented parity and a settled JPEG 2000 backend policy."
+status = "pending"
+fixtures = []
+notes = "Need reference-readable encapsulated DICOM WSI fixtures; JPEG 2000 backend policy remains a promotion blocker."
+
+[[case]]
+reader = "dicom"
+area = "multi-file-series"
+requirement = "Multi-file series discovery, concatenations, duplicate/missing parts, and incomplete concatenation diagnostics are covered by fixtures."
+status = "pending"
+fixtures = []
+notes = "Need a reference-readable DICOM WSI series that exercises same-series discovery and concatenation diagnostics."
+
+[[case]]
+reader = "dicom"
+area = "multi-plane-optical-path"
+requirement = "Optical-path and focal-plane selection behavior is covered or explicitly excluded with reference-backed fixtures."
+status = "pending"
+fixtures = []
+notes = "Current reader exposes a selected 2D view; fixture-backed policy is still needed for multiple optical paths and z-planes."
+
+[[case]]
+reader = "dicom"
+area = "sparse-tiles-associated-images-tpm"
+requirement = "Sparse tile handling, associated images, and TotalPixelMatrix metadata are covered by fixtures."
+status = "pending"
+fixtures = []
+notes = "Need reference-readable fixtures that exercise sparse tiles, associated-image roles, and TotalPixelMatrixOrigin/geometry metadata."
+
+[[case]]
+reader = "zeiss"
+area = "public-czi"
+requirement = "Reference-readable CZI fixture covers uncompressed/JPEG/Zstd/JXR paths."
+status = "blocked"
+fixtures = ["zeiss-public-jxr-and-zstd"]
+notes = "Installed reference is blocked for public CZI. Rust reads Zstd0/Zstd1 preview regions and the JXR slide-preview fixture with the optional jpegxr backend; full-slide Bgr24 JXR is wired through that backend but still needs isolated validation after a native jxrlib crash probe."
+
+[[case]]
+reader = "zeiss"
+area = "scene-z-t-c-selection"
+requirement = "Scene, Z, T, and C selection semantics are covered by reference-readable CZI fixtures or explicitly excluded."
+status = "pending"
+fixtures = []
+notes = "Need reference-readable CZI fixtures that exercise multiple scenes, z-slices, timepoints, and channel layouts."
+
+[[case]]
+reader = "zeiss"
+area = "external-file-parts"
+requirement = "External CZI file-part discovery, missing/ambiguous part diagnostics, and supported subblock resolution are fixture-backed."
+status = "pending"
+fixtures = []
+notes = "Need public or private multifile CZI fixtures with external file parts; current public CZI blockers are single-file reference failures."
+
+[[case]]
+reader = "zeiss"
+area = "pixel-types-and-compression"
+requirement = "Uncompressed, JPEG, Zstd, and JXR compression across supported integer/float pixel types have exact or documented behavior."
+status = "pending"
+fixtures = []
+notes = "Rust reads public Zstd preview regions and feature-gated JXR slide-preview pixels. Reference parity is blocked; full-slide Bgr24 JXR is wired through the optional backend but still needs a safer backend or isolation strategy for fixture validation after a native jxrlib crash probe."
+
+[[case]]
+reader = "zeiss"
+area = "attachments-and-metadata"
+requirement = "CZI attachments and XML-derived dimension/channel metadata are covered by fixtures."
+status = "pending"
+fixtures = []
+notes = "Synthetic coverage now exercises JPEG/PNG/BMP attachment decoding and upstream-style single-subblock embedded-CZI associated images. Need reference-readable CZI fixtures with label/preview/macro/navigation attachments and nontrivial metadata dimensions."
+
+[[case]]
+reader = "sakura"
+area = "real-fixture"
+requirement = "Sakura real-data fixture exists for parity and benchmark coverage."
+status = "missing-fixture"
+fixtures = ["sakura-missing"]
+notes = "No Sakura .svslide fixture was found locally or in the OpenSlide public testdata index."
+
+[[case]]
+reader = "generic-tiff"
+area = "public-baseline"
+requirement = "Public Generic TIFF CMU-1 fixture is exact."
+status = "covered"
+fixtures = ["generic-tiff-public-cmu-1"]
+
+[[case]]
+reader = "generic-tiff"
+area = "shared-codec-layout-matrix"
+requirement = "Raw, JPEG/JPEGTables, JPEG 2000, LZW, PackBits, deflate, YCbCr, planar, stripped/tiled, 16-bit, edge-tile, ICC, MPP, and associated-directory variants are covered."
+status = "blocked"
+fixtures = ["generic-tiff-local-zackthecat"]
+notes = "Local compression-6 old-JPEG TIFF is Rust-readable but reference-blocked, so it remains a non-comparable smoke witness; broader matrix still needs fixtures."
+
+[[case]]
+reader = "generic-tiff"
+area = "compression-codecs"
+requirement = "Raw, JPEG with and without JPEGTables, JPEG 2000, LZW, PackBits, deflate predictor, and libtiff-only compression behavior are covered or explicitly unsupported."
+status = "pending"
+fixtures = []
+notes = "Need reference-readable TIFF fixtures for each codec family; compression 6 is currently represented by zackthecat only as a Rust-readable, reference-blocked smoke witness."
+
+[[case]]
+reader = "generic-tiff"
+area = "sample-layouts"
+requirement = "Contiguous, planar-separated, YCbCr subsampling, gray/GrayA/RGB/RGBA, and 16-bit downscaled sample layouts are fixture-backed."
+status = "pending"
+fixtures = []
+notes = "Need broader TIFF fixtures that isolate sample layout and bit-depth behavior beyond the public CMU-1 baseline."
+
+[[case]]
+reader = "generic-tiff"
+area = "storage-geometry"
+requirement = "Stripped vs tiled storage, edge tiles, missing tiles, ICC, MPP/resolution metadata, and associated directories are fixture-backed."
+status = "pending"
+fixtures = []
+notes = "Synthetic coverage now exercises zero-byte missing-tile RGBA transparency and description-named label/macro/thumbnail/overview associated TIFF directories. Need real fixtures that cover edge geometry, metadata/property export, associated directories, and missing tile behavior before Generic TIFF can become the shared mature core."

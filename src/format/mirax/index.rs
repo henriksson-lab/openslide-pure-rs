@@ -1,7 +1,4 @@
-use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-
-use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::error::{OpenSlideError, Result};
 
@@ -26,7 +23,7 @@ pub struct NonhierRecord {
 
 /// Parsed Index.dat file handle.
 pub struct IndexFile {
-    reader: BufReader<std::fs::File>,
+    reader: crate::util::OpenSlideFile,
     hier_root: i64,
     nonhier_root: i64,
 }
@@ -34,18 +31,11 @@ pub struct IndexFile {
 impl IndexFile {
     /// Open and validate an Index.dat file.
     pub fn open(path: &Path, expected_slide_id: &str) -> Result<Self> {
-        let file = std::fs::File::open(path).map_err(|e| {
-            OpenSlideError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Cannot open index file {}: {}", path.display(), e),
-            ))
-        })?;
-        let mut reader = BufReader::new(file);
+        let mut reader = crate::util::_openslide_fopen(path)?;
 
         // Read and verify version
         let mut version_buf = [0u8; 5];
-        reader
-            .read_exact(&mut version_buf)
+        crate::util::_openslide_fread_exact(&mut reader, &mut version_buf)
             .map_err(|e| OpenSlideError::Format(format!("Cannot read index version: {}", e)))?;
         let version = std::str::from_utf8(&version_buf)
             .map_err(|_| OpenSlideError::Format("Index version is not valid UTF-8".into()))?;
@@ -59,7 +49,7 @@ impl IndexFile {
         // Read and verify slide ID
         let id_len = expected_slide_id.len();
         let mut id_buf = vec![0u8; id_len];
-        reader.read_exact(&mut id_buf).map_err(|e| {
+        crate::util::_openslide_fread_exact(&mut reader, &mut id_buf).map_err(|e| {
             OpenSlideError::Format(format!("Cannot read slide ID from index: {}", e))
         })?;
         let found_id = std::str::from_utf8(&id_buf)
@@ -83,16 +73,42 @@ impl IndexFile {
     }
 
     fn read_i32(&mut self) -> Result<i32> {
-        self.reader
-            .read_i32::<LittleEndian>()
-            .map_err(|e| OpenSlideError::Format(format!("Cannot read i32 from index: {}", e)))
+        let mut buf = [0u8; 4];
+        crate::util::_openslide_fread_exact(&mut self.reader, &mut buf)
+            .map_err(|e| OpenSlideError::Format(format!("Cannot read i32 from index: {}", e)))?;
+        Ok(i32::from_le_bytes(buf))
     }
 
-    fn seek(&mut self, pos: i64) -> Result<()> {
-        self.reader.seek(SeekFrom::Start(pos as u64)).map_err(|e| {
-            OpenSlideError::Format(format!("Cannot seek in index to {}: {}", pos, e))
-        })?;
-        Ok(())
+    fn seek_index(&mut self, pos: i64) -> Result<()> {
+        crate::util::_openslide_fseek(&mut self.reader, pos, crate::util::OpenSlideSeekWhence::Set)
+            .map_err(|e| OpenSlideError::Format(format!("Cannot seek in index to {}: {}", pos, e)))
+    }
+
+    fn read_hier_entry(&mut self) -> Result<HierEntry> {
+        let image_index = self.read_i32()?;
+        let offset = self.read_i32()?;
+        let length = self.read_i32()?;
+        let fileno = self.read_i32()?;
+
+        if image_index < 0 {
+            return Err(OpenSlideError::Format("image_index < 0".into()));
+        }
+        if offset < 0 {
+            return Err(OpenSlideError::Format("offset < 0".into()));
+        }
+        if length < 0 {
+            return Err(OpenSlideError::Format("length < 0".into()));
+        }
+        if fileno < 0 {
+            return Err(OpenSlideError::Format("fileno < 0".into()));
+        }
+
+        Ok(HierEntry {
+            image_index,
+            offset,
+            length,
+            fileno,
+        })
     }
 
     /// Read a non-hierarchical record by record number.
@@ -103,15 +119,15 @@ impl IndexFile {
             ));
         }
 
-        self.seek(self.nonhier_root)?;
+        self.seek_index(self.nonhier_root)?;
         let table_base = self.read_i32()?;
 
         // seek to record pointer
-        self.seek(table_base as i64 + 4 * recordno as i64)?;
+        self.seek_index(table_base as i64 + 4 * recordno as i64)?;
         let list_head = self.read_i32()?;
 
         // seek to list head
-        self.seek(list_head as i64)?;
+        self.seek_index(list_head as i64)?;
 
         // read initial value (0 means data follows, 0x302e3130 means empty)
         let initial = self.read_i32()?;
@@ -128,7 +144,7 @@ impl IndexFile {
 
         // read pointer to data page
         let data_page = self.read_i32()?;
-        self.seek(data_page as i64)?;
+        self.seek_index(data_page as i64)?;
 
         // read page size (should be 1)
         let page_size = self.read_i32()?;
@@ -175,7 +191,7 @@ impl IndexFile {
         images_across: i32,
         images_down: i32,
     ) -> Result<Vec<Vec<HierEntry>>> {
-        self.seek(self.hier_root)?;
+        self.seek_index(self.hier_root)?;
         let root_ptr = self.read_i32()?;
         if root_ptr < 0 {
             return Err(OpenSlideError::Format(
@@ -187,7 +203,7 @@ impl IndexFile {
         let mut seek_location = root_ptr as i64;
 
         for zoom_level in 0..zoom_levels {
-            self.seek(seek_location)?;
+            self.seek_index(seek_location)?;
             let level_ptr = self.read_i32()?;
             if level_ptr < 0 {
                 return Err(OpenSlideError::Format(format!(
@@ -196,7 +212,7 @@ impl IndexFile {
                 )));
             }
 
-            self.seek(level_ptr as i64)?;
+            self.seek_index(level_ptr as i64)?;
 
             // read initial 0
             let initial = self.read_i32()?;
@@ -215,7 +231,7 @@ impl IndexFile {
                 ));
             }
 
-            self.seek(first_page as i64)?;
+            self.seek_index(first_page as i64)?;
 
             let mut entries = Vec::new();
 
@@ -232,18 +248,9 @@ impl IndexFile {
                 }
 
                 for _ in 0..page_len {
-                    let image_index = self.read_i32()?;
-                    let offset = self.read_i32()?;
-                    let length = self.read_i32()?;
-                    let fileno = self.read_i32()?;
+                    let entry = self.read_hier_entry()?;
 
-                    if image_index < 0 || offset < 0 || length < 0 || fileno < 0 {
-                        return Err(OpenSlideError::Format(
-                            "Negative value in hier entry".into(),
-                        ));
-                    }
-
-                    let y = image_index / images_across;
+                    let y = entry.image_index / images_across;
                     if y >= images_down {
                         return Err(OpenSlideError::Format(format!(
                             "y ({}) outside of bounds for zoom level ({})",
@@ -251,18 +258,13 @@ impl IndexFile {
                         )));
                     }
 
-                    entries.push(HierEntry {
-                        image_index,
-                        offset,
-                        length,
-                        fileno,
-                    });
+                    entries.push(entry);
                 }
 
                 if next_ptr == 0 {
                     break;
                 }
-                self.seek(next_ptr as i64)?;
+                self.seek_index(next_ptr as i64)?;
             }
 
             all_entries.push(entries);
@@ -279,7 +281,7 @@ impl IndexFile {
     /// Returns Ok(entries) if the record contains tile data, or Err if it doesn't
     /// match the expected tile data page structure.
     pub fn read_hier_record_at_offset(&mut self, record_offset: i32) -> Result<Vec<HierEntry>> {
-        self.seek(self.hier_root)?;
+        self.seek_index(self.hier_root)?;
         let root_ptr = self.read_i32()?;
         if root_ptr < 0 {
             return Err(OpenSlideError::Format(
@@ -288,7 +290,7 @@ impl IndexFile {
         }
 
         let seek_location = root_ptr as i64 + record_offset as i64 * 4;
-        self.seek(seek_location)?;
+        self.seek_index(seek_location)?;
         let level_ptr = self.read_i32()?;
         if level_ptr < 0 {
             return Err(OpenSlideError::Format(format!(
@@ -297,7 +299,7 @@ impl IndexFile {
             )));
         }
 
-        self.seek(level_ptr as i64)?;
+        self.seek_index(level_ptr as i64)?;
 
         let initial = self.read_i32()?;
         if initial != 0 {
@@ -314,7 +316,7 @@ impl IndexFile {
             ));
         }
 
-        self.seek(first_page as i64)?;
+        self.seek_index(first_page as i64)?;
 
         let mut entries = Vec::new();
         loop {
@@ -326,23 +328,7 @@ impl IndexFile {
             let next_ptr = self.read_i32()?;
 
             for _ in 0..page_len {
-                let image_index = self.read_i32()?;
-                let offset = self.read_i32()?;
-                let length = self.read_i32()?;
-                let fileno = self.read_i32()?;
-
-                if image_index < 0 || offset < 0 || length < 0 || fileno < 0 {
-                    return Err(OpenSlideError::Format(
-                        "Negative value in hier entry".into(),
-                    ));
-                }
-
-                entries.push(HierEntry {
-                    image_index,
-                    offset,
-                    length,
-                    fileno,
-                });
+                entries.push(self.read_hier_entry()?);
             }
 
             if next_ptr == 0 {
@@ -353,7 +339,7 @@ impl IndexFile {
                     "Can't read next page pointer".into(),
                 ));
             }
-            self.seek(next_ptr as i64)?;
+            self.seek_index(next_ptr as i64)?;
         }
 
         Ok(entries)
@@ -363,6 +349,7 @@ impl IndexFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use byteorder::LittleEndian;
     use byteorder::WriteBytesExt;
     use std::io::Write;
 
@@ -457,6 +444,20 @@ mod tests {
         buf
     }
 
+    fn first_hier_entry_offset(slide_id: &str) -> usize {
+        b"01.02".len()
+            + slide_id.len()
+            + 8 // root pointers
+            + 4 // zoom-level pointer table
+            + 8 // list head
+            + 8 // data page header
+    }
+
+    fn patch_first_hier_entry_i32(data: &mut [u8], slide_id: &str, field_index: usize, value: i32) {
+        let offset = first_hier_entry_offset(slide_id) + field_index * 4;
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
     #[test]
     fn test_index_open_and_read_hier() {
         let slide_id = "test-slide-123";
@@ -498,6 +499,41 @@ mod tests {
         assert_eq!(record.fileno, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirax_hier_entry_negative_fields_report_upstream_errors() {
+        let slide_id = "test-slide-123";
+        let cases = [
+            (0, "image_index < 0"),
+            (1, "offset < 0"),
+            (2, "length < 0"),
+            (3, "fileno < 0"),
+        ];
+
+        for (field_index, expected) in cases {
+            let mut data = build_test_index(slide_id);
+            patch_first_hier_entry_i32(&mut data, slide_id, field_index, -1);
+
+            let dir = std::env::temp_dir().join(format!(
+                "openslide_test_index_negative_field_{}_{}",
+                field_index,
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let index_path = dir.join("Index.dat");
+            std::fs::write(&index_path, &data).unwrap();
+
+            let mut idx = IndexFile::open(&index_path, slide_id).unwrap();
+            let err = idx.read_hier_data_pages(1, 1, 1).unwrap_err();
+            assert!(format!("{err}").contains(expected));
+
+            let mut idx = IndexFile::open(&index_path, slide_id).unwrap();
+            let err = idx.read_hier_record_at_offset(0).unwrap_err();
+            assert!(format!("{err}").contains(expected));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

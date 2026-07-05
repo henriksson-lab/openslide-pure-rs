@@ -6,6 +6,8 @@ use configparser::ini::Ini;
 use crate::decode::ImageFormat;
 use crate::error::{OpenSlideError, Result};
 
+const SLIDEDAT_MAX_SIZE: i32 = 1 << 20;
+
 /// Parsed contents of Slidedat.ini.
 #[derive(Debug)]
 pub struct SlideDat {
@@ -125,23 +127,22 @@ pub struct ZoomLevelSection {
     pub image_h: i32,
 }
 
-/// Parse a float that may use either ',' or '.' as decimal separator.
 fn parse_float(s: &str) -> Result<f64> {
-    let normalized = s.replace(',', ".");
+    let normalized = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
     normalized
         .parse::<f64>()
         .map_err(|e| OpenSlideError::Format(format!("Invalid float '{}': {}", s, e)))
 }
 
 fn parse_int(s: &str) -> Result<i32> {
-    s.trim()
-        .parse::<i32>()
-        .map_err(|e| OpenSlideError::Format(format!("Invalid integer '{}': {}", s, e)))
+    let value = crate::util::_openslide_parse_int64(s)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| OpenSlideError::Format(format!("Invalid integer '{s}'")))?;
+    Ok(value)
 }
 
-fn parse_objective_magnification(s: &str) -> Option<i64> {
-    let value = s.trim().trim_end_matches(['x', 'X']).trim();
-    value.parse::<i64>().ok().filter(|value| *value > 0)
+fn parse_objective_magnification(s: &str) -> Result<i64> {
+    parse_int(s).map(i64::from)
 }
 
 fn get_value(ini: &Ini, section: &str, key: &str) -> Result<String> {
@@ -166,7 +167,7 @@ fn get_int_or_default(ini: &Ini, section: &str, key: &str, default: i32) -> i32 
 }
 
 fn parse_image_format(name: &str) -> Result<ImageFormat> {
-    match name.trim() {
+    match name {
         "JPEG" => Ok(ImageFormat::Jpeg),
         "PNG" => Ok(ImageFormat::Png),
         "BMP24" => Ok(ImageFormat::Bmp),
@@ -192,11 +193,11 @@ fn get_nonhier_name_offset(
 
         let count_key = format!("NONHIER_{}_COUNT", i);
         let count = get_int(ini, "HIERARCHICAL", &count_key)?;
-        if count <= 0 {
+        if count == 0 {
             return Err(OpenSlideError::Format("Nonhier val count is zero".into()));
         }
 
-        if value.trim() == target_name {
+        if value == target_name {
             return Ok((offset, count, i));
         }
         offset += count;
@@ -222,7 +223,7 @@ fn get_nonhier_val_offset(
         let key = format!("NONHIER_{}_VAL_{}", name_index, i);
         let value = get_value(ini, "HIERARCHICAL", &key)?;
 
-        if value.trim() == target_value {
+        if value == target_value {
             let section_key = format!("NONHIER_{}_VAL_{}_SECTION", name_index, i);
             let section = ini.get("HIERARCHICAL", &section_key);
             return Ok((offset, section));
@@ -250,10 +251,13 @@ fn get_associated_image_offset(
             "Missing section for associated image {target_value}"
         ))
     })?;
-    let format_val = get_value(ini, section_name.trim(), format_key)?;
-    // EXTENSION (not in C OpenSlide): accept any associated-image format
-    // supported by this reader, not only JPEG.
-    let _ = parse_image_format(&format_val)?;
+    let format_val = get_value(ini, &section_name, format_key)?;
+    if parse_image_format(&format_val)? != ImageFormat::Jpeg {
+        return Err(OpenSlideError::Format(format!(
+            "Unsupported associated image format: {}",
+            format_val
+        )));
+    }
 
     Ok(offset)
 }
@@ -277,15 +281,12 @@ impl SlideDat {
     /// Parse a Slidedat.ini file from the given directory.
     pub fn parse(dirname: &Path) -> Result<Self> {
         let slidedat_path = dirname.join("Slidedat.ini");
-        let mut ini = Ini::new_cs();
-        ini.set_default_section("");
-
-        // Read file content and strip UTF-8 BOM if present
-        let content = std::fs::read_to_string(&slidedat_path)
+        let content = crate::util::_openslide_read_key_file_data(&slidedat_path, SLIDEDAT_MAX_SIZE)
             .map_err(|e| OpenSlideError::Format(format!("Can't read Slidedat.ini: {}", e)))?;
-        let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+        let content = String::from_utf8(content)
+            .map_err(|e| OpenSlideError::Format(format!("Can't parse Slidedat.ini: {}", e)))?;
 
-        ini.read(content.to_string())
+        let ini = crate::util::_openslide_key_file_load_from_data(content)
             .map_err(|e| OpenSlideError::Format(format!("Can't parse Slidedat.ini: {}", e)))?;
 
         let raw_properties = extract_raw_properties(&ini);
@@ -301,9 +302,11 @@ impl SlideDat {
             .and_then(|v| parse_int(&v).ok());
         let images_x = get_int(&ini, "GENERAL", "IMAGENUMBER_X")?;
         let images_y = get_int(&ini, "GENERAL", "IMAGENUMBER_Y")?;
-        let objective_magnification = ini
-            .get("GENERAL", "OBJECTIVE_MAGNIFICATION")
-            .and_then(|value| parse_objective_magnification(&value));
+        let objective_magnification = Some(parse_objective_magnification(&get_value(
+            &ini,
+            "GENERAL",
+            "OBJECTIVE_MAGNIFICATION",
+        )?)?);
         let image_divisions = get_int_or_default(&ini, "GENERAL", "CameraImageDivisionsPerSide", 1);
 
         if images_x <= 0 || images_y <= 0 || image_divisions <= 0 {
@@ -331,7 +334,7 @@ impl SlideDat {
         for i in 0..hier_count {
             let key = format!("HIER_{}_NAME", i);
             let value = get_value(&ini, "HIERARCHICAL", &key)?;
-            if value.trim() == "Slide zoom level" {
+            if value == "Slide zoom level" {
                 slide_zoom_level_value = i;
                 break;
             }
@@ -457,13 +460,13 @@ impl SlideDat {
         for i in 0..datafile_count {
             let key = format!("FILE_{}", i);
             let name = get_value(&ini, "DATAFILE", &key)?;
-            datafile_paths.push(dirname.join(name.trim()));
+            datafile_paths.push(dirname.join(name));
         }
 
         // Zoom level sections
         let mut zoom_levels = Vec::with_capacity(zoom_level_count as usize);
         for (i, section_name) in zoom_level_section_names.iter().enumerate() {
-            let section = section_name.trim();
+            let section = section_name.as_str();
 
             let concat_exponent = get_int(&ini, section, "IMAGE_CONCAT_FACTOR")?;
             let overlap_x = get_float(&ini, section, "OVERLAP_X")?;
@@ -523,12 +526,11 @@ impl SlideDat {
         let mut filter_channels = Vec::new();
 
         for layer in &layers {
-            if layer.name.trim() != "Slide filter level" {
+            if layer.name != "Slide filter level" {
                 continue;
             }
             for level in &layer.levels {
                 if let Some(ref sec) = level.section {
-                    let sec = sec.trim();
                     let name = ini.get(sec, "FILTER_NAME").unwrap_or_default();
                     let storing_ch = ini
                         .get(sec, "STORING_CHANNEL_NUMBER")
@@ -539,15 +541,18 @@ impl SlideDat {
                         .unwrap_or_default();
                     let color_r = ini
                         .get(sec, "COLOR_R")
-                        .and_then(|v| v.trim().parse::<u8>().ok())
+                        .and_then(|v| parse_int(&v).ok())
+                        .and_then(|v| u8::try_from(v).ok())
                         .unwrap_or(255);
                     let color_g = ini
                         .get(sec, "COLOR_G")
-                        .and_then(|v| v.trim().parse::<u8>().ok())
+                        .and_then(|v| parse_int(&v).ok())
+                        .and_then(|v| u8::try_from(v).ok())
                         .unwrap_or(255);
                     let color_b = ini
                         .get(sec, "COLOR_B")
-                        .and_then(|v| v.trim().parse::<u8>().ok())
+                        .and_then(|v| parse_int(&v).ok())
+                        .and_then(|v| u8::try_from(v).ok())
                         .unwrap_or(255);
 
                     filter_channels.push(FilterChannel {
@@ -695,9 +700,86 @@ DIGITIZER_HEIGHT=512
     }
 
     #[test]
-    fn test_parse_float_comma() {
-        assert!((parse_float("10,5").unwrap() - 10.5).abs() < 1e-6);
+    fn parses_slidedat_through_shared_key_file_helper_with_bom() {
+        let dir = std::env::temp_dir().join("openslide_test_slidedat_bom");
+        let _ = std::fs::create_dir_all(&dir);
+        write_test_slidedat(&dir);
+        let path = dir.join("Slidedat.ini");
+        let content = std::fs::read(&path).unwrap();
+        let mut with_bom = b"\xef\xbb\xbf".to_vec();
+        with_bom.extend_from_slice(&content);
+        std::fs::write(&path, with_bom).unwrap();
+
+        let sd = SlideDat::parse(&dir).unwrap();
+
+        assert_eq!(sd.general.slide_id, "abc123-def456");
+        assert_eq!(sd.zoom_levels.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filter_channel_extension_uses_slidedat_integer_parser_for_colors() {
+        let dir = std::env::temp_dir().join(format!(
+            "openslide_test_slidedat_filter_exact_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        write_test_slidedat(&dir);
+        let path = dir.join("Slidedat.ini");
+        let content = std::fs::read_to_string(&path).unwrap().replace(
+            "HIER_COUNT=1\n",
+            "HIER_COUNT=2\n\
+HIER_1_NAME=Slide filter level\n\
+HIER_1_COUNT=1\n\
+HIER_1_VAL_0_SECTION=FILTER0\n",
+        ) + "\n\
+[FILTER0]\n\
+FILTER_NAME=DAPI\n\
+STORING_CHANNEL_NUMBER=+1\n\
+DATA_IN_THIS_FILTER_LEVEL=FilterLevel_0 \n\
+COLOR_R=+012\n\
+COLOR_G=34x\n\
+COLOR_B=-1\n";
+        std::fs::write(&path, content).unwrap();
+
+        let sd = SlideDat::parse(&dir).unwrap();
+
+        assert_eq!(sd.filter_channels.len(), 1);
+        let channel = &sd.filter_channels[0];
+        assert_eq!(channel.name, "DAPI");
+        assert_eq!(channel.storing_channel, 1);
+        assert_eq!(channel.filter_level_name, "FilterLevel_0");
+        assert_eq!(channel.color_r, 12);
+        assert_eq!(channel.color_g, 255);
+        assert_eq!(channel.color_b, 255);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_missing_objective_magnification_like_upstream() {
+        let dir = std::env::temp_dir().join("openslide_test_slidedat_missing_objective");
+        let _ = std::fs::create_dir_all(&dir);
+        write_test_slidedat(&dir);
+        let path = dir.join("Slidedat.ini");
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replace("OBJECTIVE_MAGNIFICATION=40\n", "")).unwrap();
+
+        let err = SlideDat::parse(&dir).unwrap_err();
+
+        assert!(format!("{err}").contains("Missing key [GENERAL].OBJECTIVE_MAGNIFICATION"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_float_like_g_key_file_get_double() {
         assert!((parse_float("10.5").unwrap() - 10.5).abs() < 1e-6);
+        assert!((parse_float(" \t+10.5").unwrap() - 10.5).abs() < 1e-6);
+        assert!(parse_float("10,5").is_err());
+        assert!(parse_float("10.5 ").is_err());
+        assert!(parse_float("1e9999").unwrap().is_infinite());
+        assert_eq!(parse_float("1e-9999").unwrap(), 0.0);
+        assert!(parse_float("NaN").unwrap().is_nan());
     }
 
     #[test]
@@ -705,15 +787,144 @@ DIGITIZER_HEIGHT=512
         assert_eq!(parse_image_format("JPEG").unwrap(), ImageFormat::Jpeg);
         assert_eq!(parse_image_format("PNG").unwrap(), ImageFormat::Png);
         assert_eq!(parse_image_format("BMP24").unwrap(), ImageFormat::Bmp);
+        assert!(parse_image_format("JPEG ").is_err());
         assert!(parse_image_format("GIF").is_err());
     }
 
     #[test]
-    fn objective_magnification_is_best_effort() {
-        assert_eq!(parse_objective_magnification("40"), Some(40));
-        assert_eq!(parse_objective_magnification("40x"), Some(40));
-        assert_eq!(parse_objective_magnification("40X"), Some(40));
-        assert_eq!(parse_objective_magnification("0"), None);
-        assert_eq!(parse_objective_magnification("unknown"), None);
+    fn associated_images_accept_only_declared_jpeg_like_upstream() {
+        let mut ini = Ini::new_cs();
+        ini.set_default_section("");
+        ini.read(
+            r#"
+[HIERARCHICAL]
+NONHIER_0_NAME=Scan data layer
+NONHIER_0_COUNT=1
+NONHIER_0_VAL_0=ScanDataLayer_SlideBarcode
+NONHIER_0_VAL_0_SECTION=BARCODE
+
+[BARCODE]
+IMAGE_FORMAT=PNG
+"#
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = get_associated_image_offset(
+            &ini,
+            1,
+            "Scan data layer",
+            "ScanDataLayer_SlideBarcode",
+            "IMAGE_FORMAT",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("Unsupported associated image format: PNG"));
+
+        ini.set("BARCODE", "IMAGE_FORMAT", Some("JPEG".into()));
+        assert_eq!(
+            get_associated_image_offset(
+                &ini,
+                1,
+                "Scan data layer",
+                "ScanDataLayer_SlideBarcode",
+                "IMAGE_FORMAT",
+            )
+            .unwrap(),
+            0
+        );
+
+        ini.set(
+            "HIERARCHICAL",
+            "NONHIER_0_NAME",
+            Some("Scan data layer ".into()),
+        );
+        assert_eq!(
+            get_associated_image_offset(
+                &ini,
+                1,
+                "Scan data layer",
+                "ScanDataLayer_SlideBarcode",
+                "IMAGE_FORMAT",
+            )
+            .unwrap(),
+            -1
+        );
+        ini.set(
+            "HIERARCHICAL",
+            "NONHIER_0_NAME",
+            Some("Scan data layer".into()),
+        );
+        ini.set(
+            "HIERARCHICAL",
+            "NONHIER_0_VAL_0",
+            Some("ScanDataLayer_SlideBarcode ".into()),
+        );
+        assert_eq!(
+            get_associated_image_offset(
+                &ini,
+                1,
+                "Scan data layer",
+                "ScanDataLayer_SlideBarcode",
+                "IMAGE_FORMAT",
+            )
+            .unwrap(),
+            -1
+        );
+    }
+
+    #[test]
+    fn nonhier_count_rejects_zero_but_preserves_negative_like_upstream() {
+        let mut ini = Ini::new_cs();
+        ini.set_default_section("");
+        ini.read(
+            r#"
+[HIERARCHICAL]
+NONHIER_0_NAME=Scan data layer
+NONHIER_0_COUNT=0
+NONHIER_0_VAL_0=ScanDataLayer_SlideBarcode
+NONHIER_0_VAL_0_SECTION=BARCODE
+
+[BARCODE]
+IMAGE_FORMAT=JPEG
+"#
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = get_associated_image_offset(
+            &ini,
+            1,
+            "Scan data layer",
+            "ScanDataLayer_SlideBarcode",
+            "IMAGE_FORMAT",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("Nonhier val count is zero"));
+
+        ini.set("HIERARCHICAL", "NONHIER_0_COUNT", Some("-1".into()));
+        assert_eq!(
+            get_associated_image_offset(
+                &ini,
+                1,
+                "Scan data layer",
+                "ScanDataLayer_SlideBarcode",
+                "IMAGE_FORMAT",
+            )
+            .unwrap(),
+            -1
+        );
+    }
+
+    #[test]
+    fn objective_magnification_requires_exact_integer_like_upstream() {
+        assert_eq!(parse_objective_magnification("40").unwrap(), 40);
+        assert_eq!(parse_objective_magnification(" \t+040").unwrap(), 40);
+        assert_eq!(parse_objective_magnification("0").unwrap(), 0);
+        assert_eq!(parse_objective_magnification("-1").unwrap(), -1);
+        assert!(parse_objective_magnification("40 ").is_err());
+        assert!(parse_objective_magnification("40x").is_err());
+        assert!(parse_objective_magnification("40X").is_err());
+        assert!(parse_objective_magnification("2147483648").is_err());
+        assert!(parse_objective_magnification("unknown").is_err());
     }
 }

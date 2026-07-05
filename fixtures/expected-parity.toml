@@ -1,0 +1,266 @@
+schema_version = 1
+reference_stack = "openslide-python 1.4.3 with libopenslide 3.4.1"
+parity_region_size = 256
+parity_regions_per_level = 4
+parity_pixel_tol = 2.0
+benchmark_command = "scripts/bench-realdata.py --region-size 128 --regions-per-level 1"
+
+[[expectation]]
+fixture = "aperio-local-77917"
+reader = "aperio"
+status = "exact"
+rust_checksum = 36660081
+reference_checksum = 36660081
+rust_rgb_checksum = 19948401
+reference_rgb_checksum = 19948401
+notes = "Exact on audited local data."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-cmu-1"
+reader = "hamamatsu-ndpi"
+status = "exact"
+rust_checksum = 122444483
+reference_checksum = 122444483
+rust_rgb_checksum = 84843203
+reference_rgb_checksum = 84843203
+notes = "Exact on audited local data."
+
+[[expectation]]
+fixture = "hamamatsu-vms-local-cmu-1"
+reader = "hamamatsu-vms"
+status = "exact"
+rust_checksum = 95211709
+reference_checksum = 95211709
+rust_rgb_checksum = 65966269
+reference_rgb_checksum = 65966269
+notes = "Exact on audited local data."
+
+[[expectation]]
+fixture = "hamamatsu-vms-local-cmu-2"
+reader = "hamamatsu-vms"
+status = "exact"
+rust_checksum = 95187621
+reference_checksum = 95187621
+rust_rgb_checksum = 65942181
+reference_rgb_checksum = 65942181
+notes = "Exact on additional audited local VMS data."
+
+[[expectation]]
+fixture = "hamamatsu-vms-local-cmu-3"
+reader = "hamamatsu-vms"
+status = "exact"
+rust_checksum = 95291362
+reference_checksum = 95291362
+rust_rgb_checksum = 66045922
+reference_rgb_checksum = 66045922
+notes = "Exact on additional audited local VMS data."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-cmu-2"
+reader = "hamamatsu-ndpi"
+status = "exact"
+rust_checksum = 130528000
+reference_checksum = 130528000
+rust_rgb_checksum = 90116110
+reference_rgb_checksum = 90116110
+notes = "DNL/zero-width JPEG fixture is exact after using TIFF dimensions plus recorded MCU restart offsets; RGBA and single-channel paths both read."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-cmu-3"
+reader = "hamamatsu-ndpi"
+status = "exact"
+rust_checksum = 132935117
+reference_checksum = 132935117
+rust_rgb_checksum = 92102477
+reference_rgb_checksum = 92102477
+notes = "DNL/zero-width JPEG fixture is exact after using TIFF dimensions plus recorded MCU restart offsets and exact-halving synthetic NDPI level generation."
+
+[[expectation]]
+fixture = "hamamatsu-vmu-ngr-missing"
+reader = "hamamatsu-vmu-ngr"
+status = "missing-fixture"
+notes = "No VMU/NGR real-data fixture is available for parity or benchmark coverage."
+
+[[expectation]]
+fixture = "leica-local-leica-1"
+reader = "leica"
+status = "exact"
+rust_checksum = 0
+reference_checksum = 0
+rust_rgb_checksum = 0
+reference_rgb_checksum = 0
+notes = "Exact on audited local data."
+
+[[expectation]]
+fixture = "leica-local-leica-2"
+reader = "leica"
+status = "exact"
+rust_checksum = 55756753
+reference_checksum = 55756753
+rust_rgb_checksum = 35906788
+reference_rgb_checksum = 35906788
+notes = "Additional local multi-area SCN fixture matches OpenSlide level dimensions, downsamples, aggregate checksums, and per-level sampled pixels after area-local coordinate truncation was aligned."
+
+[[expectation]]
+fixture = "leica-local-leica-3"
+reader = "leica"
+status = "blocked"
+notes = "Reference OpenSlide could not open this local SCN fixture."
+
+[[expectation]]
+fixture = "trestle-local-cmu-1"
+reader = "trestle"
+status = "exact"
+rust_checksum = 106116736
+reference_checksum = 106116736
+rust_rgb_checksum = 76871296
+reference_rgb_checksum = 76871296
+notes = "Exact on audited local data."
+
+[[expectation]]
+fixture = "ventana-local-os-1"
+reader = "ventana"
+status = "exact"
+rust_checksum = 131801249
+reference_checksum = 131801249
+rust_rgb_checksum = 90030435
+reference_rgb_checksum = 90030435
+notes = "Exact on audited local data."
+
+[[expectation]]
+fixture = "ventana-local-os-2"
+reader = "ventana"
+status = "exact"
+rust_checksum = 152572331
+reference_checksum = 152572331
+rust_rgb_checksum = 110821507
+reference_rgb_checksum = 110821507
+notes = "Exact on local BIF fixture with subpixel AOI origins."
+
+[[expectation]]
+fixture = "ventana-local-ventana-1"
+reader = "ventana"
+status = "blocked"
+notes = "Reference OpenSlide could not open this local Ventana fixture."
+
+[[expectation]]
+fixture = "dicom-local-readable-single-level"
+reader = "dicom"
+status = "exact-limited"
+notes = "Exact on three reference-readable single-level members only; not a maturity pass for full DICOM WSI."
+
+[[expectation]]
+fixture = "generic-tiff-public-cmu-1"
+reader = "generic-tiff"
+status = "exact"
+rust_checksum = 144947476
+reference_checksum = 144947476
+rust_rgb_checksum = 107346196
+reference_rgb_checksum = 107346196
+notes = "Exact after fixing benchmark reference coordinate rounding to match Rust's half-away rounding."
+
+[[expectation]]
+fixture = "aperio-public-cmu-1-small-region"
+reader = "aperio"
+status = "exact"
+rust_checksum = 9151037
+reference_checksum = 9151037
+rust_rgb_checksum = 4973117
+reference_rgb_checksum = 4973117
+notes = "Exact after forcing RGB-tagged TIFF JPEG tiles through libjpeg with JCS_RGB instead of default YCbCr conversion."
+
+[[expectation]]
+fixture = "dicom-public-leica-4"
+reader = "dicom"
+status = "blocked"
+notes = "Installed reference OpenSlide 3.4.1 could not open any of the six public Leica-4 DICOM members; Rust opened them, so original parity cannot be measured with this reference stack."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-public-cmu-1"
+reader = "hamamatsu-ndpi"
+status = "exact"
+rust_checksum = 122444483
+reference_checksum = 122444483
+rust_rgb_checksum = 84843203
+reference_rgb_checksum = 84843203
+notes = "Public NDPI fixture has exact sampled checksum parity."
+
+[[expectation]]
+fixture = "hamamatsu-vms-public-cmu-1"
+reader = "hamamatsu-vms"
+status = "exact"
+rust_checksum = 95211709
+reference_checksum = 95211709
+rust_rgb_checksum = 65966269
+reference_rgb_checksum = 65966269
+notes = "Public VMS fixture has exact sampled checksum parity."
+
+[[expectation]]
+fixture = "leica-public-fluorescence-1"
+reader = "leica"
+status = "blocked"
+notes = "Installed reference OpenSlide 3.4.1 could not open this public Leica fluorescence fixture: Can't find main image."
+
+[[expectation]]
+fixture = "mirax-public-cmu-1-saved-1-16"
+reader = "mirax"
+status = "exact"
+rust_checksum = 5588307
+reference_checksum = 5588307
+rust_rgb_checksum = 4005168
+reference_rgb_checksum = 4005168
+notes = "Brightfield MRXS public fixture is exact after decoding Mirax JPEG tiles through libjpeg before Cairo tilemap composition."
+
+[[expectation]]
+fixture = "mirax-public-fluorescence-2"
+reader = "mirax"
+status = "exact"
+rust_checksum = 250093
+reference_checksum = 250093
+rust_rgb_checksum = 164350
+reference_rgb_checksum = 164350
+notes = "Public fluorescence MRXS fixture is exact after same-filter Cairo RGBA tilemap composition."
+
+[[expectation]]
+fixture = "philips-public-philips-1"
+reader = "philips"
+status = "exact"
+rust_checksum = 94198079
+reference_checksum = 94198079
+rust_rgb_checksum = 60774719
+reference_rgb_checksum = 60774719
+notes = "Public Philips fixture is an immediate candidate for a blocking CI parity gate."
+
+[[expectation]]
+fixture = "trestle-public-cmu-1"
+reader = "trestle"
+status = "exact"
+rust_checksum = 106116736
+reference_checksum = 106116736
+rust_rgb_checksum = 76871296
+reference_rgb_checksum = 76871296
+notes = "Public Trestle fixture has exact sampled checksum parity."
+
+[[expectation]]
+fixture = "ventana-public-ventana-1"
+reader = "ventana"
+status = "blocked"
+notes = "Installed reference OpenSlide 3.4.1 could not open this public Ventana fixture: Bad direction attribute LEFT."
+
+[[expectation]]
+fixture = "zeiss-public-jxr-and-zstd"
+reader = "zeiss"
+status = "blocked"
+notes = "Reference could not open audited CZI samples; Rust reads public Zstd0/Zstd1 preview regions and the JXR slide-preview fixture with --features jpegxr. Full-slide Bgr24 JXR is wired through the optional backend but still needs isolated validation after a native jxrlib crash probe."
+
+[[expectation]]
+fixture = "sakura-missing"
+reader = "sakura"
+status = "missing-fixture"
+notes = "Needs an example .svslide fixture before maturity work can proceed."
+
+[[expectation]]
+fixture = "generic-tiff-local-zackthecat"
+reader = "generic-tiff"
+status = "blocked"
+notes = "Installed reference OpenSlide could not open this local old-JPEG TIFF; Rust opens it as a compression-6 smoke fixture, so it is not comparable parity evidence."

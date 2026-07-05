@@ -1,0 +1,10 @@
+schema_version = 1
+
+[[runner]]
+profile = "openslide-audit-stable-v1"
+status = "external-pending"
+fixture_root = "/big/henriksson/ome_images"
+preflight_report_artifact = "stable-runner-preflight.json"
+benchmark_report_artifact = "bench-stable.json"
+owner_action = "Register and maintain a self-hosted GitHub Actions runner with read access to /big/henriksson/ome_images."
+notes = "Repository-side preflight, workflow, JSON report validation, and operations runbook are present; actual runner registration is external state."

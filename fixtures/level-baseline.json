@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "region_size": 128,
+    "regions_per_level": 1,
+    "description": "Per-level Rust/reference checksums for readers where aggregate parity hides useful diagnostic detail."
+  },
+  "rows": [
+    {
+      "fixture": "mirax-public-cmu-1-saved-1-16",
+      "reader": "mirax",
+      "status": "exact",
+      "levels": [
+        {"level": 0, "width": 7436, "height": 15494, "downsample": 1.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 1, "width": 3718, "height": 7747, "downsample": 2.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 2, "width": 1859, "height": 3873, "downsample": 4.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 3, "width": 929, "height": 1936, "downsample": 8.0, "regions": 1, "pixels": 16384, "rust_checksum": 5598, "reference_checksum": 5598, "rust_rgb_checksum": 4560, "reference_rgb_checksum": 4560},
+        {"level": 4, "width": 464, "height": 968, "downsample": 16.0, "regions": 1, "pixels": 16384, "rust_checksum": 2792754, "reference_checksum": 2792754, "rust_rgb_checksum": 1985856, "reference_rgb_checksum": 1985856},
+        {"level": 5, "width": 232, "height": 484, "downsample": 32.0, "regions": 1, "pixels": 16384, "rust_checksum": 2789955, "reference_checksum": 2789955, "rust_rgb_checksum": 2014752, "reference_rgb_checksum": 2014752}
+      ]
+    },
+    {
+      "fixture": "mirax-public-fluorescence-2",
+      "reader": "mirax",
+      "status": "exact",
+      "levels": [
+        {"level": 0, "width": 72448, "height": 152080, "downsample": 1.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 1, "width": 36224, "height": 76040, "downsample": 2.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 2, "width": 18112, "height": 38020, "downsample": 4.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 3, "width": 9056, "height": 19010, "downsample": 8.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 4, "width": 4528, "height": 9505, "downsample": 16.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 5, "width": 2264, "height": 4752, "downsample": 32.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 6, "width": 1132, "height": 2376, "downsample": 64.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 7, "width": 566, "height": 1188, "downsample": 128.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 8, "width": 283, "height": 594, "downsample": 256.0, "regions": 1, "pixels": 16384, "rust_checksum": 0, "reference_checksum": 0, "rust_rgb_checksum": 0, "reference_rgb_checksum": 0},
+        {"level": 9, "width": 141, "height": 297, "downsample": 512.0, "regions": 1, "pixels": 16384, "rust_checksum": 250093, "reference_checksum": 250093, "rust_rgb_checksum": 164350, "reference_rgb_checksum": 164350}
+      ]
+    }
+  ]
+}

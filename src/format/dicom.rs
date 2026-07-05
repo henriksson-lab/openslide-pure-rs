@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -93,6 +92,7 @@ const TAG_NUMBER_OF_OPTICAL_PATHS: Tag = Tag(0x0048, 0x0302);
 const TAG_OPTICAL_PATH_SEQUENCE: Tag = Tag(0x0048, 0x0105);
 const TAG_OPTICAL_PATH_IDENTIFIER: Tag = Tag(0x0048, 0x0106);
 const TAG_OPTICAL_PATH_IDENTIFICATION_SEQUENCE: Tag = Tag(0x0048, 0x0207);
+const TAG_ICC_PROFILE: Tag = Tag(0x0028, 0x2000);
 const TAG_CONTAINER_IDENTIFIER: Tag = Tag(0x0040, 0x0512);
 const TAG_X_OFFSET_IN_SLIDE_COORDINATE_SYSTEM: Tag = Tag(0x0040, 0x072a);
 const TAG_Y_OFFSET_IN_SLIDE_COORDINATE_SYSTEM: Tag = Tag(0x0040, 0x073a);
@@ -109,15 +109,26 @@ const TAG_BURNED_IN_ANNOTATION: Tag = Tag(0x0028, 0x0301);
 const TAG_CONCATENATION_UID: Tag = Tag(0x0020, 0x9161);
 const TAG_IN_CONCATENATION_NUMBER: Tag = Tag(0x0020, 0x9162);
 const TAG_IN_CONCATENATION_TOTAL_NUMBER: Tag = Tag(0x0020, 0x9163);
+const TAG_CONCATENATION_FRAME_OFFSET_NUMBER: Tag = Tag(0x0020, 0x9228);
+const TAG_EXTENDED_OFFSET_TABLE: Tag = Tag(0x7fe0, 0x0001);
+const TAG_EXTENDED_OFFSET_TABLE_LENGTHS: Tag = Tag(0x7fe0, 0x0002);
 const TAG_PIXEL_DATA: Tag = Tag(0x7fe0, 0x0010);
 
 const TS_IMPLICIT_VR_LE: &str = "1.2.840.10008.1.2";
 const TS_EXPLICIT_VR_LE: &str = "1.2.840.10008.1.2.1";
 const TS_DEFLATED_EXPLICIT_VR_LE: &str = "1.2.840.10008.1.2.1.99";
 const TS_EXPLICIT_VR_BE: &str = "1.2.840.10008.1.2.2";
+const TS_RLE_LOSSLESS: &str = "1.2.840.10008.1.2.5";
 const TS_JPEG_BASELINE: &str = "1.2.840.10008.1.2.4.50";
+const TS_JPEG_LOSSLESS_PROCESS14: &str = "1.2.840.10008.1.2.4.57";
+const TS_JPEG_LOSSLESS_SV1: &str = "1.2.840.10008.1.2.4.70";
+const TS_JPEG_LS_LOSSLESS: &str = "1.2.840.10008.1.2.4.80";
+const TS_JPEG_LS_NEAR_LOSSLESS: &str = "1.2.840.10008.1.2.4.81";
 const TS_JPEG_2000_LOSSLESS: &str = "1.2.840.10008.1.2.4.90";
 const TS_JPEG_2000: &str = "1.2.840.10008.1.2.4.91";
+const TS_HTJ2K_LOSSLESS: &str = "1.2.840.10008.1.2.4.201";
+const TS_HTJ2K_LOSSLESS_RPCL: &str = "1.2.840.10008.1.2.4.202";
+const TS_HTJ2K: &str = "1.2.840.10008.1.2.4.203";
 const ITEM_TAG: Tag = Tag(0xfffe, 0xe000);
 const ITEM_DELIMITATION_ITEM_TAG: Tag = Tag(0xfffe, 0xe00d);
 const SEQUENCE_DELIMITATION_ITEM_TAG: Tag = Tag(0xfffe, 0xe0dd);
@@ -139,6 +150,7 @@ struct DicomElement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Endian {
     Little,
+    #[allow(dead_code)]
     Big,
 }
 
@@ -160,6 +172,7 @@ struct DicomSlide {
     level_slides: Vec<Option<Box<DicomSlide>>>,
     properties: HashMap<String, String>,
     associated_images: HashMap<String, DicomAssociatedImage>,
+    icc_profile: Option<Vec<u8>>,
     transfer_syntax: String,
     samples_per_pixel: u16,
     planar_configuration: u16,
@@ -181,6 +194,10 @@ struct DicomSlide {
 #[derive(Debug, Clone)]
 struct DicomAssociatedImage {
     path: PathBuf,
+    width: u64,
+    height: u64,
+    sop_instance_uid: Option<String>,
+    icc_profile: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +205,8 @@ struct DicomSeriesPyramidFile {
     path: PathBuf,
     width: u64,
     height: u64,
+    sop_instance_uid: Option<String>,
+    concatenation_uid: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,7 +259,7 @@ struct FrameFragments {
 
 #[derive(Debug, Clone)]
 struct Palette {
-    first_mapped: u16,
+    first_mapped: i32,
     red: Vec<u8>,
     green: Vec<u8>,
     blue: Vec<u8>,
@@ -267,9 +286,6 @@ struct ParsedDataset {
     elements: Vec<DicomElement>,
     pixel_data: Option<PixelDataLocation>,
     frame_metadata: Vec<FrameMetadata>,
-    dimension_indices: Vec<DimensionIndex>,
-    dimension_organization_uids: Vec<String>,
-    total_pixel_matrix_origin: Option<TotalPixelMatrixOrigin>,
     standard_optical_metadata: StandardOpticalMetadata,
     pixel_data_bytes: Option<Vec<u8>>,
 }
@@ -313,18 +329,27 @@ struct DimensionIndex {
     functional_group_pointer: Option<Tag>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TotalPixelMatrixOrigin {
-    x_offset: Option<String>,
-    y_offset: Option<String>,
-}
-
 pub fn detect(path: &Path) -> bool {
+    if has_lowercase_tiff_extension(path) && is_tiff_like(path) {
+        return false;
+    }
     let Ok((meta, _dataset_offset)) = read_file_meta(path) else {
         return false;
     };
     get_string(&meta, TAG_MEDIA_STORAGE_SOP_CLASS_UID)
         .is_some_and(|uid| uid == VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE)
+}
+
+fn has_lowercase_tiff_extension(path: &Path) -> bool {
+    let path = path.as_os_str().to_string_lossy();
+    path.ends_with(".tif") || path.ends_with(".tiff")
+}
+
+fn is_tiff_like(path: &Path) -> bool {
+    let Ok(header) = read_file_range(path, 0, 4) else {
+        return false;
+    };
+    matches!(header.as_slice(), b"II*\0" | b"MM\0*")
 }
 
 pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
@@ -349,26 +374,22 @@ impl DicomSlide {
         let (explicit_vr, endian) =
             transfer_syntax_encoding(&transfer_syntax).ok_or_else(|| {
                 OpenSlideError::UnsupportedFormat(format!(
-                    "DICOM transfer syntax is not supported yet: {transfer_syntax}"
+                    "Unsupported transfer syntax {transfer_syntax}"
                 ))
             })?;
 
-        let parsed = if transfer_syntax == TS_DEFLATED_EXPLICIT_VR_LE {
-            read_deflated_dataset(path, dataset_offset)?
-        } else {
-            read_dataset(path, dataset_offset, explicit_vr, endian)?
-        };
+        let parsed = read_dataset(path, dataset_offset, explicit_vr, endian)?;
         let dataset = parsed.elements;
-        let image_type = get_string(&dataset, TAG_IMAGE_TYPE).unwrap_or_default();
+        let image_type = get_string_all(&dataset, TAG_IMAGE_TYPE)
+            .ok_or_else(|| OpenSlideError::Format("Couldn't get ImageType".into()))?;
         let associated_image_name = associated_image_name_from_image_type(&image_type);
-        let series_uid = get_string(&dataset, TAG_SERIES_INSTANCE_UID);
+        let series_uid = get_string(&dataset, TAG_SERIES_INSTANCE_UID)
+            .ok_or_else(|| OpenSlideError::Format("SeriesInstanceUID not found".into()))?;
         if !is_pyramid_level_image_type(&image_type) && associated_image_name.is_none() {
-            return Err(OpenSlideError::UnsupportedFormat(format!(
-                "DICOM object is WSI, but ImageType is not a supported image role: {image_type}"
-            )));
+            return Err(OpenSlideError::Format("No pyramid levels found".into()));
         }
-        let same_series_pyramid_files = if discover_series && associated_image_name.is_none() {
-            discover_same_series_pyramid_levels(path, series_uid.as_deref())?
+        let same_series_pyramid_files = if discover_series {
+            discover_same_series_pyramid_levels(path, Some(series_uid.as_str()))?
         } else {
             Vec::new()
         };
@@ -379,102 +400,50 @@ impl DicomSlide {
         validate_native_bit_depth(bits_allocated, bits_stored, high_bit)?;
         let pixel_representation =
             get_required_u16(&dataset, TAG_PIXEL_REPRESENTATION, "PixelRepresentation")?;
-        if !matches!(pixel_representation, 0 | 1) {
-            return Err(OpenSlideError::UnsupportedFormat(format!(
-                "DICOM PixelRepresentation value {pixel_representation} is not supported"
+        if pixel_representation != 0 {
+            return Err(OpenSlideError::Format(format!(
+                "Attribute PixelRepresentation value {pixel_representation} != 0"
             )));
         }
-        let total_pixel_matrix_focal_planes =
-            get_u64(&dataset, TAG_TOTAL_PIXEL_MATRIX_FOCAL_PLANES).unwrap_or(1);
         let number_of_optical_paths = get_u64(&dataset, TAG_NUMBER_OF_OPTICAL_PATHS).unwrap_or(1);
-        if total_pixel_matrix_focal_planes == 0 {
-            return Err(OpenSlideError::Format(
-                "DICOM TotalPixelMatrixFocalPlanes is zero".into(),
-            ));
-        }
         if number_of_optical_paths == 0 {
             return Err(OpenSlideError::Format(
                 "DICOM NumberOfOpticalPaths is zero".into(),
             ));
         }
-
-        let photometric = get_string(&dataset, TAG_PHOTOMETRIC_INTERPRETATION)
-            .map(|value| canonical_photometric_interpretation(&value))
-            .ok_or_else(|| {
-                OpenSlideError::Format("DICOM PhotometricInterpretation missing".into())
-            })?;
-        let samples_per_pixel = get_u64(&dataset, TAG_SAMPLES_PER_PIXEL)
-            .ok_or_else(|| OpenSlideError::Format("DICOM SamplesPerPixel is missing".into()))?;
-        if !matches!(samples_per_pixel, 1 | 3) {
-            return Err(OpenSlideError::UnsupportedFormat(format!(
-                "DICOM SamplesPerPixel value {samples_per_pixel} is not supported"
-            )));
-        }
-        let samples_per_pixel = samples_per_pixel as u16;
-        let planar_configuration = if samples_per_pixel == 3 {
-            let value = match get_u64(&dataset, TAG_PLANAR_CONFIGURATION) {
-                Some(value) => u16::try_from(value).map_err(|_| {
-                    OpenSlideError::UnsupportedFormat(format!(
-                        "DICOM PlanarConfiguration value {value} does not fit u16"
-                    ))
-                })?,
-                None if is_native_transfer_syntax(&transfer_syntax) => {
-                    return Err(OpenSlideError::Format(
-                        "DICOM PlanarConfiguration is missing for native three-sample pixel data"
-                            .into(),
-                    ));
-                }
-                None => 0,
-            };
-            if !matches!(value, 0 | 1) {
-                return Err(OpenSlideError::UnsupportedFormat(format!(
-                    "DICOM PlanarConfiguration value {value} is not supported"
+        if let Some(total_pixel_matrix_focal_planes) =
+            get_u64(&dataset, TAG_TOTAL_PIXEL_MATRIX_FOCAL_PLANES)
+        {
+            if total_pixel_matrix_focal_planes != 1 {
+                return Err(OpenSlideError::Format(format!(
+                    "Attribute TotalPixelMatrixFocalPlanes value {total_pixel_matrix_focal_planes} != 1"
                 )));
             }
-            if value == 1
-                && photometric == "YBR_FULL_422"
-                && is_native_transfer_syntax(&transfer_syntax)
-            {
-                return Err(OpenSlideError::UnsupportedFormat(
-                    "DICOM planar YBR_FULL_422 native data is not supported".into(),
-                ));
-            }
-            value
-        } else {
-            0
-        };
-        let supported_photometric = match (transfer_syntax.as_str(), samples_per_pixel) {
-            (TS_IMPLICIT_VR_LE | TS_EXPLICIT_VR_LE, 1) => {
-                photometric == "MONOCHROME2"
-                    || photometric == "MONOCHROME1"
-                    || photometric == "PALETTE COLOR"
-            }
-            (TS_DEFLATED_EXPLICIT_VR_LE, 1) => {
-                photometric == "MONOCHROME2"
-                    || photometric == "MONOCHROME1"
-                    || photometric == "PALETTE COLOR"
-            }
-            (TS_EXPLICIT_VR_BE, 1) => {
-                photometric == "MONOCHROME2"
-                    || photometric == "MONOCHROME1"
-                    || photometric == "PALETTE COLOR"
-            }
-            (
-                TS_IMPLICIT_VR_LE
-                | TS_EXPLICIT_VR_LE
-                | TS_DEFLATED_EXPLICIT_VR_LE
-                | TS_EXPLICIT_VR_BE,
-                3,
-            ) => photometric == "RGB" || photometric == "YBR_FULL" || photometric == "YBR_FULL_422",
-            (TS_JPEG_BASELINE, 1) => photometric == "MONOCHROME2" || photometric == "MONOCHROME1",
-            (TS_JPEG_BASELINE, 3) => {
-                photometric == "RGB" || photometric == "YBR_FULL" || photometric == "YBR_FULL_422"
-            }
-            (TS_JPEG_2000_LOSSLESS | TS_JPEG_2000, 1) => {
-                photometric == "MONOCHROME2" || photometric == "MONOCHROME1"
-            }
-            (TS_JPEG_2000_LOSSLESS | TS_JPEG_2000, 3) => {
-                photometric == "RGB" || photometric == "YBR_ICT" || photometric == "YBR_RCT"
+        }
+
+        let photometric =
+            get_string(&dataset, TAG_PHOTOMETRIC_INTERPRETATION).ok_or_else(|| {
+                OpenSlideError::Format("DICOM PhotometricInterpretation missing".into())
+            })?;
+        let samples_per_pixel =
+            get_required_u16(&dataset, TAG_SAMPLES_PER_PIXEL, "SamplesPerPixel")?;
+        if samples_per_pixel != 3 {
+            return Err(OpenSlideError::Format(format!(
+                "Attribute SamplesPerPixel value {samples_per_pixel} != 3"
+            )));
+        }
+        let planar_configuration =
+            get_required_u16(&dataset, TAG_PLANAR_CONFIGURATION, "PlanarConfiguration")?;
+        if planar_configuration != 0 {
+            return Err(OpenSlideError::Format(format!(
+                "Attribute PlanarConfiguration value {planar_configuration} != 0"
+            )));
+        }
+        let supported_photometric = match transfer_syntax.as_str() {
+            TS_EXPLICIT_VR_LE => photometric == "RGB",
+            TS_JPEG_BASELINE => photometric == "RGB" || photometric == "YBR_FULL_422",
+            TS_JPEG_2000_LOSSLESS | TS_JPEG_2000 => {
+                photometric == "RGB" || photometric == "YBR_ICT"
             }
             _ => false,
         };
@@ -482,31 +451,6 @@ impl DicomSlide {
             return Err(OpenSlideError::UnsupportedFormat(format!(
                 "DICOM photometric interpretation is not supported for {transfer_syntax}: {photometric}"
             )));
-        }
-        if pixel_representation == 1 {
-            if !matches!(
-                transfer_syntax.as_str(),
-                TS_IMPLICIT_VR_LE
-                    | TS_EXPLICIT_VR_LE
-                    | TS_DEFLATED_EXPLICIT_VR_LE
-                    | TS_EXPLICIT_VR_BE
-            ) {
-                return Err(OpenSlideError::UnsupportedFormat(format!(
-                    "DICOM signed native samples are not supported for encapsulated transfer syntax {transfer_syntax}"
-                )));
-            }
-            if samples_per_pixel != 1
-                || !matches!(photometric.as_str(), "MONOCHROME1" | "MONOCHROME2")
-            {
-                return Err(OpenSlideError::UnsupportedFormat(format!(
-                    "DICOM signed native samples are only supported for single-sample MONOCHROME images, not SamplesPerPixel={samples_per_pixel} PhotometricInterpretation={photometric}"
-                )));
-            }
-            if !matches!(bits_allocated, 8 | 16) {
-                return Err(OpenSlideError::UnsupportedFormat(format!(
-                    "DICOM signed native samples are only supported with BitsAllocated=8 or 16, not {bits_allocated}"
-                )));
-            }
         }
         let intensity = parse_intensity_mapping(&dataset);
 
@@ -525,6 +469,15 @@ impl DicomSlide {
             return Err(OpenSlideError::Format(
                 "DICOM contains zero-sized dimensions".into(),
             ));
+        }
+        if discover_series && associated_image_name.is_some() {
+            if let Some(canonical) = same_series_pyramid_files
+                .iter()
+                .max_by(|a, b| a.width.cmp(&b.width).then_with(|| a.height.cmp(&b.height)))
+            {
+                return DicomSlide::open_with_series(&canonical.path, true);
+            }
+            return Err(OpenSlideError::Format("No pyramid levels found".into()));
         }
         if discover_series && associated_image_name.is_none() {
             if let Some(canonical) = same_series_pyramid_files
@@ -545,11 +498,9 @@ impl DicomSlide {
             tile_height,
             samples_per_pixel,
             &photometric,
+            planar_configuration,
             bits_allocated,
         )?;
-        let tile_count = tiles_across
-            .checked_mul(tiles_down)
-            .ok_or_else(|| OpenSlideError::Format("DICOM tile count overflows".into()))?;
         let concatenation_total = get_u64(&dataset, TAG_IN_CONCATENATION_TOTAL_NUMBER).unwrap_or(1);
         let multi_instance = concatenation_total > 1;
         let mut concatenation_unsupported_reason = None;
@@ -564,7 +515,7 @@ impl DicomSlide {
                 (Some(_location), Some(concatenation_uid)) => {
                     match discover_deflated_concatenation_frames(
                         path,
-                        series_uid.as_deref(),
+                        Some(series_uid.as_str()),
                         &concatenation_uid,
                         concatenation_total,
                         frame_bytes,
@@ -598,7 +549,7 @@ impl DicomSlide {
                 (Some(_location), Some(concatenation_uid)) => {
                     match discover_native_concatenation_frames(
                         path,
-                        series_uid.as_deref(),
+                        Some(series_uid.as_str()),
                         &concatenation_uid,
                         concatenation_total,
                         frame_bytes,
@@ -621,7 +572,17 @@ impl DicomSlide {
         let encapsulated_concatenated_frames = if multi_instance
             && matches!(
                 transfer_syntax.as_str(),
-                TS_JPEG_BASELINE | TS_JPEG_2000_LOSSLESS | TS_JPEG_2000
+                TS_RLE_LOSSLESS
+                    | TS_JPEG_BASELINE
+                    | TS_JPEG_LOSSLESS_PROCESS14
+                    | TS_JPEG_LOSSLESS_SV1
+                    | TS_JPEG_LS_LOSSLESS
+                    | TS_JPEG_LS_NEAR_LOSSLESS
+                    | TS_JPEG_2000_LOSSLESS
+                    | TS_JPEG_2000
+                    | TS_HTJ2K_LOSSLESS
+                    | TS_HTJ2K_LOSSLESS_RPCL
+                    | TS_HTJ2K
             )
             && associated_image_name.is_none()
         {
@@ -632,7 +593,7 @@ impl DicomSlide {
                 (Some(_location), Some(concatenation_uid)) => {
                     match discover_encapsulated_concatenation_frames(
                         path,
-                        series_uid.as_deref(),
+                        Some(series_uid.as_str()),
                         &concatenation_uid,
                         concatenation_total,
                     ) {
@@ -660,45 +621,18 @@ impl DicomSlide {
         } else {
             parsed.frame_metadata.clone()
         };
-        let multi_dimensional =
-            total_pixel_matrix_focal_planes > 1 || number_of_optical_paths > 1 || multi_instance;
-        let mut read_unsupported_reason = if multi_instance
+        let read_unsupported_reason = if multi_instance
             && deflated_concatenated_frames.is_none()
             && native_concatenated_frames.is_none()
             && encapsulated_concatenated_frames.is_none()
         {
             Some(concatenation_unsupported_reason.unwrap_or_else(|| format!(
-                "DICOM multi-file concatenation {} of {concatenation_total} is detected, but this backend opens only one SOP instance and cannot assemble the full pixel stream",
+                "DICOM multi-file concatenation {} of {concatenation_total} is detected, but the complete pixel stream could not be assembled from available same-series instances",
                 get_u64(&dataset, TAG_IN_CONCATENATION_NUMBER).unwrap_or(1)
             )))
         } else {
             None
         };
-        if frame_metadata.is_empty()
-            && associated_image_name.is_none()
-            && number_of_frames != tile_count
-        {
-            if multi_dimensional {
-                read_unsupported_reason.get_or_insert_with(|| {
-                    format!(
-                        "DICOM has {number_of_frames} frames for {tile_count} tiles without per-frame tile positions; multi-plane or multi-optical-path frame selection is not possible"
-                    )
-                });
-            } else {
-                return Err(OpenSlideError::UnsupportedFormat(format!(
-                    "DICOM has {number_of_frames} frames for {tile_count} tiles without per-frame tile positions; multi-plane or multi-optical-path layouts are not supported"
-                )));
-            }
-        }
-        if frame_metadata.is_empty()
-            && associated_image_name.is_none()
-            && get_string(&dataset, TAG_DIMENSION_ORGANIZATION_TYPE)
-                .is_some_and(|value| normalize_code_string(&value) == "TILED_SPARSE")
-        {
-            return Err(OpenSlideError::UnsupportedFormat(
-                "DICOM TILED_SPARSE images need per-frame tile positions; implicit sparse frame ordering is not supported".into(),
-            ));
-        }
         if !frame_metadata.is_empty() && frame_metadata.len() as u64 != number_of_frames {
             return Err(OpenSlideError::UnsupportedFormat(format!(
                 "DICOM PerFrameFunctionalGroupsSequence has {} items for {number_of_frames} frames",
@@ -745,7 +679,20 @@ impl DicomSlide {
                     })
                 }
             }
-            (TS_JPEG_BASELINE | TS_JPEG_2000_LOSSLESS | TS_JPEG_2000, Some(location)) => {
+            (
+                TS_RLE_LOSSLESS
+                | TS_JPEG_BASELINE
+                | TS_JPEG_LOSSLESS_PROCESS14
+                | TS_JPEG_LOSSLESS_SV1
+                | TS_JPEG_LS_LOSSLESS
+                | TS_JPEG_LS_NEAR_LOSSLESS
+                | TS_JPEG_2000_LOSSLESS
+                | TS_JPEG_2000
+                | TS_HTJ2K_LOSSLESS
+                | TS_HTJ2K_LOSSLESS_RPCL
+                | TS_HTJ2K,
+                Some(location),
+            ) => {
                 if location.len.is_some() {
                     return Err(OpenSlideError::UnsupportedFormat(
                         "Encapsulated DICOM PixelData has defined length".into(),
@@ -756,11 +703,17 @@ impl DicomSlide {
                         frames: concatenation.frames,
                     })
                 } else {
+                    let extended_offset_table =
+                        parse_extended_offset_table(&dataset, TAG_EXTENDED_OFFSET_TABLE)?;
+                    let extended_offset_table_lengths =
+                        parse_extended_offset_table(&dataset, TAG_EXTENDED_OFFSET_TABLE_LENGTHS)?;
                     Some(PixelData::Encapsulated {
                         frames: read_encapsulated_frame_table(
                             path,
                             location.offset,
                             number_of_frames,
+                            extended_offset_table.as_deref(),
+                            extended_offset_table_lengths.as_deref(),
                         )?,
                     })
                 }
@@ -780,380 +733,40 @@ impl DicomSlide {
         properties.insert(properties::PROPERTY_VENDOR.into(), "dicom".into());
         add_properties_dataset(&mut properties, "dicom", &meta);
         add_properties_dataset(&mut properties, "dicom", &dataset);
-        insert_string_property(
-            &mut properties,
-            "dicom.MediaStorageSOPClassUID",
-            &meta,
-            TAG_MEDIA_STORAGE_SOP_CLASS_UID,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.TransferSyntaxUID",
-            &meta,
-            TAG_TRANSFER_SYNTAX_UID,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.SOPClassUID",
-            &dataset,
-            TAG_SOP_CLASS_UID,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.SOPInstanceUID",
-            &dataset,
-            TAG_SOP_INSTANCE_UID,
-        );
-        insert_string_property(&mut properties, "dicom.StudyDate", &dataset, TAG_STUDY_DATE);
-        insert_string_property(
-            &mut properties,
-            "dicom.SeriesDate",
-            &dataset,
-            TAG_SERIES_DATE,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.AcquisitionDate",
-            &dataset,
-            TAG_ACQUISITION_DATE,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ContentDate",
-            &dataset,
-            TAG_CONTENT_DATE,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.AcquisitionDateTime",
-            &dataset,
-            TAG_ACQUISITION_DATE_TIME,
-        );
-        insert_string_property(&mut properties, "dicom.StudyTime", &dataset, TAG_STUDY_TIME);
-        insert_string_property(
-            &mut properties,
-            "dicom.SeriesTime",
-            &dataset,
-            TAG_SERIES_TIME,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.AcquisitionTime",
-            &dataset,
-            TAG_ACQUISITION_TIME,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ContentTime",
-            &dataset,
-            TAG_CONTENT_TIME,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.AccessionNumber",
-            &dataset,
-            TAG_ACCESSION_NUMBER,
-        );
-        insert_string_property(&mut properties, "dicom.Modality", &dataset, TAG_MODALITY);
-        insert_string_property(
-            &mut properties,
-            "dicom.Manufacturer",
-            &dataset,
-            TAG_MANUFACTURER,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.InstitutionName",
-            &dataset,
-            TAG_INSTITUTION_NAME,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ReferringPhysicianName",
-            &dataset,
-            TAG_REFERRING_PHYSICIAN_NAME,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.StudyDescription",
-            &dataset,
-            TAG_STUDY_DESCRIPTION,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.SeriesDescription",
-            &dataset,
-            TAG_SERIES_DESCRIPTION,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ManufacturerModelName",
-            &dataset,
-            TAG_MANUFACTURER_MODEL_NAME,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.DeviceSerialNumber",
-            &dataset,
-            TAG_DEVICE_SERIAL_NUMBER,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.SoftwareVersions",
-            &dataset,
-            TAG_SOFTWARE_VERSIONS,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ProtocolName",
-            &dataset,
-            TAG_PROTOCOL_NAME,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.SeriesInstanceUID",
-            &dataset,
-            TAG_SERIES_INSTANCE_UID,
-        );
         if let Some(series_instance_uid) = get_string(&dataset, TAG_SERIES_INSTANCE_UID) {
             properties.insert(
                 properties::PROPERTY_QUICKHASH1.into(),
                 tiff::openslide_quickhash1_from_string(&series_instance_uid),
             );
         }
-        insert_string_property(
-            &mut properties,
-            "dicom.StudyInstanceUID",
-            &dataset,
-            TAG_STUDY_INSTANCE_UID,
-        );
-        insert_string_property(&mut properties, "dicom.StudyID", &dataset, TAG_STUDY_ID);
-        insert_u64_property(
-            &mut properties,
-            "dicom.SeriesNumber",
-            &dataset,
-            TAG_SERIES_NUMBER,
-        );
-        insert_u64_property(
-            &mut properties,
-            "dicom.InstanceNumber",
-            &dataset,
-            TAG_INSTANCE_NUMBER,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.FrameOfReferenceUID",
-            &dataset,
-            TAG_FRAME_OF_REFERENCE_UID,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ContainerIdentifier",
-            &dataset,
-            TAG_CONTAINER_IDENTIFIER,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.DimensionOrganizationType",
-            &dataset,
-            TAG_DIMENSION_ORGANIZATION_TYPE,
-        );
-        insert_string_property(&mut properties, "dicom.ImageType", &dataset, TAG_IMAGE_TYPE);
-        insert_string_property(
-            &mut properties,
-            "dicom.PhotometricInterpretation",
-            &dataset,
-            TAG_PHOTOMETRIC_INTERPRETATION,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.WindowCenter",
-            &dataset,
-            TAG_WINDOW_CENTER,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.WindowWidth",
-            &dataset,
-            TAG_WINDOW_WIDTH,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.RescaleIntercept",
-            &dataset,
-            TAG_RESCALE_INTERCEPT,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.RescaleSlope",
-            &dataset,
-            TAG_RESCALE_SLOPE,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.RescaleType",
-            &dataset,
-            TAG_RESCALE_TYPE,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.VOILUTFunction",
-            &dataset,
-            TAG_VOI_LUT_FUNCTION,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.PixelSpacing",
-            &dataset,
-            TAG_PIXEL_SPACING,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ImagedVolumeWidth",
-            &dataset,
-            TAG_IMAGED_VOLUME_WIDTH,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ImagedVolumeHeight",
-            &dataset,
-            TAG_IMAGED_VOLUME_HEIGHT,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ImagedVolumeDepth",
-            &dataset,
-            TAG_IMAGED_VOLUME_DEPTH,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.SpecimenLabelInImage",
-            &dataset,
-            TAG_SPECIMEN_LABEL_IN_IMAGE,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.FocusMethod",
-            &dataset,
-            TAG_FOCUS_METHOD,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ExtendedDepthOfField",
-            &dataset,
-            TAG_EXTENDED_DEPTH_OF_FIELD,
-        );
-        insert_u64_property(
-            &mut properties,
-            "dicom.NumberOfFocalPlanes",
-            &dataset,
-            TAG_NUMBER_OF_FOCAL_PLANES,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.DistanceBetweenFocalPlanes",
-            &dataset,
-            TAG_DISTANCE_BETWEEN_FOCAL_PLANES,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ObjectiveLensPower",
-            &dataset,
-            TAG_OBJECTIVE_LENS_POWER,
-        );
-        insert_u64_property(
-            &mut properties,
-            "dicom.NumberOfOpticalPaths",
-            &dataset,
-            TAG_NUMBER_OF_OPTICAL_PATHS,
-        );
-        insert_u64_property(
-            &mut properties,
-            "dicom.TotalPixelMatrixFocalPlanes",
-            &dataset,
-            TAG_TOTAL_PIXEL_MATRIX_FOCAL_PLANES,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.LossyImageCompression",
-            &dataset,
-            TAG_LOSSY_IMAGE_COMPRESSION,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.LossyImageCompressionRatio",
-            &dataset,
-            TAG_LOSSY_IMAGE_COMPRESSION_RATIO,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.LossyImageCompressionMethod",
-            &dataset,
-            TAG_LOSSY_IMAGE_COMPRESSION_METHOD,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.BurnedInAnnotation",
-            &dataset,
-            TAG_BURNED_IN_ANNOTATION,
-        );
-        insert_string_property(
-            &mut properties,
-            "dicom.ConcatenationUID",
-            &dataset,
-            TAG_CONCATENATION_UID,
-        );
-        insert_u64_property(
-            &mut properties,
-            "dicom.InConcatenationNumber",
-            &dataset,
-            TAG_IN_CONCATENATION_NUMBER,
-        );
-        insert_u64_property(
-            &mut properties,
-            "dicom.InConcatenationTotalNumber",
-            &dataset,
-            TAG_IN_CONCATENATION_TOTAL_NUMBER,
-        );
-        insert_standard_optical_properties(
-            &mut properties,
-            &dataset,
-            &parsed.standard_optical_metadata,
-        );
-        insert_dimension_organization_properties(
-            &mut properties,
-            &parsed.dimension_organization_uids,
-        );
-        insert_dimension_index_properties(&mut properties, &parsed.dimension_indices);
-        insert_total_pixel_matrix_origin_properties(
-            &mut properties,
-            parsed.total_pixel_matrix_origin.as_ref(),
-        );
-        let associated_images =
-            discover_same_series_associated_images(path, series_uid.as_deref())?;
-        properties.insert(
-            "dicom.SamplesPerPixel".into(),
-            samples_per_pixel.to_string(),
-        );
-        if samples_per_pixel == 3 {
+        insert_standard_optical_properties(&mut properties, &parsed.standard_optical_metadata);
+        let icc_profile = dicom_icc_profile(&dataset);
+        if let Some(profile) = &icc_profile {
             properties.insert(
-                "dicom.PlanarConfiguration".into(),
-                planar_configuration.to_string(),
+                properties::PROPERTY_ICC_SIZE.into(),
+                profile.len().to_string(),
             );
         }
-        properties.insert("dicom.BitsAllocated".into(), bits_allocated.to_string());
-        properties.insert("dicom.BitsStored".into(), bits_stored.to_string());
-        properties.insert("dicom.HighBit".into(), high_bit.to_string());
-        properties.insert(
-            "dicom.PixelRepresentation".into(),
-            pixel_representation.to_string(),
+        insert_frame_plane_selection_properties(
+            &mut properties,
+            &frame_metadata,
+            frame_tile_map.as_deref(),
         );
-        properties.insert("dicom.Columns".into(), tile_width.to_string());
-        properties.insert("dicom.Rows".into(), tile_height.to_string());
-        properties.insert("dicom.TotalPixelMatrixColumns".into(), width.to_string());
-        properties.insert("dicom.TotalPixelMatrixRows".into(), height.to_string());
-        properties.insert("dicom.NumberOfFrames".into(), number_of_frames.to_string());
-
+        let associated_images =
+            discover_same_series_associated_images(path, Some(series_uid.as_str()))?;
+        for (name, image) in &associated_images {
+            properties.insert(properties::associated_width(name), image.width.to_string());
+            properties.insert(
+                properties::associated_height(name),
+                image.height.to_string(),
+            );
+            if let Some(profile) = &image.icc_profile {
+                properties.insert(
+                    properties::associated_icc_size(name),
+                    profile.len().to_string(),
+                );
+            }
+        }
         let mut levels = vec![DicomLevel {
             width,
             height,
@@ -1183,18 +796,15 @@ impl DicomSlide {
                 level_slides.push(Some(slide));
             }
         }
-        properties.insert("openslide.level-count".into(), levels.len().to_string());
+        properties.insert(
+            properties::PROPERTY_LEVEL_COUNT.into(),
+            levels.len().to_string(),
+        );
         for (index, level) in levels.iter().enumerate() {
+            properties.insert(properties::level_width(index), level.width.to_string());
+            properties.insert(properties::level_height(index), level.height.to_string());
             properties.insert(
-                format!("openslide.level[{index}].width"),
-                level.width.to_string(),
-            );
-            properties.insert(
-                format!("openslide.level[{index}].height"),
-                level.height.to_string(),
-            );
-            properties.insert(
-                format!("openslide.level[{index}].downsample"),
+                properties::level_downsample(index),
                 format_float(level.downsample),
             );
         }
@@ -1205,6 +815,7 @@ impl DicomSlide {
             level_slides,
             properties,
             associated_images,
+            icc_profile,
             transfer_syntax,
             samples_per_pixel,
             planar_configuration,
@@ -1405,6 +1016,115 @@ impl DicomSlide {
                     rgb,
                 })
             }
+            (TS_RLE_LOSSLESS, PixelData::Encapsulated { frames }) => {
+                let frame = frames.get(frame_index as usize).ok_or_else(|| {
+                    OpenSlideError::Format(format!(
+                        "DICOM encapsulated frame {frame_index} missing"
+                    ))
+                })?;
+                let rle = read_file_fragments(&frame.path, &frame.fragments)?;
+                let data = decode_rle_lossless_frame(
+                    &rle,
+                    self.levels[0].tile_width as usize,
+                    self.levels[0].tile_height as usize,
+                    self.samples_per_pixel,
+                    self.planar_configuration,
+                    self.bits_allocated,
+                    &self.photometric,
+                )?;
+                let rgb = native_frame_to_rgb(
+                    &data,
+                    self.levels[0].tile_width as usize,
+                    self.levels[0].tile_height as usize,
+                    self.samples_per_pixel,
+                    self.planar_configuration,
+                    self.bits_allocated,
+                    self.bits_stored,
+                    self.high_bit,
+                    self.pixel_representation,
+                    Endian::Little,
+                    &self.photometric,
+                    self.intensity,
+                    self.palette.as_ref(),
+                )?;
+                Ok(DecodedFrame {
+                    width: self.levels[0].tile_width,
+                    height: self.levels[0].tile_height,
+                    rgb,
+                })
+            }
+            (
+                TS_JPEG_LOSSLESS_PROCESS14
+                | TS_JPEG_LOSSLESS_SV1
+                | TS_JPEG_LS_LOSSLESS
+                | TS_JPEG_LS_NEAR_LOSSLESS,
+                PixelData::Encapsulated { frames },
+            ) => {
+                let frame = frames.get(frame_index as usize).ok_or_else(|| {
+                    OpenSlideError::Format(format!(
+                        "DICOM encapsulated frame {frame_index} missing"
+                    ))
+                })?;
+                ensure_single_sample_lossless_jpeg_backend(
+                    &self.transfer_syntax,
+                    self.samples_per_pixel,
+                )?;
+                let compressed = read_file_fragments(&frame.path, &frame.fragments)?;
+                let samples = if matches!(
+                    self.transfer_syntax.as_str(),
+                    TS_JPEG_LOSSLESS_PROCESS14 | TS_JPEG_LOSSLESS_SV1
+                ) {
+                    jpegli::decode(
+                        &compressed,
+                        self.levels[0].tile_width,
+                        self.levels[0].tile_height,
+                    )
+                    .map_err(|err| {
+                        OpenSlideError::Decode(format!(
+                            "DICOM JPEG Lossless frame {frame_index} decode failed: {err}"
+                        ))
+                    })?
+                    .0
+                } else {
+                    jpegls::decode(
+                        &compressed,
+                        self.levels[0].tile_width,
+                        self.levels[0].tile_height,
+                    )
+                    .map_err(|err| {
+                        OpenSlideError::Decode(format!(
+                            "DICOM JPEG-LS frame {frame_index} decode failed: {err}"
+                        ))
+                    })?
+                    .0
+                };
+                let data = single_sample_u16_pixels_to_native_bytes(
+                    &samples,
+                    self.bits_allocated,
+                    self.levels[0].tile_width as usize,
+                    self.levels[0].tile_height as usize,
+                )?;
+                let rgb = native_frame_to_rgb(
+                    &data,
+                    self.levels[0].tile_width as usize,
+                    self.levels[0].tile_height as usize,
+                    self.samples_per_pixel,
+                    self.planar_configuration,
+                    self.bits_allocated,
+                    self.bits_stored,
+                    self.high_bit,
+                    self.pixel_representation,
+                    Endian::Little,
+                    &self.photometric,
+                    self.intensity,
+                    self.palette.as_ref(),
+                )?;
+                Ok(DecodedFrame {
+                    width: self.levels[0].tile_width,
+                    height: self.levels[0].tile_height,
+                    rgb,
+                })
+            }
             (TS_JPEG_BASELINE, PixelData::Encapsulated { frames }) => {
                 let frame = frames.get(frame_index as usize).ok_or_else(|| {
                     OpenSlideError::Format(format!(
@@ -1420,7 +1140,14 @@ impl DicomSlide {
                 }
                 Ok(DecodedFrame { width, height, rgb })
             }
-            (TS_JPEG_2000_LOSSLESS | TS_JPEG_2000, PixelData::Encapsulated { frames }) => {
+            (
+                TS_JPEG_2000_LOSSLESS
+                | TS_JPEG_2000
+                | TS_HTJ2K_LOSSLESS
+                | TS_HTJ2K_LOSSLESS_RPCL
+                | TS_HTJ2K,
+                PixelData::Encapsulated { frames },
+            ) => {
                 let frame = frames.get(frame_index as usize).ok_or_else(|| {
                     OpenSlideError::Format(format!(
                         "DICOM encapsulated frame {frame_index} missing"
@@ -1688,7 +1415,7 @@ fn blit_native_rgb_frame_region(
     )
     .map_err(|_| OpenSlideError::Format("DICOM RGB copy size overflows".into()))?;
 
-    let mut file = File::open(path)?;
+    let mut file = crate::util::_openslide_fopen(path)?;
     let mut row_buf = vec![0; copy_bytes];
     for row in 0..copy_h {
         let src_y = src_y0 + row;
@@ -1702,8 +1429,17 @@ fn blit_native_rgb_frame_region(
                     })?,
             )
             .ok_or_else(|| OpenSlideError::Format("DICOM RGB source offset overflows".into()))?;
-        file.seek(SeekFrom::Start(src_offset))?;
-        file.read_exact(&mut row_buf)?;
+        let src_offset = i64::try_from(src_offset).map_err(|_| {
+            OpenSlideError::Format(format!(
+                "DICOM RGB source offset does not fit OpenSlide seek: offset={src_offset}"
+            ))
+        })?;
+        crate::util::_openslide_fseek(
+            &mut file,
+            src_offset,
+            crate::util::OpenSlideSeekWhence::Set,
+        )?;
+        crate::util::_openslide_fread_exact(&mut file, &mut row_buf)?;
 
         let dst_idx = ((dst_y0 + row) as usize * dst_width as usize + dst_x0 as usize) * 3;
         let dst_end = dst_idx
@@ -1761,6 +1497,12 @@ impl SlideBackend for DicomSlide {
         self.levels
             .get(level as usize)
             .map(|level| level.downsample)
+    }
+
+    fn level_tile_dimensions(&self, level: u32) -> Option<(u64, u64)> {
+        self.levels
+            .get(level as usize)
+            .map(|level| (u64::from(level.tile_width), u64::from(level.tile_height)))
     }
 
     fn read_region(
@@ -1831,17 +1573,51 @@ impl SlideBackend for DicomSlide {
         &self.properties
     }
 
+    fn icc_profile(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.icc_profile.clone())
+    }
+
     fn associated_image_names(&self) -> Vec<&str> {
         if self.associated_images.is_empty() {
             self.associated_image_name.as_deref().into_iter().collect()
         } else {
-            self.associated_images.keys().map(String::as_str).collect()
+            let mut names = self
+                .associated_images
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            names
         }
+    }
+
+    fn associated_image_dimensions(&self, name: &str) -> Option<(u64, u64)> {
+        if let Some(image) = self.associated_images.get(name) {
+            return Some((image.width, image.height));
+        }
+        (self.associated_image_name.as_deref() == Some(name))
+            .then(|| self.levels.first().map(|level| (level.width, level.height)))
+            .flatten()
+    }
+
+    fn associated_image_icc_profile(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .associated_images
+            .get(name)
+            .and_then(|image| image.icc_profile.clone()))
+    }
+
+    fn associated_image_icc_profile_size(&self, name: &str) -> Result<Option<usize>> {
+        Ok(self
+            .associated_images
+            .get(name)
+            .and_then(|image| image.icc_profile.as_ref())
+            .map(Vec::len))
     }
 
     fn read_associated_image(&self, name: &str) -> Result<RgbaImage> {
         if let Some(image) = self.associated_images.get(name) {
-            let slide = DicomSlide::open(&image.path)?;
+            let slide = DicomSlide::open_with_series(&image.path, false)?;
             let level = slide.levels.first().ok_or_else(|| {
                 OpenSlideError::Format("DICOM associated image has no level".into())
             })?;
@@ -1882,10 +1658,14 @@ impl SlideBackend for DicomSlide {
 }
 
 fn read_file_meta(path: &Path) -> Result<(Vec<DicomElement>, u64)> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(DICM_OFFSET))?;
+    let mut file = crate::util::_openslide_fopen(path)?;
+    crate::util::_openslide_fseek(
+        &mut file,
+        DICM_OFFSET as i64,
+        crate::util::OpenSlideSeekWhence::Set,
+    )?;
     let mut magic = [0; 4];
-    file.read_exact(&mut magic)?;
+    crate::util::_openslide_fread_exact(&mut file, &mut magic)?;
     if &magic != DICM_MAGIC {
         return Err(OpenSlideError::UnsupportedFormat(
             "Missing DICOM preamble".into(),
@@ -1894,9 +1674,9 @@ fn read_file_meta(path: &Path) -> Result<(Vec<DicomElement>, u64)> {
 
     let mut elements = Vec::new();
     loop {
-        let element_start = file.stream_position()?;
+        let element_start = dicom_file_position(&mut file)?;
         let mut tag_buf = [0; 4];
-        let read = file.read(&mut tag_buf)?;
+        let read = crate::util::_openslide_fread(&mut file, &mut tag_buf)?;
         if read == 0 {
             break;
         }
@@ -1906,7 +1686,11 @@ fn read_file_meta(path: &Path) -> Result<(Vec<DicomElement>, u64)> {
             ));
         }
         let group = u16::from_le_bytes([tag_buf[0], tag_buf[1]]);
-        file.seek(SeekFrom::Start(element_start))?;
+        crate::util::_openslide_fseek(
+            &mut file,
+            dicom_seek_offset(element_start, "file meta element")?,
+            crate::util::OpenSlideSeekWhence::Set,
+        )?;
         if group != 0x0002 {
             break;
         }
@@ -1915,21 +1699,41 @@ fn read_file_meta(path: &Path) -> Result<(Vec<DicomElement>, u64)> {
         };
         elements.push(element);
     }
-    let dataset_offset = file.stream_position()?;
+    let dataset_offset = dicom_file_position(&mut file)?;
     Ok((elements, dataset_offset))
+}
+
+fn dicom_file_position(file: &mut crate::util::OpenSlideFile) -> Result<u64> {
+    u64::try_from(crate::util::_openslide_ftell(file)?)
+        .map_err(|_| OpenSlideError::Format("DICOM file offset is negative".into()))
+}
+
+fn dicom_seek_offset(offset: u64, context: &str) -> Result<i64> {
+    i64::try_from(offset).map_err(|_| {
+        OpenSlideError::Format(format!(
+            "DICOM {context} offset does not fit OpenSlide seek: offset={offset}"
+        ))
+    })
 }
 
 fn transfer_syntax_encoding(transfer_syntax: &str) -> Option<(bool, Endian)> {
     match transfer_syntax {
-        TS_IMPLICIT_VR_LE => Some((false, Endian::Little)),
-        TS_EXPLICIT_VR_LE
-        | TS_DEFLATED_EXPLICIT_VR_LE
-        | TS_JPEG_BASELINE
-        | TS_JPEG_2000_LOSSLESS
-        | TS_JPEG_2000 => Some((true, Endian::Little)),
-        TS_EXPLICIT_VR_BE => Some((true, Endian::Big)),
+        TS_EXPLICIT_VR_LE | TS_JPEG_BASELINE | TS_JPEG_2000_LOSSLESS | TS_JPEG_2000 => {
+            Some((true, Endian::Little))
+        }
         _ => None,
     }
+}
+
+fn sorted_sibling_paths(path: &Path) -> Result<Vec<PathBuf>> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut dir = crate::util::_openslide_dir_open(directory)?;
+    let mut paths = Vec::new();
+    while let Some(name) = crate::util::_openslide_dir_next(&mut dir)? {
+        paths.push(directory.join(name));
+    }
+    paths.sort_by_key(|path| path.file_name().map(|name| name.to_os_string()));
+    Ok(paths)
 }
 
 fn discover_same_series_associated_images(
@@ -1939,24 +1743,34 @@ fn discover_same_series_associated_images(
     let Some(series_uid) = series_uid else {
         return Ok(HashMap::new());
     };
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
 
     let mut associated_images = HashMap::new();
-    for entry in entries {
-        let candidate = entry.path();
+    for candidate in sorted_sibling_paths(path)? {
         if candidate == path || !candidate.is_file() {
             continue;
         }
-        let Ok(Some((name, candidate))) =
-            summarize_same_series_associated_image(&candidate, series_uid)
-        else {
-            continue;
+        let (name, candidate) = match summarize_same_series_associated_image(&candidate, series_uid)
+        {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => continue,
+            Err(err) if is_associated_summary_hard_error(&err) => return Err(err),
+            Err(_) => continue,
         };
-        associated_images.insert(name, DicomAssociatedImage { path: candidate });
+        if let Some(previous) = associated_images.get(&name) {
+            ensure_associated_sop_instance_uids_equal(&candidate, previous)?;
+            continue;
+        }
+        associated_images.insert(name, candidate);
     }
     Ok(associated_images)
+}
+
+fn is_associated_summary_hard_error(err: &OpenSlideError) -> bool {
+    matches!(
+        err,
+        OpenSlideError::Format(message)
+            if message == "Couldn't read associated image dimensions"
+    )
 }
 
 fn discover_same_series_pyramid_levels(
@@ -1966,19 +1780,25 @@ fn discover_same_series_pyramid_levels(
     let Some(series_uid) = series_uid else {
         return Ok(Vec::new());
     };
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
 
-    let mut levels = Vec::new();
-    for entry in entries {
-        let candidate = entry.path();
+    let mut levels: Vec<DicomSeriesPyramidFile> = Vec::new();
+    for candidate in sorted_sibling_paths(path)? {
         if candidate == path || !candidate.is_file() {
             continue;
         }
         let Ok(Some(level)) = summarize_same_series_pyramid_level(&candidate, series_uid) else {
             continue;
         };
+        if let Some(previous) = levels
+            .iter()
+            .find(|previous| previous.width == level.width && previous.height == level.height)
+        {
+            if same_concatenation_pyramid_level(&level, previous) {
+                continue;
+            }
+            ensure_pyramid_sop_instance_uids_equal(&level, previous)?;
+            continue;
+        }
         levels.push(level);
     }
     levels.sort_by(|a, b| b.width.cmp(&a.width).then_with(|| b.height.cmp(&a.height)));
@@ -1988,7 +1808,7 @@ fn discover_same_series_pyramid_levels(
 fn summarize_same_series_associated_image(
     path: &Path,
     series_uid: &str,
-) -> Result<Option<(String, PathBuf)>> {
+) -> Result<Option<(String, DicomAssociatedImage)>> {
     let (meta, dataset_offset) = read_file_meta(path)?;
     if get_string(&meta, TAG_MEDIA_STORAGE_SOP_CLASS_UID).as_deref()
         != Some(VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE)
@@ -2009,8 +1829,48 @@ fn summarize_same_series_associated_image(
     if get_string(&parsed.elements, TAG_SERIES_INSTANCE_UID).as_deref() != Some(series_uid) {
         return Ok(None);
     }
-    let image_type = get_string(&parsed.elements, TAG_IMAGE_TYPE).unwrap_or_default();
-    Ok(associated_image_name_from_image_type(&image_type).map(|name| (name, path.to_path_buf())))
+    let image_type = get_string_all(&parsed.elements, TAG_IMAGE_TYPE).unwrap_or_default();
+    let Some(name) = associated_image_name_from_image_type(&image_type) else {
+        return Ok(None);
+    };
+    let Some(width) = get_u64(&parsed.elements, TAG_TOTAL_PIXEL_MATRIX_COLUMNS) else {
+        return Err(OpenSlideError::Format(
+            "Couldn't read associated image dimensions".into(),
+        ));
+    };
+    let Some(height) = get_u64(&parsed.elements, TAG_TOTAL_PIXEL_MATRIX_ROWS) else {
+        return Err(OpenSlideError::Format(
+            "Couldn't read associated image dimensions".into(),
+        ));
+    };
+    Ok(Some((
+        name,
+        DicomAssociatedImage {
+            path: path.to_path_buf(),
+            width,
+            height,
+            sop_instance_uid: get_string(&parsed.elements, TAG_SOP_INSTANCE_UID),
+            icc_profile: dicom_icc_profile(&parsed.elements),
+        },
+    )))
+}
+
+fn ensure_associated_sop_instance_uids_equal(
+    current: &DicomAssociatedImage,
+    previous: &DicomAssociatedImage,
+) -> Result<()> {
+    let current_uid = current.sop_instance_uid.as_deref().ok_or_else(|| {
+        OpenSlideError::Format("Couldn't read DICOM associated SOPInstanceUID".into())
+    })?;
+    let previous_uid = previous.sop_instance_uid.as_deref().ok_or_else(|| {
+        OpenSlideError::Format("Couldn't read DICOM associated SOPInstanceUID".into())
+    })?;
+    if current_uid != previous_uid {
+        return Err(OpenSlideError::Format(format!(
+            "Slide contains unexpected DICOM associated image ({current_uid} vs. {previous_uid})"
+        )));
+    }
+    Ok(())
 }
 
 fn summarize_same_series_pyramid_level(
@@ -2037,7 +1897,7 @@ fn summarize_same_series_pyramid_level(
     if get_string(&parsed.elements, TAG_SERIES_INSTANCE_UID).as_deref() != Some(series_uid) {
         return Ok(None);
     }
-    let image_type = get_string(&parsed.elements, TAG_IMAGE_TYPE).unwrap_or_default();
+    let image_type = get_string_all(&parsed.elements, TAG_IMAGE_TYPE).unwrap_or_default();
     if !is_pyramid_level_image_type(&image_type) {
         return Ok(None);
     }
@@ -2055,7 +1915,42 @@ fn summarize_same_series_pyramid_level(
         path: path.to_path_buf(),
         width,
         height,
+        sop_instance_uid: get_string(&parsed.elements, TAG_SOP_INSTANCE_UID),
+        concatenation_uid: get_string(&parsed.elements, TAG_CONCATENATION_UID),
     }))
+}
+
+fn same_concatenation_pyramid_level(
+    current: &DicomSeriesPyramidFile,
+    previous: &DicomSeriesPyramidFile,
+) -> bool {
+    matches!(
+        (
+            current.concatenation_uid.as_deref(),
+            previous.concatenation_uid.as_deref()
+        ),
+        (Some(current_uid), Some(previous_uid)) if current_uid == previous_uid
+    )
+}
+
+fn ensure_pyramid_sop_instance_uids_equal(
+    current: &DicomSeriesPyramidFile,
+    previous: &DicomSeriesPyramidFile,
+) -> Result<()> {
+    let current_uid = current
+        .sop_instance_uid
+        .as_deref()
+        .ok_or_else(|| OpenSlideError::Format("Couldn't read DICOM level SOPInstanceUID".into()))?;
+    let previous_uid = previous
+        .sop_instance_uid
+        .as_deref()
+        .ok_or_else(|| OpenSlideError::Format("Couldn't read DICOM level SOPInstanceUID".into()))?;
+    if current_uid != previous_uid {
+        return Err(OpenSlideError::Format(format!(
+            "Slide contains unexpected DICOM pyramid level ({current_uid} vs. {previous_uid})"
+        )));
+    }
+    Ok(())
 }
 
 fn discover_native_concatenation_frames(
@@ -2065,13 +1960,8 @@ fn discover_native_concatenation_frames(
     concatenation_total: u64,
     frame_bytes: u64,
 ) -> Result<NativeConcatenation> {
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-
     let mut parts = Vec::new();
-    for entry in entries {
-        let candidate = entry.path();
+    for candidate in sorted_sibling_paths(path)? {
         if !candidate.is_file() {
             continue;
         }
@@ -2101,12 +1991,44 @@ fn discover_native_concatenation_frames(
         }
     }
 
-    let mut frames = Vec::new();
-    let mut frame_metadata = Vec::new();
+    let mut frame_parts = Vec::new();
+    let mut metadata_parts = Vec::new();
+    let mut next_frame = 0u64;
+    let any_metadata = parts.iter().any(|part| !part.frame_metadata.is_empty());
     for part in parts {
-        frames.extend(part.frames);
-        frame_metadata.extend(part.frame_metadata);
+        let start = part.concatenation_frame_offset_number.unwrap_or(next_frame);
+        next_frame = start.checked_add(part.frames.len() as u64).ok_or_else(|| {
+            OpenSlideError::Format("DICOM concatenation frame count overflows".into())
+        })?;
+        frame_parts.push(ConcatenationValuePart {
+            start,
+            label: format!("part {}", part.in_concatenation_number),
+            values: part.frames,
+        });
+        if any_metadata {
+            metadata_parts.push(ConcatenationValuePart {
+                start,
+                label: format!("part {}", part.in_concatenation_number),
+                values: part.frame_metadata,
+            });
+        }
     }
+    let frames = assemble_concatenation_values(
+        concatenation_uid,
+        "DICOM concatenation",
+        "frame",
+        frame_parts,
+    )?;
+    let frame_metadata = if any_metadata {
+        assemble_concatenation_values(
+            concatenation_uid,
+            "DICOM concatenation",
+            "PerFrameFunctionalGroupsSequence item",
+            metadata_parts,
+        )?
+    } else {
+        Vec::new()
+    };
     Ok(NativeConcatenation {
         frames,
         frame_metadata,
@@ -2122,8 +2044,69 @@ struct NativeConcatenation {
 #[derive(Debug)]
 struct NativeConcatenationPart {
     in_concatenation_number: u64,
+    concatenation_frame_offset_number: Option<u64>,
     frames: Vec<NativeFrameSource>,
     frame_metadata: Vec<FrameMetadata>,
+}
+
+struct ConcatenationValuePart<T> {
+    start: u64,
+    label: String,
+    values: Vec<T>,
+}
+
+fn assemble_concatenation_values<T>(
+    concatenation_uid: &str,
+    kind: &str,
+    value_name: &str,
+    parts: Vec<ConcatenationValuePart<T>>,
+) -> Result<Vec<T>> {
+    let total_len = parts.iter().try_fold(0usize, |acc, part| {
+        let end = part
+            .start
+            .checked_add(part.values.len() as u64)
+            .ok_or_else(|| OpenSlideError::Format(format!("{kind} frame count overflows")))?;
+        let end = usize::try_from(end)
+            .map_err(|_| OpenSlideError::Format(format!("{kind} frame count is too large")))?;
+        Ok::<usize, OpenSlideError>(acc.max(end))
+    })?;
+    let mut slots: Vec<Option<T>> = Vec::new();
+    slots.resize_with(total_len, || None);
+    for part in parts {
+        let start = usize::try_from(part.start).map_err(|_| {
+            OpenSlideError::Format(format!(
+                "{kind} {concatenation_uid} {} offset is too large",
+                part.label
+            ))
+        })?;
+        for (local, value) in part.values.into_iter().enumerate() {
+            let index = start
+                .checked_add(local)
+                .ok_or_else(|| OpenSlideError::Format(format!("{kind} frame index overflows")))?;
+            let slot = slots.get_mut(index).ok_or_else(|| {
+                OpenSlideError::Format(format!(
+                    "{kind} {value_name} index {index} is outside assembly"
+                ))
+            })?;
+            if slot.is_some() {
+                return Err(OpenSlideError::UnsupportedFormat(format!(
+                    "{kind} {concatenation_uid} has overlapping {value_name} at offset {index}"
+                )));
+            }
+            *slot = Some(value);
+        }
+    }
+
+    let mut assembled = Vec::with_capacity(total_len);
+    for (index, slot) in slots.into_iter().enumerate() {
+        let Some(value) = slot else {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "{kind} {concatenation_uid} is missing {value_name} at offset {index}"
+            )));
+        };
+        assembled.push(value);
+    }
+    Ok(assembled)
 }
 
 fn summarize_native_concatenation_part(
@@ -2162,6 +2145,8 @@ fn summarize_native_concatenation_part(
     else {
         return Ok(None);
     };
+    let concatenation_frame_offset_number =
+        get_u64(&parsed.elements, TAG_CONCATENATION_FRAME_OFFSET_NUMBER);
     let Some(location) = parsed.pixel_data else {
         return Ok(None);
     };
@@ -2191,6 +2176,7 @@ fn summarize_native_concatenation_part(
     }
     Ok(Some(NativeConcatenationPart {
         in_concatenation_number,
+        concatenation_frame_offset_number,
         frames,
         frame_metadata: parsed.frame_metadata,
     }))
@@ -2203,13 +2189,8 @@ fn discover_deflated_concatenation_frames(
     concatenation_total: u64,
     frame_bytes: u64,
 ) -> Result<DeflatedConcatenation> {
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-
     let mut parts = Vec::new();
-    for entry in entries {
-        let candidate = entry.path();
+    for candidate in sorted_sibling_paths(path)? {
         if !candidate.is_file() {
             continue;
         }
@@ -2239,12 +2220,44 @@ fn discover_deflated_concatenation_frames(
         }
     }
 
-    let mut frames = Vec::new();
-    let mut frame_metadata = Vec::new();
+    let mut frame_parts = Vec::new();
+    let mut metadata_parts = Vec::new();
+    let mut next_frame = 0u64;
+    let any_metadata = parts.iter().any(|part| !part.frame_metadata.is_empty());
     for part in parts {
-        frames.extend(part.frames);
-        frame_metadata.extend(part.frame_metadata);
+        let start = part.concatenation_frame_offset_number.unwrap_or(next_frame);
+        next_frame = start.checked_add(part.frames.len() as u64).ok_or_else(|| {
+            OpenSlideError::Format("DICOM deflated concatenation frame count overflows".into())
+        })?;
+        frame_parts.push(ConcatenationValuePart {
+            start,
+            label: format!("part {}", part.in_concatenation_number),
+            values: part.frames,
+        });
+        if any_metadata {
+            metadata_parts.push(ConcatenationValuePart {
+                start,
+                label: format!("part {}", part.in_concatenation_number),
+                values: part.frame_metadata,
+            });
+        }
     }
+    let frames = assemble_concatenation_values(
+        concatenation_uid,
+        "DICOM deflated concatenation",
+        "frame",
+        frame_parts,
+    )?;
+    let frame_metadata = if any_metadata {
+        assemble_concatenation_values(
+            concatenation_uid,
+            "DICOM deflated concatenation",
+            "PerFrameFunctionalGroupsSequence item",
+            metadata_parts,
+        )?
+    } else {
+        Vec::new()
+    };
     Ok(DeflatedConcatenation {
         frames,
         frame_metadata,
@@ -2260,6 +2273,7 @@ struct DeflatedConcatenation {
 #[derive(Debug)]
 struct DeflatedConcatenationPart {
     in_concatenation_number: u64,
+    concatenation_frame_offset_number: Option<u64>,
     frames: Vec<DeflatedFrameSource>,
     frame_metadata: Vec<FrameMetadata>,
 }
@@ -2294,6 +2308,8 @@ fn summarize_deflated_concatenation_part(
     else {
         return Ok(None);
     };
+    let concatenation_frame_offset_number =
+        get_u64(&parsed.elements, TAG_CONCATENATION_FRAME_OFFSET_NUMBER);
     let Some(data) = parsed.pixel_data_bytes else {
         return Ok(None);
     };
@@ -2321,6 +2337,7 @@ fn summarize_deflated_concatenation_part(
     }
     Ok(Some(DeflatedConcatenationPart {
         in_concatenation_number,
+        concatenation_frame_offset_number,
         frames,
         frame_metadata: parsed.frame_metadata,
     }))
@@ -2332,13 +2349,8 @@ fn discover_encapsulated_concatenation_frames(
     concatenation_uid: &str,
     concatenation_total: u64,
 ) -> Result<EncapsulatedConcatenation> {
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-
     let mut parts = Vec::new();
-    for entry in entries {
-        let candidate = entry.path();
+    for candidate in sorted_sibling_paths(path)? {
         if !candidate.is_file() {
             continue;
         }
@@ -2365,12 +2377,44 @@ fn discover_encapsulated_concatenation_frames(
         }
     }
 
-    let mut frames = Vec::new();
-    let mut frame_metadata = Vec::new();
+    let mut frame_parts = Vec::new();
+    let mut metadata_parts = Vec::new();
+    let mut next_frame = 0u64;
+    let any_metadata = parts.iter().any(|part| !part.frame_metadata.is_empty());
     for part in parts {
-        frames.extend(part.frames);
-        frame_metadata.extend(part.frame_metadata);
+        let start = part.concatenation_frame_offset_number.unwrap_or(next_frame);
+        next_frame = start.checked_add(part.frames.len() as u64).ok_or_else(|| {
+            OpenSlideError::Format("DICOM encapsulated concatenation frame count overflows".into())
+        })?;
+        frame_parts.push(ConcatenationValuePart {
+            start,
+            label: format!("part {}", part.in_concatenation_number),
+            values: part.frames,
+        });
+        if any_metadata {
+            metadata_parts.push(ConcatenationValuePart {
+                start,
+                label: format!("part {}", part.in_concatenation_number),
+                values: part.frame_metadata,
+            });
+        }
     }
+    let frames = assemble_concatenation_values(
+        concatenation_uid,
+        "DICOM encapsulated concatenation",
+        "frame",
+        frame_parts,
+    )?;
+    let frame_metadata = if any_metadata {
+        assemble_concatenation_values(
+            concatenation_uid,
+            "DICOM encapsulated concatenation",
+            "PerFrameFunctionalGroupsSequence item",
+            metadata_parts,
+        )?
+    } else {
+        Vec::new()
+    };
     Ok(EncapsulatedConcatenation {
         frames,
         frame_metadata,
@@ -2386,6 +2430,7 @@ struct EncapsulatedConcatenation {
 #[derive(Debug)]
 struct EncapsulatedConcatenationPart {
     in_concatenation_number: u64,
+    concatenation_frame_offset_number: Option<u64>,
     frames: Vec<FrameFragments>,
     frame_metadata: Vec<FrameMetadata>,
 }
@@ -2405,7 +2450,17 @@ fn summarize_encapsulated_concatenation_part(
         get_string(&meta, TAG_TRANSFER_SYNTAX_UID).unwrap_or_else(|| TS_EXPLICIT_VR_LE.to_string());
     if !matches!(
         transfer_syntax.as_str(),
-        TS_JPEG_BASELINE | TS_JPEG_2000_LOSSLESS | TS_JPEG_2000
+        TS_RLE_LOSSLESS
+            | TS_JPEG_BASELINE
+            | TS_JPEG_LOSSLESS_PROCESS14
+            | TS_JPEG_LOSSLESS_SV1
+            | TS_JPEG_LS_LOSSLESS
+            | TS_JPEG_LS_NEAR_LOSSLESS
+            | TS_JPEG_2000_LOSSLESS
+            | TS_JPEG_2000
+            | TS_HTJ2K_LOSSLESS
+            | TS_HTJ2K_LOSSLESS_RPCL
+            | TS_HTJ2K
     ) {
         return Ok(None);
     }
@@ -2425,6 +2480,8 @@ fn summarize_encapsulated_concatenation_part(
     else {
         return Ok(None);
     };
+    let concatenation_frame_offset_number =
+        get_u64(&parsed.elements, TAG_CONCATENATION_FRAME_OFFSET_NUMBER);
     let Some(location) = parsed.pixel_data else {
         return Ok(None);
     };
@@ -2439,9 +2496,20 @@ fn summarize_encapsulated_concatenation_part(
             parsed.frame_metadata.len()
         )));
     }
-    let frames = read_encapsulated_frame_table(path, location.offset, number_of_frames)?;
+    let extended_offset_table =
+        parse_extended_offset_table(&parsed.elements, TAG_EXTENDED_OFFSET_TABLE)?;
+    let extended_offset_table_lengths =
+        parse_extended_offset_table(&parsed.elements, TAG_EXTENDED_OFFSET_TABLE_LENGTHS)?;
+    let frames = read_encapsulated_frame_table(
+        path,
+        location.offset,
+        number_of_frames,
+        extended_offset_table.as_deref(),
+        extended_offset_table_lengths.as_deref(),
+    )?;
     Ok(Some(EncapsulatedConcatenationPart {
         in_concatenation_number,
+        concatenation_frame_offset_number,
         frames,
         frame_metadata: parsed.frame_metadata,
     }))
@@ -2453,14 +2521,24 @@ fn read_dataset(
     explicit_vr: bool,
     endian: Endian,
 ) -> Result<ParsedDataset> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
+    let mut file = crate::util::_openslide_fopen(path)?;
+    let offset = i64::try_from(offset).map_err(|_| {
+        OpenSlideError::Format(format!(
+            "DICOM dataset offset does not fit OpenSlide seek: offset={offset}"
+        ))
+    })?;
+    crate::util::_openslide_fseek(&mut file, offset, crate::util::OpenSlideSeekWhence::Set)?;
     read_dataset_from_reader(&mut file, explicit_vr, endian, false)
 }
 
 fn read_deflated_dataset(path: &Path, offset: u64) -> Result<ParsedDataset> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
+    let mut file = crate::util::_openslide_fopen(path)?;
+    let offset = i64::try_from(offset).map_err(|_| {
+        OpenSlideError::Format(format!(
+            "DICOM deflated dataset offset does not fit OpenSlide seek: offset={offset}"
+        ))
+    })?;
+    crate::util::_openslide_fseek(&mut file, offset, crate::util::OpenSlideSeekWhence::Set)?;
     let mut inflated = Vec::new();
     DeflateDecoder::new(file)
         .take(MAX_DEFLATED_DATASET_BYTES + 1)
@@ -2477,8 +2555,66 @@ fn read_deflated_dataset(path: &Path, offset: u64) -> Result<ParsedDataset> {
     read_dataset_from_reader(&mut cursor, true, Endian::Little, true)
 }
 
+trait DicomStream {
+    fn read_some(&mut self, buf: &mut [u8]) -> Result<usize>;
+    fn read_exact_bytes(&mut self, buf: &mut [u8]) -> Result<()>;
+    fn seek_current(&mut self, offset: i64) -> Result<()>;
+    fn seek_start(&mut self, offset: u64) -> Result<()>;
+    fn position(&mut self) -> Result<u64>;
+}
+
+impl DicomStream for crate::util::OpenSlideFile {
+    fn read_some(&mut self, buf: &mut [u8]) -> Result<usize> {
+        crate::util::_openslide_fread(self, buf)
+    }
+
+    fn read_exact_bytes(&mut self, buf: &mut [u8]) -> Result<()> {
+        crate::util::_openslide_fread_exact(self, buf)
+    }
+
+    fn seek_current(&mut self, offset: i64) -> Result<()> {
+        crate::util::_openslide_fseek(self, offset, crate::util::OpenSlideSeekWhence::Cur)
+    }
+
+    fn seek_start(&mut self, offset: u64) -> Result<()> {
+        crate::util::_openslide_fseek(
+            self,
+            dicom_seek_offset(offset, "stream")?,
+            crate::util::OpenSlideSeekWhence::Set,
+        )
+    }
+
+    fn position(&mut self) -> Result<u64> {
+        dicom_file_position(self)
+    }
+}
+
+impl<T: AsRef<[u8]>> DicomStream for Cursor<T> {
+    fn read_some(&mut self, buf: &mut [u8]) -> Result<usize> {
+        Ok(Read::read(self, buf)?)
+    }
+
+    fn read_exact_bytes(&mut self, buf: &mut [u8]) -> Result<()> {
+        Ok(Read::read_exact(self, buf)?)
+    }
+
+    fn seek_current(&mut self, offset: i64) -> Result<()> {
+        Seek::seek(self, SeekFrom::Current(offset))?;
+        Ok(())
+    }
+
+    fn seek_start(&mut self, offset: u64) -> Result<()> {
+        Seek::seek(self, SeekFrom::Start(offset))?;
+        Ok(())
+    }
+
+    fn position(&mut self) -> Result<u64> {
+        Ok(Cursor::position(self))
+    }
+}
+
 fn read_dataset_from_reader(
-    file: &mut (impl Read + Seek),
+    file: &mut impl DicomStream,
     explicit_vr: bool,
     endian: Endian,
     capture_native_pixel_data: bool,
@@ -2487,9 +2623,6 @@ fn read_dataset_from_reader(
     let mut pixel_data = None;
     let mut pixel_data_bytes = None;
     let mut frame_metadata = Vec::new();
-    let mut dimension_indices = Vec::new();
-    let mut dimension_organization_uids = Vec::new();
-    let mut total_pixel_matrix_origin = None;
     let mut standard_optical_metadata = StandardOpticalMetadata::default();
     loop {
         let Some(header) = read_element_header(file, explicit_vr, endian)? else {
@@ -2513,7 +2646,7 @@ fn read_dataset_from_reader(
                     )));
                 }
                 let mut value = vec![0; header.len as usize];
-                file.read_exact(&mut value)?;
+                file.read_exact_bytes(&mut value)?;
                 pixel_data_bytes = Some(value);
             }
             break;
@@ -2557,7 +2690,6 @@ fn read_dataset_from_reader(
         }
         if header.tag == TAG_DIMENSION_INDEX_SEQUENCE {
             let items = read_sequence_element_items(file, header.len, explicit_vr, endian)?;
-            dimension_indices = dimension_indices_from_items(&items);
             elements.push(DicomElement {
                 tag: header.tag,
                 vr: header.vr,
@@ -2569,7 +2701,6 @@ fn read_dataset_from_reader(
         }
         if header.tag == TAG_DIMENSION_ORGANIZATION_SEQUENCE {
             let items = read_sequence_element_items(file, header.len, explicit_vr, endian)?;
-            dimension_organization_uids = dimension_organization_uids_from_items(&items);
             elements.push(DicomElement {
                 tag: header.tag,
                 vr: header.vr,
@@ -2581,7 +2712,6 @@ fn read_dataset_from_reader(
         }
         if header.tag == TAG_TOTAL_PIXEL_MATRIX_ORIGIN_SEQUENCE {
             let items = read_sequence_element_items(file, header.len, explicit_vr, endian)?;
-            total_pixel_matrix_origin = total_pixel_matrix_origin_from_items(&items);
             elements.push(DicomElement {
                 tag: header.tag,
                 vr: header.vr,
@@ -2609,7 +2739,7 @@ fn read_dataset_from_reader(
             )));
         }
         if header.len > 64 * 1024 * 1024 {
-            file.seek(SeekFrom::Current(header.len as i64))?;
+            file.seek_current(header.len as i64)?;
             elements.push(DicomElement {
                 tag: header.tag,
                 vr: header.vr,
@@ -2620,7 +2750,7 @@ fn read_dataset_from_reader(
             continue;
         }
         let mut value = vec![0; header.len as usize];
-        file.read_exact(&mut value)?;
+        file.read_exact_bytes(&mut value)?;
         elements.push(DicomElement {
             tag: header.tag,
             vr: header.vr,
@@ -2633,9 +2763,6 @@ fn read_dataset_from_reader(
         elements,
         pixel_data,
         frame_metadata,
-        dimension_indices,
-        dimension_organization_uids,
-        total_pixel_matrix_origin,
         standard_optical_metadata,
         pixel_data_bytes,
     })
@@ -2715,8 +2842,66 @@ fn build_frame_tile_map(
     Ok(Some(map))
 }
 
+fn insert_frame_plane_selection_properties(
+    properties: &mut HashMap<String, String>,
+    frames: &[FrameMetadata],
+    frame_tile_map: Option<&[Option<u64>]>,
+) {
+    if frames.is_empty() {
+        return;
+    }
+
+    let selected_optical_path_identifier = frames
+        .iter()
+        .find_map(|frame| frame.optical_path_identifier.clone());
+    let selected_z_offset = frames.iter().find_map(|frame| frame.z_offset.clone());
+    if let Some(value) = &selected_optical_path_identifier {
+        properties.insert("dicom.SelectedOpticalPathIdentifier".into(), value.clone());
+    }
+    if let Some(value) = &selected_z_offset {
+        properties.insert("dicom.SelectedZOffset".into(), value.clone());
+    }
+
+    let mut selected = 0usize;
+    let mut skipped = 0usize;
+    let mut unpositioned_selected = 0usize;
+    for frame in frames {
+        let optical_path_mismatch = selected_optical_path_identifier.is_some()
+            && frame.optical_path_identifier != selected_optical_path_identifier;
+        let z_mismatch = selected_z_offset.is_some() && frame.z_offset != selected_z_offset;
+        if optical_path_mismatch || z_mismatch {
+            skipped += 1;
+            continue;
+        }
+        selected += 1;
+        if frame.position.is_none() {
+            unpositioned_selected += 1;
+        }
+    }
+
+    properties.insert(
+        "dicom.PerFrameFunctionalGroups.SelectedFrameCount".into(),
+        selected.to_string(),
+    );
+    properties.insert(
+        "dicom.PerFrameFunctionalGroups.SkippedFrameCount".into(),
+        skipped.to_string(),
+    );
+    properties.insert(
+        "dicom.PerFrameFunctionalGroups.UnpositionedSelectedFrameCount".into(),
+        unpositioned_selected.to_string(),
+    );
+    if let Some(map) = frame_tile_map {
+        let mapped = map.iter().filter(|frame| frame.is_some()).count();
+        properties.insert(
+            "dicom.PerFrameFunctionalGroups.MappedTileCount".into(),
+            mapped.to_string(),
+        );
+    }
+}
+
 fn read_element(
-    file: &mut (impl Read + Seek),
+    file: &mut impl DicomStream,
     explicit_vr: bool,
     endian: Endian,
 ) -> Result<Option<DicomElement>> {
@@ -2730,7 +2915,7 @@ fn read_element(
         )));
     }
     if header.len > 64 * 1024 * 1024 {
-        file.seek(SeekFrom::Current(header.len as i64))?;
+        file.seek_current(header.len as i64)?;
         return Ok(Some(DicomElement {
             tag: header.tag,
             vr: header.vr,
@@ -2741,7 +2926,7 @@ fn read_element(
     }
 
     let mut value = vec![0; header.len as usize];
-    file.read_exact(&mut value)?;
+    file.read_exact_bytes(&mut value)?;
     Ok(Some(DicomElement {
         tag: header.tag,
         vr: header.vr,
@@ -2751,40 +2936,43 @@ fn read_element(
     }))
 }
 
-fn defined_end(file: &mut (impl Read + Seek), len: u32) -> Result<Option<u64>> {
+fn defined_end(file: &mut impl DicomStream, len: u32) -> Result<Option<u64>> {
     if len == u32::MAX {
         Ok(None)
     } else {
-        file.stream_position()?
+        file.position()?
             .checked_add(len as u64)
             .ok_or_else(|| OpenSlideError::Format("DICOM element end offset overflows".into()))
             .map(Some)
     }
 }
 
-fn reached_end(file: &mut (impl Read + Seek), end: Option<u64>) -> Result<bool> {
-    Ok(end.is_some_and(|end| file.stream_position().is_ok_and(|pos| pos >= end)))
+fn reached_end(file: &mut impl DicomStream, end: Option<u64>) -> Result<bool> {
+    Ok(match end {
+        Some(end) => file.position()? >= end,
+        None => false,
+    })
 }
 
-fn seek_to_defined_end(file: &mut (impl Read + Seek), end: Option<u64>) -> Result<()> {
+fn seek_to_defined_end(file: &mut impl DicomStream, end: Option<u64>) -> Result<()> {
     if let Some(end) = end {
-        file.seek(SeekFrom::Start(end))?;
+        file.seek_start(end)?;
     }
     Ok(())
 }
 
-fn read_defined_sequence_value(file: &mut (impl Read + Seek), len: u32) -> Result<Vec<u8>> {
+fn read_defined_sequence_value(file: &mut impl DicomStream, len: u32) -> Result<Vec<u8>> {
     if len > 64 * 1024 * 1024 {
-        file.seek(SeekFrom::Current(len as i64))?;
+        file.seek_current(len as i64)?;
         return Ok(Vec::new());
     }
     let mut value = vec![0; len as usize];
-    file.read_exact(&mut value)?;
+    file.read_exact_bytes(&mut value)?;
     Ok(value)
 }
 
 fn read_sequence_element_items(
-    file: &mut (impl Read + Seek),
+    file: &mut impl DicomStream,
     len: u32,
     explicit_vr: bool,
     endian: Endian,
@@ -2807,7 +2995,7 @@ fn parse_sequence_items_from_value(
 }
 
 fn read_sequence_items(
-    file: &mut (impl Read + Seek),
+    file: &mut impl DicomStream,
     sequence_len: u32,
     explicit_vr: bool,
     endian: Endian,
@@ -2843,7 +3031,7 @@ fn read_sequence_items(
 }
 
 fn read_dataset_elements_until(
-    file: &mut (impl Read + Seek),
+    file: &mut impl DicomStream,
     end: Option<u64>,
     explicit_vr: bool,
     endian: Endian,
@@ -2882,7 +3070,7 @@ fn read_dataset_elements_until(
                 header.tag.0, header.tag.1
             )));
         } else if header.len > 64 * 1024 * 1024 {
-            file.seek(SeekFrom::Current(header.len as i64))?;
+            file.seek_current(header.len as i64)?;
             elements.push(DicomElement {
                 tag: header.tag,
                 vr: header.vr,
@@ -2892,7 +3080,7 @@ fn read_dataset_elements_until(
             });
         } else {
             let mut value = vec![0; header.len as usize];
-            file.read_exact(&mut value)?;
+            file.read_exact_bytes(&mut value)?;
             elements.push(DicomElement {
                 tag: header.tag,
                 vr: header.vr,
@@ -2954,7 +3142,7 @@ fn plane_position_from_item(item: &[DicomElement]) -> Option<PlanePositionMetada
 fn shared_pixel_spacing_from_items(items: &[Vec<DicomElement>]) -> Option<String> {
     items.iter().find_map(|item| {
         sequence_first_item(item, TAG_PIXEL_MEASURES_SEQUENCE)
-            .and_then(|item| get_string(item, TAG_PIXEL_SPACING))
+            .and_then(|item| get_string_all(item, TAG_PIXEL_SPACING))
     })
 }
 
@@ -2964,57 +3152,23 @@ fn optical_path_objective_power_from_items(items: &[Vec<DicomElement>]) -> Optio
         .find_map(|item| get_string(item, TAG_OBJECTIVE_LENS_POWER))
 }
 
-fn dimension_indices_from_items(items: &[Vec<DicomElement>]) -> Vec<DimensionIndex> {
-    items
-        .iter()
-        .filter_map(|item| {
-            get_tag_value(item, TAG_DIMENSION_INDEX_POINTER).map(|pointer| DimensionIndex {
-                pointer,
-                functional_group_pointer: get_tag_value(item, TAG_FUNCTIONAL_GROUP_POINTER),
-            })
-        })
-        .collect()
-}
-
-fn dimension_organization_uids_from_items(items: &[Vec<DicomElement>]) -> Vec<String> {
-    items
-        .iter()
-        .filter_map(|item| get_string(item, TAG_DIMENSION_ORGANIZATION_UID))
-        .collect()
-}
-
-fn total_pixel_matrix_origin_from_items(
-    items: &[Vec<DicomElement>],
-) -> Option<TotalPixelMatrixOrigin> {
-    items.iter().find_map(|item| {
-        let x_offset = get_string(item, TAG_X_OFFSET_IN_SLIDE_COORDINATE_SYSTEM);
-        let y_offset = get_string(item, TAG_Y_OFFSET_IN_SLIDE_COORDINATE_SYSTEM);
-        (x_offset.is_some() || y_offset.is_some())
-            .then_some(TotalPixelMatrixOrigin { x_offset, y_offset })
-    })
-}
-
 fn sequence_first_item(elements: &[DicomElement], tag: Tag) -> Option<&[DicomElement]> {
     get_element(elements, tag)?.items.first().map(Vec::as_slice)
 }
 
-fn get_tag_value(elements: &[DicomElement], tag: Tag) -> Option<Tag> {
-    let element = get_element(elements, tag)?;
-    (element.value.len() >= 4).then(|| {
-        Tag(
-            read_u16(&element.value[0..2], element.endian),
-            read_u16(&element.value[2..4], element.endian),
-        )
-    })
+fn dicom_icc_profile(elements: &[DicomElement]) -> Option<Vec<u8>> {
+    let item = sequence_first_item(elements, TAG_OPTICAL_PATH_SEQUENCE)?;
+    let profile = get_element(item, TAG_ICC_PROFILE)?;
+    (!profile.value.is_empty()).then(|| profile.value.clone())
 }
 
 fn read_element_header(
-    file: &mut (impl Read + Seek),
+    file: &mut impl DicomStream,
     explicit_vr: bool,
     endian: Endian,
 ) -> Result<Option<ElementHeader>> {
     let mut tag_buf = [0; 4];
-    let read = file.read(&mut tag_buf)?;
+    let read = file.read_some(&mut tag_buf)?;
     if read == 0 {
         return Ok(None);
     }
@@ -3027,35 +3181,35 @@ fn read_element_header(
     );
     if tag.0 == 0xfffe {
         let mut len = [0; 4];
-        file.read_exact(&mut len)?;
+        file.read_exact_bytes(&mut len)?;
         return Ok(Some(ElementHeader {
             tag,
             vr: None,
             len: read_u32(&len, endian),
-            value_offset: file.stream_position()?,
+            value_offset: file.position()?,
         }));
     }
 
     let (vr, len) = if explicit_vr {
         let mut vr = [0; 2];
-        file.read_exact(&mut vr)?;
+        file.read_exact_bytes(&mut vr)?;
         let len = if uses_32_bit_explicit_vr_length(&vr) {
             let mut reserved_and_len = [0; 6];
-            file.read_exact(&mut reserved_and_len)?;
+            file.read_exact_bytes(&mut reserved_and_len)?;
             read_u32(&reserved_and_len[2..6], endian)
         } else {
             let mut len = [0; 2];
-            file.read_exact(&mut len)?;
+            file.read_exact_bytes(&mut len)?;
             read_u16(&len, endian) as u32
         };
         (Some(vr), len)
     } else {
         let mut len = [0; 4];
-        file.read_exact(&mut len)?;
+        file.read_exact_bytes(&mut len)?;
         (None, read_u32(&len, endian))
     };
 
-    let value_offset = file.stream_position()?;
+    let value_offset = file.position()?;
     Ok(Some(ElementHeader {
         tag,
         vr,
@@ -3072,10 +3226,16 @@ fn uses_32_bit_explicit_vr_length(vr: &[u8; 2]) -> bool {
 }
 
 fn get_element(elements: &[DicomElement], tag: Tag) -> Option<&DicomElement> {
-    elements.iter().find(|element| element.tag == tag)
+    elements.iter().rfind(|element| element.tag == tag)
 }
 
 fn get_string(elements: &[DicomElement], tag: Tag) -> Option<String> {
+    get_string_all(elements, tag)
+        .and_then(|value| value.split('\\').next().map(str::trim).map(str::to_string))
+        .filter(|value| !value.is_empty())
+}
+
+fn get_string_all(elements: &[DicomElement], tag: Tag) -> Option<String> {
     let element = get_element(elements, tag)?;
     let end = element
         .value
@@ -3093,6 +3253,10 @@ fn get_u64(elements: &[DicomElement], tag: Tag) -> Option<u64> {
     match element.vr.as_ref() {
         Some(b"DS") | Some(b"IS") => String::from_utf8_lossy(&element.value)
             .trim_matches(|c: char| c == '\0' || c.is_ascii_whitespace())
+            .split('\\')
+            .next()
+            .unwrap_or("")
+            .trim()
             .parse()
             .ok(),
         Some(b"US") if element.value.len() >= 2 => {
@@ -3110,17 +3274,26 @@ fn get_u64(elements: &[DicomElement], tag: Tag) -> Option<u64> {
 
 fn get_f64(elements: &[DicomElement], tag: Tag) -> Option<f64> {
     let element = get_element(elements, tag)?;
-    String::from_utf8_lossy(&element.value)
+    let value = String::from_utf8_lossy(&element.value)
         .trim_matches(|c: char| c == '\0' || c.is_ascii_whitespace())
         .split('\\')
         .next()
-        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or("")
+        .to_string();
+    crate::util::_openslide_parse_double(&value)
 }
 
 fn read_u16(bytes: &[u8], endian: Endian) -> u16 {
     match endian {
         Endian::Little => u16::from_le_bytes([bytes[0], bytes[1]]),
         Endian::Big => u16::from_be_bytes([bytes[0], bytes[1]]),
+    }
+}
+
+fn read_i16(bytes: &[u8], endian: Endian) -> i16 {
+    match endian {
+        Endian::Little => i16::from_le_bytes([bytes[0], bytes[1]]),
+        Endian::Big => i16::from_be_bytes([bytes[0], bytes[1]]),
     }
 }
 
@@ -3150,27 +3323,20 @@ fn get_required_u16(elements: &[DicomElement], tag: Tag, name: &str) -> Result<u
     })
 }
 
-fn is_native_transfer_syntax(transfer_syntax: &str) -> bool {
-    matches!(
-        transfer_syntax,
-        TS_IMPLICIT_VR_LE | TS_EXPLICIT_VR_LE | TS_DEFLATED_EXPLICIT_VR_LE | TS_EXPLICIT_VR_BE
-    )
-}
-
 fn validate_native_bit_depth(bits_allocated: u16, bits_stored: u16, high_bit: u16) -> Result<()> {
-    if !matches!(bits_allocated, 8 | 16) {
-        return Err(OpenSlideError::UnsupportedFormat(format!(
-            "DICOM BitsAllocated value {bits_allocated} is not supported; only 8- and 16-bit native samples can be downscaled"
+    if bits_allocated != 8 {
+        return Err(OpenSlideError::Format(format!(
+            "Attribute BitsAllocated value {bits_allocated} != 8"
         )));
     }
-    if bits_stored == 0 || bits_stored > bits_allocated {
-        return Err(OpenSlideError::UnsupportedFormat(format!(
-            "DICOM BitsStored value {bits_stored} is not valid for BitsAllocated {bits_allocated}"
+    if bits_stored != 8 {
+        return Err(OpenSlideError::Format(format!(
+            "Attribute BitsStored value {bits_stored} != 8"
         )));
     }
-    if high_bit + 1 != bits_stored {
-        return Err(OpenSlideError::UnsupportedFormat(format!(
-            "DICOM HighBit value {high_bit} is not supported for BitsStored {bits_stored}; only right-aligned unsigned samples are supported"
+    if high_bit != 7 {
+        return Err(OpenSlideError::Format(format!(
+            "Attribute HighBit value {high_bit} != 7"
         )));
     }
     Ok(())
@@ -3183,7 +3349,7 @@ fn parse_intensity_mapping(elements: &[DicomElement]) -> IntensityMapping {
         window_center: get_f64(elements, TAG_WINDOW_CENTER),
         window_width: get_f64(elements, TAG_WINDOW_WIDTH).filter(|width| *width > 0.0),
         voi_lut_function: get_string(elements, TAG_VOI_LUT_FUNCTION)
-            .map(|value| match value.trim().to_ascii_uppercase().as_str() {
+            .map(|value| match value.as_str() {
                 "SIGMOID" => VoiLutFunction::Sigmoid,
                 "LINEAR_EXACT" => VoiLutFunction::LinearExact,
                 _ => VoiLutFunction::Linear,
@@ -3197,6 +3363,7 @@ fn native_frame_bytes(
     height: u64,
     samples_per_pixel: u16,
     photometric: &str,
+    planar_configuration: u16,
     bits_allocated: u16,
 ) -> Result<u64> {
     let bytes_per_sample = u64::from(bits_allocated / 8);
@@ -3204,11 +3371,19 @@ fn native_frame_bytes(
         .checked_mul(height)
         .ok_or_else(|| OpenSlideError::Format("DICOM frame pixel count overflows".into()))?;
     let samples = if samples_per_pixel == 3 && photometric == "YBR_FULL_422" {
-        width
-            .checked_add(1)
-            .and_then(|width| width.checked_div(2))
-            .and_then(|pairs_per_row| pairs_per_row.checked_mul(height))
-            .and_then(|pairs| pairs.checked_mul(4))
+        let pairs_per_row = width.checked_add(1).and_then(|width| width.checked_div(2));
+        if planar_configuration == 0 {
+            pairs_per_row
+                .and_then(|pairs_per_row| pairs_per_row.checked_mul(height))
+                .and_then(|pairs| pairs.checked_mul(4))
+        } else {
+            width.checked_mul(height).and_then(|luma| {
+                pairs_per_row
+                    .and_then(|pairs_per_row| pairs_per_row.checked_mul(height))
+                    .and_then(|chroma| chroma.checked_mul(2))
+                    .and_then(|chroma| luma.checked_add(chroma))
+            })
+        }
     } else {
         pixels.checked_mul(u64::from(samples_per_pixel))
     }
@@ -3216,28 +3391,6 @@ fn native_frame_bytes(
     samples
         .checked_mul(bytes_per_sample)
         .ok_or_else(|| OpenSlideError::Format("DICOM frame byte count overflows".into()))
-}
-
-fn insert_string_property(
-    properties: &mut HashMap<String, String>,
-    name: &str,
-    elements: &[DicomElement],
-    tag: Tag,
-) {
-    if let Some(value) = get_string(elements, tag) {
-        let values: Vec<_> = value
-            .split('\\')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .collect();
-        if values.len() > 1 {
-            for (index, item) in values.iter().enumerate() {
-                properties.insert(format!("{name}[{index}]"), (*item).into());
-            }
-        } else {
-            properties.insert(name.into(), value);
-        }
-    }
 }
 
 fn add_properties_dataset(
@@ -3281,14 +3434,22 @@ fn add_properties_element(
 fn element_values_as_strings(element: &DicomElement) -> Vec<String> {
     match element.vr.as_ref() {
         Some(
-            b"AE" | b"AS" | b"CS" | b"DA" | b"DS" | b"DT" | b"IS" | b"LO" | b"LT" | b"PN" | b"SH"
-            | b"ST" | b"TM" | b"UC" | b"UI" | b"UR" | b"UT",
+            b"AE" | b"AS" | b"CS" | b"DA" | b"DT" | b"LO" | b"LT" | b"PN" | b"SH" | b"ST" | b"TM"
+            | b"UC" | b"UI" | b"UR" | b"UT",
         ) => String::from_utf8_lossy(&element.value)
             .trim_matches(|c: char| c == '\0' || c.is_ascii_whitespace())
             .split('\\')
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
+            .collect(),
+        Some(b"DS") => dicom_text_values(&element.value)
+            .filter_map(|value| value.parse::<f64>().ok())
+            .map(format_float)
+            .collect(),
+        Some(b"IS") => dicom_text_values(&element.value)
+            .filter_map(|value| value.parse::<i64>().ok())
+            .map(|value| value.to_string())
             .collect(),
         Some(b"FD") => element
             .value
@@ -3362,6 +3523,17 @@ fn element_values_as_strings(element: &DicomElement) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn dicom_text_values(value: &[u8]) -> impl Iterator<Item = String> {
+    String::from_utf8_lossy(value)
+        .trim_matches(|c: char| c == '\0' || c.is_ascii_whitespace())
+        .split('\\')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .into_iter()
 }
 
 fn dicom_keyword(tag: Tag) -> Option<&'static str> {
@@ -3444,6 +3616,7 @@ fn dicom_keyword(tag: Tag) -> Option<&'static str> {
         TAG_OPTICAL_PATH_SEQUENCE => "OpticalPathSequence",
         TAG_OPTICAL_PATH_IDENTIFIER => "OpticalPathIdentifier",
         TAG_OPTICAL_PATH_IDENTIFICATION_SEQUENCE => "OpticalPathIdentificationSequence",
+        TAG_ICC_PROFILE => "ICCProfile",
         TAG_CONTAINER_IDENTIFIER => "ContainerIdentifier",
         TAG_X_OFFSET_IN_SLIDE_COORDINATE_SYSTEM => "XOffsetInSlideCoordinateSystem",
         TAG_Y_OFFSET_IN_SLIDE_COORDINATE_SYSTEM => "YOffsetInSlideCoordinateSystem",
@@ -3460,253 +3633,88 @@ fn dicom_keyword(tag: Tag) -> Option<&'static str> {
         TAG_CONCATENATION_UID => "ConcatenationUID",
         TAG_IN_CONCATENATION_NUMBER => "InConcatenationNumber",
         TAG_IN_CONCATENATION_TOTAL_NUMBER => "InConcatenationTotalNumber",
+        TAG_CONCATENATION_FRAME_OFFSET_NUMBER => "ConcatenationFrameOffsetNumber",
+        TAG_EXTENDED_OFFSET_TABLE => "ExtendedOffsetTable",
+        TAG_EXTENDED_OFFSET_TABLE_LENGTHS => "ExtendedOffsetTableLengths",
         TAG_PIXEL_DATA => "PixelData",
         _ => return None,
     })
 }
 
-fn insert_u64_property(
-    properties: &mut HashMap<String, String>,
-    name: &str,
-    elements: &[DicomElement],
-    tag: Tag,
-) {
-    if let Some(value) = get_u64(elements, tag) {
-        properties.insert(name.into(), value.to_string());
-    }
-}
-
 fn insert_standard_optical_properties(
     props: &mut HashMap<String, String>,
-    elements: &[DicomElement],
     metadata: &StandardOpticalMetadata,
 ) {
-    let pixel_spacing = metadata
-        .pixel_spacing
-        .clone()
-        .or_else(|| get_string(elements, TAG_PIXEL_SPACING));
-    if let Some(pixel_spacing) = pixel_spacing.as_deref() {
-        let values: Vec<f64> = pixel_spacing
+    if let Some(pixel_spacing) = metadata.pixel_spacing.as_deref() {
+        let values: Vec<Option<f64>> = pixel_spacing
             .split('\\')
-            .filter_map(|value| value.trim().parse().ok())
+            .take(2)
+            .map(crate::util::_openslide_parse_double)
             .collect();
-        if values.len() >= 2 {
-            if metadata.pixel_spacing.is_some() {
-                props.insert(
-                    "dicom.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing[0]"
-                        .into(),
-                    format_float(values[0]),
-                );
-                props.insert(
-                    "dicom.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing[1]"
-                        .into(),
-                    format_float(values[1]),
-                );
-            }
+        if let [Some(spacing_y), Some(spacing_x)] = values.as_slice() {
             props.insert(
                 properties::PROPERTY_MPP_Y.into(),
-                format_float(values[0] * 1000.0),
+                format_float(*spacing_y * 1000.0),
             );
             props.insert(
                 properties::PROPERTY_MPP_X.into(),
-                format_float(values[1] * 1000.0),
+                format_float(*spacing_x * 1000.0),
             );
         }
     }
-    let objective = metadata
-        .objective_lens_power
-        .clone()
-        .or_else(|| get_string(elements, TAG_OBJECTIVE_LENS_POWER));
-    if let Some(objective) = objective.as_deref() {
-        if metadata.objective_lens_power.is_some() {
-            props.insert(
-                "dicom.OpticalPathSequence[0].ObjectiveLensPower".into(),
-                objective.to_string(),
-            );
-        }
-        props.insert(
-            properties::PROPERTY_OBJECTIVE_POWER.into(),
-            standard_objective_power_value(&objective),
-        );
-    }
-}
-
-fn insert_dimension_index_properties(
-    props: &mut HashMap<String, String>,
-    indices: &[DimensionIndex],
-) {
-    if indices.is_empty() {
-        return;
-    }
-    for (index, dimension) in indices.iter().enumerate() {
-        props.insert(
-            format!("dicom.DimensionIndexSequence[{index}].DimensionIndexPointer"),
-            format_tag(dimension.pointer),
-        );
-        if let Some(pointer) = dimension.functional_group_pointer {
-            props.insert(
-                format!("dicom.DimensionIndexSequence[{index}].FunctionalGroupPointer"),
-                format_tag(pointer),
-            );
+    if let Some(objective) = metadata.objective_lens_power.as_deref() {
+        if let Some(objective) = standard_objective_power_value(objective) {
+            props.insert(properties::PROPERTY_OBJECTIVE_POWER.into(), objective);
         }
     }
-}
-
-fn insert_dimension_organization_properties(props: &mut HashMap<String, String>, uids: &[String]) {
-    if uids.is_empty() {
-        return;
-    }
-    for (index, uid) in uids.iter().enumerate() {
-        props.insert(
-            format!("dicom.DimensionOrganizationSequence[{index}].DimensionOrganizationUID"),
-            uid.clone(),
-        );
-    }
-}
-
-fn insert_total_pixel_matrix_origin_properties(
-    props: &mut HashMap<String, String>,
-    origin: Option<&TotalPixelMatrixOrigin>,
-) {
-    let Some(origin) = origin else {
-        return;
-    };
-    if let Some(value) = &origin.x_offset {
-        props.insert(
-            "dicom.TotalPixelMatrixOriginSequence[0].XOffsetInSlideCoordinateSystem".into(),
-            value.clone(),
-        );
-    }
-    if let Some(value) = &origin.y_offset {
-        props.insert(
-            "dicom.TotalPixelMatrixOriginSequence[0].YOffsetInSlideCoordinateSystem".into(),
-            value.clone(),
-        );
-    }
-}
-
-fn format_tag(tag: Tag) -> String {
-    format!("({:04x},{:04x})", tag.0, tag.1)
 }
 
 fn format_float(value: f64) -> String {
-    let formatted = format!("{value:.12}");
-    formatted.trim_end_matches('0').trim_end_matches('.').into()
+    crate::util::_openslide_format_double(value)
 }
 
-fn standard_objective_power_value(value: &str) -> String {
-    let trimmed = value.trim();
-    let Some((index, suffix)) = trimmed.char_indices().last() else {
-        return trimmed.into();
-    };
-    if !matches!(suffix, 'x' | 'X') {
-        return trimmed.into();
-    }
-    let numeric = trimmed[..index].trim();
-    match numeric.parse::<f64>() {
-        Ok(power) if power.is_finite() => format_float(power),
-        _ => trimmed.into(),
-    }
-}
-
-fn normalize_code_string(value: &str) -> String {
-    value.trim().to_ascii_uppercase()
-}
-
-fn canonical_photometric_interpretation(value: &str) -> String {
-    let normalized = normalize_code_string(value);
-    let compact: String = normalized
-        .chars()
-        .filter(|c| !matches!(c, ' ' | '_' | '-'))
-        .collect();
-    match compact.as_str() {
-        "MONOCHROME1" => "MONOCHROME1".into(),
-        "MONOCHROME2" => "MONOCHROME2".into(),
-        "PALETTECOLOR" => "PALETTE COLOR".into(),
-        "RGB" => "RGB".into(),
-        "YBRFULL" => "YBR_FULL".into(),
-        "YBRFULL422" => "YBR_FULL_422".into(),
-        "YBRICT" => "YBR_ICT".into(),
-        "YBRRCT" => "YBR_RCT".into(),
-        _ => normalized,
-    }
+fn standard_objective_power_value(value: &str) -> Option<String> {
+    crate::util::_openslide_parse_double(value).map(format_float)
 }
 
 fn is_pyramid_level_image_type(image_type: &str) -> bool {
-    let parts: Vec<String> = image_type
-        .split('\\')
-        .map(normalize_role_code_string)
-        .collect();
-    let Some([origin, primary, volume, derivation, ..]) = parts.get(..4) else {
+    let parts: Vec<&str> = image_type.split('\\').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let Some([origin, primary, volume, derivation]) = parts.get(..4) else {
         return false;
     };
-    matches!(origin.as_str(), "ORIGINAL" | "DERIVED")
-        && primary == "PRIMARY"
-        && matches!(volume.as_str(), "VOLUME" | "VOLUMEIMAGE")
-        && matches!(derivation.as_str(), "NONE" | "RESAMPLED")
+    if *primary != "PRIMARY" || *volume != "VOLUME" {
+        return false;
+    }
+    matches!(
+        (*origin, *derivation),
+        ("ORIGINAL", "NONE") | ("DERIVED", "NONE") | ("DERIVED", "RESAMPLED")
+    )
 }
 
 fn associated_image_name_from_image_type(image_type: &str) -> Option<String> {
-    let parts: Vec<String> = image_type
-        .split('\\')
-        .map(normalize_role_code_string)
-        .collect();
-    if parts.iter().any(|part| {
-        matches!(
-            part.as_str(),
-            "LABEL" | "LABELIMAGE" | "BARCODE" | "BARCODEIMAGE"
-        )
-    }) {
-        Some("label".into())
-    } else if parts.iter().any(|part| {
-        matches!(
-            part.as_str(),
-            "OVERVIEW"
-                | "OVERVIEWIMAGE"
-                | "LOCALIZER"
-                | "LOCALISER"
-                | "LOCALIZATION"
-                | "LOCALISATION"
-                | "MACRO"
-                | "MACROIMAGE"
-                | "PREVIEW"
-                | "REFERENCE"
-                | "REFERENCEIMAGE"
-                | "MAP"
-                | "MAPIMAGE"
-                | "NAVIGATION"
-                | "NAVIGATOR"
-                | "SURVEY"
-        )
-    }) {
-        Some("macro".into())
-    } else if parts.iter().any(|part| {
-        matches!(
-            part.as_str(),
-            "THUMBNAIL" | "THUMBNAILIMAGE" | "THUMB" | "THUMBIMAGE" | "ICON" | "SMALL" | "LOWRES"
-        )
-    }) {
-        Some("thumbnail".into())
-    } else {
-        None
+    let parts: Vec<&str> = image_type.split('\\').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let Some([origin, primary, role, derivation]) = parts.get(..4) else {
+        return None;
+    };
+    if !matches!(*origin, "ORIGINAL" | "DERIVED") || *primary != "PRIMARY" {
+        return None;
+    }
+    match (*role, *derivation) {
+        ("LABEL", "NONE") => Some("label".into()),
+        ("OVERVIEW", "NONE") => Some("macro".into()),
+        ("THUMBNAIL", "RESAMPLED") => Some("thumbnail".into()),
+        _ => None,
     }
 }
 
-fn normalize_role_code_string(value: &str) -> String {
-    normalize_code_string(value)
-        .chars()
-        .filter(|c| !matches!(c, ' ' | '_' | '-'))
-        .collect()
-}
-
 fn read_file_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
-    let len = usize::try_from(len)
-        .map_err(|_| OpenSlideError::Format("DICOM file range is too large".into()))?;
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut data = vec![0; len];
-    file.read_exact(&mut data)?;
-    Ok(data)
+    crate::util::read_file_range(path, offset, len)
 }
 
 fn read_file_fragments(path: &Path, fragments: &[FileRange]) -> Result<Vec<u8>> {
@@ -3724,13 +3732,323 @@ fn read_file_fragments(path: &Path, fragments: &[FileRange]) -> Result<Vec<u8>> 
     Ok(data)
 }
 
+fn decode_rle_lossless_frame(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    samples_per_pixel: u16,
+    planar_configuration: u16,
+    bits_allocated: u16,
+    photometric: &str,
+) -> Result<Vec<u8>> {
+    if data.len() < 64 {
+        return Err(OpenSlideError::Decode(format!(
+            "DICOM RLE frame is {} bytes, shorter than the 64-byte header",
+            data.len()
+        )));
+    }
+    if bits_allocated % 8 != 0 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "DICOM RLE BitsAllocated value {bits_allocated} is not byte-aligned"
+        )));
+    }
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or_else(|| OpenSlideError::Format("DICOM RLE pixel count overflows".into()))?;
+    let bytes_per_sample = usize::from(bits_allocated / 8);
+    let samples_per_pixel = usize::from(samples_per_pixel);
+    if photometric == "YBR_FULL_422" {
+        return decode_rle_ybr_full_422_frame(
+            data,
+            width,
+            height,
+            samples_per_pixel,
+            planar_configuration,
+            bytes_per_sample,
+        );
+    }
+    let expected_segments = samples_per_pixel
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| OpenSlideError::Format("DICOM RLE segment count overflows".into()))?;
+    if expected_segments > 15 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "DICOM RLE requires {expected_segments} segments, but the header supports at most 15"
+        )));
+    }
+    let segment_count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    if segment_count != expected_segments {
+        return Err(OpenSlideError::Decode(format!(
+            "DICOM RLE frame has {segment_count} segments, expected {expected_segments}"
+        )));
+    }
+
+    let mut offsets = Vec::with_capacity(segment_count + 1);
+    for segment in 0..segment_count {
+        let start = 4 + segment * 4;
+        let offset = u32::from_le_bytes(data[start..start + 4].try_into().unwrap()) as usize;
+        if offset < 64 || offset > data.len() {
+            return Err(OpenSlideError::Decode(format!(
+                "DICOM RLE segment {segment} offset {offset} is outside the frame"
+            )));
+        }
+        offsets.push(offset);
+    }
+    if offsets.windows(2).any(|pair| pair[1] < pair[0]) {
+        return Err(OpenSlideError::Decode(
+            "DICOM RLE segment offsets are not monotonically increasing".into(),
+        ));
+    }
+    offsets.push(data.len());
+
+    let decoded_len = pixel_count
+        .checked_mul(samples_per_pixel)
+        .and_then(|samples| samples.checked_mul(bytes_per_sample))
+        .ok_or_else(|| OpenSlideError::Format("DICOM RLE decoded frame is too large".into()))?;
+    let mut decoded = vec![0; decoded_len];
+    let mut segment_data = vec![0; pixel_count];
+    for segment in 0..segment_count {
+        let compressed = &data[offsets[segment]..offsets[segment + 1]];
+        decode_rle_segment(compressed, &mut segment_data, segment)?;
+        let sample_index = segment / bytes_per_sample;
+        let byte_index = segment % bytes_per_sample;
+        let byte_offset = bytes_per_sample - 1 - byte_index;
+        for (pixel_index, &value) in segment_data.iter().enumerate() {
+            let sample_offset = if planar_configuration == 0 {
+                pixel_index
+                    .checked_mul(samples_per_pixel)
+                    .and_then(|base| base.checked_add(sample_index))
+            } else {
+                sample_index
+                    .checked_mul(pixel_count)
+                    .and_then(|base| base.checked_add(pixel_index))
+            }
+            .ok_or_else(|| OpenSlideError::Format("DICOM RLE sample offset overflows".into()))?;
+            let dst = sample_offset
+                .checked_mul(bytes_per_sample)
+                .and_then(|base| base.checked_add(byte_offset))
+                .ok_or_else(|| OpenSlideError::Format("DICOM RLE byte offset overflows".into()))?;
+            decoded[dst] = value;
+        }
+    }
+    Ok(decoded)
+}
+
+fn decode_rle_ybr_full_422_frame(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    samples_per_pixel: usize,
+    planar_configuration: u16,
+    bytes_per_sample: usize,
+) -> Result<Vec<u8>> {
+    if samples_per_pixel != 3 || bytes_per_sample != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "DICOM RLE YBR_FULL_422 requires 8-bit three-sample frames".into(),
+        ));
+    }
+    let segment_count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    if segment_count != 3 {
+        return Err(OpenSlideError::Decode(format!(
+            "DICOM RLE YBR_FULL_422 frame has {segment_count} segments, expected 3"
+        )));
+    }
+    let pairs_per_row = width
+        .checked_add(1)
+        .map(|value| value / 2)
+        .ok_or_else(|| OpenSlideError::Format("DICOM RLE YBR_FULL_422 width overflows".into()))?;
+    let y_len = width
+        .checked_mul(height)
+        .ok_or_else(|| OpenSlideError::Format("DICOM RLE YBR_FULL_422 Y plane overflows".into()))?;
+    let chroma_len = pairs_per_row.checked_mul(height).ok_or_else(|| {
+        OpenSlideError::Format("DICOM RLE YBR_FULL_422 chroma plane overflows".into())
+    })?;
+    let mut offsets = Vec::with_capacity(segment_count + 1);
+    for segment in 0..segment_count {
+        let start = 4 + segment * 4;
+        let offset = u32::from_le_bytes(data[start..start + 4].try_into().unwrap()) as usize;
+        if offset < 64 || offset > data.len() {
+            return Err(OpenSlideError::Decode(format!(
+                "DICOM RLE segment {segment} offset {offset} is outside the frame"
+            )));
+        }
+        offsets.push(offset);
+    }
+    if offsets.windows(2).any(|pair| pair[1] < pair[0]) {
+        return Err(OpenSlideError::Decode(
+            "DICOM RLE segment offsets are not monotonically increasing".into(),
+        ));
+    }
+    offsets.push(data.len());
+
+    let mut y_plane = vec![0; y_len];
+    let mut cb_plane = vec![0; chroma_len];
+    let mut cr_plane = vec![0; chroma_len];
+    for (segment, output) in [&mut y_plane, &mut cb_plane, &mut cr_plane]
+        .into_iter()
+        .enumerate()
+    {
+        decode_rle_segment(
+            &data[offsets[segment]..offsets[segment + 1]],
+            output,
+            segment,
+        )?;
+    }
+
+    if planar_configuration != 0 {
+        let decoded_len = y_len
+            .checked_add(chroma_len)
+            .and_then(|len| len.checked_add(chroma_len))
+            .ok_or_else(|| {
+                OpenSlideError::Format("DICOM RLE YBR_FULL_422 decoded frame is too large".into())
+            })?;
+        let mut decoded = Vec::with_capacity(decoded_len);
+        decoded.extend_from_slice(&y_plane);
+        decoded.extend_from_slice(&cb_plane);
+        decoded.extend_from_slice(&cr_plane);
+        return Ok(decoded);
+    }
+
+    let packed_samples_per_row = pairs_per_row
+        .checked_mul(4)
+        .ok_or_else(|| OpenSlideError::Format("DICOM RLE YBR_FULL_422 row overflows".into()))?;
+    let decoded_len = packed_samples_per_row.checked_mul(height).ok_or_else(|| {
+        OpenSlideError::Format("DICOM RLE YBR_FULL_422 decoded frame is too large".into())
+    })?;
+    let mut decoded = Vec::with_capacity(decoded_len);
+    for y in 0..height {
+        let y_row_start = y * width;
+        let c_row_start = y * pairs_per_row;
+        for pair in 0..pairs_per_row {
+            let x = pair * 2;
+            decoded.push(y_plane[y_row_start + x]);
+            decoded.push(if x + 1 < width {
+                y_plane[y_row_start + x + 1]
+            } else {
+                0
+            });
+            decoded.push(cb_plane[c_row_start + pair]);
+            decoded.push(cr_plane[c_row_start + pair]);
+        }
+    }
+    Ok(decoded)
+}
+
+fn single_sample_u16_pixels_to_native_bytes(
+    samples: &[u16],
+    bits_allocated: u16,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>> {
+    let expected = width
+        .checked_mul(height)
+        .ok_or_else(|| OpenSlideError::Format("DICOM decoded pixel count overflows".into()))?;
+    if samples.len() != expected {
+        return Err(OpenSlideError::Decode(format!(
+            "DICOM lossless JPEG frame decoded to {} samples, expected {expected}",
+            samples.len()
+        )));
+    }
+    match bits_allocated {
+        8 => {
+            let mut out = Vec::with_capacity(samples.len());
+            for &sample in samples {
+                let sample = u8::try_from(sample).map_err(|_| {
+                    OpenSlideError::Decode(format!(
+                        "DICOM 8-bit lossless JPEG sample {sample} exceeds 255"
+                    ))
+                })?;
+                out.push(sample);
+            }
+            Ok(out)
+        }
+        16 => {
+            let mut out = Vec::with_capacity(samples.len() * 2);
+            for &sample in samples {
+                out.extend_from_slice(&sample.to_le_bytes());
+            }
+            Ok(out)
+        }
+        other => Err(OpenSlideError::UnsupportedFormat(format!(
+            "DICOM lossless JPEG BitsAllocated value {other} is not supported"
+        ))),
+    }
+}
+
+fn ensure_single_sample_lossless_jpeg_backend(
+    transfer_syntax: &str,
+    samples_per_pixel: u16,
+) -> Result<()> {
+    if samples_per_pixel == 1 {
+        return Ok(());
+    }
+    Err(OpenSlideError::UnsupportedFormat(format!(
+        "DICOM transfer syntax {transfer_syntax} has SamplesPerPixel={samples_per_pixel}, but the native lossless JPEG/JPEG-LS backend currently exposes only single-sample frames"
+    )))
+}
+
+fn decode_rle_segment(compressed: &[u8], out: &mut [u8], segment: usize) -> Result<()> {
+    let mut src = 0;
+    let mut dst = 0;
+    while dst < out.len() {
+        let Some(&control) = compressed.get(src) else {
+            return Err(OpenSlideError::Decode(format!(
+                "DICOM RLE segment {segment} ended after {dst} of {} bytes",
+                out.len()
+            )));
+        };
+        src += 1;
+        let control = control as i8;
+        match control {
+            0..=127 => {
+                let count = control as usize + 1;
+                let end = src.checked_add(count).ok_or_else(|| {
+                    OpenSlideError::Format("DICOM RLE literal run overflows".into())
+                })?;
+                if end > compressed.len() || dst + count > out.len() {
+                    return Err(OpenSlideError::Decode(format!(
+                        "DICOM RLE segment {segment} literal run exceeds segment output"
+                    )));
+                }
+                out[dst..dst + count].copy_from_slice(&compressed[src..end]);
+                src = end;
+                dst += count;
+            }
+            -127..=-1 => {
+                let count = 1usize + usize::from(control.unsigned_abs());
+                let Some(&value) = compressed.get(src) else {
+                    return Err(OpenSlideError::Decode(format!(
+                        "DICOM RLE segment {segment} replicate run is missing its value"
+                    )));
+                };
+                src += 1;
+                if dst + count > out.len() {
+                    return Err(OpenSlideError::Decode(format!(
+                        "DICOM RLE segment {segment} replicate run exceeds segment output"
+                    )));
+                }
+                out[dst..dst + count].fill(value);
+                dst += count;
+            }
+            -128 => {}
+        }
+    }
+    Ok(())
+}
+
 fn read_encapsulated_frame_table(
     path: &Path,
     offset: u64,
     number_of_frames: u64,
+    extended_offsets: Option<&[u64]>,
+    extended_lengths: Option<&[u64]>,
 ) -> Result<Vec<FrameFragments>> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
+    let mut file = crate::util::_openslide_fopen(path)?;
+    let offset = i64::try_from(offset).map_err(|_| {
+        OpenSlideError::Format(format!(
+            "DICOM encapsulated frame table offset does not fit OpenSlide seek: offset={offset}"
+        ))
+    })?;
+    crate::util::_openslide_fseek(&mut file, offset, crate::util::OpenSlideSeekWhence::Set)?;
 
     let first = read_item_header(&mut file)?;
     if first.0 != ITEM_TAG {
@@ -3744,13 +4062,13 @@ fn read_encapsulated_frame_table(
         ));
     }
     let mut bot = vec![0; first.1 as usize];
-    file.read_exact(&mut bot)?;
+    crate::util::_openslide_fread_exact(&mut file, &mut bot)?;
     let frame_offsets = parse_basic_offset_table(&bot)?;
-    let fragment_origin = file.stream_position()?;
+    let fragment_origin = dicom_file_position(&mut file)?;
 
     let mut fragments = Vec::new();
     loop {
-        let item_start = file.stream_position()?;
+        let item_start = dicom_file_position(&mut file)?;
         let (tag, len) = read_item_header(&mut file)?;
         if tag == SEQUENCE_DELIMITATION_ITEM_TAG {
             break;
@@ -3766,7 +4084,7 @@ fn read_encapsulated_frame_table(
                 "DICOM encapsulated PixelData fragment has undefined length".into(),
             ));
         }
-        let frame_offset = file.stream_position()?;
+        let frame_offset = dicom_file_position(&mut file)?;
         fragments.push(EncapsulatedFragment {
             item_start,
             range: FileRange {
@@ -3774,13 +4092,19 @@ fn read_encapsulated_frame_table(
                 len: len as u64,
             },
         });
-        file.seek(SeekFrom::Current(len as i64))?;
+        crate::util::_openslide_fseek(
+            &mut file,
+            len as i64,
+            crate::util::OpenSlideSeekWhence::Cur,
+        )?;
     }
     group_encapsulated_fragments(
         path,
         fragments,
         fragment_origin,
         &frame_offsets,
+        extended_offsets,
+        extended_lengths,
         number_of_frames,
     )
 }
@@ -3806,13 +4130,51 @@ fn parse_basic_offset_table(data: &[u8]) -> Result<Vec<u32>> {
         .collect())
 }
 
+fn parse_extended_offset_table(elements: &[DicomElement], tag: Tag) -> Result<Option<Vec<u64>>> {
+    let Some(element) = get_element(elements, tag) else {
+        return Ok(None);
+    };
+    if element.value.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    if element.value.len() % 8 != 0 {
+        return Err(OpenSlideError::Format(format!(
+            "{} length is not a multiple of 8",
+            dicom_keyword(tag).unwrap_or("DICOM extended offset table")
+        )));
+    }
+    Ok(Some(
+        element
+            .value
+            .chunks_exact(8)
+            .map(|chunk| match element.endian {
+                Endian::Little => u64::from_le_bytes(chunk.try_into().unwrap()),
+                Endian::Big => u64::from_be_bytes(chunk.try_into().unwrap()),
+            })
+            .collect(),
+    ))
+}
+
 fn group_encapsulated_fragments(
     path: &Path,
     fragments: Vec<EncapsulatedFragment>,
     fragment_origin: u64,
     frame_offsets: &[u32],
+    extended_offsets: Option<&[u64]>,
+    extended_lengths: Option<&[u64]>,
     number_of_frames: u64,
 ) -> Result<Vec<FrameFragments>> {
+    if let Some(extended_offsets) = extended_offsets.filter(|offsets| !offsets.is_empty()) {
+        return group_encapsulated_fragments_by_extended_offset_table(
+            path,
+            fragments,
+            fragment_origin,
+            extended_offsets,
+            extended_lengths,
+            number_of_frames,
+        );
+    }
+
     if frame_offsets.is_empty() {
         let frame_count = usize::try_from(number_of_frames)
             .map_err(|_| OpenSlideError::Format("DICOM frame count is too large".into()))?;
@@ -3894,9 +4256,96 @@ fn group_encapsulated_fragments(
     Ok(frames)
 }
 
-fn read_item_header(file: &mut File) -> Result<(Tag, u32)> {
+fn group_encapsulated_fragments_by_extended_offset_table(
+    path: &Path,
+    fragments: Vec<EncapsulatedFragment>,
+    fragment_origin: u64,
+    extended_offsets: &[u64],
+    extended_lengths: Option<&[u64]>,
+    number_of_frames: u64,
+) -> Result<Vec<FrameFragments>> {
+    if extended_offsets.len() as u64 != number_of_frames {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "DICOM Extended Offset Table has {} frame offsets for {number_of_frames} frames",
+            extended_offsets.len()
+        )));
+    }
+    if let Some(lengths) = extended_lengths {
+        if lengths.len() != extended_offsets.len() {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "DICOM Extended Offset Table Lengths has {} entries for {} frame offsets",
+                lengths.len(),
+                extended_offsets.len()
+            )));
+        }
+    }
+    if extended_offsets.first().copied() != Some(0) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "DICOM Extended Offset Table first frame offset is {}, expected 0",
+            extended_offsets[0]
+        )));
+    }
+    if let Some(index) = extended_offsets
+        .windows(2)
+        .position(|pair| pair[1] <= pair[0])
+    {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "DICOM Extended Offset Table frame offsets are not strictly increasing at entries {index} and {}",
+            index + 1
+        )));
+    }
+
+    let mut frame_starts = Vec::with_capacity(extended_offsets.len());
+    for &offset in extended_offsets {
+        frame_starts.push(
+            fragment_origin
+                .checked_add(offset)
+                .ok_or_else(|| OpenSlideError::Format("DICOM frame offset overflows".into()))?,
+        );
+    }
+    let mut frames = vec![
+        FrameFragments {
+            path: path.to_path_buf(),
+            fragments: Vec::new(),
+        };
+        extended_offsets.len()
+    ];
+    let mut payload_lengths = vec![0u64; extended_offsets.len()];
+    for fragment in fragments {
+        let Some(frame_index) = frame_starts
+            .partition_point(|start| *start <= fragment.item_start)
+            .checked_sub(1)
+        else {
+            return Err(OpenSlideError::Format(
+                "DICOM fragment appears before the first Extended Offset Table frame".into(),
+            ));
+        };
+        payload_lengths[frame_index] = payload_lengths[frame_index]
+            .checked_add(fragment.range.len)
+            .ok_or_else(|| OpenSlideError::Format("DICOM frame payload length overflows".into()))?;
+        frames[frame_index].fragments.push(fragment.range);
+    }
+    if let Some(index) = frames.iter().position(|frame| frame.fragments.is_empty()) {
+        return Err(OpenSlideError::Format(format!(
+            "DICOM Extended Offset Table frame {index} has no fragments"
+        )));
+    }
+    if let Some(lengths) = extended_lengths {
+        for (index, (&actual, &expected)) in payload_lengths.iter().zip(lengths.iter()).enumerate()
+        {
+            if actual != expected {
+                return Err(OpenSlideError::Format(format!(
+                    "DICOM Extended Offset Table Lengths frame {index} is {expected}, but grouped fragments total {actual}"
+                )));
+            }
+        }
+    }
+    Ok(frames)
+}
+
+fn read_item_header(file: &mut crate::util::OpenSlideFile) -> Result<(Tag, u32)> {
     let mut header = [0; 8];
-    file.read_exact(&mut header)?;
+    crate::util::_openslide_fread_exact(file, &mut header)?;
     Ok((
         Tag(
             u16::from_le_bytes([header[0], header[1]]),
@@ -3961,7 +4410,7 @@ fn parse_palette_descriptor(
     elements: &[DicomElement],
     tag: Tag,
     name: &str,
-) -> Result<(usize, u16, u16)> {
+) -> Result<(usize, i32, u16)> {
     let element = get_element(elements, tag).ok_or_else(|| {
         OpenSlideError::Format(format!("DICOM PALETTE COLOR {name} descriptor is missing"))
     })?;
@@ -3971,7 +4420,11 @@ fn parse_palette_descriptor(
         )));
     }
     let entries = read_u16(&element.value[0..2], element.endian);
-    let first_mapped = read_u16(&element.value[2..4], element.endian);
+    let first_mapped = if element.vr == Some(*b"SS") {
+        read_i16(&element.value[2..4], element.endian) as i32
+    } else {
+        read_u16(&element.value[2..4], element.endian) as i32
+    };
     let bits = read_u16(&element.value[4..6], element.endian);
     let entries = if entries == 0 {
         65_536usize
@@ -4053,22 +4506,18 @@ fn native_frame_to_rgb(
     let mut rgb = match samples_per_pixel {
         1 => {
             if photometric == "PALETTE COLOR" {
-                if pixel_representation != 0 {
-                    return Err(OpenSlideError::UnsupportedFormat(
-                        "DICOM PALETTE COLOR signed sample indices are not supported".into(),
-                    ));
-                }
                 let palette = palette.ok_or_else(|| {
                     OpenSlideError::Format("DICOM PALETTE COLOR LUT is missing".into())
                 })?;
                 let mut rgb = Vec::with_capacity(samples.len().saturating_mul(3));
                 for sample in samples {
-                    if sample < 0 {
+                    let index = sample - palette.first_mapped;
+                    if index < 0 {
                         return Err(OpenSlideError::Decode(format!(
                             "DICOM PALETTE COLOR sample {sample} is outside LUT"
                         )));
                     }
-                    let index = (sample as u16).saturating_sub(palette.first_mapped) as usize;
+                    let index = index as usize;
                     if index >= palette.red.len()
                         || index >= palette.green.len()
                         || index >= palette.blue.len()
@@ -4193,35 +4642,100 @@ fn native_frame_to_rgb(
         }
         3 if photometric == "YBR_FULL_422" => {
             let pairs_per_row = expected_width.div_ceil(2);
-            let samples_per_row = pairs_per_row.checked_mul(4).ok_or_else(|| {
+            let packed_samples_per_row = pairs_per_row.checked_mul(4).ok_or_else(|| {
                 OpenSlideError::Format("DICOM frame sample count overflows".into())
             })?;
-            let expected_samples =
-                samples_per_row
+            let mut rgb = Vec::with_capacity(expected_pixels.saturating_mul(3));
+            if planar_configuration == 0 {
+                let expected_samples = packed_samples_per_row
                     .checked_mul(expected_height)
                     .ok_or_else(|| {
                         OpenSlideError::Format("DICOM frame sample count overflows".into())
                     })?;
-            if samples.len() != expected_samples {
-                return Err(OpenSlideError::Decode(format!(
-                    "DICOM native YBR_FULL_422 frame has {} samples, expected {expected_samples}",
-                    samples.len(),
-                )));
-            }
-            let mut rgb = Vec::with_capacity(expected_pixels.saturating_mul(3));
-            for row in samples.chunks_exact(samples_per_row) {
-                for (pair_index, pair) in row.chunks_exact(4).enumerate() {
-                    let y0 =
-                        scale_sample_to_u8(pair[0], bits_stored, pixel_representation, intensity);
-                    let y1 =
-                        scale_sample_to_u8(pair[1], bits_stored, pixel_representation, intensity);
-                    let cb =
-                        scale_sample_to_u8(pair[2], bits_stored, pixel_representation, intensity);
-                    let cr =
-                        scale_sample_to_u8(pair[3], bits_stored, pixel_representation, intensity);
-                    rgb.extend_from_slice(&ycbcr_to_rgb(y0, cb, cr));
-                    if pair_index * 2 + 1 < expected_width {
-                        rgb.extend_from_slice(&ycbcr_to_rgb(y1, cb, cr));
+                if samples.len() != expected_samples {
+                    return Err(OpenSlideError::Decode(format!(
+                        "DICOM native YBR_FULL_422 frame has {} samples, expected {expected_samples}",
+                        samples.len(),
+                    )));
+                }
+                for row in samples.chunks_exact(packed_samples_per_row) {
+                    for (pair_index, pair) in row.chunks_exact(4).enumerate() {
+                        let y0 = scale_sample_to_u8(
+                            pair[0],
+                            bits_stored,
+                            pixel_representation,
+                            intensity,
+                        );
+                        let y1 = scale_sample_to_u8(
+                            pair[1],
+                            bits_stored,
+                            pixel_representation,
+                            intensity,
+                        );
+                        let cb = scale_sample_to_u8(
+                            pair[2],
+                            bits_stored,
+                            pixel_representation,
+                            intensity,
+                        );
+                        let cr = scale_sample_to_u8(
+                            pair[3],
+                            bits_stored,
+                            pixel_representation,
+                            intensity,
+                        );
+                        rgb.extend_from_slice(&ycbcr_to_rgb(y0, cb, cr));
+                        if pair_index * 2 + 1 < expected_width {
+                            rgb.extend_from_slice(&ycbcr_to_rgb(y1, cb, cr));
+                        }
+                    }
+                }
+            } else {
+                let y_plane_len = expected_width.checked_mul(expected_height).ok_or_else(|| {
+                    OpenSlideError::Format("DICOM frame sample count overflows".into())
+                })?;
+                let chroma_plane_len =
+                    pairs_per_row.checked_mul(expected_height).ok_or_else(|| {
+                        OpenSlideError::Format("DICOM frame sample count overflows".into())
+                    })?;
+                let expected_planar_samples = y_plane_len
+                    .checked_add(chroma_plane_len)
+                    .and_then(|samples| samples.checked_add(chroma_plane_len))
+                    .ok_or_else(|| {
+                        OpenSlideError::Format("DICOM frame sample count overflows".into())
+                    })?;
+                if samples.len() != expected_planar_samples {
+                    return Err(OpenSlideError::Decode(format!(
+                        "DICOM native planar YBR_FULL_422 frame has {} samples, expected {expected_planar_samples}",
+                        samples.len(),
+                    )));
+                }
+                let (y_plane, rest) = samples.split_at(y_plane_len);
+                let (cb_plane, cr_plane) = rest.split_at(chroma_plane_len);
+                for y in 0..expected_height {
+                    for x in 0..expected_width {
+                        let luma_index = y * expected_width + x;
+                        let chroma_index = y * pairs_per_row + x / 2;
+                        rgb.extend_from_slice(&ycbcr_to_rgb(
+                            scale_sample_to_u8(
+                                y_plane[luma_index],
+                                bits_stored,
+                                pixel_representation,
+                                intensity,
+                            ),
+                            scale_sample_to_u8(
+                                cb_plane[chroma_index],
+                                bits_stored,
+                                pixel_representation,
+                                intensity,
+                            ),
+                            scale_sample_to_u8(
+                                cr_plane[chroma_index],
+                                bits_stored,
+                                pixel_representation,
+                                intensity,
+                            ),
+                        ));
                     }
                 }
             }
@@ -4265,7 +4779,9 @@ fn native_samples_to_i32(
         8 => Ok(data
             .iter()
             .copied()
-            .map(|sample| stored_sample_to_i32(sample as u16, bits_stored, pixel_representation))
+            .map(|sample| {
+                stored_sample_to_i32(sample as u16, bits_stored, high_bit, pixel_representation)
+            })
             .collect()),
         16 => {
             if data.len() % 2 != 0 {
@@ -4277,7 +4793,12 @@ fn native_samples_to_i32(
             Ok(data
                 .chunks_exact(2)
                 .map(|chunk| {
-                    stored_sample_to_i32(read_u16(chunk, endian), bits_stored, pixel_representation)
+                    stored_sample_to_i32(
+                        read_u16(chunk, endian),
+                        bits_stored,
+                        high_bit,
+                        pixel_representation,
+                    )
                 })
                 .collect())
         }
@@ -4285,13 +4806,19 @@ fn native_samples_to_i32(
     }
 }
 
-fn stored_sample_to_i32(sample: u16, bits_stored: u16, pixel_representation: u16) -> i32 {
+fn stored_sample_to_i32(
+    sample: u16,
+    bits_stored: u16,
+    high_bit: u16,
+    pixel_representation: u16,
+) -> i32 {
     let mask = if bits_stored == 16 {
         u16::MAX
     } else {
         ((1u32 << bits_stored) - 1) as u16
     };
-    let sample = sample & mask;
+    let shift = high_bit + 1 - bits_stored;
+    let sample = (sample >> shift) & mask;
     if pixel_representation == 0 {
         return i32::from(sample);
     }
@@ -4452,6 +4979,42 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SERIES_UID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn dicom_sibling_paths_use_translated_dir_helpers_and_sort_by_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "openslide_rs_dicom_sibling_paths_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let base = dir.join("middle.dcm");
+        let first = dir.join("a.dcm");
+        let last = dir.join("z.dcm");
+        fs::write(&last, b"z").unwrap();
+        fs::write(&base, b"m").unwrap();
+        fs::write(&first, b"a").unwrap();
+
+        let paths = sorted_sibling_paths(&base).unwrap();
+        assert_eq!(paths, vec![first, base, last]);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dicom_frame_ranges_use_shared_file_range_helper() {
+        let path = test_path("dicom-frame-range-helper.bin");
+        fs::write(&path, b"0123456789").unwrap();
+
+        assert_eq!(read_file_range(&path, 2, 4).unwrap(), b"2345");
+        assert!(read_file_range(&path, 8, 3).is_err());
+        assert!(read_file_range(&path, u64::MAX, 1).is_err());
+
+        let _ = fs::remove_file(path);
+    }
 
     #[test]
     fn detects_dicom_wsi_file_meta() {
@@ -4471,8 +5034,11 @@ mod tests {
     }
 
     #[test]
-    fn detects_dicom_wsi_file_meta_with_tiff_extension() {
-        let path = test_path("detects_dicom_wsi_file_meta_with_tiff_extension.tif");
+    fn detects_dicom_wsi_file_meta_with_tiff_extension_when_not_tiff_like() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_detects_dicom_wsi_file_meta_with_tiff_extension_{}.tif",
+            std::process::id()
+        ));
         let mut data = vec![0; DICM_OFFSET as usize];
         data.extend_from_slice(DICM_MAGIC);
         write_explicit_element(
@@ -4484,6 +5050,33 @@ mod tests {
         fs::write(&path, data).unwrap();
 
         assert!(detect(&path));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_dual_personality_dicom_tiff_with_tiff_extension_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_rejects_dual_personality_dicom_tiff_with_tiff_extension_{}.tif",
+            std::process::id()
+        ));
+        let mut data = vec![0; DICM_OFFSET as usize];
+        data[0..4].copy_from_slice(b"II*\0");
+        data.extend_from_slice(DICM_MAGIC);
+        write_explicit_element(
+            &mut data,
+            TAG_MEDIA_STORAGE_SOP_CLASS_UID,
+            b"UI",
+            VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE.as_bytes(),
+        );
+        fs::write(&path, data).unwrap();
+
+        assert!(!detect(&path));
+        let err = match open(&path) {
+            Ok(_) => panic!("expected dual-personality DICOM-TIFF to be unsupported"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, OpenSlideError::UnsupportedFormat(_)));
+
         let _ = fs::remove_file(path);
     }
 
@@ -4578,8 +5171,8 @@ mod tests {
     }
 
     #[test]
-    fn exposes_label_image_type_as_associated_image() {
-        let path = test_path("exposes_label_image_type_as_associated_image.dcm");
+    fn rejects_standalone_label_image_type_like_upstream() {
+        let path = test_path("rejects_standalone_label_image_type_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_image_type(
             &mut data,
@@ -4595,18 +5188,19 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3, 4, 5, 6]);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(slide.associated_image_names(), vec!["label"]);
-        let label = slide.read_associated_image("label").unwrap();
-        assert_eq!(label.width, 2);
-        assert_eq!(label.height, 1);
-        assert_eq!(label.data, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        let err = match DicomSlide::open(&path) {
+            Ok(_) => panic!("expected standalone associated DICOM to fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("No pyramid levels found"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn maps_pixel_spacing_and_objective_properties() {
-        let path = test_path("maps_pixel_spacing_and_objective_properties.dcm");
+    fn ignores_top_level_pixel_spacing_and_objective_for_standard_properties_like_upstream() {
+        let path = test_path(
+            "ignores_top_level_pixel_spacing_and_objective_for_standard_properties_like_upstream.dcm",
+        );
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
         write_explicit_element(&mut data, TAG_PIXEL_SPACING, b"DS", b"0.00025\\0.0005");
@@ -4616,17 +5210,23 @@ mod tests {
 
         let slide = DicomSlide::open(&path).unwrap();
         assert_eq!(
-            slide.properties().get(properties::PROPERTY_MPP_X),
-            Some(&"0.5".to_string())
+            slide.properties().get("dicom.PixelSpacing[0]"),
+            Some(&"0.00025000000000000001".to_string())
         );
         assert_eq!(
-            slide.properties().get(properties::PROPERTY_MPP_Y),
-            Some(&"0.25".to_string())
+            slide.properties().get("dicom.PixelSpacing[1]"),
+            Some(&"0.00050000000000000001".to_string())
         );
         assert_eq!(
-            slide.properties().get(properties::PROPERTY_OBJECTIVE_POWER),
+            slide.properties().get("dicom.ObjectiveLensPower"),
             Some(&"40".to_string())
         );
+        assert!(slide.properties().get(properties::PROPERTY_MPP_X).is_none());
+        assert!(slide.properties().get(properties::PROPERTY_MPP_Y).is_none());
+        assert!(slide
+            .properties()
+            .get(properties::PROPERTY_OBJECTIVE_POWER)
+            .is_none());
         let _ = fs::remove_file(path);
     }
 
@@ -4659,7 +5259,7 @@ mod tests {
             slide.properties().get(
                 "dicom.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing[0]"
             ),
-            Some(&"0.00025".to_string())
+            Some(&"0.00025000000000000001".to_string())
         );
         assert_eq!(
             slide
@@ -4668,6 +5268,63 @@ mod tests {
             Some(&"40".to_string())
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_standard_pixel_spacing_like_openslide_double() {
+        assert_eq!(format_float(1.0 / 3.0), "0.33333333333333331");
+
+        let mut props = HashMap::new();
+        let metadata = StandardOpticalMetadata {
+            pixel_spacing: Some(" \t+0,00025\\0.0005".into()),
+            objective_lens_power: Some("20".into()),
+        };
+        insert_standard_optical_properties(&mut props, &metadata);
+        assert_eq!(
+            props.get(properties::PROPERTY_MPP_Y),
+            Some(&"0.25".to_string())
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_MPP_X),
+            Some(&"0.5".to_string())
+        );
+        assert!(props
+            .get("dicom.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing[0]")
+            .is_none());
+        assert_eq!(
+            props.get(properties::PROPERTY_OBJECTIVE_POWER),
+            Some(&"20".to_string())
+        );
+        assert!(props
+            .get("dicom.OpticalPathSequence[0].ObjectiveLensPower")
+            .is_none());
+
+        let mut props = HashMap::new();
+        let metadata = StandardOpticalMetadata {
+            pixel_spacing: Some("0.00025 \\0.0005".into()),
+            objective_lens_power: None,
+        };
+        insert_standard_optical_properties(&mut props, &metadata);
+        assert!(props.get(properties::PROPERTY_MPP_Y).is_none());
+
+        let mut props = HashMap::new();
+        let metadata = StandardOpticalMetadata {
+            pixel_spacing: Some("1e9999\\0.0005".into()),
+            objective_lens_power: None,
+        };
+        insert_standard_optical_properties(&mut props, &metadata);
+        assert!(props.get(properties::PROPERTY_MPP_Y).is_none());
+
+        let mut props = HashMap::new();
+        let metadata = StandardOpticalMetadata {
+            pixel_spacing: Some("bad\\0.00025\\0.0005".into()),
+            objective_lens_power: None,
+        };
+        insert_standard_optical_properties(&mut props, &metadata);
+        assert!(props.get(properties::PROPERTY_MPP_Y).is_none());
+        assert!(props
+            .get("dicom.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing[0]")
+            .is_none());
     }
 
     #[test]
@@ -4715,14 +5372,34 @@ mod tests {
             slide.properties().get(
                 "dicom.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing[0]"
             ),
-            Some(&"0.00025".to_string())
+            Some(&"0.00025000000000000001".to_string())
         );
         assert_eq!(
             slide.properties().get(
                 "dicom.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing[1]"
             ),
-            Some(&"0.0005".to_string())
+            Some(&"0.00050000000000000001".to_string())
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn exposes_icc_profile_from_first_optical_path() {
+        let path = test_path("exposes_icc_profile_from_first_optical_path.dcm");
+        let profile = b"synthetic dicom icc profile";
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
+        write_optical_path_sequence_with_icc(&mut data, profile);
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
+        fs::write(&path, data).unwrap();
+
+        let slide = DicomSlide::open(&path).unwrap();
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_ICC_SIZE),
+            Some(&profile.len().to_string())
+        );
+        assert_eq!(slide.icc_profile().unwrap(), Some(profile.to_vec()));
+
         let _ = fs::remove_file(path);
     }
 
@@ -4783,6 +5460,7 @@ mod tests {
             "RGB",
             b"ORIGINAL\\PRIMARY\\LABEL\\NONE",
         );
+        write_optical_path_sequence_with_icc(&mut label, b"associated dicom icc");
         write_explicit_element(
             &mut label,
             TAG_SERIES_INSTANCE_UID,
@@ -4794,6 +5472,20 @@ mod tests {
 
         let slide = DicomSlide::open(&path).unwrap();
         assert_eq!(slide.associated_image_names(), vec!["label"]);
+        assert_eq!(
+            slide.properties().get("openslide.associated.label.width"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("openslide.associated.label.height"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            slide
+                .properties()
+                .get("openslide.associated.label.icc-size"),
+            Some(&"20".to_string())
+        );
         let image = slide.read_associated_image("label").unwrap();
         assert_eq!(image.width, 1);
         assert_eq!(image.height, 1);
@@ -4801,6 +5493,202 @@ mod tests {
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(label_path);
+    }
+
+    #[test]
+    fn ignores_duplicate_same_series_associated_dicom_with_same_sop_instance_uid() {
+        let path = test_path("ignores_duplicate_same_series_associated_volume.dcm");
+        let label_a_path = test_path("ignores_duplicate_same_series_associated_label_a.dcm");
+        let label_b_path = test_path("ignores_duplicate_same_series_associated_label_b.dcm");
+        let series_uid = format!("1.2.826.0.1.3680043.10.574.{}", std::process::id());
+        let sop_uid = format!("{series_uid}.label");
+
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
+        write_explicit_element(
+            &mut data,
+            TAG_SERIES_INSTANCE_UID,
+            b"UI",
+            series_uid.as_bytes(),
+        );
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
+        fs::write(&path, data).unwrap();
+
+        write_label_associated_dicom(&label_a_path, &series_uid, &sop_uid, &[9, 8, 7]);
+        write_label_associated_dicom(&label_b_path, &series_uid, &sop_uid, &[6, 5, 4]);
+
+        let slide = DicomSlide::open(&path).unwrap();
+        assert_eq!(slide.associated_image_names(), vec!["label"]);
+        let label = slide.read_associated_image("label").unwrap();
+        assert_eq!(label.data, vec![9, 8, 7, 255]);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(label_a_path);
+        let _ = fs::remove_file(label_b_path);
+    }
+
+    #[test]
+    fn rejects_same_series_associated_dicom_without_total_matrix_dimensions_like_upstream() {
+        let path = test_path("rejects_associated_without_total_matrix_volume.dcm");
+        let label_path = test_path("rejects_associated_without_total_matrix_label.dcm");
+        let series_uid = format!("1.2.826.0.1.3680043.10.584.{}", std::process::id());
+
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
+        write_explicit_element(
+            &mut data,
+            TAG_SERIES_INSTANCE_UID,
+            b"UI",
+            series_uid.as_bytes(),
+        );
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
+        fs::write(&path, data).unwrap();
+
+        let mut label = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_explicit_element(
+            &mut label,
+            TAG_SOP_CLASS_UID,
+            b"UI",
+            VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE.as_bytes(),
+        );
+        write_explicit_element(
+            &mut label,
+            TAG_IMAGE_TYPE,
+            b"CS",
+            b"ORIGINAL\\PRIMARY\\LABEL\\NONE",
+        );
+        write_explicit_element(
+            &mut label,
+            TAG_SERIES_INSTANCE_UID,
+            b"UI",
+            series_uid.as_bytes(),
+        );
+        write_explicit_element(
+            &mut label,
+            TAG_SOP_INSTANCE_UID,
+            b"UI",
+            b"missing-dim-label",
+        );
+        write_explicit_element(
+            &mut label,
+            TAG_SAMPLES_PER_PIXEL,
+            b"US",
+            &3u16.to_le_bytes(),
+        );
+        write_explicit_element(&mut label, TAG_PHOTOMETRIC_INTERPRETATION, b"CS", b"RGB");
+        write_explicit_element(
+            &mut label,
+            TAG_PLANAR_CONFIGURATION,
+            b"US",
+            &0u16.to_le_bytes(),
+        );
+        write_explicit_element(&mut label, TAG_NUMBER_OF_FRAMES, b"IS", b"1");
+        write_explicit_element(&mut label, TAG_ROWS, b"US", &1u16.to_le_bytes());
+        write_explicit_element(&mut label, TAG_COLUMNS, b"US", &1u16.to_le_bytes());
+        write_explicit_element(&mut label, TAG_BITS_ALLOCATED, b"US", &8u16.to_le_bytes());
+        write_explicit_element(&mut label, TAG_BITS_STORED, b"US", &8u16.to_le_bytes());
+        write_explicit_element(&mut label, TAG_HIGH_BIT, b"US", &7u16.to_le_bytes());
+        write_explicit_element(
+            &mut label,
+            TAG_PIXEL_REPRESENTATION,
+            b"US",
+            &0u16.to_le_bytes(),
+        );
+        write_explicit_element(
+            &mut label,
+            TAG_TOTAL_PIXEL_MATRIX_COLUMNS,
+            b"UL",
+            &1u32.to_le_bytes(),
+        );
+        write_explicit_element(
+            &mut label,
+            TAG_TOTAL_PIXEL_MATRIX_FOCAL_PLANES,
+            b"US",
+            &1u16.to_le_bytes(),
+        );
+        write_explicit_element(&mut label, TAG_PIXEL_DATA, b"OB", &[9, 8, 7]);
+        fs::write(&label_path, label).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Couldn't read associated image dimensions"));
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(label_path);
+    }
+
+    #[test]
+    fn opening_same_series_associated_dicom_uses_pyramid_level_like_upstream() {
+        let path = test_path("opens_associated_entry_via_same_series_volume.dcm");
+        let label_path = test_path("opens_associated_entry_via_same_series_label.dcm");
+        let series_uid = format!("1.2.826.0.1.3680043.10.576.{}", std::process::id());
+
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
+        write_explicit_element(
+            &mut data,
+            TAG_SERIES_INSTANCE_UID,
+            b"UI",
+            series_uid.as_bytes(),
+        );
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
+        fs::write(&path, data).unwrap();
+
+        write_label_associated_dicom(
+            &label_path,
+            &series_uid,
+            &format!("{series_uid}.label"),
+            &[9, 8, 7],
+        );
+
+        let slide = DicomSlide::open(&label_path).unwrap();
+        assert_eq!(slide.level_dimensions(0), Some((1, 1)));
+        assert_eq!(slide.associated_image_names(), vec!["label"]);
+        let region = slide.read_region(0, 0, 0, 0, 1, 1).unwrap();
+        assert_eq!(region.data, vec![1]);
+        let label = slide.read_associated_image("label").unwrap();
+        assert_eq!(label.data, vec![9, 8, 7, 255]);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(label_path);
+    }
+
+    #[test]
+    fn rejects_duplicate_same_series_associated_dicom_with_different_sop_instance_uid() {
+        let path = test_path("rejects_duplicate_same_series_associated_volume.dcm");
+        let label_a_path = test_path("rejects_duplicate_same_series_associated_label_a.dcm");
+        let label_b_path = test_path("rejects_duplicate_same_series_associated_label_b.dcm");
+        let series_uid = format!("1.2.826.0.1.3680043.10.575.{}", std::process::id());
+
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
+        write_explicit_element(
+            &mut data,
+            TAG_SERIES_INSTANCE_UID,
+            b"UI",
+            series_uid.as_bytes(),
+        );
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
+        fs::write(&path, data).unwrap();
+
+        write_label_associated_dicom(
+            &label_a_path,
+            &series_uid,
+            &format!("{series_uid}.label-a"),
+            &[9, 8, 7],
+        );
+        write_label_associated_dicom(
+            &label_b_path,
+            &series_uid,
+            &format!("{series_uid}.label-b"),
+            &[6, 5, 4],
+        );
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("unexpected DICOM associated image"));
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(label_a_path);
+        let _ = fs::remove_file(label_b_path);
     }
 
     #[test]
@@ -4861,6 +5749,116 @@ mod tests {
     }
 
     #[test]
+    fn ignores_duplicate_same_series_pyramid_level_with_same_sop_instance_uid() {
+        let path = test_path("ignores_duplicate_same_series_pyramid_level_base.dcm");
+        let level1_a_path = test_path("ignores_duplicate_same_series_pyramid_level_low_a.dcm");
+        let level1_b_path = test_path("ignores_duplicate_same_series_pyramid_level_low_b.dcm");
+        let series_uid = format!("1.2.826.0.1.3680043.10.586.{}", std::process::id());
+        let sop_uid = format!("{series_uid}.low");
+
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 1, 2, 1, 1, "RGB");
+        write_explicit_element(
+            &mut data,
+            TAG_SERIES_INSTANCE_UID,
+            b"UI",
+            series_uid.as_bytes(),
+        );
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3, 4, 5, 6]);
+        fs::write(&path, data).unwrap();
+
+        for (level_path, pixel) in [(&level1_a_path, [9, 8, 7]), (&level1_b_path, [6, 5, 4])] {
+            let mut level = dicom_preamble(TS_EXPLICIT_VR_LE);
+            write_common_wsi_dataset_with_image_type(
+                &mut level,
+                TS_EXPLICIT_VR_LE,
+                1,
+                1,
+                1,
+                1,
+                1,
+                "RGB",
+                b"DERIVED\\PRIMARY\\VOLUME\\RESAMPLED",
+            );
+            write_explicit_element(
+                &mut level,
+                TAG_SERIES_INSTANCE_UID,
+                b"UI",
+                series_uid.as_bytes(),
+            );
+            write_explicit_element(&mut level, TAG_SOP_INSTANCE_UID, b"UI", sop_uid.as_bytes());
+            write_explicit_element(&mut level, TAG_PIXEL_DATA, b"OB", &pixel);
+            fs::write(level_path, level).unwrap();
+        }
+
+        let slide = DicomSlide::open(&path).unwrap();
+
+        assert_eq!(slide.level_count(), 2);
+        assert_eq!(slide.level_dimensions(1), Some((1, 1)));
+        let red = slide.read_region(0, 0, 0, 1, 1, 1).unwrap();
+        assert_eq!(red.data, vec![9]);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(level1_a_path);
+        let _ = fs::remove_file(level1_b_path);
+    }
+
+    #[test]
+    fn rejects_duplicate_same_series_pyramid_level_with_different_sop_instance_uid() {
+        let path = test_path("rejects_duplicate_same_series_pyramid_level_base.dcm");
+        let level1_a_path = test_path("rejects_duplicate_same_series_pyramid_level_low_a.dcm");
+        let level1_b_path = test_path("rejects_duplicate_same_series_pyramid_level_low_b.dcm");
+        let series_uid = format!("1.2.826.0.1.3680043.10.587.{}", std::process::id());
+
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 1, 2, 1, 1, "RGB");
+        write_explicit_element(
+            &mut data,
+            TAG_SERIES_INSTANCE_UID,
+            b"UI",
+            series_uid.as_bytes(),
+        );
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3, 4, 5, 6]);
+        fs::write(&path, data).unwrap();
+
+        for (level_path, suffix) in [(&level1_a_path, "low-a"), (&level1_b_path, "low-b")] {
+            let mut level = dicom_preamble(TS_EXPLICIT_VR_LE);
+            write_common_wsi_dataset_with_image_type(
+                &mut level,
+                TS_EXPLICIT_VR_LE,
+                1,
+                1,
+                1,
+                1,
+                1,
+                "RGB",
+                b"DERIVED\\PRIMARY\\VOLUME\\RESAMPLED",
+            );
+            write_explicit_element(
+                &mut level,
+                TAG_SERIES_INSTANCE_UID,
+                b"UI",
+                series_uid.as_bytes(),
+            );
+            write_explicit_element(
+                &mut level,
+                TAG_SOP_INSTANCE_UID,
+                b"UI",
+                format!("{series_uid}.{suffix}").as_bytes(),
+            );
+            write_explicit_element(&mut level, TAG_PIXEL_DATA, b"OB", &[9, 8, 7]);
+            fs::write(level_path, level).unwrap();
+        }
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("unexpected DICOM pyramid level"));
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(level1_a_path);
+        let _ = fs::remove_file(level1_b_path);
+    }
+
+    #[test]
     fn generic_property_export_indexes_multi_value_scalars() {
         let mut props = HashMap::new();
         let elements = vec![DicomElement {
@@ -4876,6 +5874,123 @@ mod tests {
         assert_eq!(props.get("dicom.ImageType[0]"), Some(&"ORIGINAL".into()));
         assert_eq!(props.get("dicom.ImageType[1]"), Some(&"PRIMARY".into()));
         assert_eq!(props.get("dicom.ImageType[2]"), Some(&"VOLUME".into()));
+    }
+
+    #[test]
+    fn generic_property_export_canonicalizes_decimal_and_integer_strings() {
+        let mut props = HashMap::new();
+        let elements = vec![
+            DicomElement {
+                tag: TAG_PIXEL_SPACING,
+                vr: Some(*b"DS"),
+                value: b"0.00025\\ +40.5 ".to_vec(),
+                items: Vec::new(),
+                endian: Endian::Little,
+            },
+            DicomElement {
+                tag: TAG_NUMBER_OF_FRAMES,
+                vr: Some(*b"IS"),
+                value: b"+040".to_vec(),
+                items: Vec::new(),
+                endian: Endian::Little,
+            },
+        ];
+
+        add_properties_dataset(&mut props, "dicom", &elements);
+
+        assert_eq!(
+            props.get("dicom.PixelSpacing[0]"),
+            Some(&"0.00025000000000000001".into())
+        );
+        assert_eq!(props.get("dicom.PixelSpacing[1]"), Some(&"40.5".into()));
+        assert_eq!(props.get("dicom.NumberOfFrames"), Some(&"40".into()));
+    }
+
+    #[test]
+    fn integer_tag_helpers_read_first_text_value_like_upstream() {
+        let elements = vec![
+            DicomElement {
+                tag: TAG_NUMBER_OF_FRAMES,
+                vr: Some(*b"IS"),
+                value: b"2\\99".to_vec(),
+                items: Vec::new(),
+                endian: Endian::Little,
+            },
+            DicomElement {
+                tag: TAG_TOTAL_PIXEL_MATRIX_COLUMNS,
+                vr: Some(*b"DS"),
+                value: b" 512 \\1024".to_vec(),
+                items: Vec::new(),
+                endian: Endian::Little,
+            },
+        ];
+
+        assert_eq!(get_u64(&elements, TAG_NUMBER_OF_FRAMES), Some(2));
+        assert_eq!(
+            get_u64(&elements, TAG_TOTAL_PIXEL_MATRIX_COLUMNS),
+            Some(512)
+        );
+    }
+
+    #[test]
+    fn decimal_tag_helpers_use_openslide_double_parser() {
+        let elements = vec![
+            DicomElement {
+                tag: TAG_RESCALE_SLOPE,
+                vr: Some(*b"DS"),
+                value: b" \t+2,5\\99".to_vec(),
+                items: Vec::new(),
+                endian: Endian::Little,
+            },
+            DicomElement {
+                tag: TAG_RESCALE_INTERCEPT,
+                vr: Some(*b"DS"),
+                value: b"12x".to_vec(),
+                items: Vec::new(),
+                endian: Endian::Little,
+            },
+            DicomElement {
+                tag: TAG_WINDOW_CENTER,
+                vr: Some(*b"DS"),
+                value: b"-inf".to_vec(),
+                items: Vec::new(),
+                endian: Endian::Little,
+            },
+            DicomElement {
+                tag: TAG_WINDOW_WIDTH,
+                vr: Some(*b"DS"),
+                value: b"1e9999".to_vec(),
+                items: Vec::new(),
+                endian: Endian::Little,
+            },
+        ];
+
+        let intensity = parse_intensity_mapping(&elements);
+
+        assert_eq!(intensity.rescale_slope, 2.5);
+        assert_eq!(intensity.rescale_intercept, 0.0);
+        assert_eq!(intensity.window_center, Some(f64::NEG_INFINITY));
+        assert_eq!(intensity.window_width, None);
+    }
+
+    #[test]
+    fn string_tag_helpers_read_first_text_value_but_preserve_full_multivalue_when_requested() {
+        let elements = vec![DicomElement {
+            tag: TAG_SERIES_INSTANCE_UID,
+            vr: Some(*b"UI"),
+            value: b"1.2.3\\4.5.6".to_vec(),
+            items: Vec::new(),
+            endian: Endian::Little,
+        }];
+
+        assert_eq!(
+            get_string(&elements, TAG_SERIES_INSTANCE_UID).as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            get_string_all(&elements, TAG_SERIES_INSTANCE_UID).as_deref(),
+            Some("1.2.3\\4.5.6")
+        );
     }
 
     #[test]
@@ -4907,26 +6022,38 @@ mod tests {
             props.get(
                 "dicom.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing[0]"
             ),
-            Some(&"0.00025".into())
+            Some(&"0.00025000000000000001".into())
         );
         assert_eq!(
             props.get(
                 "dicom.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing[1]"
             ),
-            Some(&"0.0005".into())
+            Some(&"0.00050000000000000001".into())
         );
     }
 
     #[test]
-    fn normalizes_objective_power_trailing_x_for_standard_property() {
-        assert_eq!(standard_objective_power_value("20X"), "20");
-        assert_eq!(standard_objective_power_value("40.500 x"), "40.5");
+    fn duplicates_only_numeric_objective_power_for_standard_property() {
+        assert_eq!(standard_objective_power_value("20"), Some("20".into()));
         assert_eq!(
-            standard_objective_power_value("Plan Apo 20X"),
-            "Plan Apo 20X"
+            standard_objective_power_value("40,500"),
+            Some("40.5".into())
         );
+        assert_eq!(
+            standard_objective_power_value(" \t+40,500"),
+            Some("40.5".into())
+        );
+        assert_eq!(standard_objective_power_value("40.5 "), None);
+        assert_eq!(standard_objective_power_value("inf"), Some("inf".into()));
+        assert_eq!(standard_objective_power_value("-inf"), Some("-inf".into()));
+        assert_eq!(standard_objective_power_value("NaN"), None);
+        assert_eq!(standard_objective_power_value("1e9999"), None);
+        assert_eq!(standard_objective_power_value("1e-9999"), None);
+        assert_eq!(standard_objective_power_value("20X"), None);
+        assert_eq!(standard_objective_power_value("40.500 x"), None);
+        assert_eq!(standard_objective_power_value("Plan Apo 20X"), None);
 
-        let path = test_path("normalizes_objective_power_trailing_x_for_standard_property.dcm");
+        let path = test_path("duplicates_only_numeric_objective_power_for_standard_property.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
         write_explicit_element(&mut data, TAG_OBJECTIVE_LENS_POWER, b"DS", b"20X");
@@ -4934,14 +6061,11 @@ mod tests {
         fs::write(&path, data).unwrap();
 
         let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.ObjectiveLensPower"),
-            Some(&"20X".to_string())
-        );
-        assert_eq!(
-            slide.properties().get(properties::PROPERTY_OBJECTIVE_POWER),
-            Some(&"20".to_string())
-        );
+        assert!(slide.properties().get("dicom.ObjectiveLensPower").is_none());
+        assert!(slide
+            .properties()
+            .get(properties::PROPERTY_OBJECTIVE_POWER)
+            .is_none());
         let _ = fs::remove_file(path);
     }
 
@@ -4970,78 +6094,84 @@ mod tests {
     }
 
     #[test]
-    fn selects_first_positioned_optical_path_and_z_plane() {
-        let path = test_path("selects_first_positioned_optical_path_and_z_plane.dcm");
+    fn selects_first_positioned_optical_path_like_upstream() {
+        let path = test_path("selects_first_positioned_optical_path_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
-        write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 1, 1, 1, 8, "RGB");
+        write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 1, 1, 1, 4, "RGB");
         write_explicit_element(
             &mut data,
             TAG_NUMBER_OF_OPTICAL_PATHS,
             b"US",
             &2u16.to_le_bytes(),
         );
-        write_explicit_element(
-            &mut data,
-            TAG_TOTAL_PIXEL_MATRIX_FOCAL_PLANES,
-            b"US",
-            &2u16.to_le_bytes(),
-        );
         write_per_frame_dimension_metadata(
             &mut data,
             &[
-                (
-                    FramePosition { column: 1, row: 1 },
-                    Some("bright"),
-                    Some("0"),
-                ),
-                (
-                    FramePosition { column: 2, row: 1 },
-                    Some("bright"),
-                    Some("0"),
-                ),
-                (
-                    FramePosition { column: 1, row: 1 },
-                    Some("fluor"),
-                    Some("0"),
-                ),
-                (
-                    FramePosition { column: 2, row: 1 },
-                    Some("fluor"),
-                    Some("0"),
-                ),
-                (
-                    FramePosition { column: 1, row: 1 },
-                    Some("bright"),
-                    Some("1"),
-                ),
-                (
-                    FramePosition { column: 2, row: 1 },
-                    Some("bright"),
-                    Some("1"),
-                ),
-                (
-                    FramePosition { column: 1, row: 1 },
-                    Some("fluor"),
-                    Some("1"),
-                ),
-                (
-                    FramePosition { column: 2, row: 1 },
-                    Some("fluor"),
-                    Some("1"),
-                ),
+                (FramePosition { column: 1, row: 1 }, Some("bright"), None),
+                (FramePosition { column: 2, row: 1 }, Some("bright"), None),
+                (FramePosition { column: 1, row: 1 }, Some("fluor"), None),
+                (FramePosition { column: 2, row: 1 }, Some("fluor"), None),
             ],
         );
 
         let mut pixels = Vec::new();
-        for red in [10, 20, 110, 120, 210, 220, 240, 250] {
+        for red in [10, 20, 110, 120] {
             pixels.extend_from_slice(&[red, 0, 0]);
         }
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &pixels);
         fs::write(&path, data).unwrap();
 
         let slide = DicomSlide::open(&path).unwrap();
+        assert_eq!(
+            slide.properties().get("dicom.TotalPixelMatrixFocalPlanes"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            slide
+                .properties()
+                .get("dicom.SelectedOpticalPathIdentifier"),
+            Some(&"bright".to_string())
+        );
+        assert!(slide.properties().get("dicom.SelectedZOffset").is_none());
+        assert_eq!(
+            slide
+                .properties()
+                .get("dicom.PerFrameFunctionalGroups.SelectedFrameCount"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            slide
+                .properties()
+                .get("dicom.PerFrameFunctionalGroups.SkippedFrameCount"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            slide
+                .properties()
+                .get("dicom.PerFrameFunctionalGroups.MappedTileCount"),
+            Some(&"2".to_string())
+        );
         let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
         assert_eq!(red.data, vec![10, 20]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_multiple_total_pixel_matrix_focal_planes_like_upstream() {
+        let path = test_path("rejects_multiple_total_pixel_matrix_focal_planes_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
+        write_explicit_element(
+            &mut data,
+            TAG_TOTAL_PIXEL_MATRIX_FOCAL_PLANES,
+            b"US",
+            &2u16.to_le_bytes(),
+        );
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("TotalPixelMatrixFocalPlanes value 2 != 1"));
         let _ = fs::remove_file(path);
     }
 
@@ -5088,6 +6218,98 @@ mod tests {
         assert_eq!(
             slide.properties().get("dicom.ConcatenationUID"),
             Some(&concatenation_uid)
+        );
+        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
+        assert_eq!(red.data, vec![1, 4]);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(part2_path);
+    }
+
+    #[test]
+    fn incomplete_concatenation_read_error_reflects_assembly_failure() {
+        let path = test_path("incomplete_concatenation_read_error_reflects_assembly_failure.dcm");
+
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
+        write_explicit_element(
+            &mut data,
+            TAG_IN_CONCATENATION_NUMBER,
+            b"US",
+            &1u16.to_le_bytes(),
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_IN_CONCATENATION_TOTAL_NUMBER,
+            b"US",
+            &2u16.to_le_bytes(),
+        );
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
+        fs::write(&path, data).unwrap();
+
+        let slide = DicomSlide::open(&path).unwrap();
+        let err = slide.read_region(0, 0, 0, 0, 1, 1).unwrap_err();
+        let OpenSlideError::UnsupportedFormat(reason) = err else {
+            panic!("expected UnsupportedFormat");
+        };
+        assert!(reason.contains("complete pixel stream could not be assembled"));
+        assert!(!reason.contains("opens only one SOP instance"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn uses_concatenation_frame_offset_number_for_native_frames() {
+        let path = test_path("uses_concatenation_frame_offset_number_part1.dcm");
+        let part2_path = test_path("uses_concatenation_frame_offset_number_part2.dcm");
+        let series_uid = format!("1.2.826.0.1.3680043.10.551.{}", std::process::id());
+        let concatenation_uid = format!("1.2.826.0.1.3680043.10.552.{}", std::process::id());
+
+        for (file_path, in_number, frame_offset, pixel) in [
+            (&path, 1u16, 1u32, [4, 5, 6]),
+            (&part2_path, 2u16, 0u32, [1, 2, 3]),
+        ] {
+            let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+            write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 1, 1, 1, 1, "RGB");
+            write_explicit_element(
+                &mut data,
+                TAG_SERIES_INSTANCE_UID,
+                b"UI",
+                series_uid.as_bytes(),
+            );
+            write_explicit_element(
+                &mut data,
+                TAG_CONCATENATION_UID,
+                b"UI",
+                concatenation_uid.as_bytes(),
+            );
+            write_explicit_element(
+                &mut data,
+                TAG_IN_CONCATENATION_NUMBER,
+                b"US",
+                &in_number.to_le_bytes(),
+            );
+            write_explicit_element(
+                &mut data,
+                TAG_IN_CONCATENATION_TOTAL_NUMBER,
+                b"US",
+                &2u16.to_le_bytes(),
+            );
+            write_explicit_element(
+                &mut data,
+                TAG_CONCATENATION_FRAME_OFFSET_NUMBER,
+                b"UL",
+                &frame_offset.to_le_bytes(),
+            );
+            write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &pixel);
+            fs::write(file_path, data).unwrap();
+        }
+
+        let slide = DicomSlide::open(&path).unwrap();
+        assert_eq!(
+            slide
+                .properties()
+                .get("dicom.ConcatenationFrameOffsetNumber"),
+            Some(&"1".to_string())
         );
         let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
         assert_eq!(red.data, vec![1, 4]);
@@ -5150,12 +6372,12 @@ mod tests {
     }
 
     #[test]
-    fn reads_deflated_multi_file_concatenation() {
+    fn rejects_deflated_multi_file_concatenation_like_upstream() {
         use flate2::write::DeflateEncoder;
         use flate2::Compression;
 
-        let path = test_path("reads_deflated_multi_file_concatenation_part1.dcm");
-        let part2_path = test_path("reads_deflated_multi_file_concatenation_part2.dcm");
+        let path = test_path("rejects_deflated_multi_file_concatenation_part1.dcm");
+        let part2_path = test_path("rejects_deflated_multi_file_concatenation_part2.dcm");
         let series_uid = format!("1.2.826.0.1.3680043.10.549.{}", std::process::id());
         let concatenation_uid = format!("1.2.826.0.1.3680043.10.550.{}", std::process::id());
 
@@ -5199,13 +6421,8 @@ mod tests {
             fs::write(file_path, data).unwrap();
         }
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.ConcatenationUID"),
-            Some(&concatenation_uid)
-        );
-        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(red.data, vec![7, 10]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(part2_path);
     }
@@ -5270,18 +6487,69 @@ mod tests {
     }
 
     #[test]
-    fn rejects_extra_row_major_frames_without_position_metadata() {
-        let path = test_path("rejects_extra_row_major_frames_without_position_metadata.dcm");
+    fn opens_encapsulated_frames_with_extended_offset_table() {
+        let path = test_path("opens_encapsulated_frames_with_extended_offset_table.dcm");
+        let mut data = dicom_preamble(TS_JPEG_BASELINE);
+        write_common_wsi_dataset(&mut data, TS_JPEG_BASELINE, 2, 1, 1, 1, 2, "RGB");
+        let frame_offsets = [0u64, 20u64];
+        let frame_lengths = [4u64, 4u64];
+        write_explicit_element(
+            &mut data,
+            TAG_EXTENDED_OFFSET_TABLE,
+            b"OV",
+            &u64_table_payload(&frame_offsets),
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_EXTENDED_OFFSET_TABLE_LENGTHS,
+            b"OV",
+            &u64_table_payload(&frame_lengths),
+        );
+        data.extend_from_slice(&TAG_PIXEL_DATA.0.to_le_bytes());
+        data.extend_from_slice(&TAG_PIXEL_DATA.1.to_le_bytes());
+        data.extend_from_slice(b"OB");
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        write_item(&mut data, b"");
+        write_item(&mut data, b"aa");
+        write_item(&mut data, b"bb");
+        write_item(&mut data, b"cc");
+        write_item(&mut data, b"dd");
+        write_sequence_delimitation_item(&mut data);
+        fs::write(&path, data).unwrap();
+
+        let slide = DicomSlide::open(&path).unwrap();
+        let Some(PixelData::Encapsulated { frames }) = &slide.pixel_data else {
+            panic!("expected encapsulated pixel data");
+        };
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            read_file_fragments(&frames[0].path, &frames[0].fragments).unwrap(),
+            b"aabb"
+        );
+        assert_eq!(
+            read_file_fragments(&frames[1].path, &frames[1].fragments).unwrap(),
+            b"ccdd"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_first_row_major_grid_when_extra_frames_lack_position_metadata() {
+        let path =
+            test_path("reads_first_row_major_grid_when_extra_frames_lack_position_metadata.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 2, "RGB");
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3, 4, 5, 6]);
         fs::write(&path, data).unwrap();
 
-        let err = match DicomSlide::open(&path) {
-            Ok(_) => panic!("expected extra unpositioned frames to be rejected"),
-            Err(err) => err,
-        };
-        assert!(format!("{err}").contains("multi-plane or multi-optical-path"));
+        let slide = DicomSlide::open(&path).unwrap();
+        let red = slide.read_region(0, 0, 0, 0, 1, 1).unwrap();
+        let green = slide.read_region(1, 0, 0, 0, 1, 1).unwrap();
+        let blue = slide.read_region(2, 0, 0, 0, 1, 1).unwrap();
+        assert_eq!(red.data, vec![1]);
+        assert_eq!(green.data, vec![2]);
+        assert_eq!(blue.data, vec![3]);
         let _ = fs::remove_file(path);
     }
 
@@ -5333,7 +6601,13 @@ mod tests {
             slide
                 .properties()
                 .get("dicom.DimensionIndexSequence[0].FunctionalGroupPointer"),
-            Some(&"(0048,021a)".to_string())
+            None
+        );
+        assert_eq!(
+            slide
+                .properties()
+                .get("dicom.DimensionIndexSequence[0].DimensionIndexPointer"),
+            None
         );
         let _ = fs::remove_file(path);
     }
@@ -5425,8 +6699,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tiled_sparse_without_per_frame_positions() {
-        let path = test_path("rejects_tiled_sparse_without_per_frame_positions.dcm");
+    fn opens_tiled_sparse_without_per_frame_positions_like_upstream() {
+        let path = test_path("opens_tiled_sparse_without_per_frame_positions.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 2, 1, 1, 4, "RGB");
         write_explicit_element(
@@ -5438,17 +6712,17 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[0; 12]);
         fs::write(&path, data).unwrap();
 
-        let err = match DicomSlide::open(&path) {
-            Ok(_) => panic!("expected sparse unpositioned frames to be rejected"),
-            Err(err) => err,
-        };
-        assert!(format!("{err}").contains("TILED_SPARSE"));
+        let slide = DicomSlide::open(&path).unwrap();
+        assert_eq!(
+            slide.properties().get("dicom.DimensionOrganizationType"),
+            Some(&"TILED_SPARSE".to_string())
+        );
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn rejects_tiled_sparse_case_insensitively() {
-        let path = test_path("rejects_tiled_sparse_case_insensitively.dcm");
+    fn opens_tiled_sparse_case_variant_like_upstream() {
+        let path = test_path("opens_tiled_sparse_case_variant_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 2, 1, 1, 4, "RGB");
         write_explicit_element(
@@ -5460,11 +6734,11 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[0; 12]);
         fs::write(&path, data).unwrap();
 
-        let err = match DicomSlide::open(&path) {
-            Ok(_) => panic!("expected sparse unpositioned frames to be rejected"),
-            Err(err) => err,
-        };
-        assert!(format!("{err}").contains("TILED_SPARSE"));
+        let slide = DicomSlide::open(&path).unwrap();
+        assert_eq!(
+            slide.properties().get("dicom.DimensionOrganizationType"),
+            Some(&"tiled_sparse".to_string())
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -5482,7 +6756,7 @@ mod tests {
         write_sequence_delimitation_item(&mut data);
         fs::write(&path, data).unwrap();
 
-        let frames = read_encapsulated_frame_table(&path, 0, 2).unwrap();
+        let frames = read_encapsulated_frame_table(&path, 0, 2, None, None).unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].fragments.len(), 2);
         assert_eq!(frames[1].fragments.len(), 1);
@@ -5498,6 +6772,38 @@ mod tests {
     }
 
     #[test]
+    fn groups_encapsulated_frames_with_extended_offset_table() {
+        let path = test_path("groups_encapsulated_frames_with_extended_offset_table.dcm");
+        let mut data = Vec::new();
+        write_item(&mut data, b"");
+        write_item(&mut data, b"aa");
+        write_item(&mut data, b"bb");
+        write_item(&mut data, b"cc");
+        write_item(&mut data, b"dd");
+        write_sequence_delimitation_item(&mut data);
+
+        let frame_offsets = [0u64, 20u64];
+        let frame_lengths = [4u64, 4u64];
+        fs::write(&path, data).unwrap();
+
+        let frames =
+            read_encapsulated_frame_table(&path, 0, 2, Some(&frame_offsets), Some(&frame_lengths))
+                .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].fragments.len(), 2);
+        assert_eq!(frames[1].fragments.len(), 2);
+        assert_eq!(
+            read_file_fragments(&path, &frames[0].fragments).unwrap(),
+            b"aabb"
+        );
+        assert_eq!(
+            read_file_fragments(&path, &frames[1].fragments).unwrap(),
+            b"ccdd"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn groups_single_encapsulated_frame_without_basic_offset_table() {
         let path = test_path("groups_single_encapsulated_frame_without_basic_offset_table.dcm");
         let mut data = Vec::new();
@@ -5507,7 +6813,7 @@ mod tests {
         write_sequence_delimitation_item(&mut data);
         fs::write(&path, data).unwrap();
 
-        let frames = read_encapsulated_frame_table(&path, 0, 1).unwrap();
+        let frames = read_encapsulated_frame_table(&path, 0, 1, None, None).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].fragments.len(), 2);
         assert_eq!(
@@ -5518,8 +6824,8 @@ mod tests {
     }
 
     #[test]
-    fn opens_jpeg_2000_metadata_and_decodes_pixels() {
-        let path = test_path("opens_jpeg_2000_metadata_and_decodes_pixels.dcm");
+    fn rejects_single_sample_jpeg_2000_like_upstream() {
+        let path = test_path("rejects_single_sample_jpeg_2000_like_upstream.dcm");
         let mut data = dicom_preamble(TS_JPEG_2000_LOSSLESS);
         write_common_wsi_dataset_with_samples(
             &mut data,
@@ -5537,19 +6843,385 @@ mod tests {
         write_encapsulated_pixel_data(&mut data, &[&jpeg2000]);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.TransferSyntaxUID"),
-            Some(&TS_JPEG_2000_LOSSLESS.to_string())
-        );
-        let region = slide.read_region(0, 0, 0, 0, 1, 1).unwrap();
-        assert_eq!(region.data, vec![42]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("SamplesPerPixel value 1 != 3"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_monochrome_frames() {
-        let path = test_path("reads_native_monochrome_frames.dcm");
+    fn rejects_single_sample_htj2k_like_upstream() {
+        let path = test_path("rejects_single_sample_htj2k_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_HTJ2K_LOSSLESS);
+        write_common_wsi_dataset_with_samples(
+            &mut data,
+            TS_HTJ2K_LOSSLESS,
+            2,
+            1,
+            2,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+        );
+        let htj2k = encoded_htj2k_codestream(&[42, 84], 2, 1, 1);
+        write_encapsulated_pixel_data(&mut data, &[&htj2k]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_rle_lossless_rgb_like_upstream() {
+        let path = test_path("rejects_rle_lossless_rgb_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_RLE_LOSSLESS);
+        write_common_wsi_dataset(&mut data, TS_RLE_LOSSLESS, 2, 1, 2, 1, 1, "RGB");
+        let rle = encoded_rle_frame(&[
+            &[10, 20], // red segment
+            &[30, 40], // green segment
+            &[50, 60], // blue segment
+        ]);
+        write_encapsulated_pixel_data(&mut data, &[&rle]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_rle_lossless_ybr_full_422_like_upstream() {
+        let path = test_path("rejects_rle_lossless_ybr_full_422_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_RLE_LOSSLESS);
+        write_common_wsi_dataset(&mut data, TS_RLE_LOSSLESS, 3, 2, 3, 2, 1, "YBR_FULL_422");
+        let rle = encoded_rle_frame(&[
+            &[10, 20, 30, 40, 50, 60], // Y segment
+            &[128, 128, 128, 128],     // Cb segment, two pairs per row
+            &[128, 128, 128, 128],     // Cr segment, two pairs per row
+        ]);
+        write_encapsulated_pixel_data(&mut data, &[&rle]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_rle_lossless_planar_ybr_full_422_like_upstream() {
+        let path = test_path("rejects_rle_lossless_planar_ybr_full_422_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_RLE_LOSSLESS);
+        write_common_wsi_dataset_with_bits_representation_and_planar(
+            &mut data,
+            TS_RLE_LOSSLESS,
+            3,
+            2,
+            3,
+            2,
+            1,
+            "YBR_FULL_422",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            3,
+            8,
+            8,
+            0,
+            1,
+        );
+        let rle = encoded_rle_frame(&[
+            &[10, 20, 30, 40, 50, 60], // Y segment
+            &[128, 128, 128, 128],     // Cb segment, two pairs per row
+            &[128, 128, 128, 128],     // Cr segment, two pairs per row
+        ]);
+        write_encapsulated_pixel_data(&mut data, &[&rle]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_rle_lossless_16_bit_monochrome_like_upstream() {
+        let path = test_path("rejects_rle_lossless_16_bit_monochrome_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_RLE_LOSSLESS);
+        write_common_wsi_dataset_with_bits(
+            &mut data,
+            TS_RLE_LOSSLESS,
+            3,
+            1,
+            3,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+            16,
+            12,
+        );
+        let rle = encoded_rle_frame(&[
+            &[0, 8, 15],  // most significant bytes
+            &[0, 0, 255], // least significant bytes
+        ]);
+        write_encapsulated_pixel_data(&mut data, &[&rle]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_rle_lossless_signed_16_bit_monochrome_like_upstream() {
+        let path = test_path("rejects_rle_lossless_signed_16_bit_monochrome_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_RLE_LOSSLESS);
+        write_common_wsi_dataset_with_bits_and_representation(
+            &mut data,
+            TS_RLE_LOSSLESS,
+            3,
+            1,
+            3,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+            16,
+            16,
+            1,
+        );
+        write_explicit_element(&mut data, TAG_RESCALE_INTERCEPT, b"DS", b"10");
+        write_explicit_element(&mut data, TAG_RESCALE_SLOPE, b"DS", b"2");
+        write_explicit_element(&mut data, TAG_WINDOW_CENTER, b"DS", b"10");
+        write_explicit_element(&mut data, TAG_WINDOW_WIDTH, b"DS", b"20");
+        let encoded = encoded_rle_frame(&[
+            &[0xff, 0x00, 0x00], // most significant bytes for -5, 0, 5
+            &[0xfb, 0x00, 0x05], // least significant bytes for -5, 0, 5
+        ]);
+        write_encapsulated_pixel_data(&mut data, &[&encoded]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_jpeg_ls_lossless_monochrome_like_upstream() {
+        let path = test_path("rejects_jpeg_ls_lossless_monochrome_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_JPEG_LS_LOSSLESS);
+        write_common_wsi_dataset_with_samples(
+            &mut data,
+            TS_JPEG_LS_LOSSLESS,
+            3,
+            1,
+            3,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+        );
+        let pixels = [0u16, 128, 255];
+        let mut encoded = Vec::new();
+        jpegls::encode(&pixels, 3, 1, &mut encoded).unwrap();
+        write_encapsulated_pixel_data(&mut data, &[&encoded]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_jpeg_ls_rgb_like_upstream() {
+        let path = test_path("rejects_jpeg_ls_rgb_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_JPEG_LS_LOSSLESS);
+        write_common_wsi_dataset_with_samples(
+            &mut data,
+            TS_JPEG_LS_LOSSLESS,
+            1,
+            1,
+            1,
+            1,
+            1,
+            "RGB",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            3,
+        );
+        let pixels = [10u16];
+        let mut encoded = Vec::new();
+        jpegls::encode(&pixels, 1, 1, &mut encoded).unwrap();
+        write_encapsulated_pixel_data(&mut data, &[&encoded]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_jpeg_ls_near_lossless_monochrome_like_upstream() {
+        let path = test_path("rejects_jpeg_ls_near_lossless_monochrome_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_JPEG_LS_NEAR_LOSSLESS);
+        write_common_wsi_dataset_with_samples(
+            &mut data,
+            TS_JPEG_LS_NEAR_LOSSLESS,
+            3,
+            1,
+            3,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+        );
+        let pixels = [0u16, 128, 255];
+        let mut encoded = Vec::new();
+        jpegls::encode(&pixels, 3, 1, &mut encoded).unwrap();
+        write_encapsulated_pixel_data(&mut data, &[&encoded]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_jpeg_lossless_sv1_16_bit_monochrome_like_upstream() {
+        let path = test_path("rejects_jpeg_lossless_sv1_16_bit_monochrome_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_JPEG_LOSSLESS_SV1);
+        write_common_wsi_dataset_with_bits(
+            &mut data,
+            TS_JPEG_LOSSLESS_SV1,
+            3,
+            1,
+            3,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+            16,
+            16,
+        );
+        let pixels = [0u16, 32_768, 65_535];
+        let mut encoded = Vec::new();
+        jpegli::encode(&pixels, 3, 1, &mut encoded).unwrap();
+        write_encapsulated_pixel_data(&mut data, &[&encoded]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_jpeg_lossless_process14_16_bit_monochrome_like_upstream() {
+        let path = test_path("rejects_jpeg_lossless_process14_16_bit_monochrome_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_JPEG_LOSSLESS_PROCESS14);
+        write_common_wsi_dataset_with_bits(
+            &mut data,
+            TS_JPEG_LOSSLESS_PROCESS14,
+            3,
+            1,
+            3,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+            16,
+            16,
+        );
+        let pixels = [0u16, 32_768, 65_535];
+        let mut encoded = Vec::new();
+        jpegli::encode(&pixels, 3, 1, &mut encoded).unwrap();
+        write_encapsulated_pixel_data(&mut data, &[&encoded]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_jpeg_lossless_sv1_signed_16_bit_monochrome_like_upstream() {
+        let path =
+            test_path("rejects_jpeg_lossless_sv1_signed_16_bit_monochrome_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_JPEG_LOSSLESS_SV1);
+        write_common_wsi_dataset_with_bits_and_representation(
+            &mut data,
+            TS_JPEG_LOSSLESS_SV1,
+            3,
+            1,
+            3,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+            16,
+            16,
+            1,
+        );
+        write_explicit_element(&mut data, TAG_RESCALE_INTERCEPT, b"DS", b"10");
+        write_explicit_element(&mut data, TAG_RESCALE_SLOPE, b"DS", b"2");
+        write_explicit_element(&mut data, TAG_WINDOW_CENTER, b"DS", b"10");
+        write_explicit_element(&mut data, TAG_WINDOW_WIDTH, b"DS", b"20");
+        let pixels: Vec<u16> = [-5i16, 0, 5]
+            .into_iter()
+            .map(|sample| sample as u16)
+            .collect();
+        let mut encoded = Vec::new();
+        jpegli::encode(&pixels, 3, 1, &mut encoded).unwrap();
+        write_encapsulated_pixel_data(&mut data, &[&encoded]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_jpeg_ls_lossless_signed_16_bit_monochrome_like_upstream() {
+        let path = test_path("rejects_jpeg_ls_lossless_signed_16_bit_monochrome_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_JPEG_LS_LOSSLESS);
+        write_common_wsi_dataset_with_bits_and_representation(
+            &mut data,
+            TS_JPEG_LS_LOSSLESS,
+            3,
+            1,
+            3,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+            16,
+            16,
+            1,
+        );
+        write_explicit_element(&mut data, TAG_WINDOW_CENTER, b"DS", b"0");
+        write_explicit_element(&mut data, TAG_WINDOW_WIDTH, b"DS", b"10");
+        let pixels: Vec<u16> = [-5i16, 0, 5]
+            .into_iter()
+            .map(|sample| sample as u16)
+            .collect();
+        let mut encoded = Vec::new();
+        jpegls::encode(&pixels, 3, 1, &mut encoded).unwrap();
+        write_encapsulated_pixel_data(&mut data, &[&encoded]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_native_monochrome_like_upstream() {
+        let path = test_path("rejects_native_monochrome_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_samples(
             &mut data,
@@ -5566,21 +7238,14 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[5, 10, 15, 20]);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(slide.channel_count(), 1);
-        assert_eq!(slide.channel_name(0), Some("gray"));
-        assert_eq!(
-            slide.properties().get("dicom.SamplesPerPixel"),
-            Some(&"1".to_string())
-        );
-        let gray = slide.read_region(0, 0, 0, 0, 2, 2).unwrap();
-        assert_eq!(gray.data, vec![5, 10, 15, 20]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("SamplesPerPixel value 1 != 3"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_monochrome_photometric_case_insensitively() {
-        let path = test_path("reads_native_monochrome_photometric_case_insensitively.dcm");
+    fn rejects_lowercase_monochrome_photometric_like_upstream() {
+        let path = test_path("rejects_lowercase_monochrome_photometric_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_samples(
             &mut data,
@@ -5597,19 +7262,14 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[5, 10]);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.PhotometricInterpretation"),
-            Some(&"monochrome2".to_string())
-        );
-        let gray = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(gray.data, vec![5, 10]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("SamplesPerPixel value 1 != 3"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_monochrome1_as_inverted_gray() {
-        let path = test_path("reads_native_monochrome1_as_inverted_gray.dcm");
+    fn rejects_native_monochrome1_like_upstream() {
+        let path = test_path("rejects_native_monochrome1_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_samples(
             &mut data,
@@ -5626,15 +7286,14 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[0, 255]);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        let gray = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(gray.data, vec![255, 0]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("SamplesPerPixel value 1 != 3"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_ybr_full_frames() {
-        let path = test_path("reads_native_ybr_full_frames.dcm");
+    fn rejects_native_ybr_full_like_upstream() {
+        let path = test_path("rejects_native_ybr_full_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 1, 2, 1, 1, "YBR_FULL");
         write_explicit_element(
@@ -5648,23 +7307,49 @@ mod tests {
         );
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.PhotometricInterpretation"),
-            Some(&"YBR_FULL".to_string())
-        );
-        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        let green = slide.read_region(1, 0, 0, 0, 2, 1).unwrap();
-        let blue = slide.read_region(2, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(red.data, vec![254, 0]);
-        assert_eq!(green.data, vec![0, 255]);
-        assert_eq!(blue.data, vec![0, 1]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("photometric interpretation is not supported"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_ybr_full_422_frames() {
-        let path = test_path("reads_native_ybr_full_422_frames.dcm");
+    fn rejects_native_signed_ybr_full_like_upstream() {
+        let path = test_path("rejects_native_signed_ybr_full_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset_with_bits_and_representation(
+            &mut data,
+            TS_EXPLICIT_VR_LE,
+            2,
+            1,
+            2,
+            1,
+            1,
+            "YBR_FULL",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            3,
+            8,
+            8,
+            1,
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_PIXEL_DATA,
+            b"OB",
+            &[
+                0xff, 0xff, 0xff, // Y/Cb/Cr all map to 128 after signed scaling
+                127, 0xff, 0xff, // Y maps to 255 with neutral chroma
+            ],
+        );
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("PixelRepresentation value 1 != 0"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_native_ybr_full_422_like_upstream() {
+        let path = test_path("rejects_native_ybr_full_422_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 1, 2, 1, 1, "YBR_FULL_422");
         write_explicit_element(
@@ -5677,17 +7362,14 @@ mod tests {
         );
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        let green = slide.read_region(1, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(red.data, vec![254, 255]);
-        assert_eq!(green.data, vec![0, 74]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("photometric interpretation is not supported"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_ybr_full_422_odd_width_frame() {
-        let path = test_path("reads_native_ybr_full_422_odd_width_frame.dcm");
+    fn rejects_native_ybr_full_422_odd_width_frame_like_upstream() {
+        let path = test_path("rejects_native_ybr_full_422_odd_width_frame_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 3, 1, 3, 1, 1, "YBR_FULL_422");
         write_explicit_element(
@@ -5701,15 +7383,14 @@ mod tests {
         );
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        let red = slide.read_region(0, 0, 0, 0, 3, 1).unwrap();
-        assert_eq!(red.data, vec![254, 255, 254]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("photometric interpretation is not supported"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_ybr_full_422_odd_width_rows() {
-        let path = test_path("reads_native_ybr_full_422_odd_width_rows.dcm");
+    fn rejects_native_ybr_full_422_odd_width_rows_like_upstream() {
+        let path = test_path("rejects_native_ybr_full_422_odd_width_rows_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 3, 2, 3, 2, 1, "YBR_FULL_422");
         write_explicit_element(
@@ -5723,15 +7404,51 @@ mod tests {
         );
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        let red = slide.read_region(0, 0, 0, 0, 3, 2).unwrap();
-        assert_eq!(red.data, vec![10, 20, 30, 40, 50, 60]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("photometric interpretation is not supported"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_16_bit_monochrome_frames_as_downscaled_gray() {
-        let path = test_path("reads_native_16_bit_monochrome_frames_as_downscaled_gray.dcm");
+    fn rejects_native_planar_ybr_full_422_like_upstream() {
+        let path = test_path("rejects_native_planar_ybr_full_422_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset_with_bits_representation_and_planar(
+            &mut data,
+            TS_EXPLICIT_VR_LE,
+            3,
+            2,
+            3,
+            2,
+            1,
+            "YBR_FULL_422",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            3,
+            8,
+            8,
+            0,
+            1,
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_PIXEL_DATA,
+            b"OB",
+            &[
+                10, 20, 30, 40, 50, 60, // Y plane
+                128, 128, 128, 128, // Cb plane, two pairs per row
+                128, 128, 128, 128, // Cr plane, two pairs per row
+            ],
+        );
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("PlanarConfiguration value 1 != 0"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_native_16_bit_monochrome_like_upstream() {
+        let path = test_path("rejects_native_16_bit_monochrome_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_bits(
             &mut data,
@@ -5754,19 +7471,46 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OW", &pixels);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.BitsStored"),
-            Some(&"12".to_string())
-        );
-        let gray = slide.read_region(0, 0, 0, 0, 3, 1).unwrap();
-        assert_eq!(gray.data, vec![0, 128, 255]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("BitsAllocated value 16 != 8"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_signed_16_bit_monochrome_with_window() {
-        let path = test_path("reads_native_signed_16_bit_monochrome_with_window.dcm");
+    fn rejects_left_aligned_native_16_bit_monochrome_like_upstream() {
+        let path = test_path("rejects_left_aligned_native_16_bit_monochrome_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset_with_bits_high_bit_representation_and_planar(
+            &mut data,
+            3,
+            1,
+            3,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+            16,
+            12,
+            15,
+            0,
+            0,
+        );
+        let mut pixels = Vec::new();
+        for sample in [0u16, 2048, 4095] {
+            pixels.extend_from_slice(&(sample << 4).to_le_bytes());
+        }
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OW", &pixels);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("BitsAllocated value 16 != 8"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_native_signed_16_bit_monochrome_like_upstream() {
+        let path = test_path("rejects_native_signed_16_bit_monochrome_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_bits_and_representation(
             &mut data,
@@ -5794,23 +7538,50 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OW", &pixels);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.PixelRepresentation"),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            slide.properties().get("dicom.RescaleSlope"),
-            Some(&"2".to_string())
-        );
-        let gray = slide.read_region(0, 0, 0, 0, 3, 1).unwrap();
-        assert_eq!(gray.data, vec![0, 134, 255]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("BitsAllocated value 16 != 8"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_16_bit_rgb_frames_as_downscaled_channels() {
-        let path = test_path("reads_native_16_bit_rgb_frames_as_downscaled_channels.dcm");
+    fn rejects_left_aligned_signed_native_16_bit_monochrome_like_upstream() {
+        let path =
+            test_path("rejects_left_aligned_signed_native_16_bit_monochrome_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset_with_bits_high_bit_representation_and_planar(
+            &mut data,
+            3,
+            1,
+            3,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+            16,
+            12,
+            15,
+            1,
+            0,
+        );
+        write_explicit_element(&mut data, TAG_WINDOW_CENTER, b"DS", b"0");
+        write_explicit_element(&mut data, TAG_WINDOW_WIDTH, b"DS", b"10");
+        let mut pixels = Vec::new();
+        for sample in [-5i16, 0, 5] {
+            let stored = ((sample as u16) & 0x0fff) << 4;
+            pixels.extend_from_slice(&stored.to_le_bytes());
+        }
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OW", &pixels);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("BitsAllocated value 16 != 8"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_native_16_bit_rgb_like_upstream() {
+        let path = test_path("rejects_native_16_bit_rgb_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_bits(
             &mut data,
@@ -5833,19 +7604,14 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OW", &pixels);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        let green = slide.read_region(1, 0, 0, 0, 2, 1).unwrap();
-        let blue = slide.read_region(2, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(red.data, vec![0, 255]);
-        assert_eq!(green.data, vec![128, 0]);
-        assert_eq!(blue.data, vec![255, 128]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("BitsAllocated value 16 != 8"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_planar_rgb_frames() {
-        let path = test_path("reads_native_planar_rgb_frames.dcm");
+    fn rejects_native_planar_rgb_like_upstream() {
+        let path = test_path("rejects_native_planar_rgb_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_bits_representation_and_planar(
             &mut data,
@@ -5875,23 +7641,14 @@ mod tests {
         );
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.PlanarConfiguration"),
-            Some(&"1".to_string())
-        );
-        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        let green = slide.read_region(1, 0, 0, 0, 2, 1).unwrap();
-        let blue = slide.read_region(2, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(red.data, vec![10, 20]);
-        assert_eq!(green.data, vec![30, 40]);
-        assert_eq!(blue.data, vec![50, 60]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("PlanarConfiguration value 1 != 0"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_planar_ybr_full_frames() {
-        let path = test_path("reads_native_planar_ybr_full_frames.dcm");
+    fn rejects_native_planar_ybr_full_like_upstream() {
+        let path = test_path("rejects_native_planar_ybr_full_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_bits_representation_and_planar(
             &mut data,
@@ -5921,19 +7678,14 @@ mod tests {
         );
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        let green = slide.read_region(1, 0, 0, 0, 2, 1).unwrap();
-        let blue = slide.read_region(2, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(red.data, vec![254, 0]);
-        assert_eq!(green.data, vec![0, 255]);
-        assert_eq!(blue.data, vec![0, 1]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("PlanarConfiguration value 1 != 0"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_signed_8_bit_monochrome_with_sigmoid_window() {
-        let path = test_path("reads_native_signed_8_bit_monochrome_with_sigmoid_window.dcm");
+    fn rejects_native_signed_8_bit_monochrome_like_upstream() {
+        let path = test_path("rejects_native_signed_8_bit_monochrome_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_bits_and_representation(
             &mut data,
@@ -5956,19 +7708,45 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[0xC0, 0x00, 0x40]);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.VOILUTFunction"),
-            Some(&"SIGMOID".to_string())
-        );
-        let gray = slide.read_region(0, 0, 0, 0, 3, 1).unwrap();
-        assert_eq!(gray.data, vec![5, 128, 250]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("PixelRepresentation value 1 != 0"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_native_16_bit_palette_color_frames() {
-        let path = test_path("reads_native_16_bit_palette_color_frames.dcm");
+    fn lowercase_voi_lut_function_with_signed_pixels_fails_pixel_representation_first() {
+        let path =
+            test_path("lowercase_voi_lut_function_with_signed_pixels_fails_representation.dcm");
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset_with_bits_and_representation(
+            &mut data,
+            TS_EXPLICIT_VR_LE,
+            3,
+            1,
+            3,
+            1,
+            1,
+            "MONOCHROME2",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+            8,
+            8,
+            1,
+        );
+        write_explicit_element(&mut data, TAG_WINDOW_CENTER, b"DS", b"0");
+        write_explicit_element(&mut data, TAG_WINDOW_WIDTH, b"DS", b"64");
+        write_explicit_element(&mut data, TAG_VOI_LUT_FUNCTION, b"CS", b"sigmoid");
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[0xC0, 0x00, 0x40]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("PixelRepresentation value 1 != 0"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_native_16_bit_palette_color_like_upstream() {
+        let path = test_path("rejects_native_16_bit_palette_color_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_bits(
             &mut data,
@@ -6033,103 +7811,240 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OW", &pixels);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        let green = slide.read_region(1, 0, 0, 0, 2, 1).unwrap();
-        let blue = slide.read_region(2, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(red.data, vec![0, 255]);
-        assert_eq!(green.data, vec![255, 0]);
-        assert_eq!(blue.data, vec![0, 128]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("BitsAllocated value 16 != 8"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn exposes_associated_image_role_aliases() {
+    fn rejects_native_signed_palette_color_indices_like_upstream() {
+        let path = test_path("rejects_native_signed_palette_color_indices_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset_with_bits_and_representation(
+            &mut data,
+            TS_EXPLICIT_VR_LE,
+            2,
+            1,
+            2,
+            1,
+            1,
+            "PALETTE COLOR",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            1,
+            8,
+            8,
+            1,
+        );
+        let descriptor = [
+            2i16.to_le_bytes(),
+            (-1i16).to_le_bytes(),
+            8i16.to_le_bytes(),
+        ]
+        .concat();
+        write_explicit_element(
+            &mut data,
+            TAG_RED_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+            b"SS",
+            &descriptor,
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_GREEN_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+            b"SS",
+            &descriptor,
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_BLUE_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR,
+            b"SS",
+            &descriptor,
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_RED_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+            b"OW",
+            &[10, 200],
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_GREEN_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+            b"OW",
+            &[20, 210],
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_BLUE_PALETTE_COLOR_LOOKUP_TABLE_DATA,
+            b"OW",
+            &[30, 220],
+        );
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[0xff, 0x00]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("PixelRepresentation value 1 != 0"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn maps_only_upstream_associated_image_roles() {
+        assert_eq!(
+            associated_image_name_from_image_type("ORIGINAL\\PRIMARY\\LABEL\\NONE"),
+            Some("label".to_string())
+        );
+        assert_eq!(
+            associated_image_name_from_image_type("DERIVED\\PRIMARY\\LABEL\\NONE"),
+            Some("label".to_string())
+        );
+        assert_eq!(
+            associated_image_name_from_image_type("ORIGINAL\\PRIMARY\\OVERVIEW\\NONE"),
+            Some("macro".to_string())
+        );
+        assert_eq!(
+            associated_image_name_from_image_type("DERIVED\\PRIMARY\\OVERVIEW\\NONE"),
+            Some("macro".to_string())
+        );
+        assert_eq!(
+            associated_image_name_from_image_type("ORIGINAL\\PRIMARY\\THUMBNAIL\\RESAMPLED"),
+            Some("thumbnail".to_string())
+        );
+        assert_eq!(
+            associated_image_name_from_image_type("DERIVED\\PRIMARY\\THUMBNAIL\\RESAMPLED"),
+            Some("thumbnail".to_string())
+        );
         assert_eq!(
             associated_image_name_from_image_type("DERIVED\\PRIMARY\\BARCODE\\NONE"),
-            Some("label".to_string())
+            None
         );
         assert_eq!(
             associated_image_name_from_image_type("DERIVED\\PRIMARY\\LABELIMAGE\\NONE"),
-            Some("label".to_string())
+            None
         );
         assert_eq!(
             associated_image_name_from_image_type("DERIVED\\PRIMARY\\LOCALIZER\\NONE"),
-            Some("macro".to_string())
-        );
-        assert_eq!(
-            associated_image_name_from_image_type("derived\\primary\\referenceimage\\none"),
-            Some("macro".to_string())
+            None
         );
         assert_eq!(
             associated_image_name_from_image_type("DERIVED\\PRIMARY\\THUMB\\NONE"),
-            Some("thumbnail".to_string())
+            None
         );
         assert_eq!(
-            associated_image_name_from_image_type("DERIVED\\PRIMARY\\ICON\\NONE"),
-            Some("thumbnail".to_string())
+            associated_image_name_from_image_type("DERIVED\\PRIMARY\\THUMBNAIL\\NONE"),
+            None
         );
         assert_eq!(
-            associated_image_name_from_image_type("DERIVED\\PRIMARY\\NAVIGATOR\\NONE"),
-            Some("macro".to_string())
+            associated_image_name_from_image_type("DERIVED\\PRIMARY\\label-image\\NONE"),
+            None
         );
         assert_eq!(
-            associated_image_name_from_image_type("DERIVED\\PRIMARY\\THUMBNAILIMAGE\\NONE"),
-            Some("thumbnail".to_string())
+            associated_image_name_from_image_type("DERIVED\\PRIMARY\\THUMB_NAIL\\RESAMPLED"),
+            None
         );
         assert_eq!(
-            associated_image_name_from_image_type("DERIVED\\PRIMARY\\BARCODE IMAGE\\NONE"),
-            Some("label".to_string())
+            associated_image_name_from_image_type("DERIVED\\PRIMARY\\LABEL \\NONE"),
+            None
         );
-        assert_eq!(
-            associated_image_name_from_image_type("DERIVED\\PRIMARY\\macro-image\\NONE"),
-            Some("macro".to_string())
-        );
-        assert_eq!(
-            associated_image_name_from_image_type("DERIVED\\PRIMARY\\THUMBNAIL_IMAGE\\NONE"),
-            Some("thumbnail".to_string())
-        );
-        assert!(is_pyramid_level_image_type(
+        assert!(!is_pyramid_level_image_type(
             "original\\primary\\volume\\resampled"
         ));
-        assert!(is_pyramid_level_image_type(
+        assert!(!is_pyramid_level_image_type(
+            "DERIVED\\PRIMARY\\VOLUME \\RESAMPLED"
+        ));
+        assert!(!is_pyramid_level_image_type(
             "ORIGINAL\\PRIMARY\\VOLUME\\NONE\\MIXED"
         ));
-        assert!(is_pyramid_level_image_type(
+        assert!(!is_pyramid_level_image_type(
             "ORIGINAL\\PRIMARY\\volume-image\\RESAMPLED"
         ));
-        assert!(is_pyramid_level_image_type(
+        assert!(!is_pyramid_level_image_type(
             "DERIVED\\PRIMARY\\VOLUME_IMAGE\\RE SAMPLED"
+        ));
+        assert!(is_pyramid_level_image_type(
+            "DERIVED\\PRIMARY\\VOLUME\\RESAMPLED"
         ));
     }
 
     #[test]
-    fn accepts_photometric_interpretation_aliases() {
-        assert_eq!(
-            canonical_photometric_interpretation("palette_color"),
-            "PALETTE COLOR"
+    fn rejects_missing_image_type_like_upstream() {
+        let path = test_path("rejects_missing_image_type_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset_without_image_type(
+            &mut data, 1, 1, 1, 1, 1, "RGB", 3, 8, 8, 0, 0, 0,
         );
-        assert_eq!(
-            canonical_photometric_interpretation("YBR FULL 422"),
-            "YBR_FULL_422"
-        );
-        assert_eq!(canonical_photometric_interpretation("ybr-ict"), "YBR_ICT");
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
+        fs::write(&path, data).unwrap();
+
+        let err = match DicomSlide::open(&path) {
+            Ok(_) => panic!("expected missing ImageType to fail"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("Couldn't get ImageType"));
+        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn opens_native_ybr_full_422_photometric_alias() {
-        let path = test_path("opens_native_ybr_full_422_photometric_alias.dcm");
+    fn rejects_missing_series_instance_uid_like_upstream() {
+        let path = test_path("rejects_missing_series_instance_uid_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset_without_image_type_or_series(
+            &mut data, 1, 1, 1, 1, 1, "RGB", 3, 8, 8, 0, 0, 0,
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_IMAGE_TYPE,
+            b"CS",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+        );
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
+        fs::write(&path, data).unwrap();
+
+        let err = match DicomSlide::open(&path) {
+            Ok(_) => panic!("expected missing SeriesInstanceUID to fail"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("SeriesInstanceUID not found"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ignores_unknown_image_type_roles_like_upstream_until_no_levels_remain() {
+        let path =
+            test_path("ignores_unknown_image_type_roles_like_upstream_until_no_levels_remain.dcm");
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset_with_image_type(
+            &mut data,
+            TS_EXPLICIT_VR_LE,
+            1,
+            1,
+            1,
+            1,
+            1,
+            "RGB",
+            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE\\MIXED",
+        );
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
+        fs::write(&path, data).unwrap();
+
+        let err = match DicomSlide::open(&path) {
+            Ok(_) => panic!("expected unknown ImageType role to leave no levels"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("No pyramid levels found"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_ybr_full_422_separator_alias_like_upstream() {
+        let path = test_path("rejects_ybr_full_422_separator_alias_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 1, 2, 1, 1, "YBR FULL 422");
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[76, 85, 150, 85]);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.PhotometricInterpretation"),
-            Some(&"YBR FULL 422".to_string())
-        );
-        assert_eq!(slide.level_dimensions(0).unwrap(), (2, 1));
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("YBR FULL 422"));
         let _ = fs::remove_file(path);
     }
 
@@ -6213,15 +8128,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_monochrome_signed_native_samples_clearly() {
-        let path = test_path("rejects_non_monochrome_signed_native_samples_clearly.dcm");
+    fn rejects_native_signed_16_bit_rgb_like_upstream() {
+        let path = test_path("rejects_native_signed_16_bit_rgb_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_bits_and_representation(
             &mut data,
             TS_EXPLICIT_VR_LE,
+            2,
             1,
-            1,
-            1,
+            2,
             1,
             1,
             "RGB",
@@ -6231,14 +8146,15 @@ mod tests {
             16,
             1,
         );
-        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OW", &[0; 6]);
+        let mut pixels = Vec::new();
+        for sample in [-32768i16, 0, 32767, 32767, -32768, 0] {
+            pixels.extend_from_slice(&sample.to_le_bytes());
+        }
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OW", &pixels);
         fs::write(&path, data).unwrap();
 
-        let err = match DicomSlide::open(&path) {
-            Ok(_) => panic!("expected signed RGB to be rejected"),
-            Err(err) => err,
-        };
-        assert!(format!("{err}").contains("signed native samples"));
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("BitsAllocated value 16 != 8"));
         let _ = fs::remove_file(path);
     }
 
@@ -6255,17 +8171,17 @@ mod tests {
         write_sequence_delimitation_item(&mut data);
         fs::write(&path, data).unwrap();
 
-        let err = read_encapsulated_frame_table(&path, 0, 2).unwrap_err();
+        let err = read_encapsulated_frame_table(&path, 0, 2, None, None).unwrap_err();
         assert!(format!("{err}").contains("not strictly increasing"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_deflated_explicit_vr_little_endian_native_rgb() {
+    fn rejects_deflated_explicit_vr_little_endian_native_rgb_like_upstream() {
         use flate2::write::DeflateEncoder;
         use flate2::Compression;
 
-        let path = test_path("reads_deflated_explicit_vr_little_endian_native_rgb.dcm");
+        let path = test_path("rejects_deflated_explicit_vr_little_endian_native_rgb.dcm");
         let mut dataset = Vec::new();
         write_common_wsi_dataset(&mut dataset, TS_EXPLICIT_VR_LE, 2, 1, 2, 1, 1, "RGB");
         write_explicit_element(
@@ -6283,15 +8199,8 @@ mod tests {
         data.extend_from_slice(&deflated);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.TransferSyntaxUID"),
-            Some(&TS_DEFLATED_EXPLICIT_VR_LE.to_string())
-        );
-        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        let green = slide.read_region(1, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(red.data, vec![11, 21]);
-        assert_eq!(green.data, vec![12, 22]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
         let _ = fs::remove_file(path);
     }
 
@@ -6336,8 +8245,8 @@ mod tests {
     }
 
     #[test]
-    fn reads_native_palette_color_frames() {
-        let path = test_path("reads_native_palette_color_frames.dcm");
+    fn rejects_native_palette_color_like_upstream() {
+        let path = test_path("rejects_native_palette_color_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset_with_samples(
             &mut data,
@@ -6391,19 +8300,15 @@ mod tests {
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[0, 1, 2]);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(slide.channel_count(), 3);
-        assert_eq!(slide.channel_name(0), Some("red"));
-        let red = slide.read_region(0, 0, 0, 0, 3, 1).unwrap();
-        let green = slide.read_region(1, 0, 0, 0, 3, 1).unwrap();
-        assert_eq!(red.data, vec![0, 255, 0]);
-        assert_eq!(green.data, vec![0, 0, 255]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("SamplesPerPixel value 1 != 3"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn accepts_encapsulated_rgb_without_planar_configuration() {
-        let path = test_path("accepts_encapsulated_rgb_without_planar_configuration.dcm");
+    fn rejects_encapsulated_rgb_without_planar_configuration_like_upstream() {
+        let path =
+            test_path("rejects_encapsulated_rgb_without_planar_configuration_like_upstream.dcm");
         let mut data = dicom_preamble(TS_JPEG_BASELINE);
         write_explicit_element(
             &mut data,
@@ -6416,6 +8321,12 @@ mod tests {
             TAG_IMAGE_TYPE,
             b"CS",
             b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_SERIES_INSTANCE_UID,
+            b"UI",
+            b"1.2.826.0.1.3680043.10.839",
         );
         write_explicit_element(&mut data, TAG_SAMPLES_PER_PIXEL, b"US", &3u16.to_le_bytes());
         write_explicit_element(&mut data, TAG_PHOTOMETRIC_INTERPRETATION, b"CS", b"RGB");
@@ -6452,21 +8363,14 @@ mod tests {
         write_encapsulated_pixel_data(&mut data, &[b"jpeg"]);
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.TransferSyntaxUID"),
-            Some(&TS_JPEG_BASELINE.to_string())
-        );
-        assert_eq!(
-            slide.properties().get("dicom.PlanarConfiguration"),
-            Some(&"0".to_string())
-        );
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("DICOM PlanarConfiguration is missing"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn reads_explicit_vr_big_endian_native_rgb() {
-        let path = test_path("reads_explicit_vr_big_endian_native_rgb.dcm");
+    fn rejects_explicit_vr_big_endian_like_upstream() {
+        let path = test_path("rejects_explicit_vr_big_endian_like_upstream.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_BE);
         write_explicit_element_endian(
             &mut data,
@@ -6480,6 +8384,13 @@ mod tests {
             TAG_IMAGE_TYPE,
             b"CS",
             b"ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            Endian::Big,
+        );
+        write_explicit_element_endian(
+            &mut data,
+            TAG_SERIES_INSTANCE_UID,
+            b"UI",
+            b"1.2.826.0.1.3680043.10.851",
             Endian::Big,
         );
         write_explicit_element_endian(
@@ -6570,13 +8481,8 @@ mod tests {
         );
         fs::write(&path, data).unwrap();
 
-        let slide = DicomSlide::open(&path).unwrap();
-        assert_eq!(
-            slide.properties().get("dicom.TransferSyntaxUID"),
-            Some(&TS_EXPLICIT_VR_BE.to_string())
-        );
-        let red = slide.read_region(0, 0, 0, 0, 2, 1).unwrap();
-        assert_eq!(red.data, vec![10, 40]);
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported transfer syntax"));
         let _ = fs::remove_file(path);
     }
 
@@ -6758,13 +8664,117 @@ mod tests {
         pixel_representation: u16,
         planar_configuration: u16,
     ) {
+        write_common_wsi_dataset_with_bits_high_bit_representation_and_planar(
+            data,
+            width,
+            height,
+            tile_width,
+            tile_height,
+            frames,
+            photometric,
+            image_type,
+            samples_per_pixel,
+            bits_allocated,
+            bits_stored,
+            bits_stored - 1,
+            pixel_representation,
+            planar_configuration,
+        );
+    }
+
+    fn write_common_wsi_dataset_with_bits_high_bit_representation_and_planar(
+        data: &mut Vec<u8>,
+        width: u32,
+        height: u32,
+        tile_width: u16,
+        tile_height: u16,
+        frames: u32,
+        photometric: &str,
+        image_type: &[u8],
+        samples_per_pixel: u16,
+        bits_allocated: u16,
+        bits_stored: u16,
+        high_bit: u16,
+        pixel_representation: u16,
+        planar_configuration: u16,
+    ) {
+        write_common_wsi_dataset_without_image_type(
+            data,
+            width,
+            height,
+            tile_width,
+            tile_height,
+            frames,
+            photometric,
+            samples_per_pixel,
+            bits_allocated,
+            bits_stored,
+            high_bit,
+            pixel_representation,
+            planar_configuration,
+        );
+        write_explicit_element(data, TAG_IMAGE_TYPE, b"CS", image_type);
+    }
+
+    fn write_common_wsi_dataset_without_image_type(
+        data: &mut Vec<u8>,
+        width: u32,
+        height: u32,
+        tile_width: u16,
+        tile_height: u16,
+        frames: u32,
+        photometric: &str,
+        samples_per_pixel: u16,
+        bits_allocated: u16,
+        bits_stored: u16,
+        high_bit: u16,
+        pixel_representation: u16,
+        planar_configuration: u16,
+    ) {
+        write_common_wsi_dataset_without_image_type_or_series(
+            data,
+            width,
+            height,
+            tile_width,
+            tile_height,
+            frames,
+            photometric,
+            samples_per_pixel,
+            bits_allocated,
+            bits_stored,
+            high_bit,
+            pixel_representation,
+            planar_configuration,
+        );
+        let uid = format!(
+            "1.2.826.0.1.3680043.10.1.{}.{}",
+            std::process::id(),
+            TEST_SERIES_UID_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        write_explicit_element(data, TAG_SERIES_INSTANCE_UID, b"UI", uid.as_bytes());
+    }
+
+    fn write_common_wsi_dataset_without_image_type_or_series(
+        data: &mut Vec<u8>,
+        width: u32,
+        height: u32,
+        tile_width: u16,
+        tile_height: u16,
+        frames: u32,
+        photometric: &str,
+        samples_per_pixel: u16,
+        bits_allocated: u16,
+        bits_stored: u16,
+        high_bit: u16,
+        pixel_representation: u16,
+        planar_configuration: u16,
+    ) {
         write_explicit_element(
             data,
             TAG_SOP_CLASS_UID,
             b"UI",
             VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE.as_bytes(),
         );
-        write_explicit_element(data, TAG_IMAGE_TYPE, b"CS", image_type);
         write_explicit_element(
             data,
             TAG_SAMPLES_PER_PIXEL,
@@ -6800,7 +8810,7 @@ mod tests {
             &bits_allocated.to_le_bytes(),
         );
         write_explicit_element(data, TAG_BITS_STORED, b"US", &bits_stored.to_le_bytes());
-        write_explicit_element(data, TAG_HIGH_BIT, b"US", &(bits_stored - 1).to_le_bytes());
+        write_explicit_element(data, TAG_HIGH_BIT, b"US", &high_bit.to_le_bytes());
         write_explicit_element(
             data,
             TAG_PIXEL_REPRESENTATION,
@@ -7038,6 +9048,38 @@ mod tests {
         write_explicit_element(data, TAG_OPTICAL_PATH_SEQUENCE, b"SQ", &sequence);
     }
 
+    fn write_optical_path_sequence_with_icc(data: &mut Vec<u8>, profile: &[u8]) {
+        let mut item = Vec::new();
+        write_explicit_element(&mut item, TAG_ICC_PROFILE, b"OB", profile);
+        let mut sequence = Vec::new();
+        write_item(&mut sequence, &item);
+        write_explicit_element(data, TAG_OPTICAL_PATH_SEQUENCE, b"SQ", &sequence);
+    }
+
+    fn write_label_associated_dicom(path: &Path, series_uid: &str, sop_uid: &str, pixel: &[u8]) {
+        let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
+        write_common_wsi_dataset_with_image_type(
+            &mut data,
+            TS_EXPLICIT_VR_LE,
+            1,
+            1,
+            1,
+            1,
+            1,
+            "RGB",
+            b"ORIGINAL\\PRIMARY\\LABEL\\NONE",
+        );
+        write_explicit_element(
+            &mut data,
+            TAG_SERIES_INSTANCE_UID,
+            b"UI",
+            series_uid.as_bytes(),
+        );
+        write_explicit_element(&mut data, TAG_SOP_INSTANCE_UID, b"UI", sop_uid.as_bytes());
+        write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", pixel);
+        fs::write(path, data).unwrap();
+    }
+
     fn write_dimension_index_sequence(data: &mut Vec<u8>, indices: &[DimensionIndex]) {
         let mut sequence = Vec::new();
         for index in indices {
@@ -7149,6 +9191,43 @@ mod tests {
         write_sequence_delimitation_item(data);
     }
 
+    fn encoded_rle_frame(segments: &[&[u8]]) -> Vec<u8> {
+        assert!(segments.len() <= 15);
+        let encoded_segments: Vec<Vec<u8>> = segments
+            .iter()
+            .map(|segment| encoded_rle_segment(segment))
+            .collect();
+        let mut out = vec![0; 64];
+        out[0..4].copy_from_slice(&(segments.len() as u32).to_le_bytes());
+        let mut offset = 64u32;
+        for (index, segment) in encoded_segments.iter().enumerate() {
+            let slot = 4 + index * 4;
+            out[slot..slot + 4].copy_from_slice(&offset.to_le_bytes());
+            offset += segment.len() as u32;
+        }
+        for segment in encoded_segments {
+            out.extend_from_slice(&segment);
+        }
+        out
+    }
+
+    fn encoded_rle_segment(segment: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in segment.chunks(128) {
+            out.push((chunk.len() - 1) as u8);
+            out.extend_from_slice(chunk);
+        }
+        out
+    }
+
+    fn u64_table_payload(values: &[u64]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 8);
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
     fn encoded_jpeg2000_codestream(
         pixels: &[u8],
         width: u32,
@@ -7160,6 +9239,15 @@ mod tests {
             ..dicom_toolkit_jpeg2000::EncodeOptions::default()
         };
         dicom_toolkit_jpeg2000::encode(pixels, width, height, components, 8, false, &options)
+            .unwrap()
+    }
+
+    fn encoded_htj2k_codestream(pixels: &[u8], width: u32, height: u32, components: u8) -> Vec<u8> {
+        let options = dicom_toolkit_jpeg2000::EncodeOptions {
+            num_decomposition_levels: 0,
+            ..dicom_toolkit_jpeg2000::EncodeOptions::default()
+        };
+        dicom_toolkit_jpeg2000::encode_htj2k(pixels, width, height, components, 8, false, &options)
             .unwrap()
     }
 }

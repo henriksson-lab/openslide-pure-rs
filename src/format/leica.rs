@@ -1,15 +1,15 @@
 use std::collections::{BTreeSet, HashMap};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
-use crate::format::SlideBackend;
+use crate::format::{tiff::OpenslideHash, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+use crate::util::read_file_range;
 
 const LEICA_XMLNS_1: &str = "http://www.leica-microsystems.com/scn/2010/03/10";
 const LEICA_XMLNS_2: &str = "http://www.leica-microsystems.com/scn/2010/10/01";
@@ -49,18 +49,29 @@ const TAG_SOFTWARE: u16 = 305;
 const TAG_DATETIME: u16 = 306;
 const TAG_ARTIST: u16 = 315;
 const TAG_HOSTCOMPUTER: u16 = 316;
+const TAG_PREDICTOR: u16 = 317;
 const TAG_TILEWIDTH: u16 = 322;
 const TAG_TILELENGTH: u16 = 323;
 const TAG_TILEOFFSETS: u16 = 324;
 const TAG_TILEBYTECOUNTS: u16 = 325;
 const TAG_JPEGTABLES: u16 = 347;
+const TAG_JPEG_PROC: u16 = 512;
+const TAG_JPEG_RESTART_INTERVAL: u16 = 515;
+const TAG_JPEG_Q_TABLES: u16 = 519;
+const TAG_JPEG_DC_TABLES: u16 = 520;
+const TAG_JPEG_AC_TABLES: u16 = 521;
+const TAG_YCBCRSUBSAMPLING: u16 = 530;
 const TAG_COPYRIGHT: u16 = 33432;
 
 const COMPRESSION_NONE: u16 = 1;
+const COMPRESSION_OLD_JPEG: u16 = 6;
 const COMPRESSION_JPEG: u16 = 7;
 const COMPRESSION_ADOBE_DEFLATE: u16 = 8;
+const COMPRESSION_JP2K_YCBCR: u16 = 33003;
+const COMPRESSION_JP2K_RGB: u16 = 33005;
 const COMPRESSION_DEFLATE: u16 = 32946;
 const COMPRESSION_PACKBITS: u16 = 32773;
+const COMPRESSION_JP2K: u16 = 34712;
 
 const PHOTOMETRIC_WHITE_IS_ZERO: u16 = 0;
 const PHOTOMETRIC_BLACK_IS_ZERO: u16 = 1;
@@ -143,7 +154,7 @@ impl TiffFile {
         selected_dirs: Option<&BTreeSet<usize>>,
         external_value_tags: Option<&[u16]>,
     ) -> Result<Self> {
-        let mut file = File::open(path)?;
+        let mut file = crate::util::_openslide_fopen(path)?;
         let TiffHeader {
             endian,
             bigtiff,
@@ -170,6 +181,7 @@ impl TiffFile {
             let read_entries = selected_dirs.is_none_or(|dirs| dirs.contains(&index));
             let (directory, following_offset) = if read_entries {
                 read_directory(
+                    path,
                     &mut file,
                     endian,
                     bigtiff,
@@ -316,10 +328,11 @@ struct TiffHeader {
     file_len: u64,
 }
 
-fn read_tiff_header(file: &mut File) -> Result<TiffHeader> {
-    let file_len = file.metadata()?.len();
+fn read_tiff_header(file: &mut crate::util::OpenSlideFile) -> Result<TiffHeader> {
+    let file_len = u64::try_from(crate::util::_openslide_fsize(file)?)
+        .map_err(|_| OpenSlideError::Format("Negative Leica TIFF file size".into()))?;
     let mut header = [0u8; 16];
-    file.read_exact(&mut header[..8])?;
+    crate::util::_openslide_fread_exact(file, &mut header[..8])?;
 
     let endian = match &header[0..2] {
         b"II" => Endian::Little,
@@ -331,7 +344,7 @@ fn read_tiff_header(file: &mut File) -> Result<TiffHeader> {
     let (bigtiff, next_offset) = match magic {
         TIFF_MAGIC_CLASSIC => (false, endian.read_u32(&header[4..8]) as u64),
         TIFF_MAGIC_BIG => {
-            file.read_exact(&mut header[8..16])?;
+            crate::util::_openslide_fread_exact(file, &mut header[8..16])?;
             if endian.read_u16(&header[4..6]) != 8 || endian.read_u16(&header[6..8]) != 0 {
                 return Err(OpenSlideError::Format(
                     "Unsupported BigTIFF offset header".into(),
@@ -351,7 +364,8 @@ fn read_tiff_header(file: &mut File) -> Result<TiffHeader> {
 }
 
 fn read_directory(
-    file: &mut File,
+    path: &Path,
+    file: &mut crate::util::OpenSlideFile,
     endian: Endian,
     bigtiff: bool,
     index: usize,
@@ -359,15 +373,19 @@ fn read_directory(
     file_len: u64,
     external_value_tags: Option<&[u16]>,
 ) -> Result<(TiffDirectory, u64)> {
-    file.seek(SeekFrom::Start(offset))?;
+    crate::util::_openslide_fseek(
+        file,
+        tiff_seek_offset(offset, "IFD")?,
+        crate::util::OpenSlideSeekWhence::Set,
+    )?;
 
     let entry_count = if bigtiff {
         let mut buf = [0u8; 8];
-        file.read_exact(&mut buf)?;
+        crate::util::_openslide_fread_exact(file, &mut buf)?;
         endian.read_u64(&buf)
     } else {
         let mut buf = [0u8; 2];
-        file.read_exact(&mut buf)?;
+        crate::util::_openslide_fread_exact(file, &mut buf)?;
         endian.read_u16(&buf) as u64
     };
     if entry_count > 100_000 {
@@ -383,7 +401,7 @@ fn read_directory(
 
     for _ in 0..entry_count {
         let mut entry_buf = vec![0u8; entry_size];
-        file.read_exact(&mut entry_buf)?;
+        crate::util::_openslide_fread_exact(file, &mut entry_buf)?;
 
         let tag = endian.read_u16(&entry_buf[0..2]);
         let value_type = endian.read_u16(&entry_buf[2..4]);
@@ -433,12 +451,7 @@ fn read_directory(
                     tag
                 )));
             }
-            let return_pos = file.stream_position()?;
-            file.seek(SeekFrom::Start(value_offset))?;
-            let mut data = vec![0u8; value_size as usize];
-            file.read_exact(&mut data)?;
-            file.seek(SeekFrom::Start(return_pos))?;
-            data
+            read_file_range(path, value_offset, value_size)?
         };
 
         entries.insert(
@@ -453,11 +466,11 @@ fn read_directory(
 
     let following_offset = if bigtiff {
         let mut buf = [0u8; 8];
-        file.read_exact(&mut buf)?;
+        crate::util::_openslide_fread_exact(file, &mut buf)?;
         endian.read_u64(&buf)
     } else {
         let mut buf = [0u8; 4];
-        file.read_exact(&mut buf)?;
+        crate::util::_openslide_fread_exact(file, &mut buf)?;
         endian.read_u32(&buf) as u64
     };
 
@@ -465,22 +478,26 @@ fn read_directory(
 }
 
 fn skip_directory(
-    file: &mut File,
+    file: &mut crate::util::OpenSlideFile,
     endian: Endian,
     bigtiff: bool,
     index: usize,
     offset: u64,
     file_len: u64,
 ) -> Result<(TiffDirectory, u64)> {
-    file.seek(SeekFrom::Start(offset))?;
+    crate::util::_openslide_fseek(
+        file,
+        tiff_seek_offset(offset, "IFD")?,
+        crate::util::OpenSlideSeekWhence::Set,
+    )?;
 
     let entry_count = if bigtiff {
         let mut buf = [0u8; 8];
-        file.read_exact(&mut buf)?;
+        crate::util::_openslide_fread_exact(file, &mut buf)?;
         endian.read_u64(&buf)
     } else {
         let mut buf = [0u8; 2];
-        file.read_exact(&mut buf)?;
+        crate::util::_openslide_fread_exact(file, &mut buf)?;
         endian.read_u16(&buf) as u64
     };
     if entry_count > 100_000 {
@@ -495,12 +512,15 @@ fn skip_directory(
     let entries_size = entry_count
         .checked_mul(entry_size)
         .ok_or_else(|| OpenSlideError::Format("TIFF directory entry table size overflow".into()))?;
-    let next_offset_pos = file
-        .stream_position()?
-        .checked_add(entries_size)
-        .ok_or_else(|| {
-            OpenSlideError::Format("TIFF directory next offset position overflow".into())
-        })?;
+    let current_pos = u64::try_from(crate::util::_openslide_ftell(file)?).map_err(|_| {
+        OpenSlideError::Format(format!(
+            "TIFF directory {} current offset is negative",
+            index
+        ))
+    })?;
+    let next_offset_pos = current_pos.checked_add(entries_size).ok_or_else(|| {
+        OpenSlideError::Format("TIFF directory next offset position overflow".into())
+    })?;
     if next_offset_pos
         .checked_add(next_offset_size)
         .is_none_or(|end| end > file_len)
@@ -510,15 +530,19 @@ fn skip_directory(
             index
         )));
     }
-    file.seek(SeekFrom::Start(next_offset_pos))?;
+    crate::util::_openslide_fseek(
+        file,
+        tiff_seek_offset(next_offset_pos, "next IFD")?,
+        crate::util::OpenSlideSeekWhence::Set,
+    )?;
 
     let following_offset = if bigtiff {
         let mut buf = [0u8; 8];
-        file.read_exact(&mut buf)?;
+        crate::util::_openslide_fread_exact(file, &mut buf)?;
         endian.read_u64(&buf)
     } else {
         let mut buf = [0u8; 4];
-        file.read_exact(&mut buf)?;
+        crate::util::_openslide_fread_exact(file, &mut buf)?;
         endian.read_u32(&buf) as u64
     };
 
@@ -529,6 +553,14 @@ fn skip_directory(
         },
         following_offset,
     ))
+}
+
+fn tiff_seek_offset(offset: u64, context: &str) -> Result<i64> {
+    i64::try_from(offset).map_err(|_| {
+        OpenSlideError::Format(format!(
+            "Leica TIFF {context} offset does not fit OpenSlide seek: offset={offset}"
+        ))
+    })
 }
 
 fn read_chunks<T>(
@@ -619,7 +651,19 @@ struct Area {
     samples_per_pixel: u16,
     bits_per_sample: Vec<u16>,
     planar_config: u16,
+    predictor: u16,
+    ycbcr_subsampling: (u16, u16),
     jpeg_tables: Option<Vec<u8>>,
+    old_jpeg: Option<OldJpegTables>,
+}
+
+#[derive(Debug, Clone)]
+struct OldJpegTables {
+    proc: u16,
+    restart_interval: Option<u16>,
+    q_tables: Vec<u64>,
+    dc_tables: Vec<u64>,
+    ac_tables: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -696,7 +740,7 @@ fn leica_open(path: &Path) -> Result<Box<dyn SlideBackend>> {
         quickhash_dir,
         property_dir,
     )?;
-    properties.remove("openslide.comment");
+    properties.remove(properties::PROPERTY_COMMENT);
     properties.remove("tiff.ImageDescription");
     add_tiff_properties(&mut properties, &tiff, &levels);
     add_level_properties(&mut properties, &levels);
@@ -752,6 +796,11 @@ impl SlideBackend for LeicaSlide {
             .map(|level| level.downsample)
     }
 
+    fn level_tile_dimensions(&self, level: u32) -> Option<(u64, u64)> {
+        let area = self.levels.get(level as usize)?.areas.first()?;
+        Some((u64::from(area.tile_width), u64::from(area.tile_height)))
+    }
+
     fn read_region(
         &self,
         channel: u32,
@@ -776,8 +825,8 @@ impl SlideBackend for LeicaSlide {
         let mut output = GrayImage::new(w, h);
 
         for area in &level_data.areas {
-            let area_lx = lx - area.offset_x as f64;
-            let area_ly = ly - area.offset_y as f64;
+            let area_lx = area_coordinate(lx, area.offset_x);
+            let area_ly = area_coordinate(ly, area.offset_y);
             let col_start = (area_lx / area.tile_width as f64).floor() as i64;
             let col_end = ((area_lx + w as f64) / area.tile_width as f64).ceil() as i64;
             let row_start = (area_ly / area.tile_height as f64).floor() as i64;
@@ -805,8 +854,8 @@ impl SlideBackend for LeicaSlide {
                         visible_w,
                         visible_h,
                         &mut output,
-                        area.offset_x as f64 + tile_origin_x - lx,
-                        area.offset_y as f64 + tile_origin_y - ly,
+                        tile_origin_x - area_lx,
+                        tile_origin_y - area_ly,
                     );
                 }
             }
@@ -843,8 +892,8 @@ impl SlideBackend for LeicaSlide {
         let default_opaque_alpha = channels[3].is_none();
 
         for area in &level_data.areas {
-            let area_lx = lx - area.offset_x as f64;
-            let area_ly = ly - area.offset_y as f64;
+            let area_lx = area_coordinate(lx, area.offset_x);
+            let area_ly = area_coordinate(ly, area.offset_y);
             let col_start = (area_lx / area.tile_width as f64).floor() as i64;
             let col_end = ((area_lx + w as f64) / area.tile_width as f64).ceil() as i64;
             let row_start = (area_ly / area.tile_height as f64).floor() as i64;
@@ -873,8 +922,8 @@ impl SlideBackend for LeicaSlide {
                         visible_w,
                         visible_h,
                         &mut output,
-                        area.offset_x as f64 + tile_origin_x - lx,
-                        area.offset_y as f64 + tile_origin_y - ly,
+                        tile_origin_x - area_lx,
+                        tile_origin_y - area_ly,
                     );
                 }
             }
@@ -888,10 +937,19 @@ impl SlideBackend for LeicaSlide {
     }
 
     fn associated_image_names(&self) -> Vec<&str> {
-        self.associated_images
+        let mut names = self
+            .associated_images
             .keys()
             .map(|name| name.as_str())
-            .collect()
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    fn associated_image_dimensions(&self, name: &str) -> Option<(u64, u64)> {
+        self.associated_images
+            .get(name)
+            .map(|image| (image.width, image.height))
     }
 
     fn read_associated_image(&self, name: &str) -> Result<RgbaImage> {
@@ -961,10 +1019,7 @@ fn parse_xml_description(xml: &str) -> Result<Collection> {
         let tag = tag.trim();
         if tag.starts_with('/') {
             let name = local_name(tag.trim_start_matches('/').trim());
-            if !path
-                .last()
-                .is_some_and(|current| current.eq_ignore_ascii_case(name))
-            {
+            if !path.last().is_some_and(|current| current == name) {
                 return Err(OpenSlideError::Format(format!(
                     "Mismatched Leica XML end tag: {name}"
                 )));
@@ -1182,7 +1237,7 @@ fn xml_path_matches(path: &[String], expected: &[&str]) -> bool {
         && path
             .iter()
             .zip(expected)
-            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+            .all(|(actual, expected)| actual == expected)
 }
 
 fn finish_image(image: &mut Image) -> Result<()> {
@@ -1204,9 +1259,7 @@ fn finish_image(image: &mut Image) -> Result<()> {
         }
         dimension.nm_per_pixel = image.nm_across as f64 / dimension.width as f64;
     }
-    image
-        .dimensions
-        .sort_by(|a, b| b.width.cmp(&a.width).then_with(|| b.height.cmp(&a.height)));
+    image.dimensions.sort_by(|a, b| b.width.cmp(&a.width));
     Ok(())
 }
 
@@ -1270,12 +1323,11 @@ fn create_levels_from_collection(
         "leica.objective",
         first.objective.as_deref(),
     );
-    if let Some(objective) = first.objective.as_deref().and_then(objective_power_value) {
-        properties.insert(
-            properties::PROPERTY_OBJECTIVE_POWER.into(),
-            objective.to_string(),
-        );
-    }
+    crate::util::_openslide_duplicate_int_prop(
+        &mut properties,
+        "leica.objective",
+        properties::PROPERTY_OBJECTIVE_POWER,
+    );
 
     let mut levels: Vec<LeicaLevel> = first
         .dimensions
@@ -1331,7 +1383,10 @@ fn create_levels_from_collection(
                 samples_per_pixel: tiff_level.samples_per_pixel,
                 bits_per_sample: tiff_level.bits_per_sample,
                 planar_config: tiff_level.planar_config,
+                predictor: tiff_level.predictor,
+                ycbcr_subsampling: tiff_level.ycbcr_subsampling,
                 jpeg_tables: tiff_level.jpeg_tables,
+                old_jpeg: tiff_level.old_jpeg,
             });
         }
         if legacy_quickhash && std::ptr::eq(image, first) {
@@ -1347,9 +1402,14 @@ fn create_levels_from_collection(
             area.offset_y = (area.offset_y as f64 / level.nm_per_pixel).trunc() as i64;
         }
     }
-    let base_nm_per_pixel = levels[0].nm_per_pixel;
-    for level in &mut levels {
-        level.downsample = level.nm_per_pixel / base_nm_per_pixel;
+    let base_width = levels[0].width as f64;
+    let base_height = levels[0].height as f64;
+    for (idx, level) in levels.iter_mut().enumerate() {
+        level.downsample = if idx == 0 {
+            1.0
+        } else {
+            ((base_height / level.height as f64) + (base_width / level.width as f64)) / 2.0
+        };
     }
 
     set_region_bounds_props(&mut properties, &levels[0]);
@@ -1395,7 +1455,10 @@ fn create_levels_from_collection(
                         samples_per_pixel: area.samples_per_pixel,
                         bits_per_sample: area.bits_per_sample,
                         planar_config: area.planar_config,
+                        predictor: area.predictor,
+                        ycbcr_subsampling: area.ycbcr_subsampling,
                         jpeg_tables: area.jpeg_tables,
+                        old_jpeg: area.old_jpeg,
                     },
                     width,
                     height,
@@ -1438,11 +1501,6 @@ fn is_brightfield_illumination(value: &str) -> bool {
     value == LEICA_VALUE_BRIGHTFIELD
 }
 
-fn objective_power_value(value: &str) -> Option<&str> {
-    value.parse::<i64>().ok()?;
-    Some(value)
-}
-
 fn option_str_eq(left: &Option<String>, right: &Option<String>) -> bool {
     left == right
 }
@@ -1465,7 +1523,10 @@ struct AreaInfo {
     samples_per_pixel: u16,
     bits_per_sample: Vec<u16>,
     planar_config: u16,
+    predictor: u16,
+    ycbcr_subsampling: (u16, u16),
     jpeg_tables: Option<Vec<u8>>,
+    old_jpeg: Option<OldJpegTables>,
 }
 
 fn read_area(tiff: &TiffFile, dimension: &Dimension) -> Result<AreaInfo> {
@@ -1587,6 +1648,7 @@ fn read_area(tiff: &TiffFile, dimension: &Dimension) -> Result<AreaInfo> {
     } else {
         expected_tiles
     };
+    let predictor = optional_u16(tiff, dir, TAG_PREDICTOR, 1)?;
     for (tag, values) in [
         (
             if is_stripped {
@@ -1623,18 +1685,24 @@ fn read_area(tiff: &TiffFile, dimension: &Dimension) -> Result<AreaInfo> {
         )));
     }
     let bits_per_sample = bits_per_sample(tiff, dir, samples_per_pixel)?;
-    if planar_config == PLANARCONFIG_SEPARATE && !bits_per_sample.iter().all(|&bits| bits == 8) {
-        return Err(OpenSlideError::UnsupportedFormat(format!(
-            "Only 8-bit Leica planar TIFF samples are supported in IFD {}, got {:?}",
-            dimension.dir, bits_per_sample
-        )));
-    }
-    raw_sample_bytes(&bits_per_sample).map_err(|_| {
+    validate_supported_bits_per_sample(&bits_per_sample).map_err(|_| {
         OpenSlideError::UnsupportedFormat(format!(
-            "Only uniform 8-bit or 16-bit Leica TIFF samples are supported in IFD {}, got {:?}",
+            "Only 8-bit or 16-bit Leica TIFF samples are supported in IFD {}, got {:?}",
             dimension.dir, bits_per_sample
         ))
     })?;
+    let ycbcr_values = dir
+        .uints(tiff.endian, TAG_YCBCRSUBSAMPLING)
+        .unwrap_or_else(|| vec![2, 2]);
+    let ycbcr_subsampling = (
+        ycbcr_values.first().copied().unwrap_or(2) as u16,
+        ycbcr_values.get(1).copied().unwrap_or(2) as u16,
+    );
+    let old_jpeg = if compression == COMPRESSION_OLD_JPEG {
+        Some(parse_old_jpeg_tables(tiff, dir)?)
+    } else {
+        None
+    };
 
     Ok(AreaInfo {
         dir: dimension.dir,
@@ -1653,7 +1721,54 @@ fn read_area(tiff: &TiffFile, dimension: &Dimension) -> Result<AreaInfo> {
         samples_per_pixel,
         bits_per_sample,
         planar_config,
+        predictor,
+        ycbcr_subsampling,
         jpeg_tables: dir.entry(TAG_JPEGTABLES).map(|entry| entry.raw.clone()),
+        old_jpeg,
+    })
+}
+
+fn parse_old_jpeg_tables(tiff: &TiffFile, dir: &TiffDirectory) -> Result<OldJpegTables> {
+    let proc = dir.uint(tiff.endian, TAG_JPEG_PROC).unwrap_or(1) as u16;
+    if proc != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Leica old-JPEG processing mode {} in IFD {}",
+            proc, dir.index
+        )));
+    }
+    let q_tables = dir.uints(tiff.endian, TAG_JPEG_Q_TABLES).ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat(format!(
+            "Leica old-JPEG IFD {} has no JPEGQTables tag",
+            dir.index
+        ))
+    })?;
+    let dc_tables = dir.uints(tiff.endian, TAG_JPEG_DC_TABLES).ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat(format!(
+            "Leica old-JPEG IFD {} has no JPEGDCTables tag",
+            dir.index
+        ))
+    })?;
+    let ac_tables = dir.uints(tiff.endian, TAG_JPEG_AC_TABLES).ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat(format!(
+            "Leica old-JPEG IFD {} has no JPEGACTables tag",
+            dir.index
+        ))
+    })?;
+    if q_tables.is_empty() || dc_tables.is_empty() || ac_tables.is_empty() {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Leica old-JPEG IFD {} has empty JPEG table tags",
+            dir.index
+        )));
+    }
+    let restart_interval = dir
+        .uint(tiff.endian, TAG_JPEG_RESTART_INTERVAL)
+        .map(|value| value as u16);
+    Ok(OldJpegTables {
+        proc,
+        restart_interval,
+        q_tables,
+        dc_tables,
+        ac_tables,
     })
 }
 
@@ -1668,22 +1783,10 @@ fn set_region_bounds_props(props: &mut HashMap<String, String>, level0: &LeicaLe
     let mut y1 = i64::MIN;
 
     for (idx, area) in level0.areas.iter().enumerate() {
-        props.insert(
-            format!("openslide.region[{}].x", idx),
-            area.offset_x.to_string(),
-        );
-        props.insert(
-            format!("openslide.region[{}].y", idx),
-            area.offset_y.to_string(),
-        );
-        props.insert(
-            format!("openslide.region[{}].width", idx),
-            area.width.to_string(),
-        );
-        props.insert(
-            format!("openslide.region[{}].height", idx),
-            area.height.to_string(),
-        );
+        props.insert(properties::region_x(idx), area.offset_x.to_string());
+        props.insert(properties::region_y(idx), area.offset_y.to_string());
+        props.insert(properties::region_width(idx), area.width.to_string());
+        props.insert(properties::region_height(idx), area.height.to_string());
         x0 = x0.min(area.offset_x);
         y0 = y0.min(area.offset_y);
         x1 = x1.max(area.offset_x + area.width as i64);
@@ -1777,27 +1880,24 @@ fn add_tiff_properties(
 }
 
 fn add_level_properties(props: &mut HashMap<String, String>, levels: &[LeicaLevel]) {
-    props.insert("openslide.level-count".into(), levels.len().to_string());
+    props.insert(
+        properties::PROPERTY_LEVEL_COUNT.into(),
+        levels.len().to_string(),
+    );
     for (idx, level) in levels.iter().enumerate() {
+        props.insert(properties::level_width(idx), level.width.to_string());
+        props.insert(properties::level_height(idx), level.height.to_string());
         props.insert(
-            format!("openslide.level[{}].width", idx),
-            level.width.to_string(),
-        );
-        props.insert(
-            format!("openslide.level[{}].height", idx),
-            level.height.to_string(),
-        );
-        props.insert(
-            format!("openslide.level[{}].downsample", idx),
+            properties::level_downsample(idx),
             format_float(level.downsample),
         );
         if let Some(area) = level.areas.first() {
             props.insert(
-                format!("openslide.level[{}].tile-width", idx),
+                properties::level_tile_width(idx),
                 area.tile_width.to_string(),
             );
             props.insert(
-                format!("openslide.level[{}].tile-height", idx),
+                properties::level_tile_height(idx),
                 area.tile_height.to_string(),
             );
         }
@@ -1809,17 +1909,10 @@ fn add_associated_properties(
     associated_images: &HashMap<String, AssociatedImage>,
 ) {
     for (name, image) in associated_images {
+        props.insert(properties::associated_width(name), image.width.to_string());
         props.insert(
-            format!("openslide.associated.{}.width", name),
-            image.width.to_string(),
-        );
-        props.insert(
-            format!("openslide.associated.{}.height", name),
+            properties::associated_height(name),
             image.height.to_string(),
-        );
-        props.insert(
-            format!("leica.associated.{}.ifd", name),
-            image.area.dir.to_string(),
         );
     }
 }
@@ -1918,19 +2011,74 @@ fn decode_area_tile(path: &Path, area: &Area, tile_no: u64) -> Result<LeicaTile>
     let raw = read_file_range(path, offset, byte_count)?;
     let (decode_w, decode_h) = area_decode_dimensions(area, tile_no)?;
     match area.compression {
-        COMPRESSION_JPEG => {
-            let jpeg = merge_jpeg_tables(&raw, area.jpeg_tables.as_deref())?;
-            let (rgb, width, height) = decode::decode_rgb(ImageFormat::Jpeg, &jpeg)?;
+        COMPRESSION_OLD_JPEG | COMPRESSION_JPEG => {
+            let jpeg = if area.compression == COMPRESSION_OLD_JPEG {
+                old_jpeg_interchange_stream(path, area, decode_w, decode_h, &raw)?
+            } else {
+                raw
+            };
+            let (rgb, width, height) = if area.jpeg_tables.is_some() {
+                let jpeg = merge_jpeg_tables(&jpeg, area.jpeg_tables.as_deref())?;
+                decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
+            } else if area.photometric == PHOTOMETRIC_YCBCR {
+                decode::decode_tiff_ycbcr_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
+            } else {
+                decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
+            };
             Ok(LeicaTile { width, height, rgb })
         }
         COMPRESSION_NONE => decode_uncompressed_tile(area, decode_w, decode_h, &raw),
-        COMPRESSION_PACKBITS => {
+        COMPRESSION_PACKBITS if area.predictor == 1 => {
             let decoded = unpack_packbits(&raw, expected_tile_bytes(area, decode_w, decode_h)?)?;
             decode_uncompressed_tile(area, decode_w, decode_h, &decoded)
         }
-        COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => {
+        COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE if area.predictor == 1 => {
             let inflated = inflate_tiff_deflate(&raw)?;
             decode_uncompressed_tile(area, decode_w, decode_h, &inflated)
+        }
+        COMPRESSION_PACKBITS | COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => {
+            let decoded = read_leica_tiff_chunk_bytes(
+                path,
+                area,
+                tile_no,
+                expected_tile_bytes(area, decode_w, decode_h)?,
+                contiguous_sample_bytes(area)?,
+            )?;
+            decode_uncompressed_tile(area, decode_w, decode_h, &decoded)
+        }
+        COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+            let colorspace = match area.compression {
+                COMPRESSION_JP2K_YCBCR => "YCbCr",
+                COMPRESSION_JP2K_RGB => "RGB",
+                _ => "unspecified",
+            };
+            let context = format!(
+                "Leica JPEG 2000 ({colorspace}) TIFF directory {} compression {} photometric {} samples {} expected {}x{} RGB",
+                area.dir,
+                area.compression,
+                area.photometric,
+                area.samples_per_pixel,
+                decode_w,
+                decode_h
+            );
+            let (rgb, width, height) = decode::default_decoder_api().decode_jpeg2000_rgb(
+                &raw,
+                decode::jpeg2000::Jpeg2000DecodeOptions::new(
+                    decode_w,
+                    decode_h,
+                    area_channel_count(area),
+                    decode::jpeg2000::Jpeg2000OutputFormat::Rgb,
+                    &context,
+                )
+                .with_source(decode::jpeg2000::Jpeg2000DecodeSource::TiffTile)
+                .with_tile(decode::jpeg2000::Jpeg2000TileContext {
+                    tile_x: (tile_no % area.tiles_across) as u32,
+                    tile_y: (tile_no / area.tiles_across) as u32,
+                    tile_width: decode_w,
+                    tile_height: decode_h,
+                }),
+            )?;
+            Ok(LeicaTile { width, height, rgb })
         }
         other => Err(OpenSlideError::UnsupportedFormat(format!(
             "Unsupported Leica TIFF compression {}",
@@ -1940,24 +2088,25 @@ fn decode_area_tile(path: &Path, area: &Area, tile_no: u64) -> Result<LeicaTile>
 }
 
 fn decode_planar_area_tile(path: &Path, area: &Area, tile_no: u64) -> Result<LeicaTile> {
-    if !area.bits_per_sample.iter().all(|&bits| bits == 8) {
-        return Err(OpenSlideError::UnsupportedFormat(format!(
-            "Only 8-bit Leica planar TIFF tiles are supported, got {:?}",
-            area.bits_per_sample
-        )));
-    }
-    if area.compression == COMPRESSION_JPEG {
-        return Err(OpenSlideError::UnsupportedFormat(
-            "Planar JPEG-compressed Leica TIFF tiles are not supported".into(),
-        ));
-    }
     let (decode_w, decode_h) = area_decode_dimensions(area, tile_no)?;
     let pixels = decode_w
         .checked_mul(decode_h)
         .map(|v| v as usize)
         .ok_or_else(|| OpenSlideError::Decode("Leica planar tile byte count overflow".into()))?;
     let samples = usize::from(area.samples_per_pixel);
-    let read_plane = |plane: usize| -> Result<Vec<u8>> {
+    let read_plane = |plane: usize| -> Result<(Vec<u8>, usize)> {
+        let bytes_per_sample = planar_sample_bytes(area, plane)?;
+        if matches!(area.compression, COMPRESSION_OLD_JPEG | COMPRESSION_JPEG)
+            && bytes_per_sample != 1
+        {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "Planar JPEG-compressed Leica TIFF sample {} requires 8-bit samples",
+                plane
+            )));
+        }
+        let expected_plane_bytes = pixels.checked_mul(bytes_per_sample).ok_or_else(|| {
+            OpenSlideError::Decode("Leica planar tile byte count overflow".into())
+        })?;
         let tiles_per_plane = area
             .tiles_across
             .checked_mul(area.tiles_down)
@@ -1982,10 +2131,30 @@ fn decode_planar_area_tile(path: &Path, area: &Area, tile_no: u64) -> Result<Lei
             ))
         })?;
         let raw = read_file_range(path, offset, byte_count)?;
+        let mut decoded_bytes_per_sample = bytes_per_sample;
+        let mut min_plane_bytes = expected_plane_bytes;
         let decoded = match area.compression {
+            COMPRESSION_OLD_JPEG => decode_planar_old_jpeg_plane(path, area, &raw, plane, pixels)?,
+            COMPRESSION_JPEG => decode_planar_jpeg_plane(area, &raw, plane, pixels)?,
+            COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+                decode_planar_jpeg2000_plane(area, &raw, plane, tile_no, pixels)?
+            }
             COMPRESSION_NONE => raw,
-            COMPRESSION_PACKBITS => unpack_packbits(&raw, pixels)?,
-            COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => inflate_tiff_deflate(&raw)?,
+            COMPRESSION_PACKBITS if area.predictor == 1 => {
+                unpack_packbits(&raw, expected_plane_bytes)?
+            }
+            COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE if area.predictor == 1 => {
+                inflate_tiff_deflate(&raw)?
+            }
+            COMPRESSION_PACKBITS | COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => {
+                read_leica_tiff_chunk_bytes(
+                    path,
+                    area,
+                    plane_tile_no,
+                    expected_plane_bytes,
+                    vec![bytes_per_sample as u8],
+                )?
+            }
             other => {
                 return Err(OpenSlideError::UnsupportedFormat(format!(
                     "Unsupported Leica TIFF compression {} for planar tiles",
@@ -1993,22 +2162,37 @@ fn decode_planar_area_tile(path: &Path, area: &Area, tile_no: u64) -> Result<Lei
                 )))
             }
         };
-        if decoded.len() < pixels {
+        if matches!(area.compression, COMPRESSION_OLD_JPEG | COMPRESSION_JPEG) {
+            decoded_bytes_per_sample = 1;
+            min_plane_bytes = pixels;
+        }
+        if matches!(
+            area.compression,
+            COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K
+        ) {
+            decoded_bytes_per_sample = 1;
+            min_plane_bytes = pixels;
+        }
+        if decoded.len() < min_plane_bytes {
             return Err(OpenSlideError::Decode(format!(
                 "Leica planar tile data truncated: expected at least {} bytes, got {}",
-                pixels,
+                min_plane_bytes,
                 decoded.len()
             )));
         }
-        Ok(decoded[..pixels].to_vec())
+        Ok((
+            decoded[..min_plane_bytes].to_vec(),
+            decoded_bytes_per_sample,
+        ))
     };
 
     if area.photometric == PHOTOMETRIC_BLACK_IS_ZERO
         || area.photometric == PHOTOMETRIC_WHITE_IS_ZERO
     {
-        let gray = read_plane(0)?;
+        let (gray, bytes_per_sample) = read_plane(0)?;
         let mut rgb = Vec::with_capacity(pixels * 3);
-        for value in gray {
+        for pixel in gray.chunks_exact(bytes_per_sample).take(pixels) {
+            let value = decode_raw_sample(pixel, 0, bytes_per_sample, area.endian);
             let value = if area.photometric == PHOTOMETRIC_WHITE_IS_ZERO {
                 255u8.saturating_sub(value)
             } else {
@@ -2028,19 +2212,57 @@ fn decode_planar_area_tile(path: &Path, area: &Area, tile_no: u64) -> Result<Lei
             "Planar Leica TIFF tile has fewer than 3 samples".into(),
         ));
     }
-    let p0 = read_plane(0)?;
-    let p1 = read_plane(1)?;
-    let p2 = read_plane(2)?;
+    let (p0, p0_bytes) = read_plane(0)?;
+    let (p1, p1_bytes) = read_plane(1)?;
+    let (p2, p2_bytes) = read_plane(2)?;
     let mut rgb = Vec::with_capacity(pixels * 3);
     match area.photometric {
         PHOTOMETRIC_RGB => {
             for idx in 0..pixels {
-                rgb.extend_from_slice(&[p0[idx], p1[idx], p2[idx]]);
+                rgb.extend_from_slice(&[
+                    decode_raw_sample(
+                        &p0[idx * p0_bytes..(idx + 1) * p0_bytes],
+                        0,
+                        p0_bytes,
+                        area.endian,
+                    ),
+                    decode_raw_sample(
+                        &p1[idx * p1_bytes..(idx + 1) * p1_bytes],
+                        0,
+                        p1_bytes,
+                        area.endian,
+                    ),
+                    decode_raw_sample(
+                        &p2[idx * p2_bytes..(idx + 1) * p2_bytes],
+                        0,
+                        p2_bytes,
+                        area.endian,
+                    ),
+                ]);
             }
         }
         PHOTOMETRIC_YCBCR => {
             for idx in 0..pixels {
-                rgb.extend_from_slice(&ycbcr_to_rgb(p0[idx], p1[idx], p2[idx]));
+                rgb.extend_from_slice(&ycbcr_to_rgb(
+                    decode_raw_sample(
+                        &p0[idx * p0_bytes..(idx + 1) * p0_bytes],
+                        0,
+                        p0_bytes,
+                        area.endian,
+                    ),
+                    decode_raw_sample(
+                        &p1[idx * p1_bytes..(idx + 1) * p1_bytes],
+                        0,
+                        p1_bytes,
+                        area.endian,
+                    ),
+                    decode_raw_sample(
+                        &p2[idx * p2_bytes..(idx + 1) * p2_bytes],
+                        0,
+                        p2_bytes,
+                        area.endian,
+                    ),
+                ));
             }
         }
         other => {
@@ -2057,6 +2279,99 @@ fn decode_planar_area_tile(path: &Path, area: &Area, tile_no: u64) -> Result<Lei
     })
 }
 
+fn decode_planar_jpeg_plane(
+    area: &Area,
+    raw: &[u8],
+    plane: usize,
+    expected_samples: usize,
+) -> Result<Vec<u8>> {
+    let jpeg = merge_jpeg_tables(raw, area.jpeg_tables.as_deref())?;
+    let (rgb, width, height) = if area.photometric == PHOTOMETRIC_YCBCR {
+        decode::decode_tiff_ycbcr_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
+    } else {
+        decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
+    };
+    if width as usize * height as usize != expected_samples {
+        return Err(OpenSlideError::Decode(format!(
+            "Planar Leica JPEG sample {} decoded to {}x{}, expected {} samples",
+            plane, width, height, expected_samples
+        )));
+    }
+    let mut plane = Vec::with_capacity(expected_samples);
+    for pixel in rgb.chunks_exact(3).take(expected_samples) {
+        plane.push(pixel[0]);
+    }
+    Ok(plane)
+}
+
+fn decode_planar_jpeg2000_plane(
+    area: &Area,
+    raw: &[u8],
+    plane: usize,
+    tile_no: u64,
+    expected_samples: usize,
+) -> Result<Vec<u8>> {
+    let colorspace = match area.compression {
+        COMPRESSION_JP2K_YCBCR => "YCbCr",
+        COMPRESSION_JP2K_RGB => "RGB",
+        _ => "unspecified",
+    };
+    let context = format!(
+        "Planar Leica JPEG 2000 ({colorspace}) sample {plane} compression {} expected {}x{} plane",
+        area.compression, area.tile_width, area.tile_height
+    );
+    let gray = decode::default_decoder_api().decode_jpeg2000_gray(
+        raw,
+        decode::jpeg2000::Jpeg2000DecodeOptions::new(
+            area.tile_width,
+            area.tile_height,
+            1,
+            decode::jpeg2000::Jpeg2000OutputFormat::Gray { channel: 0 },
+            &context,
+        )
+        .with_source(decode::jpeg2000::Jpeg2000DecodeSource::TiffTile)
+        .with_tile(decode::jpeg2000::Jpeg2000TileContext {
+            tile_x: (tile_no % area.tiles_across) as u32,
+            tile_y: (tile_no / area.tiles_across) as u32,
+            tile_width: area.tile_width,
+            tile_height: area.tile_height,
+        }),
+    )?;
+    if gray.width as usize * gray.height as usize != expected_samples {
+        return Err(OpenSlideError::Decode(format!(
+            "Planar Leica JPEG 2000 sample {} decoded to {}x{}, expected {} samples",
+            plane, gray.width, gray.height, expected_samples
+        )));
+    }
+    Ok(gray.data)
+}
+
+fn decode_planar_old_jpeg_plane(
+    path: &Path,
+    area: &Area,
+    raw: &[u8],
+    plane: usize,
+    expected_samples: usize,
+) -> Result<Vec<u8>> {
+    let jpeg = old_jpeg_planar_interchange_stream(path, area, raw, plane)?;
+    let (rgb, width, height) = if area.photometric == PHOTOMETRIC_YCBCR {
+        decode::decode_tiff_ycbcr_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
+    } else {
+        decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
+    };
+    if width as usize * height as usize != expected_samples {
+        return Err(OpenSlideError::Decode(format!(
+            "Planar Leica old-JPEG sample {} decoded to {}x{}, expected {} samples",
+            plane, width, height, expected_samples
+        )));
+    }
+    let mut plane = Vec::with_capacity(expected_samples);
+    for pixel in rgb.chunks_exact(3).take(expected_samples) {
+        plane.push(pixel[0]);
+    }
+    Ok(plane)
+}
+
 fn area_decode_dimensions(area: &Area, tile_no: u64) -> Result<(u32, u32)> {
     if !area.is_stripped {
         return Ok((area.tile_width, area.tile_height));
@@ -2071,6 +2386,13 @@ fn area_decode_dimensions(area: &Area, tile_no: u64) -> Result<(u32, u32)> {
         })?,
         remaining_h.min(area.tile_height as u64) as u32,
     ))
+}
+
+fn area_channel_count(area: &Area) -> u16 {
+    match area.photometric {
+        PHOTOMETRIC_WHITE_IS_ZERO | PHOTOMETRIC_BLACK_IS_ZERO => 1,
+        _ => area.samples_per_pixel.min(3),
+    }
 }
 
 fn read_area_rgba(path: &Path, area: &Area) -> Result<RgbaImage> {
@@ -2102,90 +2424,6 @@ fn read_area_rgba(path: &Path, area: &Area) -> Result<RgbaImage> {
     }
 
     Ok(out)
-}
-
-fn read_file_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
-    let end = offset.checked_add(len).ok_or_else(|| {
-        OpenSlideError::Format(format!(
-            "File range overflows: offset={}, len={}",
-            offset, len
-        ))
-    })?;
-    if end > file_len {
-        return Err(OpenSlideError::Format(format!(
-            "File range extends outside file: offset={}, len={}, file_len={}",
-            offset, len, file_len
-        )));
-    }
-    file.seek(SeekFrom::Start(offset))?;
-    let mut data = vec![0u8; len as usize];
-    file.read_exact(&mut data)?;
-    Ok(data)
-}
-
-struct OpenslideHash {
-    sha256: Sha256,
-    enabled: bool,
-}
-
-impl OpenslideHash {
-    fn openslide_hash_quickhash1_create() -> Self {
-        Self {
-            sha256: Sha256::new(),
-            enabled: true,
-        }
-    }
-
-    fn openslide_hash_data(&mut self, data: &[u8]) {
-        if self.enabled && !data.is_empty() {
-            self.sha256.update(data);
-        }
-    }
-
-    fn openslide_hash_string(&mut self, value: Option<&str>) {
-        self.openslide_hash_data(value.unwrap_or("").as_bytes());
-        self.openslide_hash_data(&[0]);
-    }
-
-    fn openslide_hash_file_part(&mut self, filename: &Path, offset: u64, size: u64) -> Result<()> {
-        if !self.enabled || size == 0 {
-            return Ok(());
-        }
-        let mut file = File::open(filename)?;
-        let file_len = file.metadata()?.len();
-        let end = offset.checked_add(size).ok_or_else(|| {
-            OpenSlideError::Format(format!(
-                "File range overflows: offset={}, len={}",
-                offset, size
-            ))
-        })?;
-        if end > file_len {
-            return Err(OpenSlideError::Format(format!(
-                "File range extends outside file: offset={}, len={}, file_len={}",
-                offset, size, file_len
-            )));
-        }
-        file.seek(SeekFrom::Start(offset))?;
-        let mut bytes_left = size;
-        let mut buf = [0u8; 4096];
-        while bytes_left > 0 {
-            let to_read = buf.len().min(bytes_left as usize);
-            file.read_exact(&mut buf[..to_read])?;
-            self.openslide_hash_data(&buf[..to_read]);
-            bytes_left -= to_read as u64;
-        }
-        Ok(())
-    }
-
-    fn openslide_hash_disable(&mut self) {
-        self.enabled = false;
-    }
-
-    fn openslide_hash_get_string(self) -> Option<String> {
-        self.enabled.then(|| self.sha256.finalize_hex())
-    }
 }
 
 fn openslide_tifflike_init_properties_and_hash(
@@ -2294,128 +2532,6 @@ fn hash_tiff_level(hash: &mut OpenslideHash, tiff: &TiffFile, dir: usize) -> Res
     Ok(())
 }
 
-struct Sha256 {
-    state: [u32; 8],
-    buffer: [u8; 64],
-    buffer_len: usize,
-    bit_len: u64,
-}
-
-impl Sha256 {
-    fn new() -> Self {
-        Self {
-            state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-                0x5be0cd19,
-            ],
-            buffer: [0; 64],
-            buffer_len: 0,
-            bit_len: 0,
-        }
-    }
-
-    fn update(&mut self, mut data: &[u8]) {
-        self.bit_len = self.bit_len.wrapping_add((data.len() as u64) * 8);
-        if self.buffer_len != 0 {
-            let needed = 64 - self.buffer_len;
-            let take = needed.min(data.len());
-            self.buffer[self.buffer_len..self.buffer_len + take].copy_from_slice(&data[..take]);
-            self.buffer_len += take;
-            data = &data[take..];
-            if self.buffer_len == 64 {
-                let block = self.buffer;
-                self.compress(&block);
-                self.buffer_len = 0;
-            }
-        }
-        while data.len() >= 64 {
-            self.compress(&data[..64]);
-            data = &data[64..];
-        }
-        if !data.is_empty() {
-            self.buffer[..data.len()].copy_from_slice(data);
-            self.buffer_len = data.len();
-        }
-    }
-
-    fn finalize_hex(mut self) -> String {
-        self.buffer[self.buffer_len] = 0x80;
-        self.buffer_len += 1;
-        if self.buffer_len > 56 {
-            self.buffer[self.buffer_len..].fill(0);
-            let block = self.buffer;
-            self.compress(&block);
-            self.buffer_len = 0;
-        }
-        self.buffer[self.buffer_len..56].fill(0);
-        self.buffer[56..64].copy_from_slice(&self.bit_len.to_be_bytes());
-        let block = self.buffer;
-        self.compress(&block);
-
-        let mut out = String::with_capacity(64);
-        for word in self.state {
-            out.push_str(&format!("{word:08x}"));
-        }
-        out
-    }
-
-    fn compress(&mut self, block: &[u8]) {
-        const K: [u32; 64] = [
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-            0xc67178f2,
-        ];
-        let mut w = [0u32; 64];
-        for (i, chunk) in block.chunks_exact(4).take(16).enumerate() {
-            w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        self.state[0] = self.state[0].wrapping_add(a);
-        self.state[1] = self.state[1].wrapping_add(b);
-        self.state[2] = self.state[2].wrapping_add(c);
-        self.state[3] = self.state[3].wrapping_add(d);
-        self.state[4] = self.state[4].wrapping_add(e);
-        self.state[5] = self.state[5].wrapping_add(f);
-        self.state[6] = self.state[6].wrapping_add(g);
-        self.state[7] = self.state[7].wrapping_add(h);
-    }
-}
-
 fn inflate_tiff_deflate(raw: &[u8]) -> Result<Vec<u8>> {
     let mut inflated = Vec::new();
     match ZlibDecoder::new(raw).read_to_end(&mut inflated) {
@@ -2436,12 +2552,8 @@ fn inflate_tiff_deflate(raw: &[u8]) -> Result<Vec<u8>> {
 
 fn decode_uncompressed_tile(area: &Area, width: u32, height: u32, raw: &[u8]) -> Result<LeicaTile> {
     let samples = usize::from(area.samples_per_pixel);
-    let bytes_per_sample = raw_sample_bytes(&area.bits_per_sample)?;
     let pixel_count = width as usize * height as usize;
-    let expected = pixel_count
-        .checked_mul(samples)
-        .and_then(|samples| samples.checked_mul(bytes_per_sample))
-        .ok_or_else(|| OpenSlideError::Decode("Leica tile byte count overflow".into()))?;
+    let expected = expected_tile_bytes(area, width, height)?;
     if raw.len() < expected {
         return Err(OpenSlideError::Decode(format!(
             "Leica tile data truncated: expected at least {} bytes, got {}",
@@ -2453,19 +2565,15 @@ fn decode_uncompressed_tile(area: &Area, width: u32, height: u32, raw: &[u8]) ->
     let mut rgb = Vec::with_capacity(pixel_count * 3);
     match area.photometric {
         PHOTOMETRIC_BLACK_IS_ZERO => {
-            for pixel in raw[..expected].chunks_exact(samples * bytes_per_sample) {
-                let gray = decode_raw_sample(pixel, 0, bytes_per_sample, area.endian);
+            for pixel_index in 0..pixel_count {
+                let gray = decode_contiguous_raw_sample(raw, area, pixel_index, 0)?;
                 rgb.extend_from_slice(&[gray, gray, gray]);
             }
         }
         PHOTOMETRIC_WHITE_IS_ZERO => {
-            for pixel in raw[..expected].chunks_exact(samples * bytes_per_sample) {
-                let gray = 255u8.saturating_sub(decode_raw_sample(
-                    pixel,
-                    0,
-                    bytes_per_sample,
-                    area.endian,
-                ));
+            for pixel_index in 0..pixel_count {
+                let gray =
+                    255u8.saturating_sub(decode_contiguous_raw_sample(raw, area, pixel_index, 0)?);
                 rgb.extend_from_slice(&[gray, gray, gray]);
             }
         }
@@ -2475,11 +2583,11 @@ fn decode_uncompressed_tile(area: &Area, width: u32, height: u32, raw: &[u8]) ->
                     "RGB Leica TIFF tile has fewer than 3 samples per pixel".into(),
                 ));
             }
-            for pixel in raw[..expected].chunks_exact(samples * bytes_per_sample) {
+            for pixel_index in 0..pixel_count {
                 rgb.extend_from_slice(&[
-                    decode_raw_sample(pixel, 0, bytes_per_sample, area.endian),
-                    decode_raw_sample(pixel, 1, bytes_per_sample, area.endian),
-                    decode_raw_sample(pixel, 2, bytes_per_sample, area.endian),
+                    decode_contiguous_raw_sample(raw, area, pixel_index, 0)?,
+                    decode_contiguous_raw_sample(raw, area, pixel_index, 1)?,
+                    decode_contiguous_raw_sample(raw, area, pixel_index, 2)?,
                 ]);
             }
         }
@@ -2489,11 +2597,11 @@ fn decode_uncompressed_tile(area: &Area, width: u32, height: u32, raw: &[u8]) ->
                     "YCbCr Leica TIFF tile has fewer than 3 samples per pixel".into(),
                 ));
             }
-            for pixel in raw[..expected].chunks_exact(samples * bytes_per_sample) {
+            for pixel_index in 0..pixel_count {
                 rgb.extend_from_slice(&ycbcr_to_rgb(
-                    decode_raw_sample(pixel, 0, bytes_per_sample, area.endian),
-                    decode_raw_sample(pixel, 1, bytes_per_sample, area.endian),
-                    decode_raw_sample(pixel, 2, bytes_per_sample, area.endian),
+                    decode_contiguous_raw_sample(raw, area, pixel_index, 0)?,
+                    decode_contiguous_raw_sample(raw, area, pixel_index, 1)?,
+                    decode_contiguous_raw_sample(raw, area, pixel_index, 2)?,
                 ));
             }
         }
@@ -2508,16 +2616,96 @@ fn decode_uncompressed_tile(area: &Area, width: u32, height: u32, raw: &[u8]) ->
     Ok(LeicaTile { width, height, rgb })
 }
 
-fn raw_sample_bytes(bits_per_sample: &[u16]) -> Result<usize> {
-    if bits_per_sample.iter().all(|bits| *bits == 8) {
-        Ok(1)
-    } else if bits_per_sample.iter().all(|bits| *bits == 16) {
-        Ok(2)
-    } else {
-        Err(OpenSlideError::UnsupportedFormat(format!(
-            "Only uniform 8-bit or 16-bit Leica TIFF samples are supported, got {:?}",
+fn validate_supported_bits_per_sample(bits_per_sample: &[u16]) -> Result<()> {
+    if bits_per_sample.is_empty() || bits_per_sample.iter().any(|bits| !matches!(*bits, 8 | 16)) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Only 8-bit or 16-bit Leica TIFF samples are supported, got {:?}",
             bits_per_sample
-        )))
+        )));
+    }
+    Ok(())
+}
+
+fn contiguous_sample_bytes(area: &Area) -> Result<Vec<u8>> {
+    validate_supported_bits_per_sample(&area.bits_per_sample)?;
+    let sample_count = usize::from(area.samples_per_pixel);
+    let mut sample_bytes = Vec::with_capacity(sample_count);
+    for sample in 0..sample_count {
+        let bits = area
+            .bits_per_sample
+            .get(sample)
+            .or_else(|| area.bits_per_sample.first())
+            .copied()
+            .unwrap_or(8);
+        match bits {
+            8 => sample_bytes.push(1),
+            16 => sample_bytes.push(2),
+            other => {
+                return Err(OpenSlideError::UnsupportedFormat(format!(
+                    "Unsupported Leica TIFF bits-per-sample {}",
+                    other
+                )))
+            }
+        }
+    }
+    Ok(sample_bytes)
+}
+
+fn planar_sample_bytes(area: &Area, sample: usize) -> Result<usize> {
+    validate_supported_bits_per_sample(&area.bits_per_sample)?;
+    let bits = area
+        .bits_per_sample
+        .get(sample)
+        .or_else(|| area.bits_per_sample.first())
+        .copied()
+        .unwrap_or(8);
+    match bits {
+        8 => Ok(1),
+        16 => Ok(2),
+        other => Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Leica TIFF bits-per-sample {}",
+            other
+        ))),
+    }
+}
+
+fn decode_contiguous_raw_sample(
+    data: &[u8],
+    area: &Area,
+    pixel_index: usize,
+    sample: usize,
+) -> Result<u8> {
+    let sample_bytes = contiguous_sample_bytes(area)?;
+    let bytes_per_pixel = sample_bytes
+        .iter()
+        .try_fold(0usize, |acc, &bytes| acc.checked_add(usize::from(bytes)))
+        .ok_or_else(|| OpenSlideError::Decode("Leica TIFF sample offset overflow".into()))?;
+    let sample_offset = sample_bytes
+        .get(..sample)
+        .ok_or_else(|| OpenSlideError::Decode("Leica TIFF sample index overflow".into()))?
+        .iter()
+        .try_fold(0usize, |acc, &bytes| acc.checked_add(usize::from(bytes)))
+        .ok_or_else(|| OpenSlideError::Decode("Leica TIFF sample offset overflow".into()))?;
+    let offset = pixel_index
+        .checked_mul(bytes_per_pixel)
+        .and_then(|base| base.checked_add(sample_offset))
+        .ok_or_else(|| OpenSlideError::Decode("Leica TIFF sample offset overflow".into()))?;
+    match sample_bytes
+        .get(sample)
+        .copied()
+        .ok_or_else(|| OpenSlideError::Decode("Leica TIFF sample index overflow".into()))?
+    {
+        1 => data
+            .get(offset)
+            .copied()
+            .ok_or_else(|| OpenSlideError::Decode("Leica TIFF sample is truncated".into())),
+        2 => {
+            let sample = data
+                .get(offset..offset + 2)
+                .ok_or_else(|| OpenSlideError::Decode("Leica TIFF sample is truncated".into()))?;
+            Ok(decode_raw_sample(sample, 0, 2, area.endian))
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -2531,6 +2719,70 @@ fn decode_raw_sample(pixel: &[u8], sample: usize, bytes_per_sample: usize, endia
             Endian::Big => u16::from_be_bytes([pixel[offset], pixel[offset + 1]]),
         };
         (value >> 8) as u8
+    }
+}
+
+fn read_leica_tiff_chunk_bytes(
+    path: &Path,
+    area: &Area,
+    chunk_index_u64: u64,
+    expected_bytes: usize,
+    sample_bytes: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let mut decoder = ::tiff::decoder::Decoder::new(crate::util::_openslide_fopen_std(path)?)
+        .map_err(|err| OpenSlideError::Decode(format!("Leica TIFF decoder setup failed: {err}")))?;
+    decoder.seek_to_image(area.dir).map_err(|err| {
+        OpenSlideError::Decode(format!("Leica TIFF directory seek failed: {err}"))
+    })?;
+    let chunk_index = u32::try_from(chunk_index_u64)
+        .map_err(|_| OpenSlideError::Format("Leica TIFF chunk index too large".into()))?;
+    let image = decoder.read_chunk(chunk_index).map_err(|err| {
+        OpenSlideError::Decode(format!("Leica TIFF compressed chunk decode failed: {err}"))
+    })?;
+    match image {
+        ::tiff::decoder::DecodingResult::U8(data) => {
+            if sample_bytes.iter().any(|&bytes| bytes != 1) {
+                return Err(OpenSlideError::Decode(
+                    "Leica TIFF compressed chunk returned 8-bit samples for non-8-bit area".into(),
+                ));
+            }
+            if data.len() < expected_bytes {
+                return Err(OpenSlideError::Decode(format!(
+                    "Leica TIFF compressed chunk decoded to {} bytes, expected {}",
+                    data.len(),
+                    expected_bytes
+                )));
+            }
+            Ok(data[..expected_bytes].to_vec())
+        }
+        ::tiff::decoder::DecodingResult::U16(data) => {
+            if sample_bytes.iter().any(|&bytes| bytes != 2) {
+                return Err(OpenSlideError::Decode(
+                    "Leica TIFF compressed chunk returned 16-bit samples for mixed-depth area"
+                        .into(),
+                ));
+            }
+            let expected_samples = expected_bytes / 2;
+            if data.len() < expected_samples {
+                return Err(OpenSlideError::Decode(format!(
+                    "Leica TIFF compressed chunk decoded to {} samples, expected {}",
+                    data.len(),
+                    expected_samples
+                )));
+            }
+            let mut out = Vec::with_capacity(expected_bytes);
+            for sample in data.into_iter().take(expected_samples) {
+                match area.endian {
+                    Endian::Little => out.extend_from_slice(&sample.to_le_bytes()),
+                    Endian::Big => out.extend_from_slice(&sample.to_be_bytes()),
+                }
+            }
+            Ok(out)
+        }
+        other => Err(OpenSlideError::Decode(format!(
+            "Unsupported Leica TIFF compressed sample type from tiff crate: {:?}",
+            other
+        ))),
     }
 }
 
@@ -2550,11 +2802,13 @@ fn clamp_u8(value: f32) -> u8 {
 }
 
 fn expected_tile_bytes(area: &Area, width: u32, height: u32) -> Result<usize> {
-    let bytes_per_sample = raw_sample_bytes(&area.bits_per_sample)?;
+    let bytes_per_pixel = contiguous_sample_bytes(area)?
+        .into_iter()
+        .try_fold(0u32, |acc, bytes| acc.checked_add(u32::from(bytes)))
+        .ok_or_else(|| OpenSlideError::Decode("Leica tile byte count overflow".into()))?;
     width
         .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(u32::from(area.samples_per_pixel)))
-        .and_then(|samples| samples.checked_mul(bytes_per_sample as u32))
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
         .map(|bytes| bytes as usize)
         .ok_or_else(|| OpenSlideError::Decode("Leica tile byte count overflow".into()))
 }
@@ -2599,6 +2853,231 @@ fn unpack_packbits(raw: &[u8], expected_len: usize) -> Result<Vec<u8>> {
     }
     out.truncate(expected_len);
     Ok(out)
+}
+
+fn old_jpeg_interchange_stream(
+    path: &Path,
+    area: &Area,
+    width: u32,
+    height: u32,
+    entropy: &[u8],
+) -> Result<Vec<u8>> {
+    if starts_with_soi(entropy) {
+        return Ok(entropy.to_vec());
+    }
+    if area.planar_config != PLANARCONFIG_CONTIG {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Leica old-JPEG planar separate tiles are not supported".into(),
+        ));
+    }
+    if !area.bits_per_sample.iter().all(|bits| *bits == 8) {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Leica old-JPEG tiles require 8-bit samples".into(),
+        ));
+    }
+    if !matches!(area.photometric, PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Leica old-JPEG photometric interpretation {}",
+            area.photometric
+        )));
+    }
+    let tables = area.old_jpeg.as_ref().ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat("Leica old-JPEG tables are missing".into())
+    })?;
+    if tables.proc != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Leica old-JPEG processing mode {}",
+            tables.proc
+        )));
+    }
+    let components = usize::from(area.samples_per_pixel.min(3));
+    if components != 3 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Leica old-JPEG has unsupported SamplesPerPixel {}",
+            area.samples_per_pixel
+        )));
+    }
+    if tables.q_tables.len() < components
+        || tables.dc_tables.len() < components
+        || tables.ac_tables.len() < components
+    {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Leica old-JPEG table tags have fewer than 3 component tables".into(),
+        ));
+    }
+    let jpeg_width = u16::try_from(width).map_err(|_| {
+        OpenSlideError::UnsupportedFormat("Leica old-JPEG width exceeds JPEG limits".into())
+    })?;
+    let jpeg_height = u16::try_from(height).map_err(|_| {
+        OpenSlideError::UnsupportedFormat("Leica old-JPEG height exceeds JPEG limits".into())
+    })?;
+    if area.photometric == PHOTOMETRIC_YCBCR
+        && (area.ycbcr_subsampling.0 > 4 || area.ycbcr_subsampling.1 > 4)
+    {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Leica old-JPEG YCbCr subsampling {}x{}",
+            area.ycbcr_subsampling.0, area.ycbcr_subsampling.1
+        )));
+    }
+
+    let mut jpeg = Vec::with_capacity(entropy.len() + 1024);
+    jpeg.extend_from_slice(&[0xff, 0xd8]);
+    for table_id in 0..components {
+        let table = read_file_range(path, tables.q_tables[table_id], 64)?;
+        write_jpeg_marker_segment(&mut jpeg, 0xdb, 3 + table.len())?;
+        jpeg.push(table_id as u8);
+        jpeg.extend_from_slice(&table);
+    }
+
+    write_jpeg_marker_segment(&mut jpeg, 0xc0, 8 + 3 * components)?;
+    jpeg.push(8);
+    jpeg.extend_from_slice(&jpeg_height.to_be_bytes());
+    jpeg.extend_from_slice(&jpeg_width.to_be_bytes());
+    jpeg.push(components as u8);
+    for component in 0..components {
+        jpeg.push((component + 1) as u8);
+        let sampling = if component == 0 && area.photometric == PHOTOMETRIC_YCBCR {
+            let (sub_x, sub_y) = area.ycbcr_subsampling;
+            ((sub_x as u8) << 4) | sub_y as u8
+        } else {
+            0x11
+        };
+        jpeg.push(sampling);
+        jpeg.push(component as u8);
+    }
+
+    for table_id in 0..components {
+        write_old_jpeg_huffman_table(path, &mut jpeg, false, table_id, tables.dc_tables[table_id])?;
+        write_old_jpeg_huffman_table(path, &mut jpeg, true, table_id, tables.ac_tables[table_id])?;
+    }
+    if let Some(interval) = tables.restart_interval {
+        write_jpeg_marker_segment(&mut jpeg, 0xdd, 4)?;
+        jpeg.extend_from_slice(&interval.to_be_bytes());
+    }
+
+    write_jpeg_marker_segment(&mut jpeg, 0xda, 6 + 2 * components)?;
+    jpeg.push(components as u8);
+    for component in 0..components {
+        jpeg.push((component + 1) as u8);
+        jpeg.push(((component as u8) << 4) | component as u8);
+    }
+    jpeg.extend_from_slice(&[0, 63, 0]);
+    jpeg.extend_from_slice(entropy);
+    if !entropy.ends_with(&[0xff, 0xd9]) {
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+    }
+    Ok(jpeg)
+}
+
+fn old_jpeg_planar_interchange_stream(
+    path: &Path,
+    area: &Area,
+    entropy: &[u8],
+    sample: usize,
+) -> Result<Vec<u8>> {
+    if starts_with_soi(entropy) {
+        return Ok(entropy.to_vec());
+    }
+    if area.planar_config != PLANARCONFIG_SEPARATE {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Leica old-JPEG planar helper requires separate planes".into(),
+        ));
+    }
+    if !area.bits_per_sample.iter().all(|bits| *bits == 8) {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Leica old-JPEG planar tiles require 8-bit samples".into(),
+        ));
+    }
+    if !matches!(area.photometric, PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Leica old-JPEG planar photometric interpretation {}",
+            area.photometric
+        )));
+    }
+    let tables = area.old_jpeg.as_ref().ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat("Leica old-JPEG tables are missing".into())
+    })?;
+    if tables.proc != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Leica old-JPEG processing mode {}",
+            tables.proc
+        )));
+    }
+    if tables.q_tables.len() <= sample
+        || tables.dc_tables.len() <= sample
+        || tables.ac_tables.len() <= sample
+    {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Leica old-JPEG planar sample {} has no matching Q/DC/AC table",
+            sample
+        )));
+    }
+
+    let jpeg_width = u16::try_from(area.tile_width).map_err(|_| {
+        OpenSlideError::UnsupportedFormat("Leica old-JPEG planar width exceeds JPEG limits".into())
+    })?;
+    let jpeg_height = u16::try_from(area.tile_height).map_err(|_| {
+        OpenSlideError::UnsupportedFormat("Leica old-JPEG planar height exceeds JPEG limits".into())
+    })?;
+
+    let mut jpeg = Vec::with_capacity(entropy.len() + 512);
+    jpeg.extend_from_slice(&[0xff, 0xd8]);
+    let table = read_file_range(path, tables.q_tables[sample], 64)?;
+    write_jpeg_marker_segment(&mut jpeg, 0xdb, 3 + table.len())?;
+    jpeg.push(sample as u8);
+    jpeg.extend_from_slice(&table);
+
+    write_jpeg_marker_segment(&mut jpeg, 0xc0, 11)?;
+    jpeg.push(8);
+    jpeg.extend_from_slice(&jpeg_height.to_be_bytes());
+    jpeg.extend_from_slice(&jpeg_width.to_be_bytes());
+    jpeg.push(1);
+    jpeg.push(1);
+    jpeg.push(0x11);
+    jpeg.push(sample as u8);
+
+    write_old_jpeg_huffman_table(path, &mut jpeg, false, sample, tables.dc_tables[sample])?;
+    write_old_jpeg_huffman_table(path, &mut jpeg, true, sample, tables.ac_tables[sample])?;
+    if let Some(interval) = tables.restart_interval {
+        write_jpeg_marker_segment(&mut jpeg, 0xdd, 4)?;
+        jpeg.extend_from_slice(&interval.to_be_bytes());
+    }
+
+    write_jpeg_marker_segment(&mut jpeg, 0xda, 8)?;
+    jpeg.push(1);
+    jpeg.push(1);
+    jpeg.push(((sample as u8) << 4) | sample as u8);
+    jpeg.extend_from_slice(&[0, 63, 0]);
+    jpeg.extend_from_slice(entropy);
+    if !entropy.ends_with(&[0xff, 0xd9]) {
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+    }
+    Ok(jpeg)
+}
+
+fn write_old_jpeg_huffman_table(
+    path: &Path,
+    jpeg: &mut Vec<u8>,
+    ac: bool,
+    table_id: usize,
+    offset: u64,
+) -> Result<()> {
+    let counts = read_file_range(path, offset, 16)?;
+    let symbol_count: usize = counts.iter().map(|&count| usize::from(count)).sum();
+    let symbols = read_file_range(path, offset + 16, symbol_count as u64)?;
+    write_jpeg_marker_segment(jpeg, 0xc4, 3 + counts.len() + symbols.len())?;
+    jpeg.push((u8::from(ac) << 4) | table_id as u8);
+    jpeg.extend_from_slice(&counts);
+    jpeg.extend_from_slice(&symbols);
+    Ok(())
+}
+
+fn write_jpeg_marker_segment(jpeg: &mut Vec<u8>, marker: u8, len: usize) -> Result<()> {
+    let len = u16::try_from(len)
+        .map_err(|_| OpenSlideError::Format("Leica JPEG marker segment is too large".into()))?;
+    jpeg.extend_from_slice(&[0xff, marker]);
+    jpeg.extend_from_slice(&len.to_be_bytes());
+    Ok(())
 }
 
 fn merge_jpeg_tables(tile: &[u8], tables: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -2814,7 +3293,7 @@ fn local_name(name: &str) -> &str {
 }
 
 fn local_name_eq(name: &str, expected: &str) -> bool {
-    local_name(name).eq_ignore_ascii_case(expected)
+    local_name(name) == expected
 }
 
 fn parse_attrs(input: &str) -> Result<HashMap<String, String>> {
@@ -2869,24 +3348,18 @@ fn parse_attrs(input: &str) -> Result<HashMap<String, String>> {
 }
 
 fn required_i64_attr(attrs: &HashMap<String, String>, name: &str) -> Result<i64> {
-    attr_value(attrs, name)
-        .ok_or_else(|| OpenSlideError::Format(format!("Missing Leica XML attribute {}", name)))?
-        .parse::<i64>()
-        .map_err(|_| OpenSlideError::Format(format!("Invalid Leica XML attribute {}", name)))
+    let value = attr_value(attrs, name)
+        .ok_or_else(|| OpenSlideError::Format(format!("Missing Leica XML attribute {}", name)))?;
+    crate::util::_openslide_parse_int64(value)
+        .ok_or_else(|| OpenSlideError::Format(format!("Invalid Leica XML attribute {}", name)))
 }
 
 fn dimension_is_z0(attrs: &HashMap<String, String>) -> bool {
-    attr_value(attrs, "z")
-        .map(|z| z.trim().parse::<i64>().is_ok_and(|z| z == 0))
-        .unwrap_or(true)
+    attr_value(attrs, "z").map(|z| z == "0").unwrap_or(true)
 }
 
 fn attr_value<'a>(attrs: &'a HashMap<String, String>, name: &str) -> Option<&'a String> {
-    attrs.get(name).or_else(|| {
-        attrs
-            .iter()
-            .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value))
-    })
+    attrs.get(name)
 }
 
 fn text_until_end<'a>(xml: &'a str, from: usize, local: &str) -> Option<&'a str> {
@@ -2899,7 +3372,7 @@ fn text_until_end<'a>(xml: &'a str, from: usize, local: &str) -> Option<&'a str>
         let name_end = after
             .find(|ch: char| ch == '>' || ch.is_ascii_whitespace())
             .unwrap_or(after.len());
-        if local_name(&after[..name_end]).eq_ignore_ascii_case(local) {
+        if local_name(&after[..name_end]) == local {
             break pos;
         }
         pos += 2;
@@ -2917,12 +3390,11 @@ fn xml_unescape(value: &str) -> String {
 }
 
 fn xml_text_value(value: &str) -> String {
-    let trimmed = value.trim();
-    let text = trimmed
+    let text = value
         .strip_prefix("<![CDATA[")
         .and_then(|value| value.strip_suffix("]]>"))
-        .unwrap_or(trimmed);
-    xml_unescape(text.trim())
+        .unwrap_or(value);
+    xml_unescape(text)
 }
 
 fn decode_base64(value: &str) -> Option<String> {
@@ -2955,9 +3427,12 @@ fn ceil_div_f64(numerator: f64, denominator: f64) -> u64 {
     (numerator / denominator).ceil() as u64
 }
 
+fn area_coordinate(level_coordinate: f64, area_offset: i64) -> f64 {
+    (level_coordinate - area_offset as f64) as i64 as f64
+}
+
 fn format_float(value: f64) -> String {
-    let s = format!("{:.12}", value);
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    crate::util::_openslide_format_double(value)
 }
 
 #[cfg(test)]
@@ -2983,6 +3458,19 @@ mod tests {
     }
 
     #[test]
+    fn leica_area_coordinate_truncates_after_subtracting_offset() {
+        assert_eq!(area_coordinate(53128.0 / 3.9999746623105956, 9025), 4257.0);
+        assert_eq!(area_coordinate(53132.0 / 15.998891062171904, 2256), 1064.0);
+        assert_eq!(area_coordinate(153300.0 / 255.4999069285211, 639), -38.0);
+    }
+
+    #[test]
+    fn formats_leica_properties_through_shared_openslide_formatter() {
+        assert_eq!(format_float(1.0 / 3.0), "0.33333333333333331");
+        assert_eq!(format_float(123456789012345670.0), "1.2345678901234566e+17");
+    }
+
+    #[test]
     fn rejects_case_variant_brightfield_illumination() {
         let path = temp_path("leica-brightfield-case.scn");
         fs::write(&path, make_leica_tiff()).unwrap();
@@ -3005,6 +3493,22 @@ mod tests {
         assert!(create_levels_from_collection(&tiff, &collection).is_err());
         assert!(!is_brightfield_illumination("bright field"));
         assert!(!is_brightfield_illumination("bright_field"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_spaced_brightfield_illumination_like_upstream() {
+        let path = temp_path("leica-brightfield-spaced.scn");
+        fs::write(&path, make_leica_tiff()).unwrap();
+        let tiff = TiffFile::open(&path).unwrap();
+        let xml = minimal_leica_xml().replace("brightfield", " brightfield ");
+        let collection = parse_xml_description(&xml).unwrap();
+
+        assert_eq!(
+            collection.images[0].illumination_source.as_deref(),
+            Some(" brightfield ")
+        );
+        assert!(create_levels_from_collection(&tiff, &collection).is_err());
         let _ = fs::remove_file(path);
     }
 
@@ -3037,15 +3541,52 @@ mod tests {
             create_levels_from_collection(&tiff, &collection).unwrap();
 
         assert_eq!(properties.get(properties::PROPERTY_OBJECTIVE_POWER), None);
-        assert_eq!(objective_power_value("40"), Some("40"));
-        assert_eq!(objective_power_value("40X"), None);
-        assert_eq!(objective_power_value("40.0"), None);
-        assert_eq!(objective_power_value("Plan Apo 40X"), None);
+
+        let mut props = HashMap::new();
+        for (input, expected) in [
+            ("40", Some("40")),
+            ("+040", Some("40")),
+            (" \t+040", Some("40")),
+            ("40 ", None),
+            ("40X", None),
+            ("40.0", None),
+            ("Plan Apo 40X", None),
+        ] {
+            props.clear();
+            props.insert("leica.objective".into(), input.into());
+            crate::util::_openslide_duplicate_int_prop(
+                &mut props,
+                "leica.objective",
+                properties::PROPERTY_OBJECTIVE_POWER,
+            );
+            assert_eq!(
+                props
+                    .get(properties::PROPERTY_OBJECTIVE_POWER)
+                    .map(String::as_str),
+                expected,
+                "{input}"
+            );
+        }
+
+        props.insert(
+            properties::PROPERTY_OBJECTIVE_POWER.into(),
+            "existing".into(),
+        );
+        props.insert("leica.objective".into(), "40".into());
+        crate::util::_openslide_duplicate_int_prop(
+            &mut props,
+            "leica.objective",
+            properties::PROPERTY_OBJECTIVE_POWER,
+        );
+        assert_eq!(
+            props.get(properties::PROPERTY_OBJECTIVE_POWER),
+            Some(&"existing".to_string())
+        );
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn accepts_case_variant_leica_xml_attributes() {
+    fn rejects_case_variant_leica_xml_attributes_like_upstream() {
         let xml = minimal_leica_xml()
             .replace("barcode=", "Barcode=")
             .replace("sizeX=", "SizeX=")
@@ -3056,16 +3597,23 @@ mod tests {
             .replace("version=", "Version=")
             .replace("ifd=", "IFD=");
 
-        let collection = parse_xml_description(&xml).unwrap();
-
-        assert_eq!(collection.barcode.as_deref(), Some("ABC123"));
-        assert_eq!(collection.nm_across, 4000);
-        assert_eq!(collection.images[0].device_model.as_deref(), Some("AT2"));
-        assert_eq!(collection.images[0].dimensions[0].dir, 0);
+        let err = parse_xml_description(&xml).unwrap_err();
+        assert!(format!("{err}").contains("Missing Leica XML attribute sizeX"));
     }
 
     #[test]
-    fn accepts_case_variant_leica_xml_tags() {
+    fn parses_leica_xml_integer_attributes_like_upstream() {
+        let attrs = HashMap::from([
+            ("sizeX".to_string(), " \t+4000".to_string()),
+            ("sizeY".to_string(), "2000 ".to_string()),
+        ]);
+
+        assert_eq!(required_i64_attr(&attrs, "sizeX").unwrap(), 4000);
+        assert!(required_i64_attr(&attrs, "sizeY").is_err());
+    }
+
+    #[test]
+    fn rejects_case_variant_leica_xml_tags_like_upstream() {
         let xml = minimal_leica_xml()
             .replace("<collection", "<Collection")
             .replace("</collection>", "</Collection>")
@@ -3085,19 +3633,8 @@ mod tests {
             .replace("</numericalAperture>", "</NumericalAperture>")
             .replace("<dimension", "<Dimension");
 
-        let collection = parse_xml_description(&xml).unwrap();
-
-        assert_eq!(collection.barcode.as_deref(), Some("ABC123"));
-        assert_eq!(
-            collection.images[0].creation_date.as_deref(),
-            Some("2026-01-02")
-        );
-        assert_eq!(
-            collection.images[0].illumination_source.as_deref(),
-            Some("brightfield")
-        );
-        assert_eq!(collection.images[0].objective.as_deref(), Some("40"));
-        assert_eq!(collection.images[0].aperture.as_deref(), Some("0.75"));
+        let err = parse_xml_description(&xml).unwrap_err();
+        assert!(format!("{err}").contains("Leica collection is missing"));
     }
 
     #[test]
@@ -3140,16 +3677,37 @@ mod tests {
     }
 
     #[test]
-    fn accepts_numeric_zero_leica_z_plane_variants() {
+    fn rejects_numeric_zero_leica_z_plane_variants_like_upstream() {
         let xml = minimal_leica_xml()
             .replace("z=\"0\"", "z=\"+0\"")
             .replace("ifd=\"0\"", "ifd=\"1\"");
 
+        let err = parse_xml_description(&xml).unwrap_err();
+
+        assert!(format!("{err}").contains("Leica image has no dimensions in z-plane 0"));
+    }
+
+    #[test]
+    fn accepts_missing_leica_z_plane_like_upstream() {
+        let xml = minimal_leica_xml().replace(" z=\"0\"", "");
+
         let collection = parse_xml_description(&xml).unwrap();
 
         assert_eq!(collection.images[0].dimensions.len(), 1);
+        assert_eq!(collection.images[0].dimensions[0].dir, 0);
+    }
+
+    #[test]
+    fn preserves_equal_width_dimension_order_like_upstream() {
+        let xml = minimal_leica_xml().replace(
+            r#"<dimension ifd="0" sizeX="4" sizeY="2" z="0"/>"#,
+            r#"<dimension ifd="1" sizeX="4" sizeY="3" z="0"/><dimension ifd="2" sizeX="4" sizeY="2" z="0"/>"#,
+        );
+
+        let collection = parse_xml_description(&xml).unwrap();
+
         assert_eq!(collection.images[0].dimensions[0].dir, 1);
-        assert_eq!(collection.images[0].dimensions[0].nm_per_pixel, 500.0);
+        assert_eq!(collection.images[0].dimensions[1].dir, 2);
     }
 
     #[test]
@@ -3287,6 +3845,24 @@ mod tests {
     }
 
     #[test]
+    fn macro_associated_image_has_no_icc_profile_like_upstream() {
+        let path = temp_path("leica-associated-no-icc.scn");
+        fs::write(&path, make_leica_tiff_with_xml(&leica_xml_with_macro(), 0)).unwrap();
+
+        let slide = OpenSlide::open(&path).unwrap();
+
+        assert_eq!(slide.associated_image_names(), vec!["macro"]);
+        assert!(slide
+            .properties()
+            .get("openslide.associated.macro.icc-size")
+            .is_none());
+        assert_eq!(slide.associated_image_icc_profile("macro").unwrap(), None);
+        assert_eq!(slide.associated_image_icc_profile("missing").unwrap(), None);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn reads_stripped_leica_area_as_associated_image() {
         let path = temp_path("leica-stripped.bin");
         let strip0 = [10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
@@ -3311,7 +3887,10 @@ mod tests {
             samples_per_pixel: 3,
             bits_per_sample: vec![8, 8, 8],
             planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
             jpeg_tables: None,
+            old_jpeg: None,
         };
 
         let image = read_area_rgba(&path, &area).unwrap();
@@ -3354,13 +3933,320 @@ mod tests {
             samples_per_pixel: 3,
             bits_per_sample: vec![8, 8, 8],
             planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
             jpeg_tables: None,
+            old_jpeg: None,
         };
 
         let image = read_area_rgba(&path, &area).unwrap();
 
         assert_eq!(image.pixel(0, 0), [10, 50, 90, 255]);
         assert_eq!(image.pixel(1, 1), [40, 80, 120, 255]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_planar_16_bit_leica_area_by_downscaling() {
+        let path = temp_path("leica-planar-16-bit.bin");
+        let red = u16_sample_payload(&[0x1200, 0xab00]);
+        let green = u16_sample_payload(&[0x3400, 0xcd00]);
+        let blue = u16_sample_payload(&[0x5600, 0xef00]);
+        fs::write(
+            &path,
+            [red.as_slice(), green.as_slice(), blue.as_slice()].concat(),
+        )
+        .unwrap();
+        let area = Area {
+            dir: 1,
+            endian: Endian::Little,
+            width: 2,
+            height: 1,
+            tile_width: 2,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            is_stripped: false,
+            offset_x: 0,
+            offset_y: 0,
+            tile_offsets: vec![0, red.len() as u64, (red.len() + green.len()) as u64],
+            tile_byte_counts: vec![red.len() as u64, green.len() as u64, blue.len() as u64],
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![16, 16, 16],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let image = read_area_rgba(&path, &area).unwrap();
+
+        assert_eq!(image.pixel(0, 0), [0x12, 0x34, 0x56, 255]);
+        assert_eq!(image.pixel(1, 0), [0xab, 0xcd, 0xef, 255]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_planar_mixed_bits_per_sample_leica_area() {
+        let path = temp_path("leica-planar-mixed-bits.bin");
+        let red = [10u8, 40];
+        let green = u16_sample_payload(&[0x1400, 0x3200]);
+        let blue = [30u8, 60];
+        fs::write(
+            &path,
+            [red.as_slice(), green.as_slice(), blue.as_slice()].concat(),
+        )
+        .unwrap();
+        let area = Area {
+            dir: 1,
+            endian: Endian::Little,
+            width: 2,
+            height: 1,
+            tile_width: 2,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            is_stripped: false,
+            offset_x: 0,
+            offset_y: 0,
+            tile_offsets: vec![0, red.len() as u64, (red.len() + green.len()) as u64],
+            tile_byte_counts: vec![red.len() as u64, green.len() as u64, blue.len() as u64],
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 16, 8],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let image = read_area_rgba(&path, &area).unwrap();
+
+        assert_eq!(image.pixel(0, 0), [10, 0x14, 30, 255]);
+        assert_eq!(image.pixel(1, 0), [40, 0x32, 60, 255]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_planar_16_bit_ycbcr_leica_area_by_downscaling() {
+        let path = temp_path("leica-planar-ycbcr-16-bit.bin");
+        let y = u16_sample_payload(&[0x4c00, 0x9600]);
+        let cb = u16_sample_payload(&[0x5500, 0x8000]);
+        let cr = u16_sample_payload(&[0xff00, 0x8000]);
+        fs::write(&path, [y.as_slice(), cb.as_slice(), cr.as_slice()].concat()).unwrap();
+        let area = Area {
+            dir: 1,
+            endian: Endian::Little,
+            width: 2,
+            height: 1,
+            tile_width: 2,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            is_stripped: false,
+            offset_x: 0,
+            offset_y: 0,
+            tile_offsets: vec![0, y.len() as u64, (y.len() + cb.len()) as u64],
+            tile_byte_counts: vec![y.len() as u64, cb.len() as u64, cr.len() as u64],
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_YCBCR,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![16, 16, 16],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let image = read_area_rgba(&path, &area).unwrap();
+
+        assert_eq!(image.pixel(0, 0), [254, 0, 0, 255]);
+        assert_eq!(image.pixel(1, 0), [150, 150, 150, 255]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_planar_jpeg_leica_area() {
+        let path = temp_path("leica-planar-jpeg.bin");
+        fs::write(
+            &path,
+            [ONE_PIXEL_JPEG, ONE_PIXEL_JPEG, ONE_PIXEL_JPEG].concat(),
+        )
+        .unwrap();
+        let (expected_rgb, expected_w, expected_h) =
+            decode::decode_rgb_libjpeg(ImageFormat::Jpeg, ONE_PIXEL_JPEG).unwrap();
+        assert_eq!((expected_w, expected_h), (1, 1));
+        let expected = expected_rgb[0];
+        let area = Area {
+            dir: 1,
+            endian: Endian::Little,
+            width: 1,
+            height: 1,
+            tile_width: 1,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            is_stripped: false,
+            offset_x: 0,
+            offset_y: 0,
+            tile_offsets: vec![
+                0,
+                ONE_PIXEL_JPEG.len() as u64,
+                (ONE_PIXEL_JPEG.len() * 2) as u64,
+            ],
+            tile_byte_counts: vec![ONE_PIXEL_JPEG.len() as u64; 3],
+            compression: COMPRESSION_JPEG,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let image = read_area_rgba(&path, &area).unwrap();
+
+        assert_eq!(image.pixel(0, 0), [expected, expected, expected, 255]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_planar_jpeg2000_leica_area() {
+        let path = temp_path("leica-planar-jp2k.bin");
+        let red = encoded_jpeg2000_codestream(&[10, 40, 70, 100], 2, 2, 1);
+        let green = encoded_jpeg2000_codestream(&[20, 50, 80, 110], 2, 2, 1);
+        let blue = encoded_jpeg2000_codestream(&[30, 60, 90, 120], 2, 2, 1);
+        fs::write(
+            &path,
+            [red.as_slice(), green.as_slice(), blue.as_slice()].concat(),
+        )
+        .unwrap();
+        let area = Area {
+            dir: 1,
+            endian: Endian::Little,
+            width: 2,
+            height: 2,
+            tile_width: 2,
+            tile_height: 2,
+            tiles_across: 1,
+            tiles_down: 1,
+            is_stripped: false,
+            offset_x: 0,
+            offset_y: 0,
+            tile_offsets: vec![0, red.len() as u64, (red.len() + green.len()) as u64],
+            tile_byte_counts: vec![red.len() as u64, green.len() as u64, blue.len() as u64],
+            compression: COMPRESSION_JP2K,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let image = read_area_rgba(&path, &area).unwrap();
+
+        assert_eq!(image.pixel(0, 0), [10, 20, 30, 255]);
+        assert_eq!(image.pixel(1, 1), [100, 110, 120, 255]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_planar_old_jpeg_leica_area() {
+        let path = temp_path("leica-planar-old-jpeg.bin");
+        fs::write(
+            &path,
+            [ONE_PIXEL_JPEG, ONE_PIXEL_JPEG, ONE_PIXEL_JPEG].concat(),
+        )
+        .unwrap();
+        let (expected_rgb, expected_w, expected_h) =
+            decode::decode_rgb_libjpeg(ImageFormat::Jpeg, ONE_PIXEL_JPEG).unwrap();
+        assert_eq!((expected_w, expected_h), (1, 1));
+        let expected = expected_rgb[0];
+        let area = Area {
+            dir: 1,
+            endian: Endian::Little,
+            width: 1,
+            height: 1,
+            tile_width: 1,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            is_stripped: false,
+            offset_x: 0,
+            offset_y: 0,
+            tile_offsets: vec![
+                0,
+                ONE_PIXEL_JPEG.len() as u64,
+                (ONE_PIXEL_JPEG.len() * 2) as u64,
+            ],
+            tile_byte_counts: vec![ONE_PIXEL_JPEG.len() as u64; 3],
+            compression: COMPRESSION_OLD_JPEG,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let image = read_area_rgba(&path, &area).unwrap();
+
+        assert_eq!(image.pixel(0, 0), [expected, expected, expected, 255]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_jpeg2000_leica_area() {
+        let path = temp_path("leica-jp2k.bin");
+        let jp2k = encoded_jpeg2000_codestream(
+            &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120],
+            2,
+            2,
+            3,
+        );
+        fs::write(&path, &jp2k).unwrap();
+        let area = Area {
+            dir: 1,
+            endian: Endian::Little,
+            width: 2,
+            height: 2,
+            tile_width: 2,
+            tile_height: 2,
+            tiles_across: 1,
+            tiles_down: 1,
+            is_stripped: false,
+            offset_x: 0,
+            offset_y: 0,
+            tile_offsets: vec![0],
+            tile_byte_counts: vec![jp2k.len() as u64],
+            compression: COMPRESSION_JP2K_RGB,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let image = read_area_rgba(&path, &area).unwrap();
+
+        assert_eq!(image.pixel(0, 0), [10, 20, 30, 255]);
+        assert_eq!(image.pixel(1, 1), [100, 110, 120, 255]);
         let _ = fs::remove_file(path);
     }
 
@@ -3392,13 +4278,115 @@ mod tests {
             samples_per_pixel: 3,
             bits_per_sample: vec![16, 16, 16],
             planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
             jpeg_tables: None,
+            old_jpeg: None,
         };
 
         let image = read_area_rgba(&path, &area).unwrap();
 
         assert_eq!(image.pixel(0, 0), [0x12, 0x34, 0x56, 255]);
         assert_eq!(image.pixel(1, 0), [0xab, 0xcd, 0xef, 255]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_mixed_bits_per_sample_leica_area() {
+        let path = temp_path("leica-mixed-bits.bin");
+        let raw = [10, 0x34, 0x12, 30, 40, 0xcd, 0xab, 60];
+        fs::write(&path, raw).unwrap();
+        let area = Area {
+            dir: 1,
+            endian: Endian::Little,
+            width: 2,
+            height: 1,
+            tile_width: 2,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            is_stripped: false,
+            offset_x: 0,
+            offset_y: 0,
+            tile_offsets: vec![0],
+            tile_byte_counts: vec![raw.len() as u64],
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 16, 8],
+            planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
+            jpeg_tables: None,
+            old_jpeg: None,
+        };
+
+        let image = read_area_rgba(&path, &area).unwrap();
+
+        assert_eq!(image.pixel(0, 0), [10, 0x12, 30, 255]);
+        assert_eq!(image.pixel(1, 0), [40, 0xab, 60, 255]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_deflate_predictor_leica_area() {
+        use tiff::encoder::{colortype, Compression, DeflateLevel, Predictor, TiffEncoder};
+
+        let path = temp_path("leica-deflate-predictor.tif");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut encoder = TiffEncoder::new(file)
+                .unwrap()
+                .with_compression(Compression::Deflate(DeflateLevel::default()))
+                .with_predictor(Predictor::Horizontal);
+            let image = encoder.new_image::<colortype::RGB8>(3, 2).unwrap();
+            image
+                .write_data(&[
+                    10, 20, 30, 40, 50, 60, 70, 80, 90, 11, 21, 31, 41, 51, 61, 71, 81, 91,
+                ])
+                .unwrap();
+        }
+        let tiff = TiffFile::open(&path).unwrap();
+        let area = read_area(
+            &tiff,
+            &Dimension {
+                dir: 0,
+                width: 3,
+                height: 2,
+                nm_per_pixel: 250.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(area.predictor, 2);
+        let area = Area {
+            dir: area.dir,
+            endian: area.endian,
+            width: area.width,
+            height: area.height,
+            tile_width: area.tile_width,
+            tile_height: area.tile_height,
+            tiles_across: area.tiles_across,
+            tiles_down: area.tiles_down,
+            is_stripped: area.is_stripped,
+            offset_x: 0,
+            offset_y: 0,
+            tile_offsets: area.tile_offsets,
+            tile_byte_counts: area.tile_byte_counts,
+            compression: area.compression,
+            photometric: area.photometric,
+            samples_per_pixel: area.samples_per_pixel,
+            bits_per_sample: area.bits_per_sample,
+            planar_config: area.planar_config,
+            predictor: area.predictor,
+            ycbcr_subsampling: area.ycbcr_subsampling,
+            jpeg_tables: area.jpeg_tables,
+            old_jpeg: area.old_jpeg,
+        };
+
+        let image = read_area_rgba(&path, &area).unwrap();
+
+        assert_eq!(image.pixel(0, 0), [10, 20, 30, 255]);
+        assert_eq!(image.pixel(2, 1), [71, 81, 91, 255]);
         let _ = fs::remove_file(path);
     }
 
@@ -3430,7 +4418,10 @@ mod tests {
             samples_per_pixel: 3,
             bits_per_sample: vec![16, 16, 16],
             planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
+            ycbcr_subsampling: (1, 1),
             jpeg_tables: None,
+            old_jpeg: None,
         };
 
         let image = read_area_rgba(&path, &area).unwrap();
@@ -3439,6 +4430,28 @@ mod tests {
         assert_eq!(image.pixel(1, 0), [0xab, 0xcd, 0xef, 255]);
         let _ = fs::remove_file(path);
     }
+
+    fn u16_sample_payload(samples: &[u16]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for sample in samples {
+            raw.extend_from_slice(&sample.to_le_bytes());
+        }
+        raw
+    }
+
+    const ONE_PIXEL_JPEG: &[u8] = &[
+        0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07,
+        0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b, 0x0c, 0x19, 0x12,
+        0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20, 0x24, 0x2e, 0x27,
+        0x20, 0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31, 0x34, 0x34, 0x34,
+        0x1f, 0x27, 0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff, 0xc0, 0x00, 0x11,
+        0x08, 0x00, 0x01, 0x00, 0x01, 0x03, 0x52, 0x11, 0x00, 0x47, 0x11, 0x00, 0x42, 0x11, 0x00,
+        0xff, 0xc4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+        0xda, 0x00, 0x0c, 0x03, 0x52, 0x00, 0x47, 0x00, 0x42, 0x00, 0x00, 0x3f, 0x00, 0x7f, 0x3f,
+        0x9f, 0xdf, 0xff, 0xd9,
+    ];
 
     fn temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -3458,6 +4471,12 @@ mod tests {
     fn minimal_leica_xml() -> String {
         format!(
             r#"<scn xmlns="{LEICA_XMLNS_2}"><collection sizeX="4000" sizeY="2000"><barcode>QUJDMTIz</barcode><image><creationDate>2026-01-02</creationDate><device model="AT2" version="1"/><view sizeX="2000" sizeY="1000" offsetX="0" offsetY="0"/><scanSettings><illuminationSettings><illuminationSource>brightfield</illuminationSource><numericalAperture>0.75</numericalAperture></illuminationSettings><objectiveSettings><objective>40</objective></objectiveSettings></scanSettings><pixels><dimension ifd="0" sizeX="4" sizeY="2" z="0"/></pixels></image></collection></scn>"#
+        )
+    }
+
+    fn leica_xml_with_macro() -> String {
+        format!(
+            r#"<scn xmlns="{LEICA_XMLNS_2}"><collection sizeX="4000" sizeY="2000"><barcode>QUJDMTIz</barcode><image><creationDate>2026-01-02</creationDate><device model="AT2" version="1"/><view sizeX="2000" sizeY="1000" offsetX="0" offsetY="0"/><scanSettings><illuminationSettings><illuminationSource>brightfield</illuminationSource><numericalAperture>0.75</numericalAperture></illuminationSettings><objectiveSettings><objective>40</objective></objectiveSettings></scanSettings><pixels><dimension ifd="0" sizeX="4" sizeY="2" z="0"/></pixels></image><image><view sizeX="4000" sizeY="2000" offsetX="0" offsetY="0"/><scanSettings><illuminationSettings><illuminationSource>brightfield</illuminationSource></illuminationSettings></scanSettings><pixels><dimension ifd="0" sizeX="4" sizeY="2" z="0"/></pixels></image></collection></scn>"#
         )
     }
 
@@ -3605,5 +4624,19 @@ mod tests {
             _ => entry[8..12].copy_from_slice(&value.to_le_bytes()),
         }
         entries.push(entry);
+    }
+
+    fn encoded_jpeg2000_codestream(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        components: u8,
+    ) -> Vec<u8> {
+        let options = dicom_toolkit_jpeg2000::EncodeOptions {
+            num_decomposition_levels: 0,
+            ..dicom_toolkit_jpeg2000::EncodeOptions::default()
+        };
+        dicom_toolkit_jpeg2000::encode(pixels, width, height, components, 8, false, &options)
+            .expect("encode JPEG 2000 fixture")
     }
 }

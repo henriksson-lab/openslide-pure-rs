@@ -1,0 +1,104 @@
+schema_version = 1
+
+[[reader]]
+id = "aperio"
+name = "Aperio"
+status = "Fixture-verified (SVS subset)"
+evidence = ["aperio-local-77917", "aperio-public-cmu-1-small-region"]
+blockers = []
+
+[[reader]]
+id = "dicom"
+name = "DICOM"
+status = "Experimental (limited exact data)"
+evidence = ["dicom-local-readable-single-level"]
+blockers = ["dicom-public-leica-4"]
+
+[[reader]]
+id = "hamamatsu-ndpi"
+name = "Hamamatsu NDPI"
+status = "Fixture-verified (CMU-1/2/3 subset)"
+evidence = [
+  "hamamatsu-ndpi-local-cmu-1",
+  "hamamatsu-ndpi-local-cmu-2",
+  "hamamatsu-ndpi-local-cmu-3",
+  "hamamatsu-ndpi-public-cmu-1",
+]
+blockers = []
+
+[[reader]]
+id = "hamamatsu-vms"
+name = "Hamamatsu VMS"
+status = "Fixture-verified (CMU-1/2/3 subset)"
+evidence = [
+  "hamamatsu-vms-local-cmu-1",
+  "hamamatsu-vms-local-cmu-2",
+  "hamamatsu-vms-local-cmu-3",
+  "hamamatsu-vms-public-cmu-1",
+]
+blockers = []
+
+[[reader]]
+id = "hamamatsu-vmu-ngr"
+name = "Hamamatsu VMU/NGR"
+status = "Experimental (no real fixture)"
+evidence = []
+blockers = ["hamamatsu-vmu-ngr-missing"]
+
+[[reader]]
+id = "leica"
+name = "Leica"
+status = "Fixture-verified (SCN subset)"
+evidence = ["leica-local-leica-1", "leica-local-leica-2"]
+blockers = ["leica-local-leica-3", "leica-public-fluorescence-1"]
+
+[[reader]]
+id = "mirax"
+name = "MIRAX / 3DHISTECH"
+status = "Fixture-verified (brightfield and fluorescence public fixtures)"
+evidence = ["mirax-public-cmu-1-saved-1-16", "mirax-public-fluorescence-2"]
+blockers = []
+
+[[reader]]
+id = "philips"
+name = "Philips"
+status = "Fixture-verified (Philips-1)"
+evidence = ["philips-public-philips-1"]
+blockers = []
+
+[[reader]]
+id = "sakura"
+name = "Sakura"
+status = "Experimental (no fixture)"
+evidence = []
+blockers = ["sakura-missing"]
+
+[[reader]]
+id = "trestle"
+name = "Trestle"
+status = "Fixture-verified (CMU-1)"
+evidence = ["trestle-local-cmu-1", "trestle-public-cmu-1"]
+blockers = []
+
+[[reader]]
+id = "ventana"
+name = "Ventana"
+status = "Fixture-verified (BIF AOI subset)"
+evidence = ["ventana-local-os-1", "ventana-local-os-2"]
+blockers = ["ventana-local-ventana-1", "ventana-public-ventana-1"]
+
+[[reader]]
+id = "zeiss"
+name = "Zeiss"
+snapshot_name = "Zeiss CZI"
+status = "Experimental (reference blocked)"
+evidence = []
+blockers = ["zeiss-public-jxr-and-zstd"]
+
+[[reader]]
+id = "generic-tiff"
+name = "Generic tiled TIFF"
+snapshot_name = "Generic TIFF"
+status = "Fixture-verified (CMU-1.tiff)"
+evidence = ["generic-tiff-public-cmu-1"]
+blockers = ["generic-tiff-local-zackthecat"]

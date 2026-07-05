@@ -202,6 +202,47 @@ rgb_finish:
     return result;
 }
 
+int osr_jpeg_dimensions(const unsigned char *data,
+                        size_t len,
+                        unsigned int *width,
+                        unsigned int *height,
+                        char *err,
+                        size_t err_len) {
+    struct jpeg_decompress_struct cinfo;
+    struct osr_jpeg_error jerr;
+    int result = 0;
+
+    if (data == NULL || width == NULL || height == NULL) {
+        osr_set_error(err, err_len, "invalid null JPEG dimensions argument");
+        return 0;
+    }
+
+    memset(&cinfo, 0, sizeof(cinfo));
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = osr_jpeg_error_exit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        osr_set_error(err, err_len, jerr.message);
+        jpeg_destroy_decompress(&cinfo);
+        return 0;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, data, (unsigned long)len);
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        osr_set_error(err, err_len, "Couldn't read JPEG header");
+        goto dimensions_finish;
+    }
+    jpeg_calc_output_dimensions(&cinfo);
+    *width = cinfo.output_width;
+    *height = cinfo.output_height;
+    result = 1;
+
+dimensions_finish:
+    jpeg_destroy_decompress(&cinfo);
+    return result;
+}
+
 int osr_jpeg_decode_tiff_ycbcr_rgb(const unsigned char *data,
                                    size_t len,
                                    unsigned int expected_w,

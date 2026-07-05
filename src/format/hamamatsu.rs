@@ -1,6 +1,6 @@
 use std::collections::{hash_map::Entry, HashMap};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -15,19 +15,18 @@ use crate::properties;
 
 const GROUP_VMS: &str = "Virtual Microscope Specimen";
 const GROUP_VMU: &str = "Uncompressed Virtual Microscope Specimen";
-const KEY_FILE_MAX_SIZE: u64 = 64 << 10;
+const KEY_FILE_MAX_SIZE: i32 = 64 << 10;
 
 const KEY_MAP_FILE: &str = "MapFile";
 const KEY_IMAGE_FILE: &str = "ImageFile";
 const KEY_NUM_JPEG_COLS: &str = "NoJpegColumns";
 const KEY_NUM_JPEG_ROWS: &str = "NoJpegRows";
 const KEY_MACRO_IMAGE: &str = "MacroImage";
-const KEY_LABEL_IMAGE: &str = "LabelImage";
-const KEY_THUMBNAIL_IMAGE: &str = "ThumbnailImage";
 const KEY_PHYSICAL_WIDTH: &str = "PhysicalWidth";
 const KEY_PHYSICAL_HEIGHT: &str = "PhysicalHeight";
 const KEY_BITS_PER_PIXEL: &str = "BitsPerPixel";
 const KEY_PIXEL_ORDER: &str = "PixelOrder";
+const NGR_TILE_HEIGHT: u64 = 64;
 
 const TIFFTAG_IMAGEWIDTH: u16 = 256;
 const TIFFTAG_IMAGELENGTH: u16 = 257;
@@ -78,20 +77,23 @@ const NDPI_PROPERTY_MAP: u16 = 65449;
 
 /// Check whether a path looks like a Hamamatsu VMS, VMU, or NDPI slide.
 pub fn detect(path: &Path) -> bool {
-    hamamatsu_vms_vmu_detect(path) || hamamatsu_ndpi_detect(path)
+    detect_vms_vmu(path) || detect_ndpi(path)
 }
 
-/// Try to open a Hamamatsu slide, returning a metadata-capable backend.
-pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
-    if hamamatsu_vms_vmu_detect(path) {
-        return Ok(Box::new(HamamatsuSlide::hamamatsu_vms_vmu_open(path)?));
-    }
-    if hamamatsu_ndpi_detect(path) {
-        return Ok(Box::new(HamamatsuSlide::hamamatsu_ndpi_open(path)?));
-    }
-    Err(OpenSlideError::UnsupportedFormat(
-        "Not a Hamamatsu NDPI/VMS/VMU file".into(),
-    ))
+pub(crate) fn detect_vms_vmu(path: &Path) -> bool {
+    hamamatsu_vms_vmu_detect(path)
+}
+
+pub(crate) fn open_vms_vmu(path: &Path) -> Result<Box<dyn SlideBackend>> {
+    Ok(Box::new(HamamatsuSlide::hamamatsu_vms_vmu_open(path)?))
+}
+
+pub(crate) fn detect_ndpi(path: &Path) -> bool {
+    hamamatsu_ndpi_detect(path)
+}
+
+pub(crate) fn open_ndpi(path: &Path) -> Result<Box<dyn SlideBackend>> {
+    Ok(Box::new(HamamatsuSlide::hamamatsu_ndpi_open(path)?))
 }
 
 #[derive(Debug)]
@@ -153,21 +155,27 @@ struct NdpiLevel {
 
 #[derive(Debug)]
 enum AssociatedImage {
-    WholeFile(PathBuf),
+    WholeFile {
+        path: PathBuf,
+        width: u32,
+        height: u32,
+    },
     FileRange {
         path: PathBuf,
         offset: u64,
         length: u64,
+        width: u32,
+        height: u32,
     },
 }
 
 impl HamamatsuSlide {
     fn hamamatsu_vms_vmu_open(path: &Path) -> Result<Self> {
         let ini = read_key_file(path)?;
-        let group = if let Some(group) = resolve_group(&ini, GROUP_VMS) {
-            group
-        } else if let Some(group) = resolve_group(&ini, GROUP_VMU) {
-            group
+        let group = if has_group(&ini, GROUP_VMS) {
+            GROUP_VMS
+        } else if has_group(&ini, GROUP_VMU) {
+            GROUP_VMU
         } else {
             return Err(OpenSlideError::UnsupportedFormat(
                 "Not a VMS or VMU key file".into(),
@@ -178,76 +186,41 @@ impl HamamatsuSlide {
         let mut properties = HashMap::new();
         properties.insert(properties::PROPERTY_VENDOR.into(), "hamamatsu".into());
 
-        let levels = if group.eq_ignore_ascii_case(GROUP_VMS) {
-            hamamatsu_vms_part2(path, &ini, &group, dirname)?
+        let levels = if group == GROUP_VMS {
+            hamamatsu_vms_part2(path, &ini, group, dirname)?
         } else {
-            hamamatsu_vmu_part2(&ini, &group, dirname)?
+            hamamatsu_vmu_part2(&ini, group, dirname)?
         };
         if let Some(level0) = levels.first() {
-            add_properties(&ini, &group, level0, &mut properties);
+            add_properties(&ini, group, level0, &mut properties);
         }
 
         let mut associated_images = HashMap::new();
-        for (keys, name) in [
-            (
-                &[
-                    KEY_MACRO_IMAGE,
-                    "MacroImageFile",
-                    "MacroImageName",
-                    "Macro",
-                    "MacroFile",
-                    "MacroFileName",
-                    "OverviewImage",
-                    "OverviewImageFile",
-                    "Overview",
-                    "ReferenceImage",
-                    "ReferenceImageFile",
-                ] as &[&str],
-                "macro",
-            ),
-            (
-                &[
-                    KEY_LABEL_IMAGE,
-                    "LabelImageFile",
-                    "LabelImageName",
-                    "LabelFile",
-                    "LabelFileName",
-                    "BarcodeImage",
-                    "BarcodeImageFile",
-                    "BarcodeFile",
-                    "BarcodeFileName",
-                    "Barcode",
-                    "Label",
-                ],
-                "label",
-            ),
-            (
-                &[
-                    KEY_THUMBNAIL_IMAGE,
-                    "ThumbnailImageFile",
-                    "ThumbnailImageName",
-                    "ThumbImage",
-                    "ThumbImageFile",
-                    "PreviewImage",
-                    "PreviewImageFile",
-                    "PreviewFile",
-                    "PreviewFileName",
-                    "SlidePreview",
-                    "SlidePreviewImage",
-                    "SlidePreviewImageFile",
-                    "Thumbnail",
-                    "Thumb",
-                ],
-                "thumbnail",
-            ),
-        ] {
-            if let Some(image_path) = get_key_value_any(&ini, &group, keys) {
-                let Some(image_path) = resolve_sidecar_path(dirname, &image_path) else {
-                    continue;
-                };
-                associated_images.insert(name.into(), AssociatedImage::WholeFile(image_path));
+        if let Some(image_path) = get_key_value_any(&ini, &group, &[KEY_MACRO_IMAGE]) {
+            if let Some(image_path) = resolve_sidecar_path(dirname, &image_path) {
+                let mut file = crate::util::_openslide_fopen(&image_path)?;
+                let len =
+                    u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+                        OpenSlideError::Format(format!(
+                            "Negative file size for {}",
+                            image_path.display()
+                        ))
+                    })?;
+                let data = crate::util::read_file_range(&image_path, 0, len)?;
+                let (width, height) = jpeg_dimensions(&data).map_err(|err| {
+                    OpenSlideError::Format(format!("Can't read macro associated image: {err}"))
+                })?;
+                associated_images.insert(
+                    "macro".into(),
+                    AssociatedImage::WholeFile {
+                        path: image_path,
+                        width,
+                        height,
+                    },
+                );
             }
         }
+        add_associated_properties(&mut properties, &associated_images);
 
         Ok(Self {
             properties,
@@ -312,12 +285,18 @@ impl HamamatsuSlide {
                     dir.first_uint(TIFFTAG_STRIPBYTECOUNTS),
                 ) {
                     let offset = fix_offset_ndpi(dir.offset, offset);
+                    let data = crate::util::read_file_range(path, offset, length)?;
+                    let (macro_width, macro_height) = jpeg_dimensions(&data).map_err(|err| {
+                        OpenSlideError::Format(format!("Can't read macro associated image: {err}"))
+                    })?;
                     associated_images.insert(
                         "macro".into(),
                         AssociatedImage::FileRange {
                             path: path.to_path_buf(),
                             offset,
                             length,
+                            width: macro_width,
+                            height: macro_height,
                         },
                     );
                 }
@@ -335,6 +314,7 @@ impl HamamatsuSlide {
         if let Some(dir0) = tiff.dirs.first() {
             ndpi_set_props(dir0, &mut properties);
         }
+        add_associated_properties(&mut properties, &associated_images);
 
         Ok(Self {
             properties,
@@ -376,6 +356,18 @@ impl SlideBackend for HamamatsuSlide {
         self.levels
             .get(level as usize)
             .map(|level| level.downsample)
+    }
+
+    fn level_tile_dimensions(&self, level: u32) -> Option<(u64, u64)> {
+        match &self.levels.get(level as usize)?.source {
+            LevelSource::Vms { tile_w, tile_h, .. }
+            | LevelSource::Ndpi(NdpiLevel { tile_w, tile_h, .. })
+            | LevelSource::NdpiScaled(NdpiLevel { tile_w, tile_h, .. }) => {
+                Some((u64::from(*tile_w), u64::from(*tile_h)))
+            }
+            LevelSource::VmuNgr { column_width, .. } => Some((*column_width, NGR_TILE_HEIGHT)),
+            LevelSource::Unsupported => None,
+        }
     }
 
     fn read_region(
@@ -521,24 +513,40 @@ impl SlideBackend for HamamatsuSlide {
     }
 
     fn associated_image_names(&self) -> Vec<&str> {
-        self.associated_images.keys().map(|s| s.as_str()).collect()
+        let mut names = self
+            .associated_images
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    fn associated_image_dimensions(&self, name: &str) -> Option<(u64, u64)> {
+        match self.associated_images.get(name)? {
+            AssociatedImage::WholeFile { width, height, .. }
+            | AssociatedImage::FileRange { width, height, .. } => {
+                Some((u64::from(*width), u64::from(*height)))
+            }
+        }
     }
 
     fn read_associated_image(&self, name: &str) -> Result<RgbaImage> {
         let data = match self.associated_images.get(name) {
-            Some(AssociatedImage::WholeFile(path)) => fs::read(path)?,
+            Some(AssociatedImage::WholeFile { path, .. }) => {
+                let mut file = crate::util::_openslide_fopen(path)?;
+                let len =
+                    u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+                        OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+                    })?;
+                crate::util::read_file_range(path, 0, len)?
+            }
             Some(AssociatedImage::FileRange {
                 path,
                 offset,
                 length,
-            }) => {
-                let mut file = fs::File::open(path)?;
-                file.seek(SeekFrom::Start(*offset))?;
-                let mut reader = file.take(*length);
-                let mut data = Vec::with_capacity((*length).min(16 << 20) as usize);
-                reader.read_to_end(&mut data)?;
-                data
-            }
+                ..
+            }) => crate::util::read_file_range(path, *offset, *length)?,
             None => {
                 return Err(OpenSlideError::InvalidArgument(format!(
                     "No associated image '{}'",
@@ -546,7 +554,7 @@ impl SlideBackend for HamamatsuSlide {
                 )));
             }
         };
-        decode::decode_to_rgba(detect_image_format(&data)?, &data)
+        decode::decode_to_rgba(ImageFormat::Jpeg, &data)
     }
 
     fn debug_grid_tile_count(&self, _channel: u32, _level: u32) -> usize {
@@ -569,9 +577,9 @@ fn hamamatsu_vms_vmu_detect(path: &Path) -> bool {
 
 fn hamamatsu_ndpi_detect(path: &Path) -> bool {
     let result = (|| -> Result<bool> {
-        let mut file = fs::File::open(path)?;
+        let mut file = crate::util::_openslide_fopen(path)?;
         let mut header = [0u8; 16];
-        file.read_exact(&mut header[..8])?;
+        crate::util::_openslide_fread_exact(&mut file, &mut header[..8])?;
 
         let endian = match &header[0..2] {
             b"II" => Endian::Little,
@@ -582,7 +590,7 @@ fn hamamatsu_ndpi_detect(path: &Path) -> bool {
         let (bigtiff, first_ifd) = match magic {
             42 => (false, read_u32_from_chunk(&header[4..8], endian) as u64),
             43 => {
-                file.read_exact(&mut header[8..16])?;
+                crate::util::_openslide_fread_exact(&mut file, &mut header[8..16])?;
                 if read_u16_from_chunk(&header[4..6], endian) != 8 {
                     return Err(OpenSlideError::Format("Unsupported BigTIFF header".into()));
                 }
@@ -591,15 +599,20 @@ fn hamamatsu_ndpi_detect(path: &Path) -> bool {
             _ => return Err(OpenSlideError::Format("Not a TIFF file".into())),
         };
 
-        file.seek(SeekFrom::Start(first_ifd))?;
+        let first_ifd = i64::try_from(first_ifd).map_err(|_| {
+            OpenSlideError::Format(format!(
+                "Hamamatsu NDPI first IFD offset does not fit OpenSlide seek: offset={first_ifd}"
+            ))
+        })?;
+        crate::util::_openslide_fseek(&mut file, first_ifd, crate::util::OpenSlideSeekWhence::Set)?;
 
         let count = if bigtiff {
             let mut bytes = [0u8; 8];
-            file.read_exact(&mut bytes)?;
+            crate::util::_openslide_fread_exact(&mut file, &mut bytes)?;
             read_u64_from_chunk(&bytes, endian)
         } else {
             let mut bytes = [0u8; 2];
-            file.read_exact(&mut bytes)?;
+            crate::util::_openslide_fread_exact(&mut file, &mut bytes)?;
             u64::from(read_u16_from_chunk(&bytes, endian))
         };
         let count_usize = usize::try_from(count)
@@ -608,7 +621,7 @@ fn hamamatsu_ndpi_detect(path: &Path) -> bool {
 
         for _ in 0..count_usize {
             let mut entry = vec![0u8; entry_size];
-            file.read_exact(&mut entry)?;
+            crate::util::_openslide_fread_exact(&mut file, &mut entry)?;
             let tag = read_u16_from_chunk(&entry[0..2], endian);
             if tag == NDPI_FORMAT_FLAG {
                 return Ok(true);
@@ -621,39 +634,22 @@ fn hamamatsu_ndpi_detect(path: &Path) -> bool {
 }
 
 fn read_key_file(path: &Path) -> Result<Ini> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > KEY_FILE_MAX_SIZE {
-        return Err(OpenSlideError::Format(format!(
-            "Hamamatsu key file exceeds {} bytes",
-            KEY_FILE_MAX_SIZE
-        )));
-    }
-
-    let content = fs::read_to_string(path)?;
-    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
-    let mut ini = Ini::new_cs();
-    ini.set_default_section("");
-    ini.read(content.to_string())
+    let content = crate::util::_openslide_read_key_file_data(path, KEY_FILE_MAX_SIZE)?;
+    let content = String::from_utf8(content).map_err(|err| {
+        OpenSlideError::Format(format!("Can't parse Hamamatsu key file as UTF-8: {err}"))
+    })?;
+    let ini = crate::util::_openslide_key_file_load_from_data(content)
         .map_err(|e| OpenSlideError::Format(format!("Can't parse Hamamatsu key file: {e}")))?;
     Ok(ini)
 }
 
 fn has_group(ini: &Ini, group: &str) -> bool {
-    resolve_group(ini, group).is_some()
-}
-
-fn resolve_group(ini: &Ini, group: &str) -> Option<String> {
-    if ini.get_map_ref().contains_key(group) {
-        return Some(group.to_string());
-    }
-    ini.get_map_ref()
-        .keys()
-        .find(|candidate| candidate.eq_ignore_ascii_case(group))
-        .cloned()
+    ini.get_map_ref().contains_key(group)
 }
 
 fn get_int(ini: &Ini, group: &str, key: &str) -> Option<i64> {
-    get_key_value_any(ini, group, &[key])?.trim().parse().ok()
+    let value = crate::util::_openslide_parse_int64(&get_key_value_any(ini, group, &[key])?)?;
+    i32::try_from(value).ok().map(i64::from)
 }
 
 fn require_int(ini: &Ini, group: &str, key: &str) -> Result<i64> {
@@ -662,21 +658,9 @@ fn require_int(ini: &Ini, group: &str, key: &str) -> Result<i64> {
 }
 
 fn get_key_value_any(ini: &Ini, group: &str, keys: &[&str]) -> Option<String> {
-    let group = resolve_group(ini, group).unwrap_or_else(|| group.to_string());
     for key in keys {
-        if let Some(value) = ini.get(&group, key) {
+        if let Some(value) = ini.get(group, key) {
             return Some(value);
-        }
-    }
-    let section = ini.get_map_ref().get(&group)?;
-    for key in keys {
-        if let Some(value) = section.iter().find_map(|(candidate, value)| {
-            candidate
-                .eq_ignore_ascii_case(key)
-                .then(|| value.as_ref())
-                .flatten()
-        }) {
-            return Some(value.clone());
         }
     }
     None
@@ -688,25 +672,18 @@ fn add_properties(
     level0: &Level,
     properties: &mut HashMap<String, String>,
 ) {
-    if let Some(group) = resolve_group(ini, group) {
-        if let Some(section) = ini.get_map_ref().get(&group) {
-            for (key, value) in section {
-                if let Some(value) = value {
-                    properties.insert(format!("hamamatsu.{key}"), value.clone());
-                }
+    if let Some(section) = ini.get_map_ref().get(group) {
+        for (key, value) in section {
+            if let Some(value) = value {
+                properties.insert(format!("hamamatsu.{key}"), value.clone());
             }
         }
     }
-    if let Some(source_lens) =
-        get_key_value_any(ini, group, &["SourceLens", "Objective", "ObjectivePower"])
-    {
-        if let Some(objective) = objective_power_value(&source_lens) {
-            properties.insert(
-                properties::PROPERTY_OBJECTIVE_POWER.into(),
-                objective.into(),
-            );
-        }
-    }
+    crate::util::_openslide_duplicate_double_prop(
+        properties,
+        "hamamatsu.SourceLens",
+        properties::PROPERTY_OBJECTIVE_POWER,
+    );
     add_mpp_property(
         ini,
         group,
@@ -734,18 +711,8 @@ fn hamamatsu_vms_part2(path: &Path, ini: &Ini, group: &str, dirname: &Path) -> R
         ));
     }
 
-    let map_file = get_key_value_any(
-        ini,
-        group,
-        &[
-            KEY_MAP_FILE,
-            "MapFileName",
-            "MapImage",
-            "MapImageFile",
-            "Map",
-        ],
-    )
-    .ok_or_else(|| OpenSlideError::Format("Missing VMS map file".into()))?;
+    let map_file = get_key_value_any(ini, group, &[KEY_MAP_FILE])
+        .ok_or_else(|| OpenSlideError::Format("Missing VMS map file".into()))?;
     let Some(map_file) = resolve_sidecar_path(dirname, &map_file) else {
         return Err(OpenSlideError::Format(format!(
             "VMS map file is not readable for {}",
@@ -863,14 +830,14 @@ fn vms_optimisation_row_starts(
     let Some(opt_file) = resolve_sidecar_path(dirname, &opt_file) else {
         return Ok(None);
     };
-    let Ok(mut file) = fs::File::open(opt_file) else {
+    let Ok(mut file) = crate::util::_openslide_fopen(&opt_file) else {
         return Ok(None);
     };
 
     let mut all_starts = Vec::with_capacity(image_files.len());
     let mut any = false;
     for image_file in image_files {
-        let Some(header) = jpeg_restart_header(image_file, 0, fs::metadata(image_file)?.len())?
+        let Some(header) = jpeg_restart_header(image_file, 0, file_size(image_file)?, None, None)?
         else {
             all_starts.push(None);
             continue;
@@ -880,7 +847,7 @@ fn vms_optimisation_row_starts(
         let mut starts = Vec::with_capacity(rows);
         for row in 0..rows {
             let mut buf = [0; 40];
-            if file.read_exact(&mut buf).is_err() {
+            if crate::util::_openslide_fread_exact(&mut file, &mut buf).is_err() {
                 if row == 0 {
                     starts.clear();
                 }
@@ -903,56 +870,36 @@ fn vms_optimisation_row_starts(
 
 fn hamamatsu_vmu_part2(ini: &Ini, group: &str, dirname: &Path) -> Result<Vec<Level>> {
     let bits_per_pixel = require_int(ini, group, KEY_BITS_PER_PIXEL)?;
-    let pixel_order = get_key_value_any(ini, group, &[KEY_PIXEL_ORDER]).unwrap_or_default();
+    let pixel_order = get_key_value_any(ini, group, &[KEY_PIXEL_ORDER]);
     if bits_per_pixel != 36 {
         return Err(OpenSlideError::UnsupportedFormat(format!(
             "Only 36-bit Hamamatsu VMU/NGR RGB samples are supported, got {bits_per_pixel} bits per pixel"
         )));
     }
-    if !pixel_order.trim().eq_ignore_ascii_case("RGB") {
+    if pixel_order.as_deref() != Some("RGB") {
         return Err(OpenSlideError::UnsupportedFormat(format!(
             "Only RGB Hamamatsu VMU/NGR pixel order is supported, got {:?}",
-            pixel_order.trim()
+            pixel_order
         )));
     }
 
     let mut paths = Vec::new();
-    let image_file = get_key_value_any(
-        ini,
-        group,
-        &[
-            KEY_IMAGE_FILE,
-            "ImageFileName",
-            "Image",
-            "ImagePath",
-            "ImageName",
-        ],
-    )
-    .ok_or_else(|| OpenSlideError::Format("Missing VMU image file".into()))?;
+    let image_file = get_key_value_any(ini, group, &[KEY_IMAGE_FILE])
+        .ok_or_else(|| OpenSlideError::Format("Missing VMU image file".into()))?;
     let image_file = resolve_sidecar_path(dirname, &image_file)
         .ok_or_else(|| OpenSlideError::Format("Missing VMU image file".into()))?;
     paths.push(image_file);
-    if let Some(map_file) = get_key_value_any(
-        ini,
-        group,
-        &[
-            KEY_MAP_FILE,
-            "MapFileName",
-            "MapImage",
-            "MapImageFile",
-            "Map",
-        ],
-    ) {
-        let map_file = resolve_sidecar_path(dirname, &map_file)
-            .ok_or_else(|| OpenSlideError::Format("Missing VMU map file".into()))?;
-        if !map_file.is_file() {
-            return Err(OpenSlideError::Format(format!(
-                "VMU map file is not readable: {}",
-                map_file.display()
-            )));
-        }
-        paths.push(map_file);
+    let map_file = get_key_value_any(ini, group, &[KEY_MAP_FILE])
+        .ok_or_else(|| OpenSlideError::Format("Missing VMU map file".into()))?;
+    let map_file = resolve_sidecar_path(dirname, &map_file)
+        .ok_or_else(|| OpenSlideError::Format("Missing VMU map file".into()))?;
+    if !map_file.is_file() {
+        return Err(OpenSlideError::Format(format!(
+            "VMU map file is not readable: {}",
+            map_file.display()
+        )));
     }
+    paths.push(map_file);
 
     let mut levels = Vec::new();
     for path in paths {
@@ -971,68 +918,16 @@ fn hamamatsu_vmu_part2(ini: &Ini, group: &str, dirname: &Path) -> Result<Vec<Lev
     normalize_levels(levels)
 }
 
-fn clean_key_path(value: &str) -> std::borrow::Cow<'_, str> {
-    let trimmed = value.trim();
-    let unquoted = trimmed
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .or_else(|| {
-            trimmed
-                .strip_prefix('\'')
-                .and_then(|value| value.strip_suffix('\''))
-        })
-        .unwrap_or(trimmed)
-        .trim();
-    std::borrow::Cow::Borrowed(unquoted)
-}
-
 fn resolve_sidecar_path(dirname: &Path, value: &str) -> Option<PathBuf> {
-    let cleaned = clean_key_path(value);
-    let cleaned = cleaned.as_ref();
-    if cleaned.is_empty() {
+    if value.is_empty() {
         return None;
     }
-
-    let path = Path::new(cleaned);
-    let joined = if path.is_absolute() {
+    let path = Path::new(value);
+    Some(if path.is_absolute() {
         path.to_path_buf()
     } else {
         dirname.join(path)
-    };
-    if joined.is_file() {
-        return Some(joined);
-    }
-
-    let Some(basename) = cleaned.rsplit(['/', '\\']).find(|part| !part.is_empty()) else {
-        return Some(joined);
-    };
-    let fallback = if basename == cleaned {
-        joined.clone()
-    } else {
-        dirname.join(basename)
-    };
-    if fallback.is_file() {
-        Some(fallback)
-    } else if let Some(case_match) = resolve_case_insensitive_child(dirname, basename) {
-        Some(case_match)
-    } else {
-        Some(joined)
-    }
-}
-
-fn resolve_case_insensitive_child(dirname: &Path, basename: &str) -> Option<PathBuf> {
-    let mut matches = fs::read_dir(dirname)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.eq_ignore_ascii_case(basename))
-        })
-        .map(|entry| entry.path());
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first)
+    })
 }
 
 fn collect_vms_image_files(
@@ -1053,9 +948,7 @@ fn collect_vms_image_files(
         .ok_or_else(|| OpenSlideError::Format(format!("Missing group {group}")))?;
 
     for (key, value) in section {
-        if key.len() < KEY_IMAGE_FILE.len()
-            || !key[..KEY_IMAGE_FILE.len()].eq_ignore_ascii_case(KEY_IMAGE_FILE)
-        {
+        if !key.starts_with(KEY_IMAGE_FILE) {
             continue;
         }
         let Some(value) = value else {
@@ -1095,33 +988,85 @@ fn collect_vms_image_files(
 }
 
 fn parse_vms_image_key_suffix(suffix: &str) -> Result<Option<(i64, i64)>> {
-    let suffix = suffix.trim();
     if suffix.is_empty() {
         return Ok(Some((0, 0)));
     }
-    let inner = suffix
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .ok_or_else(|| OpenSlideError::Format(format!("Invalid VMS image key suffix {suffix}")))?;
-    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
-    let parse_part = |idx: usize| -> Result<i64> {
-        parts[idx].parse::<i64>().map_err(|e| {
-            OpenSlideError::Format(format!("Invalid VMS image key suffix {suffix}: {e}"))
-        })
+    let mut parts: Vec<&str> = suffix.split(',').collect();
+    if let Some(last) = parts.last_mut() {
+        if let Some(stripped) = last.strip_suffix(')') {
+            *last = stripped;
+        }
+    }
+    let parse_part = |part: &str| -> Result<i64> { parse_vms_image_key_int(part, suffix) };
+    let parse_first = |part: &str| -> Result<i64> {
+        let rest = part.get(1..).ok_or_else(|| {
+            OpenSlideError::Format(format!("Invalid VMS image key suffix {suffix}"))
+        })?;
+        parse_part(rest)
     };
     match parts.len() {
         1 => {
-            let layer = parse_part(0)?;
+            let layer = parse_first(parts[0])?;
             Ok((layer == 0).then_some((0, 0)))
         }
-        2 => Ok(Some((parse_part(0)?, parse_part(1)?))),
+        2 => Ok(Some((parse_first(parts[0])?, parse_part(parts[1])?))),
         3 => {
-            let layer = parse_part(0)?;
-            Ok((layer == 0).then_some((parse_part(1)?, parse_part(2)?)))
+            let layer = parse_first(parts[0])?;
+            Ok((layer == 0).then_some((parse_part(parts[1])?, parse_part(parts[2])?)))
         }
         _ => Err(OpenSlideError::Format(format!(
             "Unknown VMS image key dimensionality: {suffix}"
         ))),
+    }
+}
+
+fn parse_vms_image_key_int(part: &str, suffix: &str) -> Result<i64> {
+    let bytes = part.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    let mut negative = false;
+    if let Some(sign) = bytes.get(i) {
+        if *sign == b'+' || *sign == b'-' {
+            negative = *sign == b'-';
+            i += 1;
+        }
+    }
+
+    let mut saw_digit = false;
+    let mut value: i128 = 0;
+    while let Some(byte) = bytes.get(i).filter(|byte| byte.is_ascii_digit()) {
+        saw_digit = true;
+        value = value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add((byte - b'0') as i128))
+            .ok_or_else(|| {
+                OpenSlideError::Format(format!("Invalid VMS image key suffix {suffix}"))
+            })?;
+        let limit = if negative {
+            (i64::MAX as i128) + 1
+        } else {
+            i64::MAX as i128
+        };
+        if value > limit {
+            return Err(OpenSlideError::Format(format!(
+                "Invalid VMS image key suffix {suffix}"
+            )));
+        }
+        i += 1;
+    }
+
+    if !saw_digit {
+        return Ok(0);
+    }
+    if negative && value == (i64::MAX as i128) + 1 {
+        Ok(i64::MIN)
+    } else if negative {
+        Ok(-(value as i64))
+    } else {
+        Ok(value as i64)
     }
 }
 
@@ -1142,15 +1087,6 @@ fn add_mpp_property(
     }
 }
 
-fn objective_power_value(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    let numeric = trimmed
-        .strip_suffix(['x', 'X'])
-        .map(str::trim)
-        .unwrap_or(trimmed);
-    numeric.parse::<f64>().is_ok().then_some(numeric)
-}
-
 fn add_ndpi_level_with_scaled(levels: &mut Vec<Level>, level: Level) {
     levels.push(level.clone());
     let LevelSource::Ndpi(ndpi) = &level.source else {
@@ -1159,10 +1095,17 @@ fn add_ndpi_level_with_scaled(levels: &mut Vec<Level>, level: Level) {
     if !matches!(ndpi.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG) {
         return;
     }
-    for downsample in [2_u64, 4] {
+    let mut width = level.width;
+    let mut height = level.height;
+    for _ in 0..2 {
+        if width % 2 != 0 || height % 2 != 0 {
+            break;
+        }
+        width /= 2;
+        height /= 2;
         levels.push(Level {
-            width: level.width.div_ceil(downsample),
-            height: level.height.div_ceil(downsample),
+            width,
+            height,
             downsample: 1.0,
             source: LevelSource::NdpiScaled(ndpi.clone()),
         });
@@ -1209,9 +1152,11 @@ fn level_source_preference(source: &LevelSource) -> u8 {
 }
 
 fn read_jpeg_dimensions(path: &Path) -> Result<(u64, u64)> {
-    let mut file = fs::File::open(path)?;
-    let mut data = Vec::with_capacity(1024 * 1024);
-    file.by_ref().take(1024 * 1024).read_to_end(&mut data)?;
+    let mut file = crate::util::_openslide_fopen(path)?;
+    let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+        OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+    })?;
+    let data = crate::util::read_file_range(path, 0, file_len.min(1024 * 1024))?;
     if data.len() < 4 || data[0] != 0xff || data[1] != 0xd8 {
         return Err(OpenSlideError::Format(format!(
             "Not a JPEG file: {}",
@@ -1286,20 +1231,28 @@ struct JpegRestartHeader {
 }
 
 static JPEG_RESTART_INFO_CACHE: OnceLock<
-    Mutex<HashMap<(PathBuf, u64, u64), Arc<JpegRestartInfo>>>,
+    Mutex<HashMap<(PathBuf, u64, u64, u32, u32), Arc<JpegRestartInfo>>>,
 > = OnceLock::new();
 
 static JPEG_RESTART_HEADER_CACHE: OnceLock<
-    Mutex<HashMap<(PathBuf, u64, u64), Arc<JpegRestartHeader>>>,
+    Mutex<HashMap<(PathBuf, u64, u64, u32, u32), Arc<JpegRestartHeader>>>,
 > = OnceLock::new();
 
 fn jpeg_restart_header(
     path: &Path,
     header_start: u64,
     file_stop: u64,
+    fallback_width: Option<u32>,
+    fallback_height: Option<u32>,
 ) -> Result<Option<Arc<JpegRestartHeader>>> {
     let cache = JPEG_RESTART_HEADER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (path.to_path_buf(), header_start, file_stop);
+    let key = (
+        path.to_path_buf(),
+        header_start,
+        file_stop,
+        fallback_width.unwrap_or(0),
+        fallback_height.unwrap_or(0),
+    );
     if let Some(header) = cache
         .lock()
         .map_err(|_| OpenSlideError::Format("JPEG restart header cache poisoned".into()))?
@@ -1309,7 +1262,14 @@ fn jpeg_restart_header(
         return Ok(Some(header));
     }
 
-    let Some(header) = parse_jpeg_restart_header(path, header_start, file_stop)? else {
+    let Some(header) = parse_jpeg_restart_header(
+        path,
+        header_start,
+        file_stop,
+        fallback_width,
+        fallback_height,
+    )?
+    else {
         return Ok(None);
     };
     let header = Arc::new(header);
@@ -1321,17 +1281,31 @@ fn jpeg_restart_header(
 }
 
 fn vms_restart_info(path: &Path) -> Result<Option<Arc<JpegRestartInfo>>> {
-    let file_stop = fs::metadata(path)?.len();
-    jpeg_restart_info(path, 0, file_stop)
+    let file_stop = file_size(path)?;
+    jpeg_restart_info(path, 0, file_stop, None, None)
+}
+
+fn file_size(path: &Path) -> Result<u64> {
+    let mut file = crate::util::_openslide_fopen(path)?;
+    u64::try_from(crate::util::_openslide_fsize(&mut file)?)
+        .map_err(|_| OpenSlideError::Format(format!("Negative file size for {}", path.display())))
 }
 
 fn jpeg_restart_info(
     path: &Path,
     header_start: u64,
     file_stop: u64,
+    fallback_width: Option<u32>,
+    fallback_height: Option<u32>,
 ) -> Result<Option<Arc<JpegRestartInfo>>> {
     let cache = JPEG_RESTART_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (path.to_path_buf(), header_start, file_stop);
+    let key = (
+        path.to_path_buf(),
+        header_start,
+        file_stop,
+        fallback_width.unwrap_or(0),
+        fallback_height.unwrap_or(0),
+    );
     if let Some(info) = cache
         .lock()
         .map_err(|_| OpenSlideError::Format("JPEG restart cache poisoned".into()))?
@@ -1341,7 +1315,14 @@ fn jpeg_restart_info(
         return Ok(Some(info));
     }
 
-    let Some(info) = parse_jpeg_restart_info(path, header_start, file_stop)? else {
+    let Some(info) = parse_jpeg_restart_info(
+        path,
+        header_start,
+        file_stop,
+        fallback_width,
+        fallback_height,
+    )?
+    else {
         return Ok(None);
     };
     let info = Arc::new(info);
@@ -1356,15 +1337,18 @@ fn parse_jpeg_restart_header(
     path: &Path,
     header_start: u64,
     file_stop: u64,
+    fallback_width: Option<u32>,
+    fallback_height: Option<u32>,
 ) -> Result<Option<JpegRestartHeader>> {
-    let mut file = fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
+    let mut file = crate::util::_openslide_fopen(path)?;
+    let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+        OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+    })?;
     if header_start >= file_stop || file_stop > file_len {
         return Ok(None);
     }
-    let mut data = Vec::with_capacity(1024 * 1024);
-    file.seek(SeekFrom::Start(header_start))?;
-    file.by_ref().take(1024 * 1024).read_to_end(&mut data)?;
+    let prefix_len = (file_len - header_start).min(1024 * 1024);
+    let data = crate::util::read_file_range(path, header_start, prefix_len)?;
     if data.len() < 4 || data[0] != 0xff || data[1] != 0xd8 {
         return Ok(None);
     }
@@ -1427,6 +1411,12 @@ fn parse_jpeg_restart_header(
         pos += len;
     }
 
+    if width == 0 {
+        width = fallback_width.unwrap_or(0);
+    }
+    if height == 0 {
+        height = fallback_height.unwrap_or(0);
+    }
     if width == 0 || height == 0 || restart_interval == 0 || header_stop == 0 {
         return Ok(None);
     }
@@ -1456,15 +1446,18 @@ fn parse_jpeg_restart_info(
     path: &Path,
     header_start: u64,
     file_stop: u64,
+    fallback_width: Option<u32>,
+    fallback_height: Option<u32>,
 ) -> Result<Option<JpegRestartInfo>> {
-    let mut file = fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
+    let mut file = crate::util::_openslide_fopen(path)?;
+    let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+        OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+    })?;
     if header_start >= file_stop || file_stop > file_len {
         return Ok(None);
     }
-    let mut data = Vec::with_capacity(1024 * 1024);
-    file.seek(SeekFrom::Start(header_start))?;
-    file.by_ref().take(1024 * 1024).read_to_end(&mut data)?;
+    let prefix_len = (file_len - header_start).min(1024 * 1024);
+    let data = crate::util::read_file_range(path, header_start, prefix_len)?;
     if data.len() < 4 || data[0] != 0xff || data[1] != 0xd8 {
         return Ok(None);
     }
@@ -1524,6 +1517,12 @@ fn parse_jpeg_restart_info(
         pos += len;
     }
 
+    if width == 0 {
+        width = fallback_width.unwrap_or(0);
+    }
+    if height == 0 {
+        height = fallback_height.unwrap_or(0);
+    }
     if width == 0 || height == 0 || restart_interval == 0 || header_stop == 0 {
         return Ok(None);
     }
@@ -1546,14 +1545,23 @@ fn parse_jpeg_restart_info(
 
     let mut starts = Vec::with_capacity(tile_count_usize);
     starts.push(header_stop);
-    file.seek(SeekFrom::Start(header_stop))?;
+    let header_stop_i64 = i64::try_from(header_stop).map_err(|_| {
+        OpenSlideError::Format(format!(
+            "VMS JPEG restart offset does not fit OpenSlide seek: offset={header_stop}"
+        ))
+    })?;
+    crate::util::_openslide_fseek(
+        &mut file,
+        header_stop_i64,
+        crate::util::OpenSlideSeekWhence::Set,
+    )?;
     let mut chunk = [0u8; 64 * 1024];
     let mut absolute = header_stop;
     let mut last_ff = false;
     while starts.len() < tile_count_usize && absolute < file_stop {
         let remaining = usize::try_from((file_stop - absolute).min(chunk.len() as u64))
             .map_err(|_| OpenSlideError::Format("JPEG restart scan size overflow".into()))?;
-        let read = file.read(&mut chunk[..remaining])?;
+        let read = crate::util::_openslide_fread(&mut file, &mut chunk[..remaining])?;
         if read == 0 {
             break;
         }
@@ -1599,9 +1607,9 @@ struct NgrHeader {
 }
 
 fn read_ngr_header(path: &Path) -> Result<NgrHeader> {
-    let mut file = fs::File::open(path)?;
+    let mut file = crate::util::_openslide_fopen(path)?;
     let mut data = [0; 28];
-    file.read_exact(&mut data)?;
+    crate::util::_openslide_fread_exact(&mut file, &mut data)?;
     if &data[0..2] != b"GN" {
         return Err(OpenSlideError::Format(format!(
             "Bad NGR header in {}",
@@ -1632,18 +1640,79 @@ fn read_ngr_header(path: &Path) -> Result<NgrHeader> {
     })
 }
 
-fn detect_image_format(data: &[u8]) -> Result<ImageFormat> {
-    if data.starts_with(&[0xff, 0xd8]) {
-        Ok(ImageFormat::Jpeg)
-    } else if data.starts_with(b"\x89PNG") {
-        Ok(ImageFormat::Png)
-    } else if data.starts_with(b"BM") {
-        Ok(ImageFormat::Bmp)
-    } else {
-        Err(OpenSlideError::UnsupportedFormat(
-            "Unsupported Hamamatsu associated image format; expected JPEG, PNG, or BMP".into(),
-        ))
+fn add_associated_properties(
+    properties: &mut HashMap<String, String>,
+    associated_images: &HashMap<String, AssociatedImage>,
+) {
+    for (name, image) in associated_images {
+        let (width, height) = match image {
+            AssociatedImage::WholeFile { width, height, .. }
+            | AssociatedImage::FileRange { width, height, .. } => (*width, *height),
+        };
+        properties.insert(properties::associated_width(name), width.to_string());
+        properties.insert(properties::associated_height(name), height.to_string());
     }
+}
+
+fn jpeg_dimensions(data: &[u8]) -> Result<(u32, u32)> {
+    if data.len() < 4 || data[0] != 0xff || data[1] != 0xd8 {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "associated image is not JPEG".into(),
+        ));
+    }
+    let mut pos = 2usize;
+    while pos + 4 <= data.len() {
+        while pos < data.len() && data[pos] == 0xff {
+            pos += 1;
+        }
+        if pos >= data.len() {
+            break;
+        }
+        let marker = data[pos];
+        pos += 1;
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        if pos + 2 > data.len() {
+            break;
+        }
+        let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        if len < 2 || pos + len > data.len() {
+            break;
+        }
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) {
+            if len < 7 {
+                break;
+            }
+            let height = u16::from_be_bytes([data[pos + 3], data[pos + 4]]) as u32;
+            let width = u16::from_be_bytes([data[pos + 5], data[pos + 6]]) as u32;
+            if width == 0 || height == 0 {
+                break;
+            }
+            return Ok((width, height));
+        }
+        pos += len;
+    }
+    Err(OpenSlideError::Format(
+        "Couldn't read JPEG dimensions".into(),
+    ))
 }
 
 fn ndpi_level_source(
@@ -1870,7 +1939,7 @@ fn read_vms_restart_sampled_rgb_region(
 ) -> Result<Option<(Vec<u8>, u32, u32)>> {
     let full_info;
     let info = if restart_row_starts.is_some() {
-        let Some(header) = jpeg_restart_header(path, 0, fs::metadata(path)?.len())? else {
+        let Some(header) = jpeg_restart_header(path, 0, file_size(path)?, None, None)? else {
             return Ok(None);
         };
         full_info = None;
@@ -1998,7 +2067,7 @@ fn vms_optimised_restart_tile_range(
         .map_err(|_| OpenSlideError::Format("VMS restart tile index overflow".into()))?;
     let row = tile_index_u64 / info.tiles_across;
     let col = tile_index_u64 % info.tiles_across;
-    let mut file = fs::File::open(path)?;
+    let mut file = crate::util::_openslide_fopen(path)?;
     let Some(row_start) = vms_optimised_row_start(&mut file, info, row_starts, row)? else {
         return Ok(None);
     };
@@ -2032,7 +2101,7 @@ fn vms_optimised_restart_tile_range(
 }
 
 fn vms_optimised_row_start(
-    file: &mut fs::File,
+    file: &mut crate::util::OpenSlideFile,
     info: &JpegRestartHeader,
     row_starts: &[u64],
     row: u64,
@@ -2049,9 +2118,13 @@ fn vms_optimised_row_start(
     let Some(marker_pos) = offset.checked_sub(2) else {
         return Ok(None);
     };
-    file.seek(SeekFrom::Start(marker_pos))?;
+    crate::util::_openslide_fseek(
+        file,
+        hamamatsu_seek_offset(marker_pos, "VMS restart marker")?,
+        crate::util::OpenSlideSeekWhence::Set,
+    )?;
     let mut marker = [0; 2];
-    file.read_exact(&mut marker)?;
+    crate::util::_openslide_fread_exact(file, &mut marker)?;
     if marker[0] != 0xff || !(0xd0..=0xd7).contains(&marker[1]) {
         return Ok(None);
     }
@@ -2059,7 +2132,7 @@ fn vms_optimised_row_start(
 }
 
 fn find_nth_restart_after(
-    file: &mut fs::File,
+    file: &mut crate::util::OpenSlideFile,
     start: u64,
     file_stop: u64,
     target_count: u64,
@@ -2067,7 +2140,11 @@ fn find_nth_restart_after(
     if target_count == 0 {
         return Ok(Some(start));
     }
-    file.seek(SeekFrom::Start(start))?;
+    crate::util::_openslide_fseek(
+        file,
+        hamamatsu_seek_offset(start, "VMS restart scan")?,
+        crate::util::OpenSlideSeekWhence::Set,
+    )?;
     let mut chunk = [0u8; 4096];
     let mut absolute = start;
     let mut last_ff = false;
@@ -2075,7 +2152,7 @@ fn find_nth_restart_after(
     while absolute < file_stop {
         let remaining = usize::try_from((file_stop - absolute).min(chunk.len() as u64))
             .map_err(|_| OpenSlideError::Format("VMS restart scan size overflow".into()))?;
-        let read = file.read(&mut chunk[..remaining])?;
+        let read = crate::util::_openslide_fread(file, &mut chunk[..remaining])?;
         if read == 0 {
             break;
         }
@@ -2266,8 +2343,10 @@ fn read_vmu_region(
         return Ok(output);
     }
 
-    let mut file = fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
+    let mut file = crate::util::_openslide_fopen(path)?;
+    let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+        OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+    })?;
     if column_width == 0 || !level.width.is_multiple_of(column_width) {
         return Err(OpenSlideError::Format(format!(
             "VMU NGR width {} is not a multiple of column width {}",
@@ -2303,9 +2382,18 @@ fn read_vmu_region(
             let local_x = src_x % column_width;
             let offset =
                 start + column * bytes_per_column + src_y * column_width * 6 + local_x * 6 + ch * 2;
-            file.seek(SeekFrom::Start(offset))?;
+            let offset = i64::try_from(offset).map_err(|_| {
+                OpenSlideError::Format(format!(
+                    "VMU NGR pixel offset does not fit OpenSlide seek: offset={offset}"
+                ))
+            })?;
+            crate::util::_openslide_fseek(
+                &mut file,
+                offset,
+                crate::util::OpenSlideSeekWhence::Set,
+            )?;
             let mut bytes = [0u8; 2];
-            file.read_exact(&mut bytes)?;
+            crate::util::_openslide_fread_exact(&mut file, &mut bytes)?;
             let dst_x = (src_x as i64 - x) as u32;
             let dst_y = (src_y as i64 - y) as u32;
             output.data[(dst_y * w + dst_x) as usize] = (u16::from_le_bytes(bytes) >> 4) as u8;
@@ -2342,7 +2430,6 @@ fn read_ndpi_region(
         .max(0)
         .min(ndpi.tiles_down as i64) as u64;
 
-    let mut file = fs::File::open(&ndpi.path)?;
     for row in start_row..end_row {
         for col in start_col..end_col {
             let tile_index = usize::try_from(row * ndpi.tiles_across + col)
@@ -2383,8 +2470,7 @@ fn read_ndpi_region(
                     tile_origin_y + crop_y as f64 - ly,
                 );
             } else {
-                let tile =
-                    read_ndpi_tile(&mut file, ndpi, tile_index, decode_w, decode_h, channel)?;
+                let tile = read_ndpi_tile(ndpi, tile_index, decode_w, decode_h, channel)?;
                 blit_gray_visible(
                     &tile,
                     visible_w,
@@ -2430,7 +2516,6 @@ fn read_scaled_ndpi_region(
         .max(0)
         .min(ndpi.tiles_down as i64) as u64;
 
-    let mut file = fs::File::open(&ndpi.path)?;
     for row in start_row..end_row {
         for col in start_col..end_col {
             let tile_index = usize::try_from(row * ndpi.tiles_across + col)
@@ -2473,8 +2558,7 @@ fn read_scaled_ndpi_region(
                     relative_downsample,
                 );
             } else {
-                let tile =
-                    read_ndpi_tile(&mut file, ndpi, tile_index, decode_w, decode_h, channel)?;
+                let tile = read_ndpi_tile(ndpi, tile_index, decode_w, decode_h, channel)?;
                 blit_gray_scaled_visible(
                     &tile,
                     visible_w,
@@ -2653,7 +2737,6 @@ fn read_scaled_ndpi_region_rgba(
 }
 
 fn read_ndpi_tile(
-    file: &mut fs::File,
     ndpi: &NdpiLevel,
     tile_index: usize,
     actual_w: u32,
@@ -2661,7 +2744,7 @@ fn read_ndpi_tile(
     channel: u32,
 ) -> Result<GrayImage> {
     if ndpi.planar_config == PLANARCONFIG_SEPARATE {
-        return read_planar_ndpi_tile(file, ndpi, tile_index, actual_w, actual_h, channel);
+        return read_planar_ndpi_tile(ndpi, tile_index, actual_w, actual_h, channel);
     }
 
     let offset = *ndpi
@@ -2672,7 +2755,7 @@ fn read_ndpi_tile(
         .byte_counts
         .get(tile_index)
         .ok_or_else(|| OpenSlideError::Format("NDPI tile byte count missing".into()))?;
-    let data = read_span(file, offset, byte_count)?;
+    let data = read_span(&ndpi.path, offset, byte_count)?;
     match ndpi.compression {
         COMPRESSION_NONE => decode_raw_channel(
             &data,
@@ -2734,31 +2817,161 @@ fn read_ndpi_tile_region(
     crop_h: u32,
     channel: u32,
 ) -> Result<GrayImage> {
+    if ndpi.planar_config == PLANARCONFIG_SEPARATE
+        && matches!(ndpi.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG)
+    {
+        let (rgb, rgb_w, rgb_h) =
+            read_planar_ndpi_tile_rgb_region(ndpi, tile_index, crop_x, crop_y, crop_w, crop_h)?;
+        return rgb_channel_to_gray(&rgb, rgb_w, rgb_h, channel);
+    }
     if ndpi.planar_config != PLANARCONFIG_CONTIG {
         return Err(OpenSlideError::UnsupportedFormat(
-            "Planar JPEG-compressed Hamamatsu NDPI data is not supported".into(),
+            "Unsupported NDPI planar crop layout".into(),
         ));
     }
-    let offset = *ndpi
-        .offsets
-        .get(tile_index)
-        .ok_or_else(|| OpenSlideError::Format("NDPI tile offset missing".into()))?;
     match ndpi.compression {
-        COMPRESSION_JPEG | COMPRESSION_OLD_JPEG => decode::decode_channel_region_from_file(
-            ImageFormat::Jpeg,
-            &ndpi.path,
-            offset,
-            channel,
-            crop_x,
-            crop_y,
-            crop_w,
-            crop_h,
-        ),
+        COMPRESSION_JPEG | COMPRESSION_OLD_JPEG => {
+            let (rgb, rgb_w, rgb_h) =
+                read_ndpi_tile_rgb_region(ndpi, tile_index, crop_x, crop_y, crop_w, crop_h)?;
+            rgb_channel_to_gray(&rgb, rgb_w, rgb_h, channel)
+        }
         other => Err(OpenSlideError::UnsupportedFormat(format!(
             "Unsupported NDPI TIFF compression {} for region JPEG decode",
             other
         ))),
     }
+}
+
+fn rgb_channel_to_gray(rgb: &[u8], width: u32, height: u32, channel: u32) -> Result<GrayImage> {
+    let channel = usize::try_from(channel)
+        .map_err(|_| OpenSlideError::InvalidArgument("RGB channel index overflow".into()))?;
+    if channel >= 3 {
+        return Err(OpenSlideError::InvalidArgument(format!(
+            "RGB channel index {channel} is out of range"
+        )));
+    }
+    if rgb.len() != width as usize * height as usize * 3 {
+        return Err(OpenSlideError::Format(
+            "RGB crop buffer length does not match dimensions".into(),
+        ));
+    }
+    let mut image = GrayImage::new(width, height);
+    for (dst, pixel) in image.data.iter_mut().zip(rgb.chunks_exact(3)) {
+        *dst = pixel[channel];
+    }
+    Ok(image)
+}
+
+fn read_planar_ndpi_tile_rgb_region(
+    ndpi: &NdpiLevel,
+    tile_index: usize,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let actual_w = (ndpi.width - (tile_index as u64 % ndpi.tiles_across) * ndpi.tile_w as u64)
+        .min(ndpi.tile_w as u64) as u32;
+    let actual_h = (ndpi.height - (tile_index as u64 / ndpi.tiles_across) * ndpi.tile_h as u64)
+        .min(ndpi.tile_h as u64) as u32;
+    let (rgb, full_w, full_h) = read_planar_ndpi_tile_rgb(ndpi, tile_index, actual_w, actual_h)?;
+    crop_rgb_region(&rgb, full_w, full_h, x, y, w, h)
+}
+
+fn read_planar_ndpi_tile_rgb(
+    ndpi: &NdpiLevel,
+    tile_index: usize,
+    actual_w: u32,
+    actual_h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    match ndpi.photometric {
+        PHOTOMETRIC_BLACK_IS_ZERO | PHOTOMETRIC_WHITE_IS_ZERO => {
+            let gray = read_planar_ndpi_tile(ndpi, tile_index, actual_w, actual_h, 0)?;
+            let mut rgb = Vec::with_capacity(gray.data.len() * 3);
+            for value in gray.data {
+                rgb.extend_from_slice(&[value, value, value]);
+            }
+            Ok((rgb, actual_w, actual_h))
+        }
+        PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR => {
+            let r = read_planar_ndpi_tile(ndpi, tile_index, actual_w, actual_h, 0)?;
+            let g = read_planar_ndpi_tile(ndpi, tile_index, actual_w, actual_h, 1)?;
+            let b = read_planar_ndpi_tile(ndpi, tile_index, actual_w, actual_h, 2)?;
+            let pixels = actual_w as usize * actual_h as usize;
+            if r.data.len() < pixels || g.data.len() < pixels || b.data.len() < pixels {
+                return Err(OpenSlideError::Decode(
+                    "Planar Hamamatsu RGB tile data is truncated".into(),
+                ));
+            }
+            let mut rgb = Vec::with_capacity(pixels * 3);
+            for idx in 0..pixels {
+                rgb.extend_from_slice(&[r.data[idx], g.data[idx], b.data[idx]]);
+            }
+            Ok((rgb, actual_w, actual_h))
+        }
+        other => Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Hamamatsu TIFF photometric interpretation {}",
+            other
+        ))),
+    }
+}
+
+fn crop_rgb_region(
+    rgb: &[u8],
+    src_w: u32,
+    src_h: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    if x.saturating_add(w) > src_w || y.saturating_add(h) > src_h {
+        return Err(OpenSlideError::InvalidArgument(
+            "RGB crop is outside the decoded NDPI tile".into(),
+        ));
+    }
+    if rgb.len() != src_w as usize * src_h as usize * 3 {
+        return Err(OpenSlideError::Decode(
+            "RGB tile buffer length does not match dimensions".into(),
+        ));
+    }
+    let mut out = Vec::with_capacity(w as usize * h as usize * 3);
+    for row in y..y + h {
+        let start = (row as usize * src_w as usize + x as usize) * 3;
+        let end = start + w as usize * 3;
+        out.extend_from_slice(&rgb[start..end]);
+    }
+    Ok((out, w, h))
+}
+
+fn sample_rgb_region(
+    rgb: &[u8],
+    crop_w: u32,
+    crop_h: u32,
+    sample_x0: f64,
+    sample_y0: f64,
+    sample_step: f64,
+    out_w: u32,
+    out_h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    if rgb.len() != crop_w as usize * crop_h as usize * 3 {
+        return Err(OpenSlideError::Decode(
+            "RGB sampled crop buffer length does not match dimensions".into(),
+        ));
+    }
+    let mut out = vec![0; out_w as usize * out_h as usize * 3];
+    for out_y in 0..out_h {
+        let src_y = floor_div(sample_y0 + f64::from(out_y) * sample_step, 1.0)
+            .clamp(0, i64::from(crop_h.saturating_sub(1))) as usize;
+        for out_x in 0..out_w {
+            let src_x = floor_div(sample_x0 + f64::from(out_x) * sample_step, 1.0)
+                .clamp(0, i64::from(crop_w.saturating_sub(1))) as usize;
+            let src_idx = (src_y * crop_w as usize + src_x) * 3;
+            let dst_idx = (out_y as usize * out_w as usize + out_x as usize) * 3;
+            out[dst_idx..dst_idx + 3].copy_from_slice(&rgb[src_idx..src_idx + 3]);
+        }
+    }
+    Ok((out, out_w, out_h))
 }
 
 fn read_ndpi_tile_rgb_region(
@@ -2769,9 +2982,14 @@ fn read_ndpi_tile_rgb_region(
     w: u32,
     h: u32,
 ) -> Result<(Vec<u8>, u32, u32)> {
+    if ndpi.planar_config == PLANARCONFIG_SEPARATE
+        && matches!(ndpi.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG)
+    {
+        return read_planar_ndpi_tile_rgb_region(ndpi, tile_index, x, y, w, h);
+    }
     if ndpi.planar_config != PLANARCONFIG_CONTIG {
         return Err(OpenSlideError::UnsupportedFormat(
-            "Planar NDPI RGB crop reads are not supported".into(),
+            "Unsupported NDPI RGB crop planar layout".into(),
         ));
     }
     let offset = *ndpi
@@ -2790,6 +3008,14 @@ fn read_ndpi_tile_rgb_region(
                 offset.checked_add(byte_count).ok_or_else(|| {
                     OpenSlideError::Format("NDPI JPEG byte range overflow".into())
                 })?,
+                Some(
+                    u32::try_from(ndpi.width)
+                        .map_err(|_| OpenSlideError::Format("NDPI JPEG width too large".into()))?,
+                ),
+                Some(
+                    u32::try_from(ndpi.height)
+                        .map_err(|_| OpenSlideError::Format("NDPI JPEG height too large".into()))?,
+                ),
                 ndpi.mcu_starts.as_deref(),
                 x,
                 y,
@@ -2825,9 +3051,24 @@ fn read_ndpi_tile_sampled_rgb_region(
     out_w: u32,
     out_h: u32,
 ) -> Result<(Vec<u8>, u32, u32)> {
+    if ndpi.planar_config == PLANARCONFIG_SEPARATE
+        && matches!(ndpi.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG)
+    {
+        let (rgb, rgb_w, rgb_h) = read_planar_ndpi_tile_rgb_region(ndpi, tile_index, x, y, w, h)?;
+        return sample_rgb_region(
+            &rgb,
+            rgb_w,
+            rgb_h,
+            sample_x0,
+            sample_y0,
+            sample_step,
+            out_w,
+            out_h,
+        );
+    }
     if ndpi.planar_config != PLANARCONFIG_CONTIG {
         return Err(OpenSlideError::UnsupportedFormat(
-            "Planar NDPI sampled RGB crop reads are not supported".into(),
+            "Unsupported NDPI sampled RGB crop planar layout".into(),
         ));
     }
     let offset = *ndpi
@@ -2846,6 +3087,14 @@ fn read_ndpi_tile_sampled_rgb_region(
                 offset.checked_add(byte_count).ok_or_else(|| {
                     OpenSlideError::Format("NDPI JPEG byte range overflow".into())
                 })?,
+                Some(
+                    u32::try_from(ndpi.width)
+                        .map_err(|_| OpenSlideError::Format("NDPI JPEG width too large".into()))?,
+                ),
+                Some(
+                    u32::try_from(ndpi.height)
+                        .map_err(|_| OpenSlideError::Format("NDPI JPEG height too large".into()))?,
+                ),
                 ndpi.mcu_starts.as_deref(),
                 x,
                 y,
@@ -2886,6 +3135,8 @@ fn read_jpeg_restart_sampled_rgb_region(
     path: &Path,
     header_start: u64,
     file_stop: u64,
+    fallback_width: Option<u32>,
+    fallback_height: Option<u32>,
     recorded_starts: Option<&[u64]>,
     crop_x: u32,
     crop_y: u32,
@@ -2899,13 +3150,27 @@ fn read_jpeg_restart_sampled_rgb_region(
 ) -> Result<Option<(Vec<u8>, u32, u32)>> {
     let full_info;
     let info = if recorded_starts.is_some() {
-        let Some(header) = jpeg_restart_header(path, header_start, file_stop)? else {
+        let Some(header) = jpeg_restart_header(
+            path,
+            header_start,
+            file_stop,
+            fallback_width,
+            fallback_height,
+        )?
+        else {
             return Ok(None);
         };
         full_info = None;
         (*header).clone()
     } else {
-        let Some(info) = jpeg_restart_info(path, header_start, file_stop)? else {
+        let Some(info) = jpeg_restart_info(
+            path,
+            header_start,
+            file_stop,
+            fallback_width,
+            fallback_height,
+        )?
+        else {
             return Ok(None);
         };
         let header = JpegRestartHeader {
@@ -3024,14 +3289,13 @@ fn ndpi_recorded_restart_tile_range(
     starts: &[u64],
     tile_index: usize,
 ) -> Result<Option<(u64, u64)>> {
-    if starts.len()
-        != usize::try_from(
-            info.tiles_across
-                .checked_mul(u64::from(info.height.div_ceil(info.tile_h)))
-                .ok_or_else(|| OpenSlideError::Format("NDPI restart tile count overflow".into()))?,
-        )
-        .map_err(|_| OpenSlideError::Format("NDPI restart tile count overflow".into()))?
-    {
+    let expected_starts = usize::try_from(
+        info.tiles_across
+            .checked_mul(u64::from(info.height.div_ceil(info.tile_h)))
+            .ok_or_else(|| OpenSlideError::Format("NDPI restart tile count overflow".into()))?,
+    )
+    .map_err(|_| OpenSlideError::Format("NDPI restart tile count overflow".into()))?;
+    if starts.len() != expected_starts {
         return Ok(None);
     }
     let Some(&data_start) = starts.get(tile_index) else {
@@ -3045,7 +3309,7 @@ fn ndpi_recorded_restart_tile_range(
         return Ok(None);
     }
 
-    let mut file = fs::File::open(path)?;
+    let mut file = crate::util::_openslide_fopen(path)?;
     if tile_index > 0 && !validate_restart_marker_before(&mut file, data_start)? {
         return Ok(None);
     }
@@ -3055,14 +3319,29 @@ fn ndpi_recorded_restart_tile_range(
     Ok(Some((data_start, data_stop)))
 }
 
-fn validate_restart_marker_before(file: &mut fs::File, offset: u64) -> Result<bool> {
+fn validate_restart_marker_before(
+    file: &mut crate::util::OpenSlideFile,
+    offset: u64,
+) -> Result<bool> {
     let Some(marker_pos) = offset.checked_sub(2) else {
         return Ok(false);
     };
-    file.seek(SeekFrom::Start(marker_pos))?;
+    crate::util::_openslide_fseek(
+        file,
+        hamamatsu_seek_offset(marker_pos, "NDPI restart marker")?,
+        crate::util::OpenSlideSeekWhence::Set,
+    )?;
     let mut marker = [0; 2];
-    file.read_exact(&mut marker)?;
+    crate::util::_openslide_fread_exact(file, &mut marker)?;
     Ok(marker[0] == 0xff && (0xd0..=0xd7).contains(&marker[1]))
+}
+
+fn hamamatsu_seek_offset(offset: u64, context: &str) -> Result<i64> {
+    i64::try_from(offset).map_err(|_| {
+        OpenSlideError::Format(format!(
+            "Hamamatsu {context} offset does not fit OpenSlide seek: offset={offset}"
+        ))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3159,12 +3438,15 @@ fn decode_raw_channel(
             "Unsupported Hamamatsu TIFF planar configuration for contiguous decode".into(),
         ));
     }
-    let bytes_per_sample = raw_sample_bytes(bits_per_sample)?;
     let samples = usize::from(samples_per_pixel);
     let pixels = width as usize * height as usize;
+    let sample_bytes = contiguous_sample_bytes(samples_per_pixel, bits_per_sample)?;
+    let bytes_per_pixel = sample_bytes
+        .iter()
+        .try_fold(0usize, |acc, &bytes| acc.checked_add(usize::from(bytes)))
+        .ok_or_else(|| OpenSlideError::Decode("Raw Hamamatsu TIFF byte count overflow".into()))?;
     let expected = pixels
-        .checked_mul(samples)
-        .and_then(|samples| samples.checked_mul(bytes_per_sample))
+        .checked_mul(bytes_per_pixel)
         .ok_or_else(|| OpenSlideError::Decode("Raw Hamamatsu TIFF byte count overflow".into()))?;
     if data.len() < expected {
         return Err(OpenSlideError::Decode(format!(
@@ -3177,21 +3459,19 @@ fn decode_raw_channel(
     let mut out = GrayImage::new(width, height);
     match photometric {
         PHOTOMETRIC_BLACK_IS_ZERO => {
-            for (dst, pixel) in out
-                .data
-                .iter_mut()
-                .zip(data[..expected].chunks_exact(samples * bytes_per_sample))
-            {
-                *dst = decode_raw_sample(pixel, 0, bytes_per_sample, endian);
+            for (pixel_index, dst) in out.data.iter_mut().enumerate() {
+                *dst = decode_contiguous_raw_sample(data, &sample_bytes, pixel_index, 0, endian)?;
             }
         }
         PHOTOMETRIC_WHITE_IS_ZERO => {
-            for (dst, pixel) in out
-                .data
-                .iter_mut()
-                .zip(data[..expected].chunks_exact(samples * bytes_per_sample))
-            {
-                *dst = 255u8.saturating_sub(decode_raw_sample(pixel, 0, bytes_per_sample, endian));
+            for (pixel_index, dst) in out.data.iter_mut().enumerate() {
+                *dst = 255u8.saturating_sub(decode_contiguous_raw_sample(
+                    data,
+                    &sample_bytes,
+                    pixel_index,
+                    0,
+                    endian,
+                )?);
             }
         }
         PHOTOMETRIC_RGB => {
@@ -3201,12 +3481,8 @@ fn decode_raw_channel(
                     "RGB Hamamatsu TIFF data has fewer than 3 samples per pixel".into(),
                 ));
             }
-            for (dst, pixel) in out
-                .data
-                .iter_mut()
-                .zip(data[..expected].chunks_exact(samples * bytes_per_sample))
-            {
-                *dst = decode_raw_sample(pixel, ch, bytes_per_sample, endian);
+            for (pixel_index, dst) in out.data.iter_mut().enumerate() {
+                *dst = decode_contiguous_raw_sample(data, &sample_bytes, pixel_index, ch, endian)?;
             }
         }
         PHOTOMETRIC_YCBCR => {
@@ -3215,15 +3491,11 @@ fn decode_raw_channel(
                     "YCbCr Hamamatsu TIFF data has fewer than 3 samples per pixel".into(),
                 ));
             }
-            for (dst, pixel) in out
-                .data
-                .iter_mut()
-                .zip(data[..expected].chunks_exact(samples * bytes_per_sample))
-            {
+            for (pixel_index, dst) in out.data.iter_mut().enumerate() {
                 let (r, g, b) = ycbcr_to_rgb(
-                    decode_raw_sample(pixel, 0, bytes_per_sample, endian),
-                    decode_raw_sample(pixel, 1, bytes_per_sample, endian),
-                    decode_raw_sample(pixel, 2, bytes_per_sample, endian),
+                    decode_contiguous_raw_sample(data, &sample_bytes, pixel_index, 0, endian)?,
+                    decode_contiguous_raw_sample(data, &sample_bytes, pixel_index, 1, endian)?,
+                    decode_contiguous_raw_sample(data, &sample_bytes, pixel_index, 2, endian)?,
                 );
                 *dst = match channel {
                     0 => r,
@@ -3248,16 +3520,79 @@ fn decode_raw_channel(
     Ok(out)
 }
 
-fn raw_sample_bytes(bits_per_sample: &[u16]) -> Result<usize> {
-    if bits_per_sample.iter().all(|bits| *bits == 8) {
-        Ok(1)
-    } else if bits_per_sample.iter().all(|bits| *bits == 16) {
-        Ok(2)
-    } else {
-        Err(OpenSlideError::UnsupportedFormat(format!(
-            "Only uniform 8-bit or 16-bit Hamamatsu TIFF samples are supported, got {:?}",
-            bits_per_sample
-        )))
+fn contiguous_sample_bytes(samples_per_pixel: u16, bits_per_sample: &[u16]) -> Result<Vec<u8>> {
+    if bits_per_sample.is_empty() {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Hamamatsu TIFF has {} BitsPerSample values for {} samples",
+            bits_per_sample.len(),
+            samples_per_pixel
+        )));
+    }
+    if bits_per_sample.len() > 1 && bits_per_sample.len() < samples_per_pixel as usize {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Hamamatsu TIFF has {} BitsPerSample values for {} samples",
+            bits_per_sample.len(),
+            samples_per_pixel
+        )));
+    }
+    let mut sample_bytes = Vec::with_capacity(samples_per_pixel as usize);
+    for sample in 0..usize::from(samples_per_pixel) {
+        let bits = bits_per_sample
+            .get(sample)
+            .or_else(|| bits_per_sample.first())
+            .copied()
+            .unwrap_or(8);
+        match bits {
+            8 => sample_bytes.push(1),
+            16 => sample_bytes.push(2),
+            other => {
+                return Err(OpenSlideError::UnsupportedFormat(format!(
+                    "Unsupported Hamamatsu TIFF bits-per-sample {}",
+                    other
+                )))
+            }
+        }
+    }
+    Ok(sample_bytes)
+}
+
+fn decode_contiguous_raw_sample(
+    data: &[u8],
+    sample_bytes: &[u8],
+    pixel_index: usize,
+    sample: usize,
+    endian: Endian,
+) -> Result<u8> {
+    let bytes_per_pixel = sample_bytes
+        .iter()
+        .try_fold(0usize, |acc, &bytes| acc.checked_add(usize::from(bytes)))
+        .ok_or_else(|| OpenSlideError::Decode("Hamamatsu TIFF sample offset overflow".into()))?;
+    let sample_offset = sample_bytes
+        .get(..sample)
+        .ok_or_else(|| OpenSlideError::Decode("Hamamatsu TIFF sample index overflow".into()))?
+        .iter()
+        .try_fold(0usize, |acc, &bytes| acc.checked_add(usize::from(bytes)))
+        .ok_or_else(|| OpenSlideError::Decode("Hamamatsu TIFF sample offset overflow".into()))?;
+    let offset = pixel_index
+        .checked_mul(bytes_per_pixel)
+        .and_then(|base| base.checked_add(sample_offset))
+        .ok_or_else(|| OpenSlideError::Decode("Hamamatsu TIFF sample offset overflow".into()))?;
+    match sample_bytes
+        .get(sample)
+        .copied()
+        .ok_or_else(|| OpenSlideError::Decode("Hamamatsu TIFF sample index overflow".into()))?
+    {
+        1 => data
+            .get(offset)
+            .copied()
+            .ok_or_else(|| OpenSlideError::Decode("Hamamatsu TIFF sample is truncated".into())),
+        2 => {
+            let sample = data.get(offset..offset + 2).ok_or_else(|| {
+                OpenSlideError::Decode("Hamamatsu TIFF sample is truncated".into())
+            })?;
+            Ok(decode_raw_sample(sample, 0, 2, endian))
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -3275,18 +3610,12 @@ fn decode_raw_sample(pixel: &[u8], sample: usize, bytes_per_sample: usize, endia
 }
 
 fn read_planar_ndpi_tile(
-    file: &mut fs::File,
     ndpi: &NdpiLevel,
     tile_index: usize,
     actual_w: u32,
     actual_h: u32,
     channel: u32,
 ) -> Result<GrayImage> {
-    if ndpi.bits_per_sample.iter().any(|bits| *bits != 8) {
-        return Err(OpenSlideError::UnsupportedFormat(
-            "Only 8-bit Hamamatsu TIFF samples are supported".into(),
-        ));
-    }
     if ndpi.samples_per_pixel == 0 {
         return Err(OpenSlideError::Decode(
             "Planar Hamamatsu TIFF data has no samples".into(),
@@ -3311,10 +3640,10 @@ fn read_planar_ndpi_tile(
 
     match ndpi.photometric {
         PHOTOMETRIC_BLACK_IS_ZERO => {
-            read_planar_ndpi_plane(file, ndpi, tile_index, actual_w, actual_h, 0)
+            read_planar_ndpi_plane(ndpi, tile_index, actual_w, actual_h, 0)
         }
         PHOTOMETRIC_WHITE_IS_ZERO => {
-            let mut image = read_planar_ndpi_plane(file, ndpi, tile_index, actual_w, actual_h, 0)?;
+            let mut image = read_planar_ndpi_plane(ndpi, tile_index, actual_w, actual_h, 0)?;
             for byte in &mut image.data {
                 *byte = 255u8.saturating_sub(*byte);
             }
@@ -3327,7 +3656,7 @@ fn read_planar_ndpi_tile(
                     channel
                 )));
             }
-            read_planar_ndpi_plane(file, ndpi, tile_index, actual_w, actual_h, channel as usize)
+            read_planar_ndpi_plane(ndpi, tile_index, actual_w, actual_h, channel as usize)
         }
         PHOTOMETRIC_YCBCR => {
             if channel >= 3 {
@@ -3336,9 +3665,9 @@ fn read_planar_ndpi_tile(
                     channel
                 )));
             }
-            let y = read_planar_ndpi_plane(file, ndpi, tile_index, actual_w, actual_h, 0)?;
-            let cb = read_planar_ndpi_plane(file, ndpi, tile_index, actual_w, actual_h, 1)?;
-            let cr = read_planar_ndpi_plane(file, ndpi, tile_index, actual_w, actual_h, 2)?;
+            let y = read_planar_ndpi_plane(ndpi, tile_index, actual_w, actual_h, 0)?;
+            let cb = read_planar_ndpi_plane(ndpi, tile_index, actual_w, actual_h, 1)?;
+            let cr = read_planar_ndpi_plane(ndpi, tile_index, actual_w, actual_h, 2)?;
             let mut out = GrayImage::new(actual_w, actual_h);
             for idx in 0..out.data.len() {
                 let (r, g, b) = ycbcr_to_rgb(y.data[idx], cb.data[idx], cr.data[idx]);
@@ -3356,7 +3685,6 @@ fn read_planar_ndpi_tile(
 }
 
 fn read_planar_ndpi_plane(
-    file: &mut fs::File,
     ndpi: &NdpiLevel,
     tile_index: usize,
     actual_w: u32,
@@ -3381,19 +3709,43 @@ fn read_planar_ndpi_plane(
         .byte_counts
         .get(plane_tile_index)
         .ok_or_else(|| OpenSlideError::Format("NDPI planar tile byte count missing".into()))?;
-    let data = read_span(file, offset, byte_count)?;
-    let expected = actual_w
+    let data = read_span(&ndpi.path, offset, byte_count)?;
+    let bytes_per_sample = planar_sample_bytes(ndpi, plane)?;
+    if matches!(ndpi.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG) && bytes_per_sample != 1
+    {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Planar JPEG-compressed Hamamatsu NDPI data requires 8-bit samples".into(),
+        ));
+    }
+    let expected_samples = actual_w
         .checked_mul(actual_h)
-        .map(|bytes| bytes as usize)
+        .map(|samples| samples as usize)
         .ok_or_else(|| OpenSlideError::Decode("NDPI TIFF plane byte count overflow".into()))?;
+    let expected = expected_samples
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| OpenSlideError::Decode("NDPI TIFF plane byte count overflow".into()))?;
+    let mut decoded_bytes_per_sample = bytes_per_sample;
+    let mut min_decoded_len = expected;
     let decoded = match ndpi.compression {
         COMPRESSION_NONE => data,
         COMPRESSION_PACKBITS => unpack_packbits(&data, expected)?,
         COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => inflate_tiff_deflate(&data)?,
         COMPRESSION_JPEG | COMPRESSION_OLD_JPEG => {
-            return Err(OpenSlideError::UnsupportedFormat(
-                "Planar JPEG-compressed Hamamatsu NDPI data is not supported".into(),
-            ))
+            let jpeg = merge_jpeg_tables(&data, ndpi.jpeg_tables.as_deref())?;
+            let (rgb, width, height) = decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?;
+            if width != actual_w || height != actual_h {
+                return Err(OpenSlideError::Decode(format!(
+                    "Planar Hamamatsu JPEG plane {} decoded to {}x{}, expected {}x{}",
+                    plane, width, height, actual_w, actual_h
+                )));
+            }
+            let mut plane_data = Vec::with_capacity(expected_samples);
+            for pixel in rgb.chunks_exact(3).take(expected_samples) {
+                plane_data.push(pixel[0]);
+            }
+            decoded_bytes_per_sample = 1;
+            min_decoded_len = expected_samples;
+            plane_data
         }
         other => {
             return Err(OpenSlideError::UnsupportedFormat(format!(
@@ -3402,18 +3754,55 @@ fn read_planar_ndpi_plane(
             )))
         }
     };
-    if decoded.len() < expected {
+    if decoded.len() < min_decoded_len {
         return Err(OpenSlideError::Decode(format!(
             "Planar Hamamatsu TIFF data truncated: expected at least {}, got {}",
-            expected,
+            min_decoded_len,
             decoded.len()
         )));
     }
     Ok(GrayImage {
         width: actual_w,
         height: actual_h,
-        data: decoded[..expected].to_vec(),
+        data: decoded[..min_decoded_len]
+            .chunks_exact(decoded_bytes_per_sample)
+            .map(|sample| decode_raw_sample(sample, 0, decoded_bytes_per_sample, ndpi.endian))
+            .take(expected_samples)
+            .collect(),
     })
+}
+
+fn planar_sample_bytes(ndpi: &NdpiLevel, sample: usize) -> Result<usize> {
+    if ndpi.bits_per_sample.is_empty() {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Hamamatsu TIFF has {} BitsPerSample values for {} samples",
+            ndpi.bits_per_sample.len(),
+            ndpi.samples_per_pixel
+        )));
+    }
+    if ndpi.bits_per_sample.len() > 1
+        && ndpi.bits_per_sample.len() < usize::from(ndpi.samples_per_pixel)
+    {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Hamamatsu TIFF has {} BitsPerSample values for {} samples",
+            ndpi.bits_per_sample.len(),
+            ndpi.samples_per_pixel
+        )));
+    }
+    let bits = ndpi
+        .bits_per_sample
+        .get(sample)
+        .or_else(|| ndpi.bits_per_sample.first())
+        .copied()
+        .unwrap_or(8);
+    match bits {
+        8 => Ok(1),
+        16 => Ok(2),
+        other => Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported Hamamatsu TIFF bits-per-sample {}",
+            other
+        ))),
+    }
 }
 
 fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> (u8, u8, u8) {
@@ -3440,7 +3829,7 @@ fn read_lzw_ndpi_region(
     w: u32,
     h: u32,
 ) -> Result<GrayImage> {
-    let mut decoder = ::tiff::decoder::Decoder::new(fs::File::open(&ndpi.path)?)
+    let mut decoder = ::tiff::decoder::Decoder::new(crate::util::_openslide_fopen_std(&ndpi.path)?)
         .map_err(|err| OpenSlideError::Decode(format!("TIFF decoder setup failed: {err}")))?;
     decoder
         .seek_to_image(ndpi.dir_index as usize)
@@ -3509,11 +3898,13 @@ fn read_lzw_ndpi_region(
 }
 
 fn expected_ndpi_tile_bytes(ndpi: &NdpiLevel, width: u32, height: u32) -> Result<usize> {
-    let bytes_per_sample = raw_sample_bytes(&ndpi.bits_per_sample)?;
+    let bytes_per_pixel = contiguous_sample_bytes(ndpi.samples_per_pixel, &ndpi.bits_per_sample)?
+        .into_iter()
+        .try_fold(0u32, |acc, bytes| acc.checked_add(u32::from(bytes)))
+        .ok_or_else(|| OpenSlideError::Decode("NDPI TIFF tile byte count overflow".into()))?;
     width
         .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(u32::from(ndpi.samples_per_pixel)))
-        .and_then(|samples| samples.checked_mul(bytes_per_sample as u32))
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
         .map(|bytes| bytes as usize)
         .ok_or_else(|| OpenSlideError::Decode("NDPI TIFF tile byte count overflow".into()))
 }
@@ -3806,13 +4197,8 @@ fn ceil_div(a: f64, b: f64) -> i64 {
     (a / b).ceil() as i64
 }
 
-fn read_span(file: &mut fs::File, offset: u64, byte_count: u64) -> Result<Vec<u8>> {
-    let len = usize::try_from(byte_count)
-        .map_err(|_| OpenSlideError::Format("Hamamatsu data span too large".into()))?;
-    let mut data = vec![0; len];
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(&mut data)?;
-    Ok(data)
+fn read_span(path: &Path, offset: u64, byte_count: u64) -> Result<Vec<u8>> {
+    crate::util::read_file_range(path, offset, byte_count)
 }
 
 fn ndpi_set_props(dir: &TiffDir, properties: &mut HashMap<String, String>) {
@@ -3831,7 +4217,7 @@ fn ndpi_set_props(dir: &TiffDir, properties: &mut HashMap<String, String>) {
         properties.insert("hamamatsu.Reference".into(), value);
     }
     if let Some(props) = dir.first_string(NDPI_PROPERTY_MAP) {
-        for record in props.split(['\n', '\r']) {
+        for record in props.split("\r\n") {
             if let Some((key, value)) = record.split_once('=') {
                 if !key.is_empty() && !value.is_empty() {
                     properties.insert(format!("hamamatsu.{key}"), value.to_string());
@@ -3875,11 +4261,7 @@ fn set_resolution_prop(
 }
 
 fn format_float(value: f64) -> String {
-    let formatted = format!("{value:.12}");
-    formatted
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_string()
+    crate::util::_openslide_format_double(value)
 }
 
 #[derive(Debug)]
@@ -3909,13 +4291,15 @@ enum Endian {
 
 impl TiffFile {
     fn open(path: &Path) -> Result<Self> {
-        let mut file = fs::File::open(path)?;
-        let file_len = file.metadata()?.len();
+        let mut file = crate::util::_openslide_fopen(path)?;
+        let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+            OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+        })?;
         if file_len < 8 {
             return Err(OpenSlideError::Format("Not a TIFF file".into()));
         }
         let mut header = [0u8; 16];
-        file.read_exact(&mut header[..8])?;
+        crate::util::_openslide_fread_exact(&mut file, &mut header[..8])?;
         let endian = match &header[0..2] {
             b"II" => Endian::Little,
             b"MM" => Endian::Big,
@@ -3925,7 +4309,7 @@ impl TiffFile {
         let (bigtiff, mut offset) = match magic {
             42 => (false, read_u32_from_chunk(&header[4..8], endian) as u64),
             43 => {
-                file.read_exact(&mut header[8..16])?;
+                crate::util::_openslide_fread_exact(&mut file, &mut header[8..16])?;
                 if read_u16_from_chunk(&header[4..6], endian) != 8 {
                     return Err(OpenSlideError::Format("Unsupported BigTIFF header".into()));
                 }
@@ -3940,7 +4324,7 @@ impl TiffFile {
             if !seen.insert(offset) {
                 return Err(OpenSlideError::Format("TIFF directory loop".into()));
             }
-            let (mut dir, next) = parse_tiff_dir(&mut file, file_len, offset, endian, bigtiff)?;
+            let (mut dir, next) = parse_tiff_dir(path, file_len, offset, endian, bigtiff)?;
             dir.offset = offset;
             dirs.push(dir);
             offset = next;
@@ -4053,14 +4437,14 @@ impl TiffValue {
 }
 
 fn parse_tiff_dir(
-    file: &mut fs::File,
+    path: &Path,
     file_len: u64,
     offset: u64,
     endian: Endian,
     bigtiff: bool,
 ) -> Result<(TiffDir, u64)> {
     if bigtiff {
-        let count_bytes = read_file_range_exact(file, offset, 8)?;
+        let count_bytes = read_file_range_exact(path, file_len, offset, 8)?;
         let count = read_u64_from_chunk(&count_bytes, endian);
         let count_usize = usize::try_from(count)
             .map_err(|_| OpenSlideError::Format("BigTIFF entry count overflow".into()))?;
@@ -4074,7 +4458,7 @@ fn parse_tiff_dir(
             .checked_add(table_len as u64)
             .ok_or_else(|| OpenSlideError::Format("BigTIFF entry table overflow".into()))?;
         ensure_file_range(file_len, next_offset_pos, 8)?;
-        let table = read_file_range_exact(file, entries_start, table_len)?;
+        let table = read_file_range_exact(path, file_len, entries_start, table_len)?;
 
         let mut entries = HashMap::new();
         for i in 0..count_usize {
@@ -4083,7 +4467,7 @@ fn parse_tiff_dir(
             let field_type = read_u16_from_chunk(&table[pos + 2..pos + 4], endian);
             let value_count = read_u64_from_chunk(&table[pos + 4..pos + 12], endian);
             let value = entry_value(
-                file,
+                path,
                 file_len,
                 &table[pos + 12..pos + 20],
                 8,
@@ -4093,11 +4477,11 @@ fn parse_tiff_dir(
             )?;
             entries.insert(tag, value);
         }
-        let next_bytes = read_file_range_exact(file, next_offset_pos, 8)?;
+        let next_bytes = read_file_range_exact(path, file_len, next_offset_pos, 8)?;
         let next = read_u64_from_chunk(&next_bytes, endian);
         Ok((TiffDir { offset: 0, entries }, next))
     } else {
-        let count_bytes = read_file_range_exact(file, offset, 2)?;
+        let count_bytes = read_file_range_exact(path, file_len, offset, 2)?;
         let count = read_u16_from_chunk(&count_bytes, endian) as usize;
         let entries_start = offset
             .checked_add(2)
@@ -4109,7 +4493,7 @@ fn parse_tiff_dir(
             .checked_add(table_len as u64)
             .ok_or_else(|| OpenSlideError::Format("TIFF entry table overflow".into()))?;
         ensure_file_range(file_len, next_offset_pos, 4)?;
-        let table = read_file_range_exact(file, entries_start, table_len)?;
+        let table = read_file_range_exact(path, file_len, entries_start, table_len)?;
 
         let mut entries = HashMap::new();
         for i in 0..count {
@@ -4118,7 +4502,7 @@ fn parse_tiff_dir(
             let field_type = read_u16_from_chunk(&table[pos + 2..pos + 4], endian);
             let value_count = read_u32_from_chunk(&table[pos + 4..pos + 8], endian) as u64;
             let value = entry_value(
-                file,
+                path,
                 file_len,
                 &table[pos + 8..pos + 12],
                 4,
@@ -4128,14 +4512,14 @@ fn parse_tiff_dir(
             )?;
             entries.insert(tag, value);
         }
-        let next_bytes = read_file_range_exact(file, next_offset_pos, 4)?;
+        let next_bytes = read_file_range_exact(path, file_len, next_offset_pos, 4)?;
         let next = read_u32_from_chunk(&next_bytes, endian) as u64;
         Ok((TiffDir { offset: 0, entries }, next))
     }
 }
 
 fn entry_value(
-    file: &mut fs::File,
+    path: &Path,
     file_len: u64,
     value_field: &[u8],
     inline_width: usize,
@@ -4159,7 +4543,7 @@ fn entry_value(
             read_u32_from_chunk(value_field, endian) as u64
         };
         ensure_file_range(file_len, offset, byte_count)?;
-        read_file_range_exact(file, offset, byte_count)?
+        read_file_range_exact(path, file_len, offset, byte_count)?
     };
     Ok(TiffValue {
         field_type,
@@ -4243,12 +4627,9 @@ fn ensure_file_range(file_len: u64, offset: u64, len: usize) -> Result<()> {
     Ok(())
 }
 
-fn read_file_range_exact(file: &mut fs::File, offset: u64, len: usize) -> Result<Vec<u8>> {
-    ensure_file_range(file.metadata()?.len(), offset, len)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut data = vec![0; len];
-    file.read_exact(&mut data)?;
-    Ok(data)
+fn read_file_range_exact(path: &Path, file_len: u64, offset: u64, len: usize) -> Result<Vec<u8>> {
+    ensure_file_range(file_len, offset, len)?;
+    crate::util::read_file_range(path, offset, len as u64)
 }
 
 fn read_u16_from_chunk(chunk: &[u8], endian: Endian) -> u16 {
@@ -4303,13 +4684,13 @@ mod tests {
         let vmu = dir.join("slide.vmu");
         let level0 = dir.join("level0.l0");
         let level1 = dir.join("level1.l1");
-        let label = dir.join("label.jpg");
+        let macro_image = dir.join("macro.jpg");
         fs::write(&level0, ngr_image(100, 50, 20, &[11, 22, 33])).unwrap();
         fs::write(&level1, ngr_image(25, 13, 5, &[44, 55, 66])).unwrap();
-        fs::write(&label, [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+        fs::write(&macro_image, ONE_PIXEL_JPEG).unwrap();
         fs::write(
             &vmu,
-            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\nPhysicalWidth=50000\nPhysicalHeight=25000\nLabelImage=label.jpg\n",
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\nPhysicalWidth=50000\nPhysicalHeight=25000\nMacroImage=macro.jpg\n",
         )
         .unwrap();
 
@@ -4319,12 +4700,54 @@ mod tests {
         assert_eq!(slide.level_dimensions(0), Some((100, 50)));
         assert_eq!(slide.level_dimensions(1), Some((25, 13)));
         assert_eq!(
+            slide.properties().get("openslide.level[0].tile-width"),
+            Some(&"20".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("openslide.level[0].tile-height"),
+            Some(&"64".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("openslide.level[1].tile-width"),
+            Some(&"5".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("openslide.level[1].tile-height"),
+            Some(&"64".to_string())
+        );
+        assert_eq!(
             slide.properties().get(properties::PROPERTY_MPP_X),
             Some(&"0.5".to_string())
         );
-        assert!(slide.associated_image_names().contains(&"label"));
+        assert!(slide.associated_image_names().contains(&"macro"));
+        assert_eq!(
+            slide.properties().get("openslide.associated.macro.width"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("openslide.associated.macro.height"),
+            Some(&"1".to_string())
+        );
+        let macro_rgba = slide.read_associated_image("macro").unwrap();
+        assert_eq!((macro_rgba.width, macro_rgba.height), (1, 1));
         let green = slide.read_region(1, 0, 0, 0, 1, 1).unwrap();
         assert_eq!(green.pixel(0, 0), 96);
+    }
+
+    #[test]
+    fn parses_vms_vmu_integer_keys_like_upstream() {
+        let mut ini = Ini::new_cs();
+        ini.set_default_section("");
+        ini.read(
+            "[Virtual Microscope Specimen]\nNoJpegColumns= \t+2\nNoJpegRows=3 \nOverflow=2147483648\nJunk=2px\n"
+                .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(get_int(&ini, GROUP_VMS, KEY_NUM_JPEG_COLS), Some(2));
+        assert_eq!(get_int(&ini, GROUP_VMS, KEY_NUM_JPEG_ROWS), Some(3));
+        assert_eq!(get_int(&ini, GROUP_VMS, "Overflow"), None);
+        assert_eq!(get_int(&ini, GROUP_VMS, "Junk"), None);
     }
 
     #[test]
@@ -4360,6 +4783,45 @@ mod tests {
         assert_eq!(slide.level_dimensions(6), Some((2, 2)));
         assert_eq!(slide.level_downsample(1), Some(2.0));
         assert_eq!(slide.level_downsample(6), Some(70.0));
+    }
+
+    #[test]
+    fn rejects_vms_image_file_key_case_aliases() {
+        let dir = unique_temp_dir("hamamatsu-vms-imagefile-case");
+        fs::create_dir_all(&dir).unwrap();
+        let vms = dir.join("slide.vms");
+        fs::write(dir.join("map.jpg"), minimal_jpeg(16, 16)).unwrap();
+        fs::write(dir.join("image00.jpg"), minimal_jpeg(16, 16)).unwrap();
+        fs::write(
+            &vms,
+            "[Virtual Microscope Specimen]\nNoJpegColumns=1\nNoJpegRows=1\nMapFile=map.jpg\nimagefile(0,0)=image00.jpg\n",
+        )
+        .unwrap();
+
+        let err = match OpenSlide::open(&vms) {
+            Ok(_) => panic!("expected case-variant VMS ImageFile key rejection"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("Missing VMS image filename"));
+    }
+
+    #[test]
+    fn parses_vms_image_file_suffix_like_upstream() {
+        assert_eq!(parse_vms_image_key_suffix("").unwrap(), Some((0, 0)));
+        assert_eq!(parse_vms_image_key_suffix("(2,3)").unwrap(), Some((2, 3)));
+        assert_eq!(parse_vms_image_key_suffix("(2,3").unwrap(), Some((2, 3)));
+        assert_eq!(parse_vms_image_key_suffix("(0,2,3)").unwrap(), Some((2, 3)));
+        assert_eq!(parse_vms_image_key_suffix("(1,2,3)").unwrap(), None);
+        assert!(parse_vms_image_key_suffix("(2, 3)").is_ok());
+        assert_eq!(parse_vms_image_key_suffix("(2,3 )").unwrap(), Some((2, 3)));
+        assert_eq!(
+            parse_vms_image_key_suffix("(2,3junk)").unwrap(),
+            Some((2, 3))
+        );
+        assert_eq!(parse_vms_image_key_suffix("(,3)").unwrap(), Some((0, 3)));
+        assert_eq!(parse_vms_image_key_suffix(" (2,3)").unwrap(), Some((0, 3)));
+        assert!(parse_vms_image_key_suffix("(9223372036854775808,0)").is_err());
     }
 
     #[test]
@@ -4414,11 +4876,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_vmu_without_map_file_like_upstream() {
+        let dir = unique_temp_dir("hamamatsu-vmu-no-map");
+        fs::create_dir_all(&dir).unwrap();
+        let vmu = dir.join("slide.vmu");
+        let level0 = dir.join("level0.l0");
+        fs::write(&level0, ngr_image(4, 2, 2, &[1, 2, 3])).unwrap();
+        fs::write(
+            &vmu,
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nBitsPerPixel=36\nPixelOrder=RGB\n",
+        )
+        .unwrap();
+
+        let err = match OpenSlide::open(&vmu) {
+            Ok(_) => panic!("expected missing VMU MapFile error"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("Missing VMU map file"));
+    }
+
+    #[test]
     fn reads_vmu_ngr_column_major_12_bit_pixels() {
         let dir = unique_temp_dir("hamamatsu-vmu-column-major");
         fs::create_dir_all(&dir).unwrap();
         let vmu = dir.join("slide.vmu");
         let level0 = dir.join("level0.l0");
+        let level1 = dir.join("level1.l1");
         let mut data = ngr_header(4, 1, 2);
         for pixel in [[1u8, 2, 3], [1, 2, 3], [4, 5, 6], [4, 5, 6]] {
             for sample in pixel {
@@ -4426,9 +4910,10 @@ mod tests {
             }
         }
         fs::write(&level0, data).unwrap();
+        fs::write(&level1, ngr_image(2, 1, 1, &[7, 8, 9])).unwrap();
         fs::write(
             &vmu,
-            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nBitsPerPixel=36\nPixelOrder=RGB\n",
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\n",
         )
         .unwrap();
 
@@ -4438,15 +4923,18 @@ mod tests {
     }
 
     #[test]
-    fn opens_vmu_associated_image_key_aliases_case_insensitively() {
+    fn ignores_non_upstream_vmu_associated_image_key_aliases() {
         let dir = unique_temp_dir("hamamatsu-vmu-associated-aliases");
         fs::create_dir_all(&dir).unwrap();
         let vmu = dir.join("slide.vmu");
         let level0 = dir.join("level0.l0");
+        let level1 = dir.join("level1.l1");
         fs::write(&level0, ngr_image(2, 1, 1, &[1, 2, 3])).unwrap();
+        fs::write(&level1, ngr_image(1, 1, 1, &[4, 5, 6])).unwrap();
+        fs::write(dir.join("macro.jpg"), minimal_jpeg(3, 2)).unwrap();
         fs::write(
             &vmu,
-            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nBitsPerPixel=36\nPixelOrder=RGB\nmacroimagefile=macro.png\nBarcodeImageFile=barcode.jpg\nPreviewImageFile=preview.bmp\n",
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\nMacroImage=macro.jpg\nMacroImageFile=macro-alias.png\nBarcodeImageFile=barcode.jpg\nPreviewImageFile=preview.bmp\n",
         )
         .unwrap();
 
@@ -4454,12 +4942,35 @@ mod tests {
         let names = slide.associated_image_names();
 
         assert!(names.contains(&"macro"));
-        assert!(names.contains(&"label"));
-        assert!(names.contains(&"thumbnail"));
+        assert!(!names.contains(&"label"));
+        assert!(!names.contains(&"thumbnail"));
     }
 
     #[test]
-    fn opens_vmu_input_and_associated_aliases() {
+    fn rejects_non_jpeg_hamamatsu_macro_image_like_upstream() {
+        let dir = unique_temp_dir("hamamatsu-vmu-macro-non-jpeg");
+        fs::create_dir_all(&dir).unwrap();
+        let vmu = dir.join("slide.vmu");
+        let level0 = dir.join("level0.l0");
+        let level1 = dir.join("level1.l1");
+        fs::write(&level0, ngr_image(2, 1, 1, &[1, 2, 3])).unwrap();
+        fs::write(&level1, ngr_image(1, 1, 1, &[4, 5, 6])).unwrap();
+        fs::write(dir.join("macro.bmp"), b"BMnot-a-jpeg").unwrap();
+        fs::write(
+            &vmu,
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\nMacroImage=macro.bmp\n",
+        )
+        .unwrap();
+
+        let err = match OpenSlide::open(&vmu) {
+            Ok(_) => panic!("expected non-JPEG Hamamatsu macro rejection"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("Can't read macro associated image"));
+    }
+
+    #[test]
+    fn rejects_vmu_input_aliases() {
         let dir = unique_temp_dir("hamamatsu-vmu-input-aliases");
         fs::create_dir_all(&dir).unwrap();
         let vmu = dir.join("slide.vmu");
@@ -4469,21 +4980,20 @@ mod tests {
         fs::write(&level1, ngr_image(2, 1, 1, &[4, 5, 6])).unwrap();
         fs::write(
             &vmu,
-            "[Uncompressed Virtual Microscope Specimen]\nImageName=level0.l0\nMapImageFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\nReferenceImageFile=reference.jpg\nBarcodeFileName=barcode.png\nSlidePreviewImageFile=preview.bmp\n",
+            "[Uncompressed Virtual Microscope Specimen]\nImageName=level0.l0\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\nReferenceImageFile=reference.jpg\nBarcodeFileName=barcode.png\nSlidePreviewImageFile=preview.bmp\n",
         )
         .unwrap();
 
-        let slide = OpenSlide::open(&vmu).unwrap();
-        let names = slide.associated_image_names();
+        let err = match OpenSlide::open(&vmu) {
+            Ok(_) => panic!("expected missing exact ImageFile error"),
+            Err(err) => err,
+        };
 
-        assert_eq!(slide.level_count(), 2);
-        assert!(names.contains(&"macro"));
-        assert!(names.contains(&"label"));
-        assert!(names.contains(&"thumbnail"));
+        assert!(!format!("{err}").is_empty());
     }
 
     #[test]
-    fn opens_vmu_sidecars_from_windows_path_basenames() {
+    fn rejects_vmu_sidecars_from_windows_path_basenames_like_upstream() {
         let dir = unique_temp_dir("hamamatsu-vmu-windows-sidecars");
         fs::create_dir_all(&dir).unwrap();
         let vmu = dir.join("slide.vmu");
@@ -4499,123 +5009,180 @@ mod tests {
         )
         .unwrap();
 
-        let slide = OpenSlide::open(&vmu).unwrap();
-        let names = slide.associated_image_names();
+        let err = match OpenSlide::open(&vmu) {
+            Ok(_) => panic!("expected Windows basename fallback to be rejected"),
+            Err(err) => err,
+        };
 
-        assert_eq!(slide.level_count(), 2);
-        assert_eq!(slide.level_dimensions(0), Some((4, 2)));
-        assert!(names.contains(&"macro"));
+        assert!(!format!("{err}").is_empty());
     }
 
     #[test]
-    fn opens_vmu_sidecars_from_case_variant_basenames() {
+    fn rejects_vmu_sidecars_from_case_variant_basenames_like_upstream() {
         let dir = unique_temp_dir("hamamatsu-vmu-case-sidecars");
         fs::create_dir_all(&dir).unwrap();
         let vmu = dir.join("slide.vmu");
         let level0 = dir.join("level0.l0");
+        let level1 = dir.join("level1.l1");
         fs::write(&level0, ngr_image(4, 2, 2, &[1, 2, 3])).unwrap();
+        fs::write(&level1, ngr_image(2, 1, 1, &[4, 5, 6])).unwrap();
         fs::write(
             &vmu,
-            "[Uncompressed Virtual Microscope Specimen]\nImageFile=C:\\scan\\LEVEL0.L0\nBitsPerPixel=36\nPixelOrder=RGB\n",
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=C:\\scan\\LEVEL0.L0\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\n",
         )
         .unwrap();
 
-        let slide = OpenSlide::open(&vmu).unwrap();
+        let err = match OpenSlide::open(&vmu) {
+            Ok(_) => panic!("expected case-variant basename fallback to be rejected"),
+            Err(err) => err,
+        };
 
-        assert_eq!(slide.level_count(), 1);
-        assert_eq!(slide.level_dimensions(0), Some((4, 2)));
+        assert!(!format!("{err}").is_empty());
     }
 
     #[test]
-    fn opens_vmu_sidecars_from_plain_case_variant_names() {
+    fn rejects_vmu_sidecars_from_plain_case_variant_names_like_upstream() {
         let dir = unique_temp_dir("hamamatsu-vmu-plain-case-sidecars");
         fs::create_dir_all(&dir).unwrap();
         let vmu = dir.join("slide.vmu");
         let level0 = dir.join("level0.l0");
+        let level1 = dir.join("level1.l1");
         let label = dir.join("label.jpg");
         fs::write(&level0, ngr_image(4, 2, 2, &[1, 2, 3])).unwrap();
+        fs::write(&level1, ngr_image(2, 1, 1, &[4, 5, 6])).unwrap();
         fs::write(&label, [0xff, 0xd8, 0xff, 0xd9]).unwrap();
         fs::write(
             &vmu,
-            "[Uncompressed Virtual Microscope Specimen]\nImageFile=LEVEL0.L0\nBitsPerPixel=36\nPixelOrder=RGB\nLabelImage=LABEL.JPG\n",
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=LEVEL0.L0\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\nLabelImage=LABEL.JPG\n",
         )
         .unwrap();
 
-        let slide = OpenSlide::open(&vmu).unwrap();
-        let names = slide.associated_image_names();
+        let err = match OpenSlide::open(&vmu) {
+            Ok(_) => panic!("expected case-variant sidecar name to be rejected"),
+            Err(err) => err,
+        };
 
-        assert_eq!(slide.level_count(), 1);
-        assert_eq!(slide.level_dimensions(0), Some((4, 2)));
-        assert!(names.contains(&"label"));
+        assert!(!format!("{err}").is_empty());
     }
 
     #[test]
-    fn reads_vmu_objective_power_alias_case_insensitively() {
+    fn ignores_non_upstream_vmu_objective_power_aliases() {
         let dir = unique_temp_dir("hamamatsu-vmu-objective-alias");
         fs::create_dir_all(&dir).unwrap();
         let vmu = dir.join("slide.vmu");
         let level0 = dir.join("level0.l0");
+        let level1 = dir.join("level1.l1");
         fs::write(&level0, ngr_image(2, 1, 1, &[1, 2, 3])).unwrap();
+        fs::write(&level1, ngr_image(1, 1, 1, &[4, 5, 6])).unwrap();
         fs::write(
             &vmu,
-            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nBitsPerPixel=36\nPixelOrder=RGB\nobjectivepower=20\n",
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\nobjectivepower=20\n",
         )
         .unwrap();
 
         let slide = OpenSlide::open(&vmu).unwrap();
 
-        assert_eq!(
-            slide.properties().get(properties::PROPERTY_OBJECTIVE_POWER),
-            Some(&"20".to_string())
-        );
+        assert!(slide
+            .properties()
+            .get(properties::PROPERTY_OBJECTIVE_POWER)
+            .is_none());
     }
 
     #[test]
-    fn reads_vmu_objective_power_with_x_suffix() {
+    fn ignores_vmu_objective_power_with_x_suffix_like_upstream() {
         let dir = unique_temp_dir("hamamatsu-vmu-objective-x");
         fs::create_dir_all(&dir).unwrap();
         let vmu = dir.join("slide.vmu");
         let level0 = dir.join("level0.l0");
+        let level1 = dir.join("level1.l1");
         fs::write(&level0, ngr_image(2, 1, 1, &[1, 2, 3])).unwrap();
+        fs::write(&level1, ngr_image(1, 1, 1, &[4, 5, 6])).unwrap();
         fs::write(
             &vmu,
-            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nBitsPerPixel=36\nPixelOrder=RGB\nSourceLens=20X\n",
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\nSourceLens=20X\n",
         )
         .unwrap();
 
         let slide = OpenSlide::open(&vmu).unwrap();
 
-        assert_eq!(
-            slide.properties().get(properties::PROPERTY_OBJECTIVE_POWER),
-            Some(&"20".to_string())
-        );
-        assert_eq!(objective_power_value("Plan Apo 20X"), None);
+        assert!(slide
+            .properties()
+            .get(properties::PROPERTY_OBJECTIVE_POWER)
+            .is_none());
+
+        let mut props = HashMap::new();
+        for (input, expected) in [
+            ("Plan Apo 20X", None),
+            ("20", Some("20")),
+            ("20,5", Some("20.5")),
+            (" \t+20,5", Some("20.5")),
+            ("20,5 ", None),
+            ("0,3333333333333333", Some("0.33333333333333331")),
+            ("inf", Some("inf")),
+            ("-inf", Some("-inf")),
+            ("NaN", None),
+            ("1e9999", None),
+            ("1e-9999", None),
+        ] {
+            props.clear();
+            props.insert("hamamatsu.SourceLens".into(), input.into());
+            crate::util::_openslide_duplicate_double_prop(
+                &mut props,
+                "hamamatsu.SourceLens",
+                properties::PROPERTY_OBJECTIVE_POWER,
+            );
+            assert_eq!(
+                props
+                    .get(properties::PROPERTY_OBJECTIVE_POWER)
+                    .map(String::as_str),
+                expected,
+                "{input}"
+            );
+        }
     }
 
     #[test]
-    fn opens_vmu_group_and_pixel_order_case_insensitively() {
+    fn rejects_vmu_missing_pixel_order_like_upstream() {
+        let dir = unique_temp_dir("hamamatsu-vmu-missing-pixel-order");
+        fs::create_dir_all(&dir).unwrap();
+        let vmu = dir.join("slide.vmu");
+        let level0 = dir.join("level0.l0");
+        let level1 = dir.join("level1.l1");
+        fs::write(&level0, ngr_image(2, 1, 1, &[1, 2, 3])).unwrap();
+        fs::write(&level1, ngr_image(1, 1, 1, &[4, 5, 6])).unwrap();
+        fs::write(
+            &vmu,
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nMapFile=level1.l1\nBitsPerPixel=36\n",
+        )
+        .unwrap();
+
+        let err = match OpenSlide::open(&vmu) {
+            Ok(_) => panic!("expected missing VMU PixelOrder rejection"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err}").contains("Only RGB Hamamatsu VMU/NGR pixel order"));
+    }
+
+    #[test]
+    fn rejects_vmu_group_and_pixel_order_case_aliases() {
         let dir = unique_temp_dir("hamamatsu-vmu-group-case");
         fs::create_dir_all(&dir).unwrap();
         let vmu = dir.join("slide.vmu");
         let level0 = dir.join("level0.l0");
+        let level1 = dir.join("level1.l1");
         fs::write(&level0, ngr_image(2, 1, 1, &[1, 2, 3])).unwrap();
+        fs::write(&level1, ngr_image(1, 1, 1, &[4, 5, 6])).unwrap();
         fs::write(
             &vmu,
-            "[uncompressed virtual microscope specimen]\nimagefile='level0.l0'\nBitsPerPixel=36\nPixelOrder=rgb\nPhysicalWidth=2000\n",
+            "[uncompressed virtual microscope specimen]\nimagefile='level0.l0'\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=rgb\nPhysicalWidth=2000\n",
         )
         .unwrap();
 
-        let slide = OpenSlide::open(&vmu).unwrap();
-
-        assert_eq!(slide.level_dimensions(0), Some((2, 1)));
-        assert_eq!(
-            slide.properties().get("hamamatsu.PhysicalWidth"),
-            Some(&"2000".to_string())
-        );
-        assert_eq!(
-            slide.properties().get(properties::PROPERTY_MPP_X),
-            Some(&"1".to_string())
-        );
+        match OpenSlide::open(&vmu) {
+            Ok(_) => panic!("expected case-variant VMU group/key rejection"),
+            Err(_) => {}
+        }
     }
 
     #[test]
@@ -4624,10 +5191,12 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let vmu = dir.join("slide.vmu");
         let level0 = dir.join("level0.l0");
+        let level1 = dir.join("level1.l1");
         fs::write(&level0, ngr_image(2, 1, 1, &[1, 2, 3])).unwrap();
+        fs::write(&level1, ngr_image(1, 1, 1, &[4, 5, 6])).unwrap();
         fs::write(
             &vmu,
-            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nBitsPerPixel=24\nPixelOrder=RGB\n",
+            "[Uncompressed Virtual Microscope Specimen]\nImageFile=level0.l0\nMapFile=level1.l1\nBitsPerPixel=24\nPixelOrder=RGB\n",
         )
         .unwrap();
 
@@ -4670,6 +5239,30 @@ mod tests {
             slide.properties().get("hamamatsu.CustomThree"),
             Some(&"gamma".to_string())
         );
+    }
+
+    #[test]
+    fn ndpi_property_map_splits_only_on_crlf_like_upstream() {
+        let mut properties = HashMap::new();
+        let dir = TiffDir {
+            offset: 0,
+            entries: HashMap::from([(
+                NDPI_PROPERTY_MAP,
+                TiffValue {
+                    field_type: 2,
+                    data: b"CustomOne=alpha\nCustomTwo=beta\0".to_vec(),
+                    endian: Endian::Little,
+                },
+            )]),
+        };
+
+        ndpi_set_props(&dir, &mut properties);
+
+        assert_eq!(
+            properties.get("hamamatsu.CustomOne"),
+            Some(&"alpha\nCustomTwo=beta".to_string())
+        );
+        assert!(properties.get("hamamatsu.CustomTwo").is_none());
     }
 
     #[test]
@@ -4853,6 +5446,52 @@ mod tests {
     }
 
     #[test]
+    fn decodes_uncompressed_mixed_bits_per_sample_ndpi_samples() {
+        let data = [10, 0x34, 0x12, 30, 40, 0xcd, 0xab, 60];
+
+        let red = decode_raw_channel(
+            &data,
+            2,
+            1,
+            3,
+            &[8, 16, 8],
+            PHOTOMETRIC_RGB,
+            PLANARCONFIG_CONTIG,
+            Endian::Little,
+            0,
+        )
+        .unwrap();
+        let green = decode_raw_channel(
+            &data,
+            2,
+            1,
+            3,
+            &[8, 16, 8],
+            PHOTOMETRIC_RGB,
+            PLANARCONFIG_CONTIG,
+            Endian::Little,
+            1,
+        )
+        .unwrap();
+        let blue = decode_raw_channel(
+            &data,
+            2,
+            1,
+            3,
+            &[8, 16, 8],
+            PHOTOMETRIC_RGB,
+            PLANARCONFIG_CONTIG,
+            Endian::Little,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(red.data, vec![10, 40]);
+        assert_eq!(green.data, vec![0x12, 0xab]);
+        assert_eq!(blue.data, vec![30, 60]);
+    }
+
+    #[test]
     fn decodes_big_endian_16_bit_ndpi_samples_by_downscaling() {
         let data = [
             0x12, 0x00, 0x34, 0x00, 0x56, 0x00, 0xab, 0x00, 0xcd, 0x00, 0xef, 0x00,
@@ -4927,12 +5566,197 @@ mod tests {
             jpeg_tables: None,
             mcu_starts: None,
         };
-        let mut file = fs::File::open(&ndpi.path).unwrap();
-
-        let green = read_ndpi_tile(&mut file, &ndpi, 0, 2, 2, 1).unwrap();
+        let green = read_ndpi_tile(&ndpi, 0, 2, 2, 1).unwrap();
 
         assert_eq!(green.data, vec![10, 20, 30, 40]);
     }
+
+    #[test]
+    fn reads_planar_ndpi_rgb16_tile_by_downscaling() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-planar16-read");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tile-data.bin");
+        fs::write(
+            &path,
+            u16_sample_payload(&[1, 2, 3, 4, 10, 20, 30, 40, 100, 110, 120, 130]),
+        )
+        .unwrap();
+        let ndpi = NdpiLevel {
+            path,
+            dir_index: 0,
+            endian: Endian::Little,
+            width: 2,
+            height: 2,
+            tile_w: 2,
+            tile_h: 2,
+            tiles_across: 1,
+            tiles_down: 1,
+            offsets: vec![0, 8, 16],
+            byte_counts: vec![8, 8, 8],
+            compression: COMPRESSION_NONE,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![16, 16, 16],
+            photometric: PHOTOMETRIC_RGB,
+            planar_config: PLANARCONFIG_SEPARATE,
+            jpeg_tables: None,
+            mcu_starts: None,
+        };
+        let green = read_ndpi_tile(&ndpi, 0, 2, 2, 1).unwrap();
+
+        assert_eq!(green.data, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn reads_planar_ndpi_mixed_bits_per_sample_tile() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-planar-mixed-read");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tile-data.bin");
+        fs::write(
+            &path,
+            [
+                &[1, 2, 3, 4][..],
+                u16_sample_payload(&[10, 20, 30, 40]).as_slice(),
+                &[100, 110, 120, 130][..],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let ndpi = NdpiLevel {
+            path,
+            dir_index: 0,
+            endian: Endian::Little,
+            width: 2,
+            height: 2,
+            tile_w: 2,
+            tile_h: 2,
+            tiles_across: 1,
+            tiles_down: 1,
+            offsets: vec![0, 4, 12],
+            byte_counts: vec![4, 8, 4],
+            compression: COMPRESSION_NONE,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 16, 8],
+            photometric: PHOTOMETRIC_RGB,
+            planar_config: PLANARCONFIG_SEPARATE,
+            jpeg_tables: None,
+            mcu_starts: None,
+        };
+        let red = read_ndpi_tile(&ndpi, 0, 2, 2, 0).unwrap();
+        let green = read_ndpi_tile(&ndpi, 0, 2, 2, 1).unwrap();
+        let blue = read_ndpi_tile(&ndpi, 0, 2, 2, 2).unwrap();
+
+        assert_eq!(red.data, vec![1, 2, 3, 4]);
+        assert_eq!(green.data, vec![10, 20, 30, 40]);
+        assert_eq!(blue.data, vec![100, 110, 120, 130]);
+    }
+
+    #[test]
+    fn reads_planar_ndpi_ycbcr16_tile_by_downscaling() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-planar-ycbcr16-read");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tile-data.bin");
+        fs::write(
+            &path,
+            u16_sample_payload(&[76, 150, 80, 10, 85, 128, 128, 128, 255, 128, 128, 128]),
+        )
+        .unwrap();
+        let ndpi = NdpiLevel {
+            path,
+            dir_index: 0,
+            endian: Endian::Little,
+            width: 2,
+            height: 2,
+            tile_w: 2,
+            tile_h: 2,
+            tiles_across: 1,
+            tiles_down: 1,
+            offsets: vec![0, 8, 16],
+            byte_counts: vec![8, 8, 8],
+            compression: COMPRESSION_NONE,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![16, 16, 16],
+            photometric: PHOTOMETRIC_YCBCR,
+            planar_config: PLANARCONFIG_SEPARATE,
+            jpeg_tables: None,
+            mcu_starts: None,
+        };
+        let red = read_ndpi_tile(&ndpi, 0, 2, 2, 0).unwrap();
+        let green = read_ndpi_tile(&ndpi, 0, 2, 2, 1).unwrap();
+
+        assert_eq!(red.data, vec![254, 150, 80, 10]);
+        assert_eq!(green.data, vec![0, 150, 80, 10]);
+    }
+
+    #[test]
+    fn reads_planar_ndpi_jpeg_tile_and_regions() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-planar-jpeg-read");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tile-data.bin");
+        fs::write(
+            &path,
+            [ONE_PIXEL_JPEG, ONE_PIXEL_JPEG, ONE_PIXEL_JPEG].concat(),
+        )
+        .unwrap();
+        let (expected_rgb, expected_w, expected_h) =
+            decode::decode_rgb_libjpeg(ImageFormat::Jpeg, ONE_PIXEL_JPEG).unwrap();
+        assert_eq!((expected_w, expected_h), (1, 1));
+        let expected = expected_rgb[0];
+        let ndpi = NdpiLevel {
+            path,
+            dir_index: 0,
+            endian: Endian::Little,
+            width: 1,
+            height: 1,
+            tile_w: 1,
+            tile_h: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            offsets: vec![
+                0,
+                ONE_PIXEL_JPEG.len() as u64,
+                (ONE_PIXEL_JPEG.len() * 2) as u64,
+            ],
+            byte_counts: vec![ONE_PIXEL_JPEG.len() as u64; 3],
+            compression: COMPRESSION_JPEG,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            photometric: PHOTOMETRIC_RGB,
+            planar_config: PLANARCONFIG_SEPARATE,
+            jpeg_tables: None,
+            mcu_starts: None,
+        };
+        let green = read_ndpi_tile(&ndpi, 0, 1, 1, 1).unwrap();
+        let (rgb, rgb_w, rgb_h) = read_ndpi_tile_rgb_region(&ndpi, 0, 0, 0, 1, 1).unwrap();
+        let (sampled, sampled_w, sampled_h) =
+            read_ndpi_tile_sampled_rgb_region(&ndpi, 0, 0, 0, 1, 1, 0.0, 0.0, 1.0, 1, 1).unwrap();
+
+        assert_eq!(green.data, vec![expected]);
+        assert_eq!((rgb_w, rgb_h), (1, 1));
+        assert_eq!(rgb, vec![expected, expected, expected]);
+        assert_eq!((sampled_w, sampled_h), (1, 1));
+        assert_eq!(sampled, vec![expected, expected, expected]);
+    }
+
+    fn u16_sample_payload(samples: &[u8]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|&sample| u16::from(sample).wrapping_shl(8).to_le_bytes())
+            .collect()
+    }
+
+    const ONE_PIXEL_JPEG: &[u8] = &[
+        0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07,
+        0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b, 0x0c, 0x19, 0x12,
+        0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20, 0x24, 0x2e, 0x27,
+        0x20, 0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31, 0x34, 0x34, 0x34,
+        0x1f, 0x27, 0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff, 0xc0, 0x00, 0x11,
+        0x08, 0x00, 0x01, 0x00, 0x01, 0x03, 0x52, 0x11, 0x00, 0x47, 0x11, 0x00, 0x42, 0x11, 0x00,
+        0xff, 0xc4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+        0xda, 0x00, 0x0c, 0x03, 0x52, 0x00, 0x47, 0x00, 0x42, 0x00, 0x00, 0x3f, 0x00, 0x7f, 0x3f,
+        0x9f, 0xdf, 0xff, 0xd9,
+    ];
 
     #[test]
     fn reads_scaled_ndpi_region_in_source_level_coordinates() {
@@ -5085,7 +5909,7 @@ mod tests {
 
         let entries_len = 14usize;
         let reference_offset = 8 + 2 + entries_len * 12 + 4;
-        let property_map = b"CustomOne=alpha\nCustomTwo=beta\rCustomThree=gamma\r\nIgnoredNoEquals\nEmpty=\n=EmptyKey\n\0";
+        let property_map = b"CustomOne=alpha\r\nCustomTwo=beta\r\nCustomThree=gamma\r\nIgnoredNoEquals\r\nEmpty=\r\n=EmptyKey\r\n\0";
         let property_map_offset = reference_offset + 6;
         let image_offset = property_map_offset + property_map.len();
         let entries: &[(u16, u16, u32, u32)] = &[

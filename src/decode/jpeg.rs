@@ -31,6 +31,14 @@ extern "C" {
         err: *mut c_char,
         err_len: usize,
     ) -> c_int;
+    fn osr_jpeg_dimensions(
+        data: *const c_uchar,
+        len: usize,
+        width: *mut c_uint,
+        height: *mut c_uint,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
     fn osr_jpeg_decode_tiff_ycbcr_rgb(
         data: *const c_uchar,
         len: usize,
@@ -137,82 +145,34 @@ extern "C" {
 
 /// Decode JPEG data into an RGBA image.
 ///
-/// For 4-component JPEGs (YCbCr+Alpha), the alpha channel is read from the
-/// file's 4th component. For 3-component JPEGs, alpha defaults to 0xFF.
-/// For grayscale JPEGs, the gray value is replicated to RGB with alpha 0xFF.
+/// OpenSlide decodes JPEG associated images through libjpeg into opaque RGB.
 pub fn decode_jpeg_rgba(data: &[u8]) -> Result<RgbaImage> {
-    // First, decode headers to determine the number of components
-    let header_reader = BufReader::new(Cursor::new(data));
-    let mut header_decoder = JpegDecoder::new(header_reader);
-    header_decoder
-        .decode_headers()
-        .map_err(|e| OpenSlideError::Decode(format!("JPEG header read failed: {e}")))?;
+    let (rgb, w, h) = decode_jpeg_rgb_libjpeg(data)?;
+    let rgba = rgb_to_rgba(&rgb, w, h);
+    RgbaImage::from_rgba(w, h, rgba)
+}
 
-    let info = header_decoder
-        .info()
-        .ok_or_else(|| OpenSlideError::Decode("No JPEG image info".into()))?;
-    let components = info.components;
-    let input_cs = header_decoder
-        .input_colorspace()
-        .unwrap_or(ColorSpace::YCbCr);
-    let width = info.width as u32;
-    let height = info.height as u32;
-
-    if components == 4 {
-        // 4-component JPEG: the 4th channel is alpha.
-        // Decode without color conversion by requesting output = input colorspace.
-        // This gives us raw component values (Y, Cb, Cr, A) or (C, M, Y, K).
-        // Then manually convert the first 3 channels to RGB and keep 4th as alpha.
-        let options = DecoderOptions::new_fast().jpeg_set_out_colorspace(input_cs);
-        let reader = BufReader::new(Cursor::new(data));
-        let mut decoder = JpegDecoder::new_with_options(reader, options);
-
-        let raw = decoder
-            .decode()
-            .map_err(|e| OpenSlideError::Decode(format!("JPEG decode failed: {e}")))?;
-
-        let rgba = match input_cs {
-            ColorSpace::YCCK | ColorSpace::YCbCr => ycbcra_to_rgba(&raw, width, height),
-            ColorSpace::CMYK => {
-                // Treat as raw RGBA (C=R, M=G, Y=B, K=A)
-                // This is the most common interpretation for Mirax alpha JPEGs
-                raw
-            }
-            _ => {
-                // Unknown 4-component colorspace: treat bytes as RGBA directly
-                raw
-            }
-        };
-
-        RgbaImage::from_rgba(width, height, rgba)
-    } else if components == 3 {
-        // Standard 3-component JPEG: decode as RGB, alpha = 0xFF
-        let (rgb, w, h) = decode_jpeg_rgb(data)?;
-        let rgba = rgb_to_rgba(&rgb, w, h);
-        RgbaImage::from_rgba(w, h, rgba)
-    } else if components == 1 {
-        // Grayscale: replicate to RGB, alpha = 0xFF
-        let options = DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::Luma);
-        let reader = BufReader::new(Cursor::new(data));
-        let mut decoder = JpegDecoder::new_with_options(reader, options);
-
-        let gray = decoder
-            .decode()
-            .map_err(|e| OpenSlideError::Decode(format!("JPEG decode failed: {e}")))?;
-
-        let pixel_count = width as usize * height as usize;
-        let mut rgba = Vec::with_capacity(pixel_count * 4);
-        for &g in &gray {
-            rgba.push(g);
-            rgba.push(g);
-            rgba.push(g);
-            rgba.push(0xFF);
-        }
-        RgbaImage::from_rgba(width, height, rgba)
+/// Read JPEG dimensions from headers without decoding pixel data.
+pub fn decode_jpeg_dimensions(data: &[u8]) -> Result<(u32, u32)> {
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        osr_jpeg_dimensions(
+            data.as_ptr(),
+            data.len(),
+            &mut width,
+            &mut height,
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok != 0 {
+        Ok((width, height))
     } else {
         Err(OpenSlideError::Decode(format!(
-            "Unsupported JPEG component count: {}",
-            components
+            "JPEG dimensions decode failed: {}",
+            jpeg_crop_error_message(&err)
         )))
     }
 }
@@ -707,35 +667,6 @@ fn jpeg_crop_error_message(err: &[i8]) -> String {
     }
 }
 
-/// Convert YCbCrA (4 bytes/pixel) to RGBA.
-///
-/// Applies standard YCbCr→RGB conversion on the first 3 components
-/// and passes through the 4th component as alpha.
-fn ycbcra_to_rgba(ycbcra: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let pixel_count = width as usize * height as usize;
-    let mut rgba = Vec::with_capacity(pixel_count * 4);
-
-    for pixel in ycbcra.chunks_exact(4) {
-        let y = pixel[0] as f32;
-        let cb = pixel[1] as f32 - 128.0;
-        let cr = pixel[2] as f32 - 128.0;
-        let a = pixel[3];
-
-        let r = (y + 1.402 * cr).round().clamp(0.0, 255.0) as u8;
-        let g = (y - 0.344136 * cb - 0.714136 * cr)
-            .round()
-            .clamp(0.0, 255.0) as u8;
-        let b = (y + 1.772 * cb).round().clamp(0.0, 255.0) as u8;
-
-        rgba.push(r);
-        rgba.push(g);
-        rgba.push(b);
-        rgba.push(a);
-    }
-
-    rgba
-}
-
 /// Convert RGB pixel data to RGBA by inserting alpha=0xFF after every 3 bytes.
 pub fn rgb_to_rgba(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
     let pixel_count = width as usize * height as usize;
@@ -774,6 +705,7 @@ mod tests {
         assert_eq!(img.width, 1);
         assert_eq!(img.height, 1);
         assert_eq!(img.data.len(), 4);
+        assert_eq!(decode_jpeg_dimensions(ONE_PIXEL_JPEG).unwrap(), (1, 1));
     }
 
     #[test]
@@ -781,29 +713,6 @@ mod tests {
         // A 3-component JPEG has no alpha data, so it defaults to 0xFF
         let img = decode_jpeg_rgba(ONE_PIXEL_JPEG).unwrap();
         assert_eq!(img.data[3], 0xFF);
-    }
-
-    #[test]
-    fn test_ycbcra_to_rgba() {
-        // Y=235, Cb=128, Cr=128 is white in YCbCr. Alpha=200.
-        let ycbcra = vec![235, 128, 128, 200];
-        let rgba = ycbcra_to_rgba(&ycbcra, 1, 1);
-        assert_eq!(rgba.len(), 4);
-        // Should be approximately white (235, 235, 235) with alpha=200
-        assert!(rgba[0] > 230); // R
-        assert!(rgba[1] > 230); // G
-        assert!(rgba[2] > 230); // B
-        assert_eq!(rgba[3], 200); // A preserved from file
-    }
-
-    #[test]
-    fn test_ycbcra_preserves_alpha() {
-        // Test that various alpha values are preserved, not hardcoded to 0xFF
-        for alpha in [0u8, 64, 128, 192, 255] {
-            let ycbcra = vec![128, 128, 128, alpha]; // neutral gray + alpha
-            let rgba = ycbcra_to_rgba(&ycbcra, 1, 1);
-            assert_eq!(rgba[3], alpha, "Alpha {} was not preserved", alpha);
-        }
     }
 
     #[test]
@@ -825,5 +734,11 @@ mod tests {
     fn test_decode_invalid_data() {
         let result = decode_jpeg_rgba(&[0x00, 0x01, 0x02]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_jpeg_dimensions_rejects_invalid_data() {
+        let err = decode_jpeg_dimensions(&[0x00, 0x01, 0x02]).unwrap_err();
+        assert!(format!("{err}").contains("JPEG dimensions decode failed"));
     }
 }

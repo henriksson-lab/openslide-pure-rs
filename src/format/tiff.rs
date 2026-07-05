@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 
@@ -12,6 +12,7 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::SlideBackend;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+use crate::util::read_file_range;
 
 extern "C" {
     fn osr_cairo_blit_rgb_to_rgba(
@@ -89,6 +90,11 @@ const TAG_TILELENGTH: u16 = 323;
 const TAG_TILEOFFSETS: u16 = 324;
 const TAG_TILEBYTECOUNTS: u16 = 325;
 const TAG_JPEGTABLES: u16 = 347;
+const TAG_JPEG_PROC: u16 = 512;
+const TAG_JPEG_RESTART_INTERVAL: u16 = 515;
+const TAG_JPEG_Q_TABLES: u16 = 519;
+const TAG_JPEG_DC_TABLES: u16 = 520;
+const TAG_JPEG_AC_TABLES: u16 = 521;
 const TAG_ICCPROFILE: u16 = 34675;
 const TAG_YCBCRSUBSAMPLING: u16 = 530;
 
@@ -96,6 +102,7 @@ const FILETYPE_REDUCEDIMAGE: u64 = 1;
 
 const COMPRESSION_NONE: u16 = 1;
 const COMPRESSION_LZW: u16 = 5;
+const COMPRESSION_OLD_JPEG: u16 = 6;
 const COMPRESSION_JPEG: u16 = 7;
 const COMPRESSION_ADOBE_DEFLATE: u16 = 8;
 const COMPRESSION_JP2K_YCBCR: u16 = 33003;
@@ -177,6 +184,13 @@ pub(crate) struct TiffFile {
     directories: Vec<TiffDirectory>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TiffImageDataShape {
+    None,
+    Tiled,
+    Stripped,
+}
+
 #[derive(Debug)]
 struct TiffDirectory {
     entries: HashMap<u16, TiffEntry>,
@@ -191,12 +205,14 @@ struct TiffEntry {
 
 impl TiffFile {
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        let mut file = File::open(path)?;
+        let mut file = crate::util::_openslide_fopen(path)?;
         let (endian, bigtiff, first_ifd_offset) = Self::read_header(&mut file)?;
 
         let mut directories = Vec::new();
         let mut next_offset = first_ifd_offset;
-        let file_len = file.metadata()?.len();
+        let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+            OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+        })?;
 
         while next_offset != 0 {
             if next_offset >= file_len {
@@ -212,7 +228,7 @@ impl TiffFile {
             }
 
             let (directory, following_offset) =
-                Self::read_directory(&mut file, endian, bigtiff, next_offset, file_len)?;
+                Self::read_directory(path, &mut file, endian, bigtiff, next_offset, file_len)?;
             directories.push(directory);
             next_offset = following_offset;
         }
@@ -228,17 +244,19 @@ impl TiffFile {
         })
     }
 
-    fn first_directory_has_image_data(path: &Path) -> Result<bool> {
-        let mut file = File::open(path)?;
+    fn first_directory_image_data_shape(path: &Path) -> Result<TiffImageDataShape> {
+        let mut file = crate::util::_openslide_fopen(path)?;
         let (endian, bigtiff, first_ifd_offset) = Self::read_header(&mut file)?;
         if first_ifd_offset == 0 {
-            return Ok(false);
+            return Ok(TiffImageDataShape::None);
         }
 
-        let file_len = file.metadata()?.len();
+        let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+            OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+        })?;
         let mut next_offset = first_ifd_offset;
         let mut directories = 0usize;
-        let mut first_has_image_data = false;
+        let mut first_shape = TiffImageDataShape::None;
 
         while next_offset != 0 {
             if next_offset >= file_len {
@@ -253,21 +271,21 @@ impl TiffFile {
                 ));
             }
 
-            let (has_image_data, following_offset) =
-                Self::scan_directory(&mut file, endian, bigtiff, next_offset, file_len)?;
+            let (shape, following_offset) =
+                Self::scan_directory(&mut file, endian, bigtiff, next_offset)?;
             if directories == 0 {
-                first_has_image_data = has_image_data;
+                first_shape = shape;
             }
             directories += 1;
             next_offset = following_offset;
         }
 
-        Ok(first_has_image_data)
+        Ok(first_shape)
     }
 
-    fn read_header(file: &mut File) -> Result<(Endian, bool, u64)> {
+    fn read_header(file: &mut crate::util::OpenSlideFile) -> Result<(Endian, bool, u64)> {
         let mut header = [0u8; 16];
-        file.read_exact(&mut header[..8])?;
+        crate::util::_openslide_fread_exact(file, &mut header[..8])?;
 
         let endian = match &header[0..2] {
             b"II" => Endian::Little,
@@ -279,7 +297,7 @@ impl TiffFile {
         let (bigtiff, first_ifd_offset) = match magic {
             TIFF_MAGIC_CLASSIC => (false, endian.read_u32(&header[4..8]) as u64),
             TIFF_MAGIC_BIG => {
-                file.read_exact(&mut header[8..16])?;
+                crate::util::_openslide_fread_exact(file, &mut header[8..16])?;
                 let offset_size = endian.read_u16(&header[4..6]);
                 let reserved = endian.read_u16(&header[6..8]);
                 if offset_size != 8 || reserved != 0 {
@@ -296,21 +314,24 @@ impl TiffFile {
     }
 
     fn scan_directory(
-        file: &mut File,
+        file: &mut crate::util::OpenSlideFile,
         endian: Endian,
         bigtiff: bool,
         offset: u64,
-        file_len: u64,
-    ) -> Result<(bool, u64)> {
-        file.seek(SeekFrom::Start(offset))?;
+    ) -> Result<(TiffImageDataShape, u64)> {
+        crate::util::_openslide_fseek(
+            file,
+            tiff_seek_offset(offset, "IFD")?,
+            crate::util::OpenSlideSeekWhence::Set,
+        )?;
 
         let entry_count = if bigtiff {
             let mut buf = [0u8; 8];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u64(&buf)
         } else {
             let mut buf = [0u8; 2];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u16(&buf) as u64
         };
         if entry_count > 100_000 {
@@ -321,58 +342,20 @@ impl TiffFile {
         }
 
         let entry_size = if bigtiff { 20usize } else { 12usize };
-        let inline_size = if bigtiff { 8usize } else { 4usize };
         let mut has_tile_width = false;
         let mut has_tile_length = false;
         let mut has_strip_offsets = false;
         let mut has_strip_byte_counts = false;
+        let mut has_unknown_value_type = false;
 
         for _ in 0..entry_count {
             let mut entry_buf = vec![0u8; entry_size];
-            file.read_exact(&mut entry_buf)?;
+            crate::util::_openslide_fread_exact(file, &mut entry_buf)?;
 
             let tag = endian.read_u16(&entry_buf[0..2]);
             let value_type = endian.read_u16(&entry_buf[2..4]);
-            let count = if bigtiff {
-                endian.read_u64(&entry_buf[4..12])
-            } else {
-                endian.read_u32(&entry_buf[4..8]) as u64
-            };
-            let value_field = if bigtiff {
-                &entry_buf[12..20]
-            } else {
-                &entry_buf[8..12]
-            };
-
-            let value_size = value_type_size(value_type)
-                .and_then(|size| size.checked_mul(count))
-                .ok_or_else(|| {
-                    OpenSlideError::Format(format!(
-                        "Unsupported or oversized TIFF value type {}",
-                        value_type
-                    ))
-                })?;
-            if value_size > 512 * 1024 * 1024 {
-                return Err(OpenSlideError::Format(format!(
-                    "Refusing to allocate {} bytes for TIFF tag {}",
-                    value_size, tag
-                )));
-            }
-            if value_size > inline_size as u64 {
-                let value_offset = if bigtiff {
-                    endian.read_u64(value_field)
-                } else {
-                    endian.read_u32(value_field) as u64
-                };
-                let value_end = value_offset.checked_add(value_size).ok_or_else(|| {
-                    OpenSlideError::Format(format!("TIFF tag {} value offset overflow", tag))
-                })?;
-                if value_end > file_len {
-                    return Err(OpenSlideError::Format(format!(
-                        "TIFF tag {} value extends outside file",
-                        tag
-                    )));
-                }
+            if value_type_size(value_type).is_none() {
+                has_unknown_value_type = true;
             }
 
             match tag {
@@ -386,36 +369,51 @@ impl TiffFile {
 
         let following_offset = if bigtiff {
             let mut buf = [0u8; 8];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u64(&buf)
         } else {
             let mut buf = [0u8; 4];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u32(&buf) as u64
         };
 
-        Ok((
-            has_tile_width && has_tile_length || has_strip_offsets && has_strip_byte_counts,
-            following_offset,
-        ))
+        let shape = if has_tile_width && has_tile_length {
+            if has_unknown_value_type {
+                return Err(OpenSlideError::Format(
+                    "Unsupported TIFF value type in tiled first directory".into(),
+                ));
+            }
+            TiffImageDataShape::Tiled
+        } else if has_strip_offsets && has_strip_byte_counts {
+            TiffImageDataShape::Stripped
+        } else {
+            TiffImageDataShape::None
+        };
+
+        Ok((shape, following_offset))
     }
 
     fn read_directory(
-        file: &mut File,
+        path: &Path,
+        file: &mut crate::util::OpenSlideFile,
         endian: Endian,
         bigtiff: bool,
         offset: u64,
         file_len: u64,
     ) -> Result<(TiffDirectory, u64)> {
-        file.seek(SeekFrom::Start(offset))?;
+        crate::util::_openslide_fseek(
+            file,
+            tiff_seek_offset(offset, "IFD")?,
+            crate::util::OpenSlideSeekWhence::Set,
+        )?;
 
         let entry_count = if bigtiff {
             let mut buf = [0u8; 8];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u64(&buf)
         } else {
             let mut buf = [0u8; 2];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u16(&buf) as u64
         };
 
@@ -432,7 +430,7 @@ impl TiffFile {
 
         for _ in 0..entry_count {
             let mut entry_buf = vec![0u8; entry_size];
-            file.read_exact(&mut entry_buf)?;
+            crate::util::_openslide_fread_exact(file, &mut entry_buf)?;
 
             let tag = endian.read_u16(&entry_buf[0..2]);
             let value_type = endian.read_u16(&entry_buf[2..4]);
@@ -480,12 +478,7 @@ impl TiffFile {
                     )));
                 }
 
-                let return_pos = file.stream_position()?;
-                file.seek(SeekFrom::Start(value_offset))?;
-                let mut data = vec![0u8; value_size as usize];
-                file.read_exact(&mut data)?;
-                file.seek(SeekFrom::Start(return_pos))?;
-                data
+                read_file_range(path, value_offset, value_size)?
             };
 
             entries.insert(
@@ -500,11 +493,11 @@ impl TiffFile {
 
         let following_offset = if bigtiff {
             let mut buf = [0u8; 8];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u64(&buf)
         } else {
             let mut buf = [0u8; 4];
-            file.read_exact(&mut buf)?;
+            crate::util::_openslide_fread_exact(file, &mut buf)?;
             endian.read_u32(&buf) as u64
         };
 
@@ -514,15 +507,14 @@ impl TiffFile {
     fn directory(&self, index: usize) -> Option<&TiffDirectory> {
         self.directories.get(index)
     }
+}
 
-    fn has_image_data(&self, dir: usize) -> bool {
-        self.directory(dir)
-            .map(|d| {
-                d.has(TAG_TILEWIDTH) && d.has(TAG_TILELENGTH)
-                    || d.has(TAG_STRIPOFFSETS) && d.has(TAG_STRIPBYTECOUNTS)
-            })
-            .unwrap_or(false)
-    }
+fn tiff_seek_offset(offset: u64, context: &str) -> Result<i64> {
+    i64::try_from(offset).map_err(|_| {
+        OpenSlideError::Format(format!(
+            "Generic TIFF {context} offset does not fit OpenSlide seek: offset={offset}"
+        ))
+    })
 }
 
 impl TiffDirectory {
@@ -547,10 +539,6 @@ impl TiffDirectory {
         self.entry(tag)
             .and_then(|entry| entry.floats(endian))
             .and_then(|values| values.first().copied())
-    }
-
-    fn ascii(&self, tag: u16) -> Option<String> {
-        self.entry(tag)?.ascii()
     }
 }
 
@@ -630,21 +618,6 @@ impl TiffEntry {
         }
     }
 
-    fn ascii(&self) -> Option<String> {
-        if self.value_type != TYPE_ASCII && self.value_type != TYPE_BYTE {
-            return None;
-        }
-        let nul = self
-            .raw
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.raw.len());
-        std::str::from_utf8(&self.raw[..nul])
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-
     fn c_string(&self) -> Option<String> {
         if self.value_type != TYPE_ASCII && self.value_type != TYPE_BYTE {
             return None;
@@ -709,7 +682,17 @@ struct TiffLevel {
     tile_offsets: Vec<u64>,
     tile_byte_counts: Vec<u64>,
     jpeg_tables: Option<Vec<u8>>,
+    old_jpeg: Option<OldJpegTables>,
     endian: Endian,
+}
+
+#[derive(Debug, Clone)]
+struct OldJpegTables {
+    proc: u16,
+    restart_interval: Option<u16>,
+    q_tables: Vec<u64>,
+    dc_tables: Vec<u64>,
+    ac_tables: Vec<u64>,
 }
 
 impl TiffLevel {
@@ -778,6 +761,7 @@ impl TiffLevel {
             compression,
             COMPRESSION_NONE
                 | COMPRESSION_LZW
+                | COMPRESSION_OLD_JPEG
                 | COMPRESSION_JPEG
                 | COMPRESSION_ADOBE_DEFLATE
                 | COMPRESSION_DEFLATE
@@ -839,12 +823,6 @@ impl TiffLevel {
                 dir_index
             )));
         }
-        if photometric == PHOTOMETRIC_YCBCR && bits_per_sample.iter().any(|&bits| bits != 8) {
-            return Err(OpenSlideError::UnsupportedFormat(format!(
-                "Only 8-bit YCbCr TIFF samples are supported in directory {}",
-                dir_index
-            )));
-        }
         let ycbcr_subsampling = if photometric == PHOTOMETRIC_YCBCR {
             let values = dir
                 .uints(tiff.endian, TAG_YCBCRSUBSAMPLING)
@@ -896,6 +874,11 @@ impl TiffLevel {
         }
 
         let jpeg_tables = dir.entry(TAG_JPEGTABLES).map(|entry| entry.raw.clone());
+        let old_jpeg = if compression == COMPRESSION_OLD_JPEG {
+            Some(parse_old_jpeg_tables(tiff, dir, dir_index)?)
+        } else {
+            None
+        };
 
         Ok(Some(Self {
             dir: dir_index,
@@ -916,6 +899,7 @@ impl TiffLevel {
             tile_offsets,
             tile_byte_counts,
             jpeg_tables,
+            old_jpeg,
             endian: tiff.endian,
         }))
     }
@@ -944,6 +928,82 @@ impl TiffLevel {
         }
         Ok(bits)
     }
+
+    fn bits_per_sample_for_sample(&self, sample: usize) -> Result<u16> {
+        if self.bits_per_sample.is_empty() {
+            return Ok(8);
+        }
+        if self.bits_per_sample.len() == 1 {
+            return Ok(self.bits_per_sample[0]);
+        }
+        self.bits_per_sample.get(sample).copied().ok_or_else(|| {
+            OpenSlideError::UnsupportedFormat(format!(
+                "TIFF sample {} has no BitsPerSample entry",
+                sample
+            ))
+        })
+    }
+}
+
+fn parse_old_jpeg_tables(
+    tiff: &TiffFile,
+    dir: &TiffDirectory,
+    dir_index: usize,
+) -> Result<OldJpegTables> {
+    let proc = dir.uint(tiff.endian, TAG_JPEG_PROC).unwrap_or(1) as u16;
+    if proc != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported TIFF old-JPEG processing mode {} in directory {}",
+            proc, dir_index
+        )));
+    }
+
+    let q_tables = dir
+        .uints(tiff.endian, TAG_JPEG_Q_TABLES)
+        .ok_or_else(|| {
+            OpenSlideError::UnsupportedFormat(format!(
+                "TIFF old-JPEG directory {} has no JPEGQTables tag",
+                dir_index
+            ))
+        })?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let dc_tables = dir
+        .uints(tiff.endian, TAG_JPEG_DC_TABLES)
+        .ok_or_else(|| {
+            OpenSlideError::UnsupportedFormat(format!(
+                "TIFF old-JPEG directory {} has no JPEGDCTables tag",
+                dir_index
+            ))
+        })?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let ac_tables = dir
+        .uints(tiff.endian, TAG_JPEG_AC_TABLES)
+        .ok_or_else(|| {
+            OpenSlideError::UnsupportedFormat(format!(
+                "TIFF old-JPEG directory {} has no JPEGACTables tag",
+                dir_index
+            ))
+        })?
+        .into_iter()
+        .collect::<Vec<_>>();
+    if q_tables.is_empty() || dc_tables.is_empty() || ac_tables.is_empty() {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "TIFF old-JPEG directory {} has empty JPEG table tags",
+            dir_index
+        )));
+    }
+    let restart_interval = dir
+        .uint(tiff.endian, TAG_JPEG_RESTART_INTERVAL)
+        .map(|value| value as u16);
+    Ok(OldJpegTables {
+        proc,
+        restart_interval,
+        q_tables,
+        dc_tables,
+        ac_tables,
+    })
 }
 
 fn required_uint(tiff: &TiffFile, dir: &TiffDirectory, tag: u16) -> Result<u64> {
@@ -965,19 +1025,25 @@ struct GenericTiffSlide {
     levels: Vec<TiffLevel>,
     properties: HashMap<String, String>,
     icc_profile: Option<Vec<u8>>,
-    cache: TileCache,
+    cache: Arc<TileCache>,
+    cache_binding_id: u64,
     channel_count: u32,
 }
 
 pub fn detect(path: &Path) -> bool {
-    TiffFile::first_directory_has_image_data(path).unwrap_or(false)
+    TiffFile::first_directory_image_data_shape(path)
+        .is_ok_and(|shape| shape == TiffImageDataShape::Tiled)
 }
 
 pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     let tiff = TiffFile::open(path)?;
-    if !tiff.has_image_data(0) {
+    if !tiff
+        .directories
+        .first()
+        .is_some_and(|dir| dir.has(TAG_TILEWIDTH) && dir.has(TAG_TILELENGTH))
+    {
         return Err(OpenSlideError::UnsupportedFormat(
-            "TIFF has no tiled or stripped image data".into(),
+            "TIFF first directory is not tiled".into(),
         ));
     }
     let slide = GenericTiffSlide::open(tiff)?;
@@ -1036,24 +1102,46 @@ impl GenericTiffSlide {
         let icc_profile = tiff_icc_profile(&tiff, levels[0].dir);
         let path = tiff.path.clone();
 
+        let cache = Arc::new(TileCache::new());
+        let cache_binding_id = cache.next_binding_id();
+
         Ok(Self {
             path,
             levels,
             properties,
             icc_profile,
-            cache: TileCache::new(),
+            cache,
+            cache_binding_id,
             channel_count,
         })
     }
 
     fn decode_tile(&self, level_index: u32, tile_no: u64) -> Result<CachedTile> {
         let level = self.level(level_index)?;
-        if let Ok(cache_key) = i32::try_from(tile_no) {
-            if let Some(tile) = self.cache.get(0, level_index, cache_key) {
+        if let Ok(cache_key) = i64::try_from(tile_no) {
+            if let Some(tile) = self
+                .cache
+                .get(self.cache_binding_id, 0, level_index, cache_key)
+            {
                 return Ok(tile);
             }
         }
 
+        let tile = self.decode_level_tile(level, tile_no)?;
+
+        if let Ok(cache_key) = i64::try_from(tile_no) {
+            self.cache.put(
+                self.cache_binding_id,
+                0,
+                level_index,
+                cache_key,
+                tile.clone(),
+            );
+        }
+        Ok(tile)
+    }
+
+    fn decode_level_tile(&self, level: &TiffLevel, tile_no: u64) -> Result<CachedTile> {
         let (actual_w, actual_h) = tile_visible_size(level, tile_no)?;
         let tile = if level.planar_config == PLANARCONFIG_SEPARATE {
             if should_use_tiff_decoder_for_planar(level) {
@@ -1083,8 +1171,12 @@ impl GenericTiffSlide {
                 let offset = level.tile_offsets[tile_no as usize];
                 let raw = read_file_range(&self.path, offset, byte_count)?;
                 match level.compression {
-                    COMPRESSION_JPEG => {
-                        let jpeg = merge_jpeg_tables(&raw, level.jpeg_tables.as_deref())?;
+                    COMPRESSION_OLD_JPEG | COMPRESSION_JPEG => {
+                        let jpeg = if level.compression == COMPRESSION_OLD_JPEG {
+                            old_jpeg_interchange_stream(&self.path, level, &raw)?
+                        } else {
+                            merge_jpeg_tables(&raw, level.jpeg_tables.as_deref())?
+                        };
                         let (rgb, width, height) = if level.jpeg_tables.is_some() {
                             decode::decode_tiff_bgra_rgb_region(
                                 ImageFormat::Jpeg,
@@ -1160,9 +1252,6 @@ impl GenericTiffSlide {
             }
         };
 
-        if let Ok(cache_key) = i32::try_from(tile_no) {
-            self.cache.put(0, level_index, cache_key, tile.clone());
-        }
         Ok(tile)
     }
 
@@ -1182,23 +1271,16 @@ fn should_use_tiff_decoder_for_contiguous(level: &TiffLevel) -> bool {
 }
 
 fn should_use_tiff_decoder_for_planar(level: &TiffLevel) -> bool {
-    if level.photometric == PHOTOMETRIC_YCBCR && level.ycbcr_subsampling != (1, 1) {
-        return false;
-    }
     matches!(
         level.compression,
-        COMPRESSION_NONE
-            | COMPRESSION_LZW
-            | COMPRESSION_PACKBITS
-            | COMPRESSION_ADOBE_DEFLATE
-            | COMPRESSION_DEFLATE
+        COMPRESSION_LZW | COMPRESSION_PACKBITS | COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE
     )
 }
 
 fn jpeg_color_space(photometric: u16) -> i32 {
     match photometric {
-        PHOTOMETRIC_YCBCR => 3, // JCS_YCbCr
-        _ => 2,                 // JCS_RGB
+        PHOTOMETRIC_YCBCR => 2,
+        _ => 1,
     }
 }
 
@@ -1229,6 +1311,12 @@ impl SlideBackend for GenericTiffSlide {
         self.levels
             .get(level as usize)
             .map(|level| level.downsample)
+    }
+
+    fn level_tile_dimensions(&self, level: u32) -> Option<(u64, u64)> {
+        self.levels
+            .get(level as usize)
+            .map(|level| (u64::from(level.tile_width), u64::from(level.tile_height)))
     }
 
     fn read_region(
@@ -1313,11 +1401,7 @@ impl SlideBackend for GenericTiffSlide {
             && channels[1].is_some()
             && channels[2].is_some()
             && tiff_level_needs_cairo_composition(level_data);
-        if channels[3].is_none() && !use_cairo_rgb {
-            for pixel in output.data.chunks_exact_mut(4) {
-                pixel[3] = 255;
-            }
-        }
+        let default_opaque_alpha = channels[3].is_none();
 
         let col_start = (lx / level_data.tile_width as f64).floor() as i64;
         let col_end = ((lx + w as f64) / level_data.tile_width as f64).ceil() as i64;
@@ -1333,6 +1417,9 @@ impl SlideBackend for GenericTiffSlide {
             for row in (row_start..row_end).rev() {
                 for col in (col_start..col_end).rev() {
                     let tile_no = row as u64 * level_data.tiles_across + col as u64;
+                    if is_missing_tile(level_data, tile_no) {
+                        continue;
+                    }
                     let decoded = self.decode_tile(level, tile_no)?;
                     let tile_origin_x = col as f64 * level_data.tile_width as f64;
                     let tile_origin_y = row as f64 * level_data.tile_height as f64;
@@ -1366,6 +1453,9 @@ impl SlideBackend for GenericTiffSlide {
             for row in row_start..row_end {
                 for col in col_start..col_end {
                     let tile_no = row as u64 * level_data.tiles_across + col as u64;
+                    if is_missing_tile(level_data, tile_no) {
+                        continue;
+                    }
                     let decoded = self.decode_tile(level, tile_no)?;
                     let tile_origin_x = col as f64 * level_data.tile_width as f64;
                     let tile_origin_y = row as f64 * level_data.tile_height as f64;
@@ -1379,6 +1469,7 @@ impl SlideBackend for GenericTiffSlide {
                     blit_rgb_rgba(
                         &decoded,
                         channels,
+                        default_opaque_alpha,
                         visible_w,
                         visible_h,
                         &mut output,
@@ -1407,6 +1498,11 @@ impl SlideBackend for GenericTiffSlide {
         )))
     }
 
+    fn set_cache(&mut self, cache: Arc<TileCache>) {
+        self.cache_binding_id = cache.next_binding_id();
+        self.cache = cache;
+    }
+
     fn icc_profile(&self) -> Result<Option<Vec<u8>>> {
         Ok(self.icc_profile.clone())
     }
@@ -1417,27 +1513,6 @@ impl SlideBackend for GenericTiffSlide {
             .map(TiffLevel::tile_count)
             .unwrap_or(0)
     }
-}
-
-fn read_file_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
-    let end = offset.checked_add(len).ok_or_else(|| {
-        OpenSlideError::Format(format!(
-            "File range overflows: offset={}, len={}",
-            offset, len
-        ))
-    })?;
-    if end > file_len {
-        return Err(OpenSlideError::Format(format!(
-            "File range extends outside file: offset={}, len={}, file_len={}",
-            offset, len, file_len
-        )));
-    }
-    file.seek(SeekFrom::Start(offset))?;
-    let mut data = vec![0u8; len as usize];
-    file.read_exact(&mut data)?;
-    Ok(data)
 }
 
 pub(crate) struct OpenslideHash {
@@ -1473,8 +1548,10 @@ impl OpenslideHash {
         if !self.enabled || size == 0 {
             return Ok(());
         }
-        let mut file = File::open(filename)?;
-        let file_len = file.metadata()?.len();
+        let mut file = crate::util::_openslide_fopen(filename)?;
+        let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+            OpenSlideError::Format(format!("Negative file size for {}", filename.display()))
+        })?;
         let end = offset.checked_add(size).ok_or_else(|| {
             OpenSlideError::Format(format!(
                 "File range overflows: offset={}, len={}",
@@ -1487,12 +1564,21 @@ impl OpenslideHash {
                 offset, size, file_len
             )));
         }
-        file.seek(SeekFrom::Start(offset))?;
+        let seek_offset = i64::try_from(offset).map_err(|_| {
+            OpenSlideError::Format(format!(
+                "File range offset does not fit OpenSlide seek: offset={offset}"
+            ))
+        })?;
+        crate::util::_openslide_fseek(
+            &mut file,
+            seek_offset,
+            crate::util::OpenSlideSeekWhence::Set,
+        )?;
         let mut bytes_left = size;
         let mut buf = [0u8; 4096];
         while bytes_left > 0 {
             let to_read = buf.len().min(bytes_left as usize);
-            file.read_exact(&mut buf[..to_read])?;
+            crate::util::_openslide_fread_exact(&mut file, &mut buf[..to_read])?;
             self.openslide_hash_data(&buf[..to_read]);
             bytes_left -= to_read as u64;
         }
@@ -1549,7 +1635,7 @@ fn store_and_hash_properties(
         .and_then(|dir| dir.entry(TAG_IMAGEDESCRIPTION))
         .and_then(TiffEntry::c_string)
     {
-        props.insert("openslide.comment".to_string(), value);
+        props.insert(properties::PROPERTY_COMMENT.to_string(), value);
     }
 
     for (name, tag) in [
@@ -1817,6 +1903,13 @@ fn tile_visible_size(level: &TiffLevel, tile_no: u64) -> Result<(u32, u32)> {
     Ok((visible_w, visible_h))
 }
 
+fn is_missing_tile(level: &TiffLevel, tile_no: u64) -> bool {
+    level
+        .tile_byte_counts
+        .get(tile_no as usize)
+        .is_some_and(|byte_count| *byte_count == 0)
+}
+
 fn openslide_tiff_read_tile(
     path: &Path,
     level: &TiffLevel,
@@ -1824,7 +1917,7 @@ fn openslide_tiff_read_tile(
     width: u32,
     height: u32,
 ) -> Result<CachedTile> {
-    let mut decoder = ::tiff::decoder::Decoder::new(File::open(path)?)
+    let mut decoder = ::tiff::decoder::Decoder::new(crate::util::_openslide_fopen_std(path)?)
         .map_err(|err| OpenSlideError::Decode(format!("TIFF decoder setup failed: {err}")))?;
     decoder
         .seek_to_image(level.dir)
@@ -1846,56 +1939,147 @@ fn openslide_tiff_read_tile(
     tiff_read_region(image, color_type, width, height)
 }
 
-fn tiff_read_region_planar<R: Read + Seek>(
-    decoder: &mut ::tiff::decoder::Decoder<R>,
+fn tiff_read_region_planar(
+    decoder: &mut ::tiff::decoder::Decoder<std::fs::File>,
     level: &TiffLevel,
     tile_no: u64,
     width: u32,
     height: u32,
 ) -> Result<CachedTile> {
-    let bits_per_sample = level.bits_per_sample_value()?;
-    if bits_per_sample != 8 && bits_per_sample != 16 {
-        return Err(OpenSlideError::Decode(
-            "Unsupported planar LZW TIFF sample depth".into(),
-        ));
-    }
     let tiles_per_plane = level.tiles_across * level.tiles_down;
     let pixel_count = width as usize * height as usize;
-    let mut rgb = vec![0; pixel_count * 3];
-    for sample in 0..usize::from(level.samples_per_pixel.min(3)) {
+    let sample_count = usize::from(level.samples_per_pixel.min(3));
+    let mut planes = Vec::with_capacity(sample_count);
+    for sample in 0..sample_count {
+        let sample_bits = level.bits_per_sample_for_sample(sample)?;
+        if sample_bits != 8 && sample_bits != 16 {
+            return Err(OpenSlideError::Decode(format!(
+                "Unsupported planar TIFF sample {} depth {}",
+                sample, sample_bits
+            )));
+        }
+        let plane_len = separate_plane_sample_count(level, width, height, sample)?;
         let chunk_index_u64 = sample as u64 * tiles_per_plane + tile_no;
-        if level.tile_byte_counts[chunk_index_u64 as usize] == 0 {
-            continue;
+        let plane = if level.tile_byte_counts[chunk_index_u64 as usize] == 0 {
+            if sample_bits == 16 {
+                PlanarDecodedChunk::U16(vec![0; plane_len])
+            } else {
+                PlanarDecodedChunk::U8(vec![0; plane_len])
+            }
+        } else {
+            let chunk_index = u32::try_from(chunk_index_u64)
+                .map_err(|_| OpenSlideError::Format("TIFF tile index too large".into()))?;
+            let image = decoder.read_chunk(chunk_index).map_err(|err| {
+                OpenSlideError::Decode(format!("TIFF planar chunk decode failed: {err}"))
+            })?;
+            match image {
+                ::tiff::decoder::DecodingResult::U8(data) => {
+                    if sample_bits != 8 {
+                        return Err(OpenSlideError::Decode(format!(
+                            "TIFF planar sample {} returned 8-bit data for {}-bit sample",
+                            sample, sample_bits
+                        )));
+                    }
+                    if data.len() < plane_len {
+                        return Err(OpenSlideError::Decode(
+                            "Decoded TIFF planar chunk is truncated".into(),
+                        ));
+                    }
+                    PlanarDecodedChunk::U8(data)
+                }
+                ::tiff::decoder::DecodingResult::U16(data) => {
+                    if sample_bits != 16 {
+                        return Err(OpenSlideError::Decode(format!(
+                            "TIFF planar sample {} returned 16-bit data for {}-bit sample",
+                            sample, sample_bits
+                        )));
+                    }
+                    if data.len() < plane_len {
+                        return Err(OpenSlideError::Decode(
+                            "Decoded TIFF planar chunk is truncated".into(),
+                        ));
+                    }
+                    PlanarDecodedChunk::U16(data)
+                }
+                other => {
+                    return Err(OpenSlideError::Decode(format!(
+                        "Unsupported TIFF planar sample type from tiff crate: {:?}",
+                        other
+                    )))
+                }
+            }
+        };
+        planes.push(plane);
+    }
+
+    if planes.len() < 3 && matches!(level.photometric, PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR) {
+        return Err(OpenSlideError::Decode(
+            "Planar TIFF tile has fewer than 3 decoded planes".into(),
+        ));
+    }
+
+    let mut rgb = Vec::with_capacity(pixel_count * 3);
+    match level.photometric {
+        PHOTOMETRIC_BLACK_IS_ZERO => {
+            for idx in 0..pixel_count {
+                let gray = planes[0].sample_u8(idx);
+                rgb.extend_from_slice(&[gray, gray, gray]);
+            }
         }
-        let chunk_index = u32::try_from(chunk_index_u64)
-            .map_err(|_| OpenSlideError::Format("TIFF tile index too large".into()))?;
-        let image = decoder.read_chunk(chunk_index).map_err(|err| {
-            OpenSlideError::Decode(format!("TIFF LZW planar chunk decode failed: {err}"))
-        })?;
-        match &image {
-            ::tiff::decoder::DecodingResult::U8(data) if data.len() < pixel_count => {
-                return Err(OpenSlideError::Decode(
-                    "Decoded LZW TIFF planar chunk is truncated".into(),
-                ));
-            }
-            ::tiff::decoder::DecodingResult::U16(data) if data.len() < pixel_count => {
-                return Err(OpenSlideError::Decode(
-                    "Decoded LZW TIFF planar chunk is truncated".into(),
-                ));
-            }
-            ::tiff::decoder::DecodingResult::U8(_) | ::tiff::decoder::DecodingResult::U16(_) => {}
-            other => {
-                return Err(OpenSlideError::Decode(format!(
-                    "Unsupported LZW TIFF planar sample type from tiff crate: {:?}",
-                    other
-                )))
+        PHOTOMETRIC_WHITE_IS_ZERO => {
+            for idx in 0..pixel_count {
+                let gray = 255u8.saturating_sub(planes[0].sample_u8(idx));
+                rgb.extend_from_slice(&[gray, gray, gray]);
             }
         }
-        for pixel in 0..pixel_count {
-            rgb[pixel * 3 + sample] = tiff_decoded_sample_u8(&image, pixel);
+        PHOTOMETRIC_RGB => {
+            for idx in 0..pixel_count {
+                rgb.extend_from_slice(&[
+                    planes[0].sample_u8(idx),
+                    planes[1].sample_u8(idx),
+                    planes[2].sample_u8(idx),
+                ]);
+            }
+        }
+        PHOTOMETRIC_YCBCR => {
+            let (sub_x, sub_y) = level.ycbcr_subsampling;
+            let chroma_width = width.div_ceil(u32::from(sub_x)) as usize;
+            for y in 0..height as usize {
+                for x in 0..width as usize {
+                    let y_index = y * width as usize + x;
+                    let chroma_index =
+                        (y / usize::from(sub_y)) * chroma_width + (x / usize::from(sub_x));
+                    rgb.extend_from_slice(&ycbcr_to_rgb(
+                        planes[0].sample_u8(y_index),
+                        planes[1].sample_u8(chroma_index),
+                        planes[2].sample_u8(chroma_index),
+                    ));
+                }
+            }
+        }
+        other => {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "Unsupported planar separate TIFF photometric interpretation {}",
+                other
+            )))
         }
     }
+
     Ok(CachedTile { width, height, rgb })
+}
+
+enum PlanarDecodedChunk {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+}
+
+impl PlanarDecodedChunk {
+    fn sample_u8(&self, index: usize) -> u8 {
+        match self {
+            Self::U8(data) => data[index],
+            Self::U16(data) => downscale_u16_to_u8(data[index]),
+        }
+    }
 }
 
 fn tiff_read_region(
@@ -1979,8 +2163,9 @@ fn decode_uncompressed_tile(
     raw: &[u8],
 ) -> Result<CachedTile> {
     let samples = usize::from(level.samples_per_pixel);
-    let bits_per_sample = level.bits_per_sample_value()?;
-    if bits_per_sample == 16 && level.planar_config == PLANARCONFIG_SEPARATE {
+    let sample_bytes = contiguous_sample_bytes(level)?;
+    if sample_bytes.iter().all(|&bytes| bytes == 2) && level.planar_config == PLANARCONFIG_SEPARATE
+    {
         return Err(OpenSlideError::UnsupportedFormat(
             "Planar separate 16-bit TIFF tiles are not supported".into(),
         ));
@@ -2000,18 +2185,20 @@ fn decode_uncompressed_tile(
         PHOTOMETRIC_BLACK_IS_ZERO => {
             for idx in 0..pixel_count {
                 let sample = idx
-                    .checked_mul(samples)
+                    .checked_mul(sample_bytes.len())
                     .ok_or_else(|| OpenSlideError::Decode("TIFF sample index overflow".into()))?;
-                let gray = read_tiff_sample_u8(raw, sample, bits_per_sample, level.endian)?;
+                let gray =
+                    read_contiguous_tiff_sample_u8(raw, &sample_bytes, sample, level.endian)?;
                 rgb.extend_from_slice(&[gray, gray, gray]);
             }
         }
         PHOTOMETRIC_WHITE_IS_ZERO => {
             for idx in 0..pixel_count {
                 let sample = idx
-                    .checked_mul(samples)
+                    .checked_mul(sample_bytes.len())
                     .ok_or_else(|| OpenSlideError::Decode("TIFF sample index overflow".into()))?;
-                let gray = read_tiff_sample_u8(raw, sample, bits_per_sample, level.endian)?;
+                let gray =
+                    read_contiguous_tiff_sample_u8(raw, &sample_bytes, sample, level.endian)?;
                 let gray = 255u8.saturating_sub(gray);
                 rgb.extend_from_slice(&[gray, gray, gray]);
             }
@@ -2024,21 +2211,16 @@ fn decode_uncompressed_tile(
             }
             for idx in 0..pixel_count {
                 let base = idx
-                    .checked_mul(samples)
+                    .checked_mul(sample_bytes.len())
                     .ok_or_else(|| OpenSlideError::Decode("TIFF sample index overflow".into()))?;
                 rgb.extend_from_slice(&[
-                    read_tiff_sample_u8(raw, base, bits_per_sample, level.endian)?,
-                    read_tiff_sample_u8(raw, base + 1, bits_per_sample, level.endian)?,
-                    read_tiff_sample_u8(raw, base + 2, bits_per_sample, level.endian)?,
+                    read_contiguous_tiff_sample_u8(raw, &sample_bytes, base, level.endian)?,
+                    read_contiguous_tiff_sample_u8(raw, &sample_bytes, base + 1, level.endian)?,
+                    read_contiguous_tiff_sample_u8(raw, &sample_bytes, base + 2, level.endian)?,
                 ]);
             }
         }
         PHOTOMETRIC_YCBCR => {
-            if bits_per_sample != 8 {
-                return Err(OpenSlideError::UnsupportedFormat(
-                    "16-bit YCbCr TIFF tiles are not supported".into(),
-                ));
-            }
             if samples < 3 {
                 return Err(OpenSlideError::Decode(
                     "YCbCr TIFF tile has fewer than 3 samples per pixel".into(),
@@ -2047,8 +2229,15 @@ fn decode_uncompressed_tile(
             if level.ycbcr_subsampling != (1, 1) {
                 return decode_subsampled_ycbcr_tile(level, width, height, raw);
             }
-            for pixel in raw[..expected].chunks_exact(samples) {
-                rgb.extend_from_slice(&ycbcr_to_rgb(pixel[0], pixel[1], pixel[2]));
+            for idx in 0..pixel_count {
+                let base = idx
+                    .checked_mul(sample_bytes.len())
+                    .ok_or_else(|| OpenSlideError::Decode("TIFF sample index overflow".into()))?;
+                rgb.extend_from_slice(&ycbcr_to_rgb(
+                    read_contiguous_tiff_sample_u8(raw, &sample_bytes, base, level.endian)?,
+                    read_contiguous_tiff_sample_u8(raw, &sample_bytes, base + 1, level.endian)?,
+                    read_contiguous_tiff_sample_u8(raw, &sample_bytes, base + 2, level.endian)?,
+                ));
             }
         }
         other => {
@@ -2060,6 +2249,70 @@ fn decode_uncompressed_tile(
     }
 
     Ok(CachedTile { width, height, rgb })
+}
+
+fn contiguous_sample_bytes(level: &TiffLevel) -> Result<Vec<u8>> {
+    let sample_count = usize::from(level.samples_per_pixel);
+    let mut sample_bytes = Vec::with_capacity(sample_count);
+    for sample in 0..sample_count {
+        let bits = level
+            .bits_per_sample
+            .get(sample)
+            .or_else(|| level.bits_per_sample.first())
+            .copied()
+            .unwrap_or(8);
+        match bits {
+            8 => sample_bytes.push(1),
+            16 => sample_bytes.push(2),
+            other => {
+                return Err(OpenSlideError::UnsupportedFormat(format!(
+                    "Unsupported TIFF bits-per-sample {}",
+                    other
+                )))
+            }
+        }
+    }
+    Ok(sample_bytes)
+}
+
+fn read_contiguous_tiff_sample_u8(
+    raw: &[u8],
+    sample_bytes: &[u8],
+    sample_index: usize,
+    endian: Endian,
+) -> Result<u8> {
+    let samples_per_pixel = sample_bytes.len();
+    if samples_per_pixel == 0 {
+        return Err(OpenSlideError::Decode(
+            "TIFF sample layout has zero samples per pixel".into(),
+        ));
+    }
+    let pixel = sample_index / samples_per_pixel;
+    let sample = sample_index % samples_per_pixel;
+    let bytes_per_pixel = sample_bytes
+        .iter()
+        .try_fold(0usize, |acc, &bytes| acc.checked_add(usize::from(bytes)))
+        .ok_or_else(|| OpenSlideError::Decode("TIFF sample byte offset overflow".into()))?;
+    let sample_offset = sample_bytes[..sample]
+        .iter()
+        .try_fold(0usize, |acc, &bytes| acc.checked_add(usize::from(bytes)))
+        .ok_or_else(|| OpenSlideError::Decode("TIFF sample byte offset overflow".into()))?;
+    let byte_index = pixel
+        .checked_mul(bytes_per_pixel)
+        .and_then(|base| base.checked_add(sample_offset))
+        .ok_or_else(|| OpenSlideError::Decode("TIFF sample byte offset overflow".into()))?;
+    match sample_bytes[sample] {
+        1 => raw.get(byte_index).copied().ok_or_else(|| {
+            OpenSlideError::Decode(format!("TIFF sample {} is truncated", sample_index))
+        }),
+        2 => {
+            let bytes = raw.get(byte_index..byte_index + 2).ok_or_else(|| {
+                OpenSlideError::Decode(format!("TIFF 16-bit sample {} is truncated", sample_index))
+            })?;
+            Ok(downscale_u16_to_u8(endian.read_u16(bytes)))
+        }
+        _ => unreachable!(),
+    }
 }
 
 fn read_tiff_sample_u8(
@@ -2106,8 +2359,22 @@ fn decode_subsampled_ycbcr_tile(
     let block_luma_count = block_w
         .checked_mul(block_h)
         .ok_or_else(|| OpenSlideError::Decode("TIFF YCbCr block size overflow".into()))?;
-    let block_size = block_luma_count
+    let block_sample_count = block_luma_count
         .checked_add(2)
+        .ok_or_else(|| OpenSlideError::Decode("TIFF YCbCr block sample count overflow".into()))?;
+    let bits_per_sample = level.bits_per_sample_value()?;
+    let bytes_per_sample = match bits_per_sample {
+        8 => 1usize,
+        16 => 2usize,
+        other => {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "Unsupported TIFF bits-per-sample {}",
+                other
+            )))
+        }
+    };
+    let block_size = block_sample_count
+        .checked_mul(bytes_per_sample)
         .ok_or_else(|| OpenSlideError::Decode("TIFF YCbCr block byte count overflow".into()))?;
     let blocks_x = width.div_ceil(block_w);
     let blocks_y = height.div_ceil(block_h);
@@ -2124,13 +2391,21 @@ fn decode_subsampled_ycbcr_tile(
     }
 
     let mut rgb = vec![0u8; width * height * 3];
-    let mut offset = 0usize;
+    let mut block_sample_offset = 0usize;
     for block_y in 0..blocks_y {
         for block_x in 0..blocks_x {
-            let ys = &raw[offset..offset + block_luma_count];
-            let cb = raw[offset + block_luma_count];
-            let cr = raw[offset + block_luma_count + 1];
-            offset += block_size;
+            let cb = read_tiff_sample_u8(
+                raw,
+                block_sample_offset + block_luma_count,
+                bits_per_sample,
+                level.endian,
+            )?;
+            let cr = read_tiff_sample_u8(
+                raw,
+                block_sample_offset + block_luma_count + 1,
+                bits_per_sample,
+                level.endian,
+            )?;
 
             for local_y in 0..block_h {
                 let dst_y = block_y * block_h + local_y;
@@ -2142,12 +2417,18 @@ fn decode_subsampled_ycbcr_tile(
                     if dst_x >= width {
                         continue;
                     }
-                    let y = ys[local_y * block_w + local_x];
+                    let y = read_tiff_sample_u8(
+                        raw,
+                        block_sample_offset + local_y * block_w + local_x,
+                        bits_per_sample,
+                        level.endian,
+                    )?;
                     let pixel = ycbcr_to_rgb(y, cb, cr);
                     let dst = (dst_y * width + dst_x) * 3;
                     rgb[dst..dst + 3].copy_from_slice(&pixel);
                 }
             }
+            block_sample_offset += block_sample_count;
         }
     }
 
@@ -2165,22 +2446,6 @@ fn decode_separate_tile(
     width: u32,
     height: u32,
 ) -> Result<CachedTile> {
-    if matches!(
-        level.compression,
-        COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K
-    ) {
-        return Err(unsupported_planar_jpeg2000_tile_error(level));
-    }
-    if level.compression == COMPRESSION_JPEG {
-        return Err(OpenSlideError::UnsupportedFormat(
-            "Planar separate JPEG TIFF tiles are not supported".into(),
-        ));
-    }
-    if level.bits_per_sample_value()? != 8 {
-        return Err(OpenSlideError::UnsupportedFormat(
-            "Planar separate non-8-bit TIFF tiles are not supported".into(),
-        ));
-    }
     if level.samples_per_pixel < 3
         && matches!(level.photometric, PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR)
     {
@@ -2188,38 +2453,83 @@ fn decode_separate_tile(
             "Planar TIFF tile has fewer than 3 samples per pixel".into(),
         ));
     }
-    if level.predictor != 1
-        && matches!(
-            level.compression,
-            COMPRESSION_PACKBITS | COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE
-        )
-    {
-        return Err(OpenSlideError::UnsupportedFormat(
-            "Planar separate predictor-compressed TIFF tiles are not supported tile-by-tile".into(),
-        ));
-    }
 
     let pixel_count = width as usize * height as usize;
     let tiles_per_plane = level.tiles_across * level.tiles_down;
     let sample_count = usize::from(level.samples_per_pixel);
     let mut planes = Vec::with_capacity(sample_count);
+    let mut plane_bits = Vec::with_capacity(sample_count);
     for sample in 0..sample_count {
+        let sample_bits = level.bits_per_sample_for_sample(sample)?;
+        let bytes_per_sample = match sample_bits {
+            8 => 1usize,
+            16 => 2usize,
+            other => {
+                return Err(OpenSlideError::UnsupportedFormat(format!(
+                    "Unsupported planar separate TIFF sample {} bits-per-sample {}",
+                    sample, other
+                )))
+            }
+        };
+        if matches!(level.compression, COMPRESSION_OLD_JPEG | COMPRESSION_JPEG) && sample_bits != 8
+        {
+            return Err(OpenSlideError::UnsupportedFormat(format!(
+                "Unsupported planar separate JPEG TIFF sample {} bits-per-sample {}",
+                sample, sample_bits
+            )));
+        }
         let plane_len = separate_plane_sample_count(level, width, height, sample)?;
+        let plane_byte_len = plane_len
+            .checked_mul(bytes_per_sample)
+            .ok_or_else(|| OpenSlideError::Decode("TIFF plane byte size overflow".into()))?;
         let index = sample as u64 * tiles_per_plane + tile_no;
         let byte_count = level.tile_byte_counts[index as usize];
+        let mut decoded_bits = sample_bits;
+        let mut min_plane_bytes = plane_byte_len;
         let plane = if byte_count == 0 {
-            vec![0; plane_len]
+            vec![0; plane_byte_len]
         } else {
-            let raw = read_file_range(path, level.tile_offsets[index as usize], byte_count)?;
             match level.compression {
-                COMPRESSION_NONE => raw,
-                COMPRESSION_PACKBITS => unpack_packbits(&raw, plane_len)?,
-                COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => inflate_tiff_deflate(&raw)?,
-                COMPRESSION_LZW => {
-                    return Err(OpenSlideError::UnsupportedFormat(
-                        "Planar separate LZW TIFF tiles are not supported tile-by-tile".into(),
-                    ))
+                COMPRESSION_OLD_JPEG => {
+                    let raw =
+                        read_file_range(path, level.tile_offsets[index as usize], byte_count)?;
+                    decode_planar_old_jpeg_plane(path, level, &raw, sample, width, height)?
                 }
+                COMPRESSION_JPEG => {
+                    let raw =
+                        read_file_range(path, level.tile_offsets[index as usize], byte_count)?;
+                    decode_planar_jpeg_plane(level, &raw, sample, width, height)?
+                }
+                COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+                    let raw =
+                        read_file_range(path, level.tile_offsets[index as usize], byte_count)?;
+                    decoded_bits = 8;
+                    min_plane_bytes = plane_len;
+                    decode_planar_jpeg2000_plane(level, &raw, sample, tile_no, width, height)?
+                }
+                COMPRESSION_NONE => {
+                    read_file_range(path, level.tile_offsets[index as usize], byte_count)?
+                }
+                COMPRESSION_PACKBITS if level.predictor == 1 => {
+                    let raw =
+                        read_file_range(path, level.tile_offsets[index as usize], byte_count)?;
+                    unpack_packbits(&raw, plane_byte_len)?
+                }
+                COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE if level.predictor == 1 => {
+                    let raw =
+                        read_file_range(path, level.tile_offsets[index as usize], byte_count)?;
+                    inflate_tiff_deflate(&raw)?
+                }
+                COMPRESSION_PACKBITS
+                | COMPRESSION_ADOBE_DEFLATE
+                | COMPRESSION_DEFLATE
+                | COMPRESSION_LZW => read_planar_tiff_chunk_bytes(
+                    path,
+                    level,
+                    index,
+                    plane_byte_len,
+                    bytes_per_sample,
+                )?,
                 other => {
                     return Err(OpenSlideError::UnsupportedFormat(format!(
                         "Unsupported planar separate TIFF compression {}",
@@ -2228,33 +2538,40 @@ fn decode_separate_tile(
                 }
             }
         };
-        if plane.len() < plane_len {
+        if plane.len() < min_plane_bytes {
             return Err(OpenSlideError::Decode(format!(
                 "Planar TIFF tile sample {} truncated: expected at least {} bytes, got {}",
                 sample,
-                plane_len,
+                min_plane_bytes,
                 plane.len()
             )));
         }
         planes.push(plane);
+        plane_bits.push(decoded_bits);
     }
 
     let mut rgb = Vec::with_capacity(pixel_count * 3);
     match level.photometric {
         PHOTOMETRIC_BLACK_IS_ZERO => {
-            for &gray in planes[0].iter().take(pixel_count) {
+            for idx in 0..pixel_count {
+                let gray = read_planar_sample_u8(&planes[0], idx, plane_bits[0], level.endian)?;
                 rgb.extend_from_slice(&[gray, gray, gray]);
             }
         }
         PHOTOMETRIC_WHITE_IS_ZERO => {
-            for &gray in planes[0].iter().take(pixel_count) {
+            for idx in 0..pixel_count {
+                let gray = read_planar_sample_u8(&planes[0], idx, plane_bits[0], level.endian)?;
                 let gray = 255u8.saturating_sub(gray);
                 rgb.extend_from_slice(&[gray, gray, gray]);
             }
         }
         PHOTOMETRIC_RGB => {
             for idx in 0..pixel_count {
-                rgb.extend_from_slice(&[planes[0][idx], planes[1][idx], planes[2][idx]]);
+                rgb.extend_from_slice(&[
+                    read_planar_sample_u8(&planes[0], idx, plane_bits[0], level.endian)?,
+                    read_planar_sample_u8(&planes[1], idx, plane_bits[1], level.endian)?,
+                    read_planar_sample_u8(&planes[2], idx, plane_bits[2], level.endian)?,
+                ]);
             }
         }
         PHOTOMETRIC_YCBCR => {
@@ -2266,9 +2583,19 @@ fn decode_separate_tile(
                     let chroma_index =
                         (y / usize::from(sub_y)) * chroma_width + (x / usize::from(sub_x));
                     rgb.extend_from_slice(&ycbcr_to_rgb(
-                        planes[0][y_index],
-                        planes[1][chroma_index],
-                        planes[2][chroma_index],
+                        read_planar_sample_u8(&planes[0], y_index, plane_bits[0], level.endian)?,
+                        read_planar_sample_u8(
+                            &planes[1],
+                            chroma_index,
+                            plane_bits[1],
+                            level.endian,
+                        )?,
+                        read_planar_sample_u8(
+                            &planes[2],
+                            chroma_index,
+                            plane_bits[2],
+                            level.endian,
+                        )?,
                     ));
                 }
             }
@@ -2284,16 +2611,286 @@ fn decode_separate_tile(
     Ok(CachedTile { width, height, rgb })
 }
 
-fn unsupported_planar_jpeg2000_tile_error(level: &TiffLevel) -> OpenSlideError {
+fn decode_planar_old_jpeg_plane(
+    path: &Path,
+    level: &TiffLevel,
+    raw: &[u8],
+    sample: usize,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    let jpeg = old_jpeg_planar_interchange_stream(path, level, raw, sample)?;
+    let (rgb, decoded_w, decoded_h) = decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?;
+    let (plane_width, plane_height) = separate_plane_dimensions(level, width, height, sample);
+    if decoded_w < plane_width || decoded_h < plane_height {
+        return Err(OpenSlideError::Decode(format!(
+            "Planar old-JPEG TIFF sample {} decoded to {}x{}, expected at least {}x{}",
+            sample, decoded_w, decoded_h, plane_width, plane_height
+        )));
+    }
+    let expected_samples = plane_width
+        .checked_mul(plane_height)
+        .map(|samples| samples as usize)
+        .ok_or_else(|| OpenSlideError::Decode("TIFF old-JPEG plane size overflow".into()))?;
+    let mut plane = Vec::with_capacity(expected_samples);
+    let decoded_w = decoded_w as usize;
+    for y in 0..plane_height as usize {
+        for x in 0..plane_width as usize {
+            let pixel = y
+                .checked_mul(decoded_w)
+                .and_then(|base| base.checked_add(x))
+                .ok_or_else(|| {
+                    OpenSlideError::Decode("TIFF old-JPEG plane index overflow".into())
+                })?;
+            plane.push(rgb[pixel * 3]);
+        }
+    }
+    Ok(plane)
+}
+
+fn old_jpeg_planar_interchange_stream(
+    path: &Path,
+    level: &TiffLevel,
+    entropy: &[u8],
+    sample: usize,
+) -> Result<Vec<u8>> {
+    if starts_with_soi(entropy) {
+        return Ok(entropy.to_vec());
+    }
+    if level.planar_config != PLANARCONFIG_SEPARATE {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "TIFF old-JPEG planar helper requires separate planes".into(),
+        ));
+    }
+    if level.bits_per_sample_for_sample(sample)? != 8 {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "TIFF old-JPEG planar tiles require 8-bit samples".into(),
+        ));
+    }
+    if !matches!(level.photometric, PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported TIFF old-JPEG planar photometric interpretation {}",
+            level.photometric
+        )));
+    }
+    let tables = level.old_jpeg.as_ref().ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat("TIFF old-JPEG tables are missing".into())
+    })?;
+    if tables.proc != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported TIFF old-JPEG processing mode {}",
+            tables.proc
+        )));
+    }
+    if tables.q_tables.len() <= sample
+        || tables.dc_tables.len() <= sample
+        || tables.ac_tables.len() <= sample
+    {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "TIFF old-JPEG planar sample {} has no matching Q/DC/AC table",
+            sample
+        )));
+    }
+
+    let (jpeg_width, jpeg_height) =
+        separate_plane_dimensions(level, level.tile_width, level.tile_height, sample);
+    let jpeg_width = u16::try_from(jpeg_width).map_err(|_| {
+        OpenSlideError::UnsupportedFormat("TIFF old-JPEG planar width exceeds JPEG limits".into())
+    })?;
+    let jpeg_height = u16::try_from(jpeg_height).map_err(|_| {
+        OpenSlideError::UnsupportedFormat("TIFF old-JPEG planar height exceeds JPEG limits".into())
+    })?;
+
+    let mut jpeg = Vec::with_capacity(entropy.len() + 512);
+    jpeg.extend_from_slice(&[0xff, 0xd8]);
+    let table = read_file_range(path, tables.q_tables[sample], 64)?;
+    write_jpeg_marker_segment(&mut jpeg, 0xdb, 3 + table.len())?;
+    jpeg.push(sample as u8);
+    jpeg.extend_from_slice(&table);
+
+    write_jpeg_marker_segment(&mut jpeg, 0xc0, 11)?;
+    jpeg.push(8);
+    jpeg.extend_from_slice(&jpeg_height.to_be_bytes());
+    jpeg.extend_from_slice(&jpeg_width.to_be_bytes());
+    jpeg.push(1);
+    jpeg.push(1);
+    jpeg.push(0x11);
+    jpeg.push(sample as u8);
+
+    write_old_jpeg_huffman_table(path, &mut jpeg, false, sample, tables.dc_tables[sample])?;
+    write_old_jpeg_huffman_table(path, &mut jpeg, true, sample, tables.ac_tables[sample])?;
+    if let Some(interval) = tables.restart_interval {
+        write_jpeg_marker_segment(&mut jpeg, 0xdd, 4)?;
+        jpeg.extend_from_slice(&interval.to_be_bytes());
+    }
+
+    write_jpeg_marker_segment(&mut jpeg, 0xda, 8)?;
+    jpeg.push(1);
+    jpeg.push(1);
+    jpeg.push(((sample as u8) << 4) | sample as u8);
+    jpeg.extend_from_slice(&[0, 63, 0]);
+    jpeg.extend_from_slice(entropy);
+    if !entropy.ends_with(&[0xff, 0xd9]) {
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+    }
+    Ok(jpeg)
+}
+
+fn read_planar_tiff_chunk_bytes(
+    path: &Path,
+    level: &TiffLevel,
+    chunk_index_u64: u64,
+    expected_plane_bytes: usize,
+    bytes_per_sample: usize,
+) -> Result<Vec<u8>> {
+    let mut decoder = ::tiff::decoder::Decoder::new(crate::util::_openslide_fopen_std(path)?)
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF decoder setup failed: {err}")))?;
+    decoder
+        .seek_to_image(level.dir)
+        .map_err(|err| OpenSlideError::Decode(format!("TIFF directory seek failed: {err}")))?;
+    let chunk_index = u32::try_from(chunk_index_u64)
+        .map_err(|_| OpenSlideError::Format("TIFF planar chunk index too large".into()))?;
+    let image = decoder.read_chunk(chunk_index).map_err(|err| {
+        OpenSlideError::Decode(format!("TIFF planar compressed chunk decode failed: {err}"))
+    })?;
+    match image {
+        ::tiff::decoder::DecodingResult::U8(data) => {
+            if bytes_per_sample != 1 {
+                return Err(OpenSlideError::Decode(
+                    "TIFF planar compressed chunk returned 8-bit samples for non-8-bit level"
+                        .into(),
+                ));
+            }
+            if data.len() < expected_plane_bytes {
+                return Err(OpenSlideError::Decode(format!(
+                    "TIFF planar compressed chunk decoded to {} bytes, expected {}",
+                    data.len(),
+                    expected_plane_bytes
+                )));
+            }
+            Ok(data[..expected_plane_bytes].to_vec())
+        }
+        ::tiff::decoder::DecodingResult::U16(data) => {
+            if bytes_per_sample != 2 {
+                return Err(OpenSlideError::Decode(
+                    "TIFF planar compressed chunk returned 16-bit samples for non-16-bit level"
+                        .into(),
+                ));
+            }
+            let expected_samples = expected_plane_bytes / 2;
+            if data.len() < expected_samples {
+                return Err(OpenSlideError::Decode(format!(
+                    "TIFF planar compressed chunk decoded to {} samples, expected {}",
+                    data.len(),
+                    expected_samples
+                )));
+            }
+            let mut out = Vec::with_capacity(expected_plane_bytes);
+            append_u16_samples_as_tiff_bytes(
+                &mut out,
+                data.into_iter().take(expected_samples),
+                level.endian,
+            );
+            Ok(out)
+        }
+        other => Err(OpenSlideError::Decode(format!(
+            "Unsupported TIFF planar compressed sample type from tiff crate: {:?}",
+            other
+        ))),
+    }
+}
+
+fn decode_planar_jpeg_plane(
+    level: &TiffLevel,
+    raw: &[u8],
+    sample: usize,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    let jpeg = merge_jpeg_tables(raw, level.jpeg_tables.as_deref())?;
+    let (rgb, decoded_w, decoded_h) = decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?;
+    let expected_samples = separate_plane_sample_count(level, width, height, sample)?;
+    if decoded_w as usize * decoded_h as usize != expected_samples {
+        return Err(OpenSlideError::Decode(format!(
+            "Planar JPEG TIFF sample {} decoded to {}x{}, expected {} samples",
+            sample, decoded_w, decoded_h, expected_samples
+        )));
+    }
+    let mut plane = Vec::with_capacity(expected_samples);
+    for pixel in rgb.chunks_exact(3).take(expected_samples) {
+        plane.push(pixel[0]);
+    }
+    Ok(plane)
+}
+
+fn decode_planar_jpeg2000_plane(
+    level: &TiffLevel,
+    raw: &[u8],
+    sample: usize,
+    tile_no: u64,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    let (plane_width, plane_height) = separate_plane_dimensions(level, width, height, sample);
+    let expected_samples = plane_width
+        .checked_mul(plane_height)
+        .map(|samples| samples as usize)
+        .ok_or_else(|| OpenSlideError::Decode("TIFF JPEG 2000 plane size overflow".into()))?;
     let colorspace = match level.compression {
         COMPRESSION_JP2K_YCBCR => "YCbCr",
         COMPRESSION_JP2K_RGB => "RGB",
         _ => "unspecified",
     };
-    OpenSlideError::UnsupportedFormat(format!(
-        "Planar separate TIFF JPEG 2000 ({colorspace}) tile compression {} in directory {} is not supported",
-        level.compression, level.dir
-    ))
+    let context = format!(
+        "Planar TIFF JPEG 2000 ({colorspace}) sample {sample} compression {} in directory {} expected {} samples",
+        level.compression, level.dir, expected_samples
+    );
+    let gray = decode::default_decoder_api().decode_jpeg2000_gray(
+        raw,
+        decode::jpeg2000::Jpeg2000DecodeOptions::new(
+            plane_width,
+            plane_height,
+            1,
+            decode::jpeg2000::Jpeg2000OutputFormat::Gray { channel: 0 },
+            &context,
+        )
+        .with_source(decode::jpeg2000::Jpeg2000DecodeSource::TiffTile)
+        .with_tile(decode::jpeg2000::Jpeg2000TileContext {
+            tile_x: (tile_no % level.tiles_across) as u32,
+            tile_y: (tile_no / level.tiles_across) as u32,
+            tile_width: plane_width,
+            tile_height: plane_height,
+        }),
+    )?;
+    if gray.width as usize * gray.height as usize != expected_samples {
+        return Err(OpenSlideError::Decode(format!(
+            "Planar JPEG 2000 TIFF sample {} decoded to {}x{}, expected {} samples",
+            sample, gray.width, gray.height, expected_samples
+        )));
+    }
+    Ok(gray.data)
+}
+
+fn read_planar_sample_u8(
+    plane: &[u8],
+    sample_index: usize,
+    bits_per_sample: u16,
+    endian: Endian,
+) -> Result<u8> {
+    read_tiff_sample_u8(plane, sample_index, bits_per_sample, endian)
+}
+
+fn append_u16_samples_as_tiff_bytes(
+    out: &mut Vec<u8>,
+    samples: impl IntoIterator<Item = u16>,
+    endian: Endian,
+) {
+    for sample in samples {
+        match endian {
+            Endian::Little => out.extend_from_slice(&sample.to_le_bytes()),
+            Endian::Big => out.extend_from_slice(&sample.to_be_bytes()),
+        }
+    }
 }
 
 fn separate_plane_sample_count(
@@ -2302,19 +2899,27 @@ fn separate_plane_sample_count(
     height: u32,
     sample: usize,
 ) -> Result<usize> {
-    if level.photometric == PHOTOMETRIC_YCBCR && level.ycbcr_subsampling != (1, 1) && sample > 0 {
-        let (sub_x, sub_y) = level.ycbcr_subsampling;
-        return width
-            .div_ceil(u32::from(sub_x))
-            .checked_mul(height.div_ceil(u32::from(sub_y)))
-            .map(|samples| samples as usize)
-            .ok_or_else(|| OpenSlideError::Decode("TIFF chroma plane size overflow".into()));
-    }
-
+    let (width, height) = separate_plane_dimensions(level, width, height, sample);
     width
         .checked_mul(height)
         .map(|samples| samples as usize)
         .ok_or_else(|| OpenSlideError::Decode("TIFF plane size overflow".into()))
+}
+
+fn separate_plane_dimensions(
+    level: &TiffLevel,
+    width: u32,
+    height: u32,
+    sample: usize,
+) -> (u32, u32) {
+    if level.photometric == PHOTOMETRIC_YCBCR && level.ycbcr_subsampling != (1, 1) && sample > 0 {
+        let (sub_x, sub_y) = level.ycbcr_subsampling;
+        return (
+            width.div_ceil(u32::from(sub_x)),
+            height.div_ceil(u32::from(sub_y)),
+        );
+    }
+    (width, height)
 }
 
 fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
@@ -2333,22 +2938,17 @@ fn clamp_u8(value: f32) -> u8 {
 }
 
 fn expected_tile_bytes(level: &TiffLevel, width: u32, height: u32) -> Result<usize> {
-    let bytes_per_sample = match level.bits_per_sample_value()? {
-        8 => 1u32,
-        16 => 2u32,
-        other => {
-            return Err(OpenSlideError::UnsupportedFormat(format!(
-                "Unsupported TIFF bits-per-sample {}",
-                other
-            )))
-        }
-    };
     if level.photometric == PHOTOMETRIC_YCBCR && level.ycbcr_subsampling != (1, 1) {
-        if bytes_per_sample != 1 {
-            return Err(OpenSlideError::UnsupportedFormat(
-                "Subsampled 16-bit YCbCr TIFF tiles are not supported".into(),
-            ));
-        }
+        let bytes_per_sample = match level.bits_per_sample_value()? {
+            8 => 1u32,
+            16 => 2u32,
+            other => {
+                return Err(OpenSlideError::UnsupportedFormat(format!(
+                    "Unsupported TIFF bits-per-sample {}",
+                    other
+                )))
+            }
+        };
         let (sub_x, sub_y) = level.ycbcr_subsampling;
         let blocks_x = width.div_ceil(u32::from(sub_x));
         let blocks_y = height.div_ceil(u32::from(sub_y));
@@ -2358,14 +2958,18 @@ fn expected_tile_bytes(level: &TiffLevel, width: u32, height: u32) -> Result<usi
         return blocks_x
             .checked_mul(blocks_y)
             .and_then(|blocks| blocks.checked_mul(block_luma.checked_add(2)?))
+            .and_then(|samples| samples.checked_mul(bytes_per_sample))
             .map(|bytes| bytes as usize)
             .ok_or_else(|| OpenSlideError::Decode("TIFF tile byte count overflow".into()));
     }
 
+    let bytes_per_pixel = contiguous_sample_bytes(level)?
+        .into_iter()
+        .try_fold(0u32, |acc, bytes| acc.checked_add(u32::from(bytes)))
+        .ok_or_else(|| OpenSlideError::Decode("TIFF tile byte count overflow".into()))?;
     width
         .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(u32::from(level.samples_per_pixel)))
-        .and_then(|samples| samples.checked_mul(bytes_per_sample))
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
         .map(|bytes| bytes as usize)
         .ok_or_else(|| OpenSlideError::Decode("TIFF tile byte count overflow".into()))
 }
@@ -2410,6 +3014,139 @@ fn unpack_packbits(raw: &[u8], expected_len: usize) -> Result<Vec<u8>> {
     }
     out.truncate(expected_len);
     Ok(out)
+}
+
+fn old_jpeg_interchange_stream(path: &Path, level: &TiffLevel, entropy: &[u8]) -> Result<Vec<u8>> {
+    if starts_with_soi(entropy) {
+        return Ok(entropy.to_vec());
+    }
+    if level.planar_config != PLANARCONFIG_CONTIG {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "TIFF old-JPEG planar separate tiles are not supported".into(),
+        ));
+    }
+    if level.bits_per_sample_value()? != 8 {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "TIFF old-JPEG tiles require 8-bit samples".into(),
+        ));
+    }
+    if !matches!(level.photometric, PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported TIFF old-JPEG photometric interpretation {}",
+            level.photometric
+        )));
+    }
+    let tables = level.old_jpeg.as_ref().ok_or_else(|| {
+        OpenSlideError::UnsupportedFormat("TIFF old-JPEG tables are missing".into())
+    })?;
+    if tables.proc != 1 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported TIFF old-JPEG processing mode {}",
+            tables.proc
+        )));
+    }
+    let components = usize::from(level.samples_per_pixel.min(3));
+    if components != 3 {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "TIFF old-JPEG has unsupported SamplesPerPixel {}",
+            level.samples_per_pixel
+        )));
+    }
+    if tables.q_tables.len() < components
+        || tables.dc_tables.len() < components
+        || tables.ac_tables.len() < components
+    {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "TIFF old-JPEG table tags have fewer than 3 component tables".into(),
+        ));
+    }
+    let jpeg_width = u16::try_from(level.tile_width).map_err(|_| {
+        OpenSlideError::UnsupportedFormat("TIFF old-JPEG tile width exceeds JPEG limits".into())
+    })?;
+    let jpeg_height = u16::try_from(level.tile_height).map_err(|_| {
+        OpenSlideError::UnsupportedFormat("TIFF old-JPEG tile height exceeds JPEG limits".into())
+    })?;
+    if level.photometric == PHOTOMETRIC_YCBCR
+        && (level.ycbcr_subsampling.0 > 4 || level.ycbcr_subsampling.1 > 4)
+    {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "Unsupported TIFF old-JPEG YCbCr subsampling {}x{}",
+            level.ycbcr_subsampling.0, level.ycbcr_subsampling.1
+        )));
+    }
+
+    let mut jpeg = Vec::with_capacity(entropy.len() + 1024);
+    jpeg.extend_from_slice(&[0xff, 0xd8]);
+    for table_id in 0..components {
+        let table = read_file_range(path, tables.q_tables[table_id], 64)?;
+        write_jpeg_marker_segment(&mut jpeg, 0xdb, 3 + table.len())?;
+        jpeg.push(table_id as u8);
+        jpeg.extend_from_slice(&table);
+    }
+
+    write_jpeg_marker_segment(&mut jpeg, 0xc0, 8 + 3 * components)?;
+    jpeg.push(8);
+    jpeg.extend_from_slice(&jpeg_height.to_be_bytes());
+    jpeg.extend_from_slice(&jpeg_width.to_be_bytes());
+    jpeg.push(components as u8);
+    for component in 0..components {
+        jpeg.push((component + 1) as u8);
+        let sampling = if component == 0 && level.photometric == PHOTOMETRIC_YCBCR {
+            let (sub_x, sub_y) = level.ycbcr_subsampling;
+            ((sub_x as u8) << 4) | sub_y as u8
+        } else {
+            0x11
+        };
+        jpeg.push(sampling);
+        jpeg.push(component as u8);
+    }
+
+    for table_id in 0..components {
+        write_old_jpeg_huffman_table(path, &mut jpeg, false, table_id, tables.dc_tables[table_id])?;
+        write_old_jpeg_huffman_table(path, &mut jpeg, true, table_id, tables.ac_tables[table_id])?;
+    }
+    if let Some(interval) = tables.restart_interval {
+        write_jpeg_marker_segment(&mut jpeg, 0xdd, 4)?;
+        jpeg.extend_from_slice(&interval.to_be_bytes());
+    }
+
+    write_jpeg_marker_segment(&mut jpeg, 0xda, 6 + 2 * components)?;
+    jpeg.push(components as u8);
+    for component in 0..components {
+        jpeg.push((component + 1) as u8);
+        jpeg.push(((component as u8) << 4) | component as u8);
+    }
+    jpeg.extend_from_slice(&[0, 63, 0]);
+    jpeg.extend_from_slice(entropy);
+    if !entropy.ends_with(&[0xff, 0xd9]) {
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+    }
+    Ok(jpeg)
+}
+
+fn write_old_jpeg_huffman_table(
+    path: &Path,
+    jpeg: &mut Vec<u8>,
+    ac: bool,
+    table_id: usize,
+    offset: u64,
+) -> Result<()> {
+    let counts = read_file_range(path, offset, 16)?;
+    let symbol_count: usize = counts.iter().map(|&count| usize::from(count)).sum();
+    let symbols = read_file_range(path, offset + 16, symbol_count as u64)?;
+    write_jpeg_marker_segment(jpeg, 0xc4, 3 + counts.len() + symbols.len())?;
+    jpeg.push((u8::from(ac) << 4) | table_id as u8);
+    jpeg.extend_from_slice(&counts);
+    jpeg.extend_from_slice(&symbols);
+    Ok(())
+}
+
+fn write_jpeg_marker_segment(jpeg: &mut Vec<u8>, marker: u8, len: usize) -> Result<()> {
+    let len = u16::try_from(len)
+        .map_err(|_| OpenSlideError::Format("JPEG marker segment is too large".into()))?;
+    jpeg.extend_from_slice(&[0xff, marker]);
+    jpeg.extend_from_slice(&len.to_be_bytes());
+    Ok(())
 }
 
 fn merge_jpeg_tables(tile: &[u8], tables: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -2537,6 +3274,7 @@ fn blit_rgb_channel(
 fn blit_rgb_rgba(
     src: &CachedTile,
     channels: [Option<u32>; 4],
+    default_opaque_alpha: bool,
     visible_w: u32,
     visible_h: u32,
     dst: &mut RgbaImage,
@@ -2565,6 +3303,9 @@ fn blit_rgb_rgba(
                 if let Some(channel) = channel {
                     dst.data[dst_base + out_idx] = src.rgb[src_base + *channel as usize];
                 }
+            }
+            if default_opaque_alpha {
+                dst.data[dst_base + 3] = 255;
             }
         }
     }
@@ -2668,7 +3409,7 @@ fn build_properties(
         ("tiff.Copyright", TAG_COPYRIGHT),
         ("tiff.DocumentName", TAG_DOCUMENTNAME),
     ] {
-        if let Some(value) = dir.ascii(tag) {
+        if let Some(value) = dir.entry(tag).and_then(TiffEntry::c_string) {
             props.insert(name.to_string(), value);
         }
     }
@@ -2721,83 +3462,7 @@ fn build_properties(
 }
 
 pub(crate) fn format_float(value: f64) -> String {
-    format_g_ascii_dtostr(value)
-}
-
-fn format_g_ascii_dtostr(value: f64) -> String {
-    const PRECISION: usize = 17;
-
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value.is_sign_negative() {
-            "-inf".to_string()
-        } else {
-            "inf".to_string()
-        };
-    }
-    if value == 0.0 {
-        return if value.is_sign_negative() {
-            "-0".to_string()
-        } else {
-            "0".to_string()
-        };
-    }
-
-    let sign = if value.is_sign_negative() { "-" } else { "" };
-    let scientific = format!("{:.*e}", PRECISION - 1, value.abs());
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("Rust scientific formatting always contains exponent");
-    let exponent: i32 = exponent
-        .parse()
-        .expect("Rust scientific exponent is always numeric");
-    let mut digits: String = mantissa.chars().filter(|ch| *ch != '.').collect();
-    while digits.ends_with('0') {
-        digits.pop();
-    }
-    if digits.is_empty() {
-        digits.push('0');
-    }
-
-    if exponent >= -4 && exponent < PRECISION as i32 {
-        let mut out = String::from(sign);
-        let digits_before = exponent + 1;
-        if digits_before <= 0 {
-            out.push_str("0.");
-            for _ in 0..(-digits_before) {
-                out.push('0');
-            }
-            out.push_str(&digits);
-        } else if digits_before as usize >= digits.len() {
-            out.push_str(&digits);
-            for _ in digits.len()..digits_before as usize {
-                out.push('0');
-            }
-        } else {
-            let split = digits_before as usize;
-            out.push_str(&digits[..split]);
-            out.push('.');
-            out.push_str(&digits[split..]);
-        }
-        out
-    } else {
-        let mut out = String::from(sign);
-        let mut chars = digits.chars();
-        out.push(chars.next().unwrap_or('0'));
-        let rest: String = chars.collect();
-        if !rest.is_empty() {
-            out.push('.');
-            out.push_str(&rest);
-        }
-        out.push('e');
-        if exponent >= 0 {
-            out.push('+');
-        }
-        out.push_str(&exponent.to_string());
-        out
-    }
+    crate::util::_openslide_format_double(value)
 }
 
 #[cfg(test)]
@@ -2808,11 +3473,43 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn tiff_jpeg_color_space_matches_c_helper_constants() {
+        assert_eq!(jpeg_color_space(PHOTOMETRIC_RGB), 1);
+        assert_eq!(jpeg_color_space(PHOTOMETRIC_YCBCR), 2);
+    }
+
+    #[test]
     fn formats_tiff_floats_like_g_ascii_dtostr() {
         assert_eq!(format_float(0.1), "0.10000000000000001");
         assert_eq!(format_float(12_345_678.0), "12345678");
         assert_eq!(format_float(0.000012345), "1.2345e-5");
         assert_eq!(format_float(-0.0), "-0");
+    }
+
+    #[test]
+    fn hash_file_part_reads_through_shared_file_helpers() {
+        let path = temp_path("hash-file-part.bin");
+        fs::write(&path, b"0123456789").unwrap();
+
+        let mut hash = OpenslideHash::openslide_hash_quickhash1_create();
+        hash.openslide_hash_file_part(&path, 2, 4).unwrap();
+
+        let mut expected = OpenslideHash::openslide_hash_quickhash1_create();
+        expected.openslide_hash_data(b"2345");
+        assert_eq!(
+            hash.openslide_hash_get_string(),
+            expected.openslide_hash_get_string()
+        );
+
+        let mut overflow = OpenslideHash::openslide_hash_quickhash1_create();
+        assert!(overflow.openslide_hash_file_part(&path, 8, 3).is_err());
+
+        let mut offset_overflow = OpenslideHash::openslide_hash_quickhash1_create();
+        assert!(offset_overflow
+            .openslide_hash_file_part(&path, u64::MAX, 1)
+            .is_err());
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -2863,6 +3560,97 @@ mod tests {
     }
 
     #[test]
+    fn generic_tiff_properties_preserve_raw_ascii_whitespace_like_upstream() {
+        let path = temp_path("rgb-tiled-description-whitespace.tif");
+        let mut data = make_tiled_rgb_tiff();
+        let original = b"synthetic tiled tiff\0";
+        let replacement = b" synthetic tiled ti \0";
+        let start = data
+            .windows(original.len())
+            .position(|window| window == original)
+            .unwrap();
+        data[start..start + original.len()].copy_from_slice(replacement);
+        fs::write(&path, data).unwrap();
+
+        let tiff = TiffFile::open(&path).unwrap();
+        let slide = GenericTiffSlide::open(tiff).unwrap();
+
+        assert_eq!(
+            slide.properties().get("tiff.ImageDescription"),
+            Some(&" synthetic tiled ti ".to_string())
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_tiff_tiles_do_not_paint_rgba_pixels() {
+        let path = temp_path("rgb-tiled-missing-tile.tif");
+        fs::write(
+            &path,
+            make_tiled_tiff_with_options(
+                PHOTOMETRIC_RGB,
+                PLANARCONFIG_CONTIG,
+                (1, 1),
+                8,
+                &[
+                    vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120],
+                    vec![],
+                ],
+            ),
+        )
+        .unwrap();
+
+        let tiff = TiffFile::open(&path).unwrap();
+        let slide = GenericTiffSlide::open(tiff).unwrap();
+        let rgba = slide
+            .read_region_rgba([Some(0), Some(1), Some(2), None], 0, 0, 0, 4, 2)
+            .unwrap();
+
+        assert_eq!(rgba.pixel(0, 0), [10, 20, 30, 255]);
+        assert_eq!(rgba.pixel(1, 1), [100, 110, 120, 255]);
+        assert_eq!(rgba.pixel(2, 0), [0, 0, 0, 0]);
+        assert_eq!(rgba.pixel(3, 1), [0, 0, 0, 0]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn generic_tiff_does_not_expose_named_directories_as_associated_images() {
+        let path = temp_path("generic-associated-directory.bin");
+        fs::write(&path, [10, 20, 30, 40, 50, 60, 7, 11, 13]).unwrap();
+
+        let mut base = minimal_tiled_level_entries(2, 1);
+        base.insert(TAG_TILEOFFSETS, long_entry(0));
+        base.insert(TAG_TILEBYTECOUNTS, long_entry(6));
+        let mut label = minimal_tiled_level_entries(1, 1);
+        label.insert(TAG_SUBFILETYPE, long_entry(FILETYPE_REDUCEDIMAGE as u32));
+        label.insert(TAG_IMAGEDESCRIPTION, ascii_entry("label image"));
+        label.insert(TAG_TILEOFFSETS, long_entry(6));
+        label.insert(TAG_TILEBYTECOUNTS, long_entry(3));
+
+        let tiff = TiffFile {
+            path: path.clone(),
+            endian: Endian::Little,
+            directories: vec![
+                TiffDirectory { entries: base },
+                TiffDirectory { entries: label },
+            ],
+        };
+        let slide = GenericTiffSlide::open(tiff).unwrap();
+
+        assert_eq!(slide.level_count(), 2);
+        assert!(slide.associated_image_names().is_empty());
+        assert!(slide
+            .properties()
+            .get("openslide.associated.label.width")
+            .is_none());
+        assert!(slide.read_associated_image("label").is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn exposes_slide_level_icc_profile() {
         let path = temp_path("rgb-tiled-icc.tif");
         let profile = b"synthetic icc profile".to_vec();
@@ -2883,6 +3671,28 @@ mod tests {
     fn reads_uncompressed_tiled_ycbcr_tiff() {
         let path = temp_path("ycbcr-tiled.tif");
         fs::write(&path, make_tiled_ycbcr_tiff()).unwrap();
+
+        let tiff = TiffFile::open(&path).unwrap();
+        let slide = GenericTiffSlide::open(tiff).unwrap();
+
+        assert_eq!(slide.channel_count(), 3);
+
+        let red = slide.read_region(0, 0, 0, 0, 4, 2).unwrap();
+        assert_eq!(red.data, vec![254, 150, 80, 120, 30, 220, 200, 10]);
+
+        let green = slide.read_region(1, 0, 0, 0, 2, 1).unwrap();
+        assert_eq!(green.data, vec![0, 150]);
+
+        let blue = slide.read_region(2, 0, 0, 0, 1, 1).unwrap();
+        assert_eq!(blue.data, vec![0]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_uncompressed_tiled_ycbcr16_tiff() {
+        let path = temp_path("ycbcr16-tiled.tif");
+        fs::write(&path, make_tiled_ycbcr16_tiff()).unwrap();
 
         let tiff = TiffFile::open(&path).unwrap();
         let slide = GenericTiffSlide::open(tiff).unwrap();
@@ -2944,6 +3754,7 @@ mod tests {
             tile_offsets: vec![0],
             tile_byte_counts: vec![4],
             jpeg_tables: None,
+            old_jpeg: None,
             endian: Endian::Little,
         };
 
@@ -2973,6 +3784,7 @@ mod tests {
             tile_offsets: vec![0],
             tile_byte_counts: vec![4],
             jpeg_tables: None,
+            old_jpeg: None,
             endian: Endian::Little,
         };
 
@@ -2982,9 +3794,63 @@ mod tests {
     }
 
     #[test]
+    fn decodes_contiguous_rgb_with_mixed_bits_per_sample() {
+        let level = TiffLevel {
+            dir: 0,
+            width: 2,
+            height: 1,
+            downsample: 1.0,
+            tile_width: 2,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
+            bits_per_sample: vec![8, 16, 8],
+            ycbcr_subsampling: (1, 1),
+            tile_offsets: vec![0],
+            tile_byte_counts: vec![8],
+            jpeg_tables: None,
+            old_jpeg: None,
+            endian: Endian::Little,
+        };
+
+        let tile =
+            decode_uncompressed_tile(&level, 2, 1, &[10, 0x34, 0x12, 30, 40, 0xcd, 0xab, 60])
+                .unwrap();
+
+        assert_eq!(tile.rgb, vec![10, 0x12, 30, 40, 0xab, 60]);
+    }
+
+    #[test]
     fn reads_subsampled_ycbcr_tiled_tiff() {
         let path = temp_path("ycbcr-subsampled-tiled.tif");
         fs::write(&path, make_subsampled_ycbcr_tiff()).unwrap();
+
+        let tiff = TiffFile::open(&path).unwrap();
+        let slide = GenericTiffSlide::open(tiff).unwrap();
+
+        assert_eq!(slide.channel_count(), 3);
+
+        let red = slide.read_region(0, 0, 0, 0, 4, 2).unwrap();
+        assert_eq!(red.data, vec![254, 255, 80, 120, 208, 255, 200, 10]);
+
+        let green = slide.read_region(1, 0, 0, 0, 4, 2).unwrap();
+        assert_eq!(green.data, vec![0, 74, 80, 120, 0, 144, 200, 10]);
+
+        let blue = slide.read_region(2, 1, 0, 0, 2, 1).unwrap();
+        assert_eq!(blue.data, vec![74, 80]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_subsampled_ycbcr16_tiled_tiff() {
+        let path = temp_path("ycbcr16-subsampled-tiled.tif");
+        fs::write(&path, make_subsampled_ycbcr16_tiff()).unwrap();
 
         let tiff = TiffFile::open(&path).unwrap();
         let slide = GenericTiffSlide::open(tiff).unwrap();
@@ -3026,6 +3892,68 @@ mod tests {
     }
 
     #[test]
+    fn reads_uncompressed_planar_separate_rgb16_tiff() {
+        let path = temp_path("planar-rgb16-tiled.tif");
+        fs::write(&path, make_planar_separate_rgb16_tiff()).unwrap();
+
+        let tiff = TiffFile::open(&path).unwrap();
+        let slide = GenericTiffSlide::open(tiff).unwrap();
+
+        assert_eq!(slide.channel_count(), 3);
+
+        let red = slide.read_region(0, 0, 0, 0, 4, 2).unwrap();
+        assert_eq!(red.data, vec![10, 40, 1, 4, 70, 100, 7, 10]);
+
+        let green = slide.read_region(1, 1, 0, 0, 2, 1).unwrap();
+        assert_eq!(green.data, vec![50, 2]);
+
+        let blue = slide.read_region(2, 2, 0, 0, 2, 1).unwrap();
+        assert_eq!(blue.data, vec![3, 6]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn decodes_planar_separate_rgb_with_mixed_bits_per_sample() {
+        let path = temp_path("planar-mixed-bits-tile.bin");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[10, 40]);
+        raw.extend_from_slice(&u16_payload(&[20, 50]));
+        raw.extend_from_slice(&[30, 60]);
+        fs::write(&path, raw).unwrap();
+
+        let level = TiffLevel {
+            dir: 0,
+            width: 2,
+            height: 1,
+            downsample: 1.0,
+            tile_width: 2,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            compression: COMPRESSION_NONE,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            bits_per_sample: vec![8, 16, 8],
+            ycbcr_subsampling: (1, 1),
+            tile_offsets: vec![0, 2, 6],
+            tile_byte_counts: vec![2, 4, 2],
+            jpeg_tables: None,
+            old_jpeg: None,
+            endian: Endian::Little,
+        };
+
+        let tile = decode_separate_tile(&path, &level, 0, 2, 1).unwrap();
+
+        assert_eq!(tile.width, 2);
+        assert_eq!(tile.height, 1);
+        assert_eq!(tile.rgb, vec![10, 20, 30, 40, 50, 60]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn reads_planar_separate_subsampled_ycbcr_tiff() {
         let path = temp_path("planar-ycbcr-subsampled-tiled.tif");
         fs::write(&path, make_planar_separate_subsampled_ycbcr_tiff()).unwrap();
@@ -3052,7 +3980,12 @@ mod tests {
         let path = temp_path("rgb-stripped.tif");
         fs::write(&path, make_stripped_rgb_tiff()).unwrap();
 
-        assert!(detect(&path));
+        assert!(!detect(&path));
+        match open(&path) {
+            Err(OpenSlideError::UnsupportedFormat(_)) => {}
+            Ok(_) => panic!("stripped base TIFF should not open through the public TIFF backend"),
+            Err(err) => panic!("expected unsupported stripped base TIFF, got {err:?}"),
+        }
         let tiff = TiffFile::open(&path).unwrap();
         let slide = GenericTiffSlide::open(tiff).unwrap();
 
@@ -3075,7 +4008,7 @@ mod tests {
 
         let path = temp_path("deflate-predictor.tif");
         {
-            let file = File::create(&path).unwrap();
+            let file = std::fs::File::create(&path).unwrap();
             let mut encoder = TiffEncoder::new(file)
                 .unwrap()
                 .with_compression(Compression::Deflate(DeflateLevel::default()))
@@ -3088,7 +4021,9 @@ mod tests {
                 .unwrap();
         }
 
-        let slide = OpenSlide::open(&path).unwrap();
+        assert!(!detect(&path));
+        let tiff = TiffFile::open(&path).unwrap();
+        let slide = GenericTiffSlide::open(tiff).unwrap();
         let red = slide.read_region(0, 1, 0, 0, 2, 2).unwrap();
         assert_eq!(red.data, vec![40, 70, 41, 71]);
         let blue = slide.read_region(2, 0, 1, 0, 3, 1).unwrap();
@@ -3103,7 +4038,7 @@ mod tests {
 
         let path = temp_path("packbits-predictor.tif");
         {
-            let file = File::create(&path).unwrap();
+            let file = std::fs::File::create(&path).unwrap();
             let mut encoder = TiffEncoder::new(file)
                 .unwrap()
                 .with_compression(Compression::Packbits)
@@ -3116,11 +4051,35 @@ mod tests {
                 .unwrap();
         }
 
-        let slide = OpenSlide::open(&path).unwrap();
+        assert!(!detect(&path));
+        let tiff = TiffFile::open(&path).unwrap();
+        let slide = GenericTiffSlide::open(tiff).unwrap();
         let red = slide.read_region(0, 1, 0, 0, 2, 2).unwrap();
         assert_eq!(red.data, vec![40, 70, 41, 71]);
         let blue = slide.read_region(2, 0, 1, 0, 3, 1).unwrap();
         assert_eq!(blue.data, vec![31, 61, 91]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_planar_separate_subsampled_ycbcr16_tiff() {
+        let path = temp_path("planar-ycbcr16-subsampled-tiled.tif");
+        fs::write(&path, make_planar_separate_subsampled_ycbcr16_tiff()).unwrap();
+
+        let tiff = TiffFile::open(&path).unwrap();
+        let slide = GenericTiffSlide::open(tiff).unwrap();
+
+        assert_eq!(slide.channel_count(), 3);
+
+        let red = slide.read_region(0, 0, 0, 0, 4, 2).unwrap();
+        assert_eq!(red.data, vec![254, 255, 80, 120, 208, 255, 200, 10]);
+
+        let green = slide.read_region(1, 0, 0, 0, 4, 2).unwrap();
+        assert_eq!(green.data, vec![0, 74, 80, 120, 0, 144, 200, 10]);
+
+        let blue = slide.read_region(2, 1, 0, 0, 3, 1).unwrap();
+        assert_eq!(blue.data, vec![74, 80, 120]);
 
         let _ = fs::remove_file(path);
     }
@@ -3189,7 +4148,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_planar_separate_iso_jpeg2000_layout_gap() {
+    fn planar_separate_iso_jpeg2000_reaches_decoder_validation() {
         let level = TiffLevel {
             dir: 7,
             width: 1,
@@ -3209,51 +4168,115 @@ mod tests {
             tile_offsets: vec![0],
             tile_byte_counts: vec![4],
             jpeg_tables: None,
+            old_jpeg: None,
             endian: Endian::Little,
         };
 
-        let err = unsupported_planar_jpeg2000_tile_error(&level);
-        match err {
-            OpenSlideError::UnsupportedFormat(message) => {
-                assert!(message.contains("Planar separate TIFF JPEG 2000 (unspecified)"));
-                assert!(message.contains("34712"));
-                assert!(message.contains("directory 7"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let err = decode_planar_jpeg2000_plane(&level, &[0, 1, 2, 3], 0, 0, 1, 1).unwrap_err();
+        assert!(format!("{err}").contains("JPEG 2000 data does not start"));
     }
 
     #[test]
-    fn rejects_planar_separate_predictor_compressed_tile_by_tile_decode() {
+    fn planar_tiff_chunk_u16_conversion_preserves_tiff_endian_order() {
+        let mut little = Vec::new();
+        append_u16_samples_as_tiff_bytes(&mut little, [0x1234, 0xabcd], Endian::Little);
+        assert_eq!(little, vec![0x34, 0x12, 0xcd, 0xab]);
+
+        let mut big = Vec::new();
+        append_u16_samples_as_tiff_bytes(&mut big, [0x1234, 0xabcd], Endian::Big);
+        assert_eq!(big, vec![0x12, 0x34, 0xab, 0xcd]);
+    }
+
+    #[test]
+    fn decodes_planar_separate_jpeg_tile() {
+        let path = temp_path("planar-jpeg-tile.bin");
+        fs::write(
+            &path,
+            [ONE_PIXEL_JPEG, ONE_PIXEL_JPEG, ONE_PIXEL_JPEG].concat(),
+        )
+        .unwrap();
+        let (decoded, _, _) =
+            decode::decode_rgb_libjpeg(ImageFormat::Jpeg, ONE_PIXEL_JPEG).unwrap();
+        let expected = decoded[0];
         let level = TiffLevel {
             dir: 0,
-            width: 2,
-            height: 2,
+            width: 1,
+            height: 1,
             downsample: 1.0,
-            tile_width: 2,
-            tile_height: 2,
+            tile_width: 1,
+            tile_height: 1,
             tiles_across: 1,
             tiles_down: 1,
-            compression: COMPRESSION_DEFLATE,
-            photometric: PHOTOMETRIC_YCBCR,
+            compression: COMPRESSION_JPEG,
+            photometric: PHOTOMETRIC_RGB,
             samples_per_pixel: 3,
             planar_config: PLANARCONFIG_SEPARATE,
-            predictor: 2,
+            predictor: 1,
             bits_per_sample: vec![8, 8, 8],
-            ycbcr_subsampling: (2, 2),
-            tile_offsets: vec![0, 0, 0],
-            tile_byte_counts: vec![1, 1, 1],
+            ycbcr_subsampling: (1, 1),
+            tile_offsets: vec![
+                0,
+                ONE_PIXEL_JPEG.len() as u64,
+                (ONE_PIXEL_JPEG.len() * 2) as u64,
+            ],
+            tile_byte_counts: vec![ONE_PIXEL_JPEG.len() as u64; 3],
             jpeg_tables: None,
+            old_jpeg: None,
             endian: Endian::Little,
         };
 
-        match decode_separate_tile(std::path::Path::new(""), &level, 0, 2, 2) {
-            Err(OpenSlideError::UnsupportedFormat(message)) => {
-                assert!(message.contains("predictor-compressed"));
-            }
-            Err(other) => panic!("unexpected error: {other:?}"),
-            Ok(_) => panic!("expected unsupported predictor-compressed tile"),
-        }
+        let tile = decode_separate_tile(&path, &level, 0, 1, 1).unwrap();
+
+        assert_eq!(tile.width, 1);
+        assert_eq!(tile.height, 1);
+        assert_eq!(tile.rgb, vec![expected, expected, expected]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn decodes_planar_separate_old_jpeg_interchange_tile() {
+        let path = temp_path("planar-old-jpeg-tile.bin");
+        fs::write(
+            &path,
+            [ONE_PIXEL_JPEG, ONE_PIXEL_JPEG, ONE_PIXEL_JPEG].concat(),
+        )
+        .unwrap();
+        let (decoded, _, _) =
+            decode::decode_rgb_libjpeg(ImageFormat::Jpeg, ONE_PIXEL_JPEG).unwrap();
+        let expected = decoded[0];
+        let level = TiffLevel {
+            dir: 0,
+            width: 1,
+            height: 1,
+            downsample: 1.0,
+            tile_width: 1,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            compression: COMPRESSION_OLD_JPEG,
+            photometric: PHOTOMETRIC_RGB,
+            samples_per_pixel: 3,
+            planar_config: PLANARCONFIG_SEPARATE,
+            predictor: 1,
+            bits_per_sample: vec![8, 8, 8],
+            ycbcr_subsampling: (1, 1),
+            tile_offsets: vec![
+                0,
+                ONE_PIXEL_JPEG.len() as u64,
+                (ONE_PIXEL_JPEG.len() * 2) as u64,
+            ],
+            tile_byte_counts: vec![ONE_PIXEL_JPEG.len() as u64; 3],
+            jpeg_tables: None,
+            old_jpeg: None,
+            endian: Endian::Little,
+        };
+
+        let tile = decode_separate_tile(&path, &level, 0, 1, 1).unwrap();
+
+        assert_eq!(tile.width, 1);
+        assert_eq!(tile.height, 1);
+        assert_eq!(tile.rgb, vec![expected, expected, expected]);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -3322,6 +4345,7 @@ mod tests {
             tile_offsets: vec![0],
             tile_byte_counts: vec![0],
             jpeg_tables: None,
+            old_jpeg: None,
             endian: Endian::Little,
         }];
 
@@ -3496,6 +4520,7 @@ mod tests {
             tile_offsets: vec![0],
             tile_byte_counts: vec![0],
             jpeg_tables: None,
+            old_jpeg: None,
             endian: Endian::Little,
         }];
 
@@ -3623,6 +4648,19 @@ mod tests {
         )
     }
 
+    fn make_tiled_ycbcr16_tiff() -> Vec<u8> {
+        make_tiled_tiff_with_options(
+            PHOTOMETRIC_YCBCR,
+            PLANARCONFIG_CONTIG,
+            (1, 1),
+            16,
+            &[
+                u16_payload(&[76, 85, 255, 150, 128, 128, 30, 128, 128, 220, 128, 128]),
+                u16_payload(&[80, 128, 128, 120, 128, 128, 200, 128, 128, 10, 128, 128]),
+            ],
+        )
+    }
+
     fn make_tiled_rgb16_tiff() -> Vec<u8> {
         fn sample(value: u16, out: &mut Vec<u8>) {
             out.extend_from_slice(&(value << 8).to_le_bytes());
@@ -3652,6 +4690,19 @@ mod tests {
         )
     }
 
+    fn make_subsampled_ycbcr16_tiff() -> Vec<u8> {
+        make_tiled_tiff_with_options(
+            PHOTOMETRIC_YCBCR,
+            PLANARCONFIG_CONTIG,
+            (2, 2),
+            16,
+            &[
+                u16_payload(&[76, 150, 30, 220, 85, 255]),
+                u16_payload(&[80, 120, 200, 10, 128, 128]),
+            ],
+        )
+    }
+
     fn make_planar_separate_rgb_tiff() -> Vec<u8> {
         make_tiled_tiff(
             PHOTOMETRIC_RGB,
@@ -3663,6 +4714,23 @@ mod tests {
                 vec![2, 5, 8, 11],
                 vec![30, 60, 90, 120],
                 vec![3, 6, 9, 12],
+            ],
+        )
+    }
+
+    fn make_planar_separate_rgb16_tiff() -> Vec<u8> {
+        make_tiled_tiff_with_options(
+            PHOTOMETRIC_RGB,
+            PLANARCONFIG_SEPARATE,
+            (1, 1),
+            16,
+            &[
+                u16_payload(&[10, 40, 70, 100]),
+                u16_payload(&[1, 4, 7, 10]),
+                u16_payload(&[20, 50, 80, 110]),
+                u16_payload(&[2, 5, 8, 11]),
+                u16_payload(&[30, 60, 90, 120]),
+                u16_payload(&[3, 6, 9, 12]),
             ],
         )
     }
@@ -3682,6 +4750,44 @@ mod tests {
             ],
         )
     }
+
+    fn make_planar_separate_subsampled_ycbcr16_tiff() -> Vec<u8> {
+        make_tiled_tiff_with_options(
+            PHOTOMETRIC_YCBCR,
+            PLANARCONFIG_SEPARATE,
+            (2, 2),
+            16,
+            &[
+                u16_payload(&[76, 150, 30, 220]),
+                u16_payload(&[80, 120, 200, 10]),
+                u16_payload(&[85]),
+                u16_payload(&[128]),
+                u16_payload(&[255]),
+                u16_payload(&[128]),
+            ],
+        )
+    }
+
+    fn u16_payload(samples: &[u8]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|&sample| u16::from(sample).wrapping_shl(8).to_le_bytes())
+            .collect()
+    }
+
+    const ONE_PIXEL_JPEG: &[u8] = &[
+        0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07,
+        0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b, 0x0c, 0x19, 0x12,
+        0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20, 0x24, 0x2e, 0x27,
+        0x20, 0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31, 0x34, 0x34, 0x34,
+        0x1f, 0x27, 0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff, 0xc0, 0x00, 0x11,
+        0x08, 0x00, 0x01, 0x00, 0x01, 0x03, 0x52, 0x11, 0x00, 0x47, 0x11, 0x00, 0x42, 0x11, 0x00,
+        0xff, 0xc4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+        0xda, 0x00, 0x0c, 0x03, 0x52, 0x00, 0x47, 0x00, 0x42, 0x00, 0x00, 0x3f, 0x00, 0x7f, 0x3f,
+        0x9f, 0xdf, 0xff, 0xd9,
+    ];
 
     fn make_stripped_rgb_tiff() -> Vec<u8> {
         const ENTRY_COUNT: usize = 15;

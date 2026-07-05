@@ -26,6 +26,7 @@ Use ``--pixel-tol`` / ``--fail-on-pixels`` to make pixel parity enforced.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import math
 import os
@@ -160,6 +161,12 @@ def sample_regions(width: int, height: int, size: int, count: int) -> list[tuple
     return regions[:count]
 
 
+def round_half_away_from_zero(value: float) -> int:
+    if value >= 0:
+        return int(math.floor(value + 0.5))
+    return int(math.ceil(value - 0.5))
+
+
 def compare_pixels(
     binary: str,
     slide: Path,
@@ -179,8 +186,8 @@ def compare_pixels(
         downsample = ref.level_downsamples[lvl]
         for (lx, ly) in sample_regions(lw, lh, region_size, regions_per_level):
             # OpenSlide wants the location in level-0 coordinates.
-            x0 = int(round(lx * downsample))
-            y0 = int(round(ly * downsample))
+            x0 = round_half_away_from_zero(lx * downsample)
+            y0 = round_half_away_from_zero(ly * downsample)
             w = min(region_size, lw - lx)
             h = min(region_size, lh - ly)
 
@@ -223,6 +230,108 @@ def compare_pixels(
     return stats, mismatches
 
 
+def associated_dimensions(meta: dict, ref: "openslide.OpenSlide") -> tuple[dict[str, dict], list[Mismatch]]:
+    """Compare associated-image names and dimensions.
+
+    The Rust CLI exposes associated-image dimensions as OpenSlide-compatible
+    properties. The reference Python binding exposes them through PIL image
+    objects. Keeping this in the parity row makes associated-image coverage a
+    machine-readable gate rather than just a console warning.
+    """
+    stats: dict[str, dict] = {}
+    mismatches: list[Mismatch] = []
+    rust_assoc = set(meta.get("associated", []))
+    ref_assoc = set(ref.associated_images.keys())
+
+    if rust_assoc != ref_assoc:
+        mismatches.append(
+            Mismatch(
+                "",
+                "associated",
+                f"rust={sorted(rust_assoc)} ref={sorted(ref_assoc)}",
+                hard=False,
+            )
+        )
+
+    for name in sorted(rust_assoc | ref_assoc):
+        rust_width = meta["properties"].get(f"openslide.associated.{name}.width")
+        rust_height = meta["properties"].get(f"openslide.associated.{name}.height")
+        rust_dims = None
+        if rust_width is not None and rust_height is not None:
+            try:
+                rust_dims = [int(rust_width), int(rust_height)]
+            except ValueError:
+                mismatches.append(
+                    Mismatch(
+                        "",
+                        "associated-dimensions",
+                        f"{name}: rust dimensions are not integers: {rust_width!r}x{rust_height!r}",
+                        hard=False,
+                    )
+                )
+
+        ref_dims = None
+        if name in ref.associated_images:
+            try:
+                width, height = ref.associated_images[name].size
+                ref_dims = [int(width), int(height)]
+            except Exception as exc:  # noqa: BLE001
+                mismatches.append(
+                    Mismatch("", "associated-read", f"{name}: reference read failed: {exc}", hard=False)
+                )
+
+        stats[name] = {
+            "rust": rust_dims,
+            "reference": ref_dims,
+        }
+        if rust_dims != ref_dims:
+            mismatches.append(
+                Mismatch(
+                    "",
+                    "associated-dimensions",
+                    f"{name}: rust={rust_dims} ref={ref_dims}",
+                    hard=False,
+                )
+            )
+
+    return stats, mismatches
+
+
+def metadata_evidence(meta: dict, ref: "openslide.OpenSlide") -> dict:
+    rust_levels = {level["level"]: level for level in meta.get("levels", [])}
+    levels = []
+    common = min(meta.get("level_count", 0), ref.level_count)
+    for lvl in range(common):
+        rust = rust_levels.get(lvl, {})
+        ref_width, ref_height = ref.level_dimensions[lvl]
+        levels.append(
+            {
+                "level": lvl,
+                "rust": {
+                    "width": rust.get("width"),
+                    "height": rust.get("height"),
+                    "downsample": rust.get("downsample"),
+                },
+                "reference": {
+                    "width": int(ref_width),
+                    "height": int(ref_height),
+                    "downsample": ref.level_downsamples[lvl],
+                },
+            }
+        )
+    return {
+        "vendor": {
+            "rust": meta.get("vendor"),
+            "reference": ref.properties.get("openslide.vendor", "?"),
+        },
+        "level_count": {
+            "rust": meta.get("level_count"),
+            "reference": ref.level_count,
+        },
+        "levels": levels,
+    }
+
+
 def check_slide(
     binary: str,
     slide: Path,
@@ -233,7 +342,7 @@ def check_slide(
     do_pixels: bool,
     workdir: Path,
 ) -> dict:
-    result = {"slide": str(slide), "mismatches": [], "pixel_stats": []}
+    result = {"slide": str(slide), "mismatches": [], "metadata": {}, "pixel_stats": [], "associated_images": {}}
     mismatches: list[Mismatch] = []
 
     meta = rust_meta(binary, slide)
@@ -256,6 +365,8 @@ def check_slide(
         result["mismatches"] = [str(m) for m in mismatches]
         result["_hard"] = True
         return result
+
+    result["metadata"] = metadata_evidence(meta, ref)
 
     # --- vendor ---
     ref_vendor = ref.properties.get("openslide.vendor", "?")
@@ -304,11 +415,11 @@ def check_slide(
                                            f"{key}: rust={rust_val!r} ref={ref_val!r}", hard=False))
 
     # --- associated images ---
-    rust_assoc = set(meta.get("associated", []))
-    ref_assoc = set(ref.associated_images.keys())
-    if rust_assoc != ref_assoc:
-        mismatches.append(Mismatch(str(slide), "associated",
-                                   f"rust={sorted(rust_assoc)} ref={sorted(ref_assoc)}", hard=False))
+    assoc_stats, assoc_mm = associated_dimensions(meta, ref)
+    result["associated_images"] = assoc_stats
+    for mismatch in assoc_mm:
+        mismatch.slide = str(slide)
+    mismatches.extend(assoc_mm)
 
     # --- pixels (brightfield only) ---
     if do_pixels and meta.get("channel_count") == 3:
@@ -333,6 +444,53 @@ def check_slide(
     result["vendor"] = meta["vendor"]
     result["level_count"] = meta["level_count"]
     return result
+
+
+def check_slide_worker(args: tuple[str, str, int, int, float, bool, bool]) -> dict:
+    binary, slide, region_size, regions_per_level, pixel_tol, fail_on_pixels, do_pixels = args
+    with tempfile.TemporaryDirectory() as tmp:
+        return check_slide(
+            binary,
+            Path(slide),
+            region_size,
+            regions_per_level,
+            pixel_tol,
+            fail_on_pixels,
+            do_pixels,
+            Path(tmp),
+        )
+
+
+def print_result(slide: Path, res: dict) -> int:
+    label = slide.name
+    if res.get("skipped"):
+        print(f"• {label}: SKIP ({res['skipped']})")
+        return 0
+
+    mm = res["mismatches"]
+    pix = res.get("pixel_stats", [])
+    if res.get("_hard"):
+        status = "FAIL"
+        hard = 1
+    elif mm:
+        status = "warn"
+        hard = 0
+    else:
+        status = "OK"
+        hard = 0
+
+    extra = ""
+    if pix:
+        worst = max(s["mean_abs"] for s in pix)
+        best_exact = max(s["exact_frac"] for s in pix)
+        extra = f"  pixels: worst mean-abs={worst:.2f}, best exact-match={best_exact:.0%} ({len(pix)} regions)"
+    elif res.get("pixel_note"):
+        extra = f"  ({res['pixel_note']})"
+
+    print(f"• {label}: {status}  [{res.get('vendor','?')}, {res.get('level_count','?')} levels]{extra}")
+    for line in mm:
+        print(line)
+    return hard
 
 
 def main() -> int:
@@ -363,6 +521,12 @@ def main() -> int:
         help="exclude discovered slides by extension, e.g. --exclude-ext .mrxs; can be repeated",
     )
     parser.add_argument("--exclude-mirax", action="store_true", help="exclude Mirax .mrxs entry points")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=int(os.environ.get("OPENSLIDE_AUDIT_JOBS", "1")),
+        help="number of slides to check concurrently",
+    )
     parser.add_argument("--json", help="write a full JSON report to this path")
     args = parser.parse_args()
 
@@ -394,45 +558,46 @@ def main() -> int:
     print(f"Binary:    {args.binary}")
     print(f"Slides:    {len(slides)}\n")
 
-    results = []
+    jobs = max(1, args.jobs)
+    results = [None] * len(slides)
     hard_failures = 0
-    with tempfile.TemporaryDirectory() as tmp:
-        workdir = Path(tmp)
-        for slide in slides:
-            res = check_slide(
-                args.binary, slide,
-                args.region_size, args.regions_per_level,
-                args.pixel_tol, args.fail_on_pixels,
-                not args.no_pixels, workdir,
-            )
-            results.append(res)
-
-            label = slide.name
-            if res.get("skipped"):
-                print(f"• {label}: SKIP ({res['skipped']})")
-                continue
-
-            mm = res["mismatches"]
-            pix = res.get("pixel_stats", [])
-            if res.get("_hard"):
-                hard_failures += 1
-                status = "FAIL"
-            elif mm:
-                status = "warn"
-            else:
-                status = "OK"
-
-            extra = ""
-            if pix:
-                worst = max(s["mean_abs"] for s in pix)
-                best_exact = max(s["exact_frac"] for s in pix)
-                extra = f"  pixels: worst mean-abs={worst:.2f}, best exact-match={best_exact:.0%} ({len(pix)} regions)"
-            elif res.get("pixel_note"):
-                extra = f"  ({res['pixel_note']})"
-
-            print(f"• {label}: {status}  [{res.get('vendor','?')}, {res.get('level_count','?')} levels]{extra}")
-            for line in mm:
-                print(line)
+    if jobs == 1 or len(slides) == 1:
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            for index, slide in enumerate(slides):
+                res = check_slide(
+                    args.binary, slide,
+                    args.region_size, args.regions_per_level,
+                    args.pixel_tol, args.fail_on_pixels,
+                    not args.no_pixels, workdir,
+                )
+                results[index] = res
+                hard_failures += print_result(slide, res)
+    else:
+        with ProcessPoolExecutor(max_workers=jobs) as executor:
+            futures = {
+                executor.submit(
+                    check_slide_worker,
+                    (
+                        args.binary,
+                        str(slide),
+                        args.region_size,
+                        args.regions_per_level,
+                        args.pixel_tol,
+                        args.fail_on_pixels,
+                        not args.no_pixels,
+                    ),
+                ): (index, slide)
+                for index, slide in enumerate(slides)
+            }
+            for future in as_completed(futures):
+                index, slide = futures[future]
+                try:
+                    res = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    res = {"slide": str(slide), "mismatches": [f"  [FAIL] worker: {exc}"], "_hard": True}
+                results[index] = res
+                hard_failures += print_result(slide, res)
 
     print()
     ok = sum(1 for r in results if not r.get("_hard") and not r.get("skipped") and not r["mismatches"])
@@ -441,7 +606,20 @@ def main() -> int:
     print(f"Summary: {ok} clean, {warn} warnings, {hard_failures} failures, {skip} skipped")
 
     if args.json:
-        Path(args.json).write_text(json.dumps(results, indent=2))
+        report = {
+            "schema_version": 1,
+            "region_size": args.region_size,
+            "regions_per_level": args.regions_per_level,
+            "pixel_tol": args.pixel_tol,
+            "fail_on_pixels": args.fail_on_pixels,
+            "do_pixels": not args.no_pixels,
+            "jobs": jobs,
+            "binary": args.binary,
+            "data_dir": str(args.data_dir),
+            "slide_count": len(slides),
+            "rows": results,
+        }
+        Path(args.json).write_text(json.dumps(report, indent=2))
         print(f"Wrote JSON report to {args.json}")
 
     return 1 if hard_failures else 0

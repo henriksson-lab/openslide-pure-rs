@@ -2,14 +2,29 @@
 name = "openslide-pure-rs"
 version = "0.1.1"
 edition = "2021"
-description = "Pure Rust library for reading whole slide images (digital pathology), including Mirax (.mrxs)"
+description = "Whole slide image reader with Rust format parsers and native codec/compositor helpers"
 license = "LGPL-2.1-only"
 homepage = "https://github.com/henriksson-lab/openslide-rs"
 repository = "https://github.com/henriksson-lab/openslide-rs"
 readme = "README.md"
 keywords = ["openslide", "pathology", "microscopy", "wsi", "mirax"]
 categories = ["multimedia::images", "science", "parsing"]
-include = ["/src/**/*.rs", "/README.md", "/Cargo.toml"]
+include = [
+    "/build.rs",
+    "/docs/*.md",
+    "/examples/*.rs",
+    "/fixtures/*.json",
+    "/fixtures/*.toml",
+    "/MATURITY_PLAN.md",
+    "/src/**/*.rs",
+    "/src/decode/*.c",
+    "/scripts/*.py",
+    "/scripts/*.sh",
+    "/scripts/README.md",
+    "/README.md",
+    "/TOAUDIT.md",
+    "/Cargo.toml",
+]
 
 [dependencies]
 thiserror = "2"
@@ -20,5 +35,13 @@ byteorder = "1"
 flate2 = "1"
 lru = "0.12"
 tiff = "0.11"
-zstd-pure-rs = "0.1"
-dicom-toolkit-jpeg2000 = { version = "0.5", default-features = false, features = ["std"] }
+zstd-pure-rs = "0.1.2"
+dicom-toolkit-jpeg2000 = { version = "0.5", default-features = false, features = ["std", "openjph-htj2k"] }
+jpegli = { package = "pure_jpegli", version = "1.0" }
+jpegls = { package = "pure_jpegls", version = "1.0" }
+jpegxr = { version = "0.3.1", optional = true }
+
+[features]
+default = []
+jpegxr = ["dep:jpegxr"]
+jpegxr-backend = ["jpegxr"]

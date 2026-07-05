@@ -1,0 +1,263 @@
+{
+  "schema_version": 1,
+  "reference_stack": "openslide-python 1.4.3 with libopenslide 3.4.1",
+  "command": "scripts/bench-realdata.py --region-size 128 --regions-per-level 1",
+  "region_size": 128,
+  "regions_per_level": 1,
+  "thresholds": {
+    "read_time_warning_fraction": 0.15,
+    "read_time_failure_fraction": 0.25,
+    "rss_warning_fraction": 0.10,
+    "rss_failure_fraction": 0.20
+  },
+  "enforcement_policy": {
+    "default_mode": "stable-profile-strict",
+    "strict_runner_profile": "openslide-audit-stable-v1",
+    "notes": "Strict read-time/RSS enforcement is automatic for benchmark reports generated on this runner profile. Scheduled github-hosted runs remain audit-only because they use a different runner profile."
+  },
+  "rows": [
+    {
+      "fixture": "aperio-local-77917",
+      "reader": "aperio",
+      "status": "exact",
+      "rust_read_s": 0.083952,
+      "rust_rss_kib": 9872,
+      "reference_read_s": 0.085273,
+      "reference_rss_kib": 31868,
+      "speed_vs_reference": 1.02,
+      "rss_vs_reference": 0.31
+    },
+    {
+      "fixture": "hamamatsu-ndpi-local-cmu-1",
+      "reader": "hamamatsu-ndpi",
+      "status": "exact",
+      "rust_read_s": 0.018808,
+      "rust_rss_kib": 11012,
+      "reference_read_s": 0.041345,
+      "reference_rss_kib": 35188,
+      "speed_vs_reference": 2.20,
+      "rss_vs_reference": 0.31
+    },
+    {
+      "fixture": "hamamatsu-ndpi-local-cmu-2",
+      "reader": "hamamatsu-ndpi",
+      "status": "exact",
+      "rust_read_s": 0.019222,
+      "rust_rss_kib": 12956,
+      "reference_read_s": 0.056429,
+      "reference_rss_kib": 39068,
+      "speed_vs_reference": 2.94,
+      "rss_vs_reference": 0.33
+    },
+    {
+      "fixture": "hamamatsu-ndpi-local-cmu-3",
+      "reader": "hamamatsu-ndpi",
+      "status": "exact",
+      "rust_read_s": 0.018359,
+      "rust_rss_kib": 15692,
+      "reference_read_s": 0.056465,
+      "reference_rss_kib": 41120,
+      "speed_vs_reference": 3.08,
+      "rss_vs_reference": 0.38
+    },
+    {
+      "fixture": "hamamatsu-vms-local-cmu-1",
+      "reader": "hamamatsu-vms",
+      "status": "exact",
+      "rust_read_s": 0.053581,
+      "rust_rss_kib": 9192,
+      "reference_read_s": 0.061253,
+      "reference_rss_kib": 36800,
+      "speed_vs_reference": 1.14,
+      "rss_vs_reference": 0.25
+    },
+    {
+      "fixture": "hamamatsu-vms-local-cmu-2",
+      "reader": "hamamatsu-vms",
+      "status": "exact",
+      "rust_read_s": 0.601555,
+      "rust_rss_kib": 8580,
+      "reference_read_s": 0.200543,
+      "reference_rss_kib": 37760,
+      "speed_vs_reference": 0.33,
+      "rss_vs_reference": 0.23
+    },
+    {
+      "fixture": "hamamatsu-vms-local-cmu-3",
+      "reader": "hamamatsu-vms",
+      "status": "exact",
+      "rust_read_s": 0.219971,
+      "rust_rss_kib": 8872,
+      "reference_read_s": 0.063159,
+      "reference_rss_kib": 40000,
+      "speed_vs_reference": 0.29,
+      "rss_vs_reference": 0.22
+    },
+    {
+      "fixture": "hamamatsu-ndpi-public-cmu-1",
+      "reader": "hamamatsu-ndpi",
+      "status": "exact",
+      "rust_read_s": 0.015033,
+      "rust_rss_kib": 11296,
+      "reference_read_s": 0.049926,
+      "reference_rss_kib": 36736,
+      "speed_vs_reference": 3.32,
+      "rss_vs_reference": 0.31
+    },
+    {
+      "fixture": "hamamatsu-vms-public-cmu-1",
+      "reader": "hamamatsu-vms",
+      "status": "exact",
+      "rust_read_s": 0.064384,
+      "rust_rss_kib": 9188,
+      "reference_read_s": 0.063455,
+      "reference_rss_kib": 37760,
+      "speed_vs_reference": 0.99,
+      "rss_vs_reference": 0.24
+    },
+    {
+      "fixture": "leica-local-leica-1",
+      "reader": "leica",
+      "status": "exact",
+      "rust_read_s": 0.005123,
+      "rust_rss_kib": 7296,
+      "reference_read_s": 0.017077,
+      "reference_rss_kib": 30400,
+      "speed_vs_reference": 3.33,
+      "rss_vs_reference": 0.24
+    },
+    {
+      "fixture": "leica-local-leica-2",
+      "reader": "leica",
+      "status": "exact",
+      "rust_read_s": 0.030382,
+      "rust_rss_kib": 8244,
+      "reference_read_s": 0.051198,
+      "reference_rss_kib": 42240,
+      "speed_vs_reference": 1.69,
+      "rss_vs_reference": 0.2
+    },
+    {
+      "fixture": "trestle-local-cmu-1",
+      "reader": "trestle",
+      "status": "exact",
+      "rust_read_s": 0.047703,
+      "rust_rss_kib": 23360,
+      "reference_read_s": 0.044271,
+      "reference_rss_kib": 39040,
+      "speed_vs_reference": 0.93,
+      "rss_vs_reference": 0.60
+    },
+    {
+      "fixture": "ventana-local-os-1",
+      "reader": "ventana",
+      "status": "exact",
+      "rust_read_s": 0.181807,
+      "rust_rss_kib": 32060,
+      "reference_read_s": 0.190205,
+      "reference_rss_kib": 88016,
+      "speed_vs_reference": 1.05,
+      "rss_vs_reference": 0.36
+    },
+    {
+      "fixture": "ventana-local-os-2",
+      "reader": "ventana",
+      "status": "exact",
+      "rust_read_s": 0.238318,
+      "rust_rss_kib": 33712,
+      "reference_read_s": 0.262666,
+      "reference_rss_kib": 82828,
+      "speed_vs_reference": 1.10,
+      "rss_vs_reference": 0.41
+    },
+    {
+      "fixture": "dicom-local-readable-single-level",
+      "reader": "dicom",
+      "status": "exact-limited",
+      "rust_read_s_range": [0.000358, 0.000471],
+      "rust_rss_kib_range": [6720, 7040],
+      "reference_read_s_range": [0.006836, 0.008807],
+      "reference_rss_kib_range": [32320, 34560],
+      "speed_vs_reference_range": [18.0, 19.0],
+      "rss_vs_reference_range": [0.19, 0.21]
+    },
+    {
+      "fixture": "generic-tiff-public-cmu-1",
+      "reader": "generic-tiff",
+      "status": "exact",
+      "rust_read_s": 0.02283,
+      "rust_rss_kib": 10880,
+      "reference_read_s": 0.049972,
+      "reference_rss_kib": 33920,
+      "speed_vs_reference": 2.19,
+      "rss_vs_reference": 0.32
+    },
+    {
+      "fixture": "aperio-public-cmu-1-small-region",
+      "reader": "aperio",
+      "status": "exact",
+      "rust_read_s": 0.003637,
+      "rust_rss_kib": 7360,
+      "reference_read_s": 0.005006,
+      "reference_rss_kib": 30680,
+      "speed_vs_reference": 1.38,
+      "rss_vs_reference": 0.24
+    },
+    {
+      "fixture": "mirax-public-cmu-1-saved-1-16",
+      "reader": "mirax",
+      "status": "exact",
+      "rust_read_s": 0.067614,
+      "rust_rss_kib": 20824,
+      "reference_read_s": 0.028177,
+      "reference_rss_kib": 33116,
+      "speed_vs_reference": 0.42,
+      "rss_vs_reference": 0.63
+    },
+    {
+      "fixture": "mirax-public-fluorescence-2",
+      "reader": "mirax",
+      "status": "exact",
+      "rust_read_s": 0.005396,
+      "rust_rss_kib": 11632,
+      "reference_read_s": 0.035314,
+      "reference_rss_kib": 31632,
+      "speed_vs_reference": 6.54,
+      "rss_vs_reference": 0.37
+    },
+    {
+      "fixture": "philips-public-philips-1",
+      "reader": "philips",
+      "status": "exact",
+      "rust_read_s": 0.033697,
+      "rust_rss_kib": 14484,
+      "reference_read_s": 0.057009,
+      "reference_rss_kib": 37440,
+      "speed_vs_reference": 1.69,
+      "rss_vs_reference": 0.39
+    },
+    {
+      "fixture": "trestle-public-cmu-1",
+      "reader": "trestle",
+      "status": "exact",
+      "rust_read_s": 0.2141,
+      "rust_rss_kib": 23360,
+      "reference_read_s": 0.052126,
+      "reference_rss_kib": 38720,
+      "speed_vs_reference": 0.24,
+      "rss_vs_reference": 0.60
+    },
+    {
+      "fixture": "zeiss-public-jxr-and-zstd",
+      "reader": "zeiss",
+      "status": "blocked",
+      "notes": "No comparable benchmark because reference OpenSlide could not open audited fixtures."
+    },
+    {
+      "fixture": "sakura-missing",
+      "reader": "sakura",
+      "status": "missing-fixture",
+      "notes": "No benchmark until a fixture is found."
+    }
+  ]
+}
