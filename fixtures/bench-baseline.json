@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
   "reference_stack": "openslide-python 1.4.3 with libopenslide 3.4.1",
-  "command": "scripts/bench-realdata.py --region-size 128 --regions-per-level 1",
+  "command": "scripts/bench-realdata.py --cpu-list 0-3 --region-size 128 --regions-per-level 1",
   "region_size": 128,
   "regions_per_level": 1,
   "thresholds": {
     "read_time_warning_fraction": 0.15,
     "read_time_failure_fraction": 0.25,
-    "rss_warning_fraction": 0.10,
-    "rss_failure_fraction": 0.20
+    "rss_warning_fraction": 0.1,
+    "rss_failure_fraction": 0.2
   },
   "enforcement_policy": {
     "default_mode": "stable-profile-strict",
@@ -20,232 +20,250 @@
       "fixture": "aperio-local-77917",
       "reader": "aperio",
       "status": "exact",
-      "rust_read_s": 0.083952,
-      "rust_rss_kib": 9872,
-      "reference_read_s": 0.085273,
-      "reference_rss_kib": 31868,
-      "speed_vs_reference": 1.02,
-      "rss_vs_reference": 0.31
+      "rust_read_s": 0.060252,
+      "rust_rss_kib": 13560,
+      "reference_read_s": 0.086509,
+      "reference_rss_kib": 33564,
+      "speed_vs_reference": 1.44,
+      "rss_vs_reference": 0.4
     },
     {
       "fixture": "hamamatsu-ndpi-local-cmu-1",
       "reader": "hamamatsu-ndpi",
       "status": "exact",
-      "rust_read_s": 0.018808,
-      "rust_rss_kib": 11012,
-      "reference_read_s": 0.041345,
-      "reference_rss_kib": 35188,
-      "speed_vs_reference": 2.20,
+      "rust_read_s": 0.018366,
+      "rust_rss_kib": 11316,
+      "reference_read_s": 0.04465,
+      "reference_rss_kib": 36892,
+      "speed_vs_reference": 2.43,
       "rss_vs_reference": 0.31
     },
     {
       "fixture": "hamamatsu-ndpi-local-cmu-2",
       "reader": "hamamatsu-ndpi",
       "status": "exact",
-      "rust_read_s": 0.019222,
-      "rust_rss_kib": 12956,
-      "reference_read_s": 0.056429,
-      "reference_rss_kib": 39068,
-      "speed_vs_reference": 2.94,
-      "rss_vs_reference": 0.33
+      "rust_read_s": 0.017641,
+      "rust_rss_kib": 13616,
+      "reference_read_s": 0.047983,
+      "reference_rss_kib": 39020,
+      "speed_vs_reference": 2.72,
+      "rss_vs_reference": 0.35
     },
     {
       "fixture": "hamamatsu-ndpi-local-cmu-3",
       "reader": "hamamatsu-ndpi",
       "status": "exact",
-      "rust_read_s": 0.018359,
-      "rust_rss_kib": 15692,
-      "reference_read_s": 0.056465,
-      "reference_rss_kib": 41120,
-      "speed_vs_reference": 3.08,
-      "rss_vs_reference": 0.38
+      "rust_read_s": 0.017522,
+      "rust_rss_kib": 16100,
+      "reference_read_s": 0.049154,
+      "reference_rss_kib": 41172,
+      "speed_vs_reference": 2.81,
+      "rss_vs_reference": 0.39
     },
     {
       "fixture": "hamamatsu-vms-local-cmu-1",
       "reader": "hamamatsu-vms",
       "status": "exact",
-      "rust_read_s": 0.053581,
-      "rust_rss_kib": 9192,
-      "reference_read_s": 0.061253,
-      "reference_rss_kib": 36800,
-      "speed_vs_reference": 1.14,
-      "rss_vs_reference": 0.25
+      "rust_read_s": 0.028689,
+      "rust_rss_kib": 10168,
+      "reference_read_s": 0.054574,
+      "reference_rss_kib": 38080,
+      "speed_vs_reference": 1.9,
+      "rss_vs_reference": 0.27
     },
     {
       "fixture": "hamamatsu-vms-local-cmu-2",
       "reader": "hamamatsu-vms",
       "status": "exact",
-      "rust_read_s": 0.601555,
-      "rust_rss_kib": 8580,
-      "reference_read_s": 0.200543,
-      "reference_rss_kib": 37760,
-      "speed_vs_reference": 0.33,
-      "rss_vs_reference": 0.23
+      "rust_read_s": 0.021541,
+      "rust_rss_kib": 10488,
+      "reference_read_s": 0.059653,
+      "reference_rss_kib": 39680,
+      "speed_vs_reference": 2.77,
+      "rss_vs_reference": 0.26
     },
     {
       "fixture": "hamamatsu-vms-local-cmu-3",
       "reader": "hamamatsu-vms",
       "status": "exact",
-      "rust_read_s": 0.219971,
-      "rust_rss_kib": 8872,
-      "reference_read_s": 0.063159,
-      "reference_rss_kib": 40000,
-      "speed_vs_reference": 0.29,
-      "rss_vs_reference": 0.22
+      "rust_read_s": 0.020215,
+      "rust_rss_kib": 11128,
+      "reference_read_s": 0.05384,
+      "reference_rss_kib": 41600,
+      "speed_vs_reference": 2.66,
+      "rss_vs_reference": 0.27
     },
     {
       "fixture": "hamamatsu-ndpi-public-cmu-1",
       "reader": "hamamatsu-ndpi",
       "status": "exact",
-      "rust_read_s": 0.015033,
-      "rust_rss_kib": 11296,
-      "reference_read_s": 0.049926,
-      "reference_rss_kib": 36736,
-      "speed_vs_reference": 3.32,
+      "rust_read_s": 0.018459,
+      "rust_rss_kib": 11344,
+      "reference_read_s": 0.042145,
+      "reference_rss_kib": 36920,
+      "speed_vs_reference": 2.28,
       "rss_vs_reference": 0.31
     },
     {
       "fixture": "hamamatsu-vms-public-cmu-1",
       "reader": "hamamatsu-vms",
       "status": "exact",
-      "rust_read_s": 0.064384,
-      "rust_rss_kib": 9188,
-      "reference_read_s": 0.063455,
-      "reference_rss_kib": 37760,
-      "speed_vs_reference": 0.99,
-      "rss_vs_reference": 0.24
+      "rust_read_s": 0.026865,
+      "rust_rss_kib": 10164,
+      "reference_read_s": 0.053557,
+      "reference_rss_kib": 38080,
+      "speed_vs_reference": 1.99,
+      "rss_vs_reference": 0.27
     },
     {
       "fixture": "leica-local-leica-1",
       "reader": "leica",
       "status": "exact",
-      "rust_read_s": 0.005123,
-      "rust_rss_kib": 7296,
-      "reference_read_s": 0.017077,
-      "reference_rss_kib": 30400,
-      "speed_vs_reference": 3.33,
-      "rss_vs_reference": 0.24
+      "rust_read_s": 0.005764,
+      "rust_rss_kib": 8264,
+      "reference_read_s": 0.017001,
+      "reference_rss_kib": 32320,
+      "speed_vs_reference": 2.95,
+      "rss_vs_reference": 0.26
     },
     {
       "fixture": "leica-local-leica-2",
       "reader": "leica",
       "status": "exact",
-      "rust_read_s": 0.030382,
-      "rust_rss_kib": 8244,
-      "reference_read_s": 0.051198,
-      "reference_rss_kib": 42240,
-      "speed_vs_reference": 1.69,
+      "rust_read_s": 0.029645,
+      "rust_rss_kib": 8576,
+      "reference_read_s": 0.04726,
+      "reference_rss_kib": 41920,
+      "speed_vs_reference": 1.59,
       "rss_vs_reference": 0.2
     },
     {
       "fixture": "trestle-local-cmu-1",
       "reader": "trestle",
       "status": "exact",
-      "rust_read_s": 0.047703,
+      "rust_read_s": 0.038104,
       "rust_rss_kib": 23360,
-      "reference_read_s": 0.044271,
-      "reference_rss_kib": 39040,
-      "speed_vs_reference": 0.93,
-      "rss_vs_reference": 0.60
+      "reference_read_s": 0.041948,
+      "reference_rss_kib": 40640,
+      "speed_vs_reference": 1.1,
+      "rss_vs_reference": 0.57
     },
     {
       "fixture": "ventana-local-os-1",
       "reader": "ventana",
       "status": "exact",
-      "rust_read_s": 0.181807,
-      "rust_rss_kib": 32060,
-      "reference_read_s": 0.190205,
-      "reference_rss_kib": 88016,
+      "rust_read_s": 0.179328,
+      "rust_rss_kib": 56836,
+      "reference_read_s": 0.188814,
+      "reference_rss_kib": 89392,
       "speed_vs_reference": 1.05,
-      "rss_vs_reference": 0.36
+      "rss_vs_reference": 0.64
     },
     {
       "fixture": "ventana-local-os-2",
       "reader": "ventana",
       "status": "exact",
-      "rust_read_s": 0.238318,
-      "rust_rss_kib": 33712,
-      "reference_read_s": 0.262666,
-      "reference_rss_kib": 82828,
-      "speed_vs_reference": 1.10,
-      "rss_vs_reference": 0.41
+      "rust_read_s": 0.201066,
+      "rust_rss_kib": 67028,
+      "reference_read_s": 0.231555,
+      "reference_rss_kib": 82968,
+      "speed_vs_reference": 1.15,
+      "rss_vs_reference": 0.81
     },
     {
       "fixture": "dicom-local-readable-single-level",
       "reader": "dicom",
       "status": "exact-limited",
-      "rust_read_s_range": [0.000358, 0.000471],
-      "rust_rss_kib_range": [6720, 7040],
-      "reference_read_s_range": [0.006836, 0.008807],
-      "reference_rss_kib_range": [32320, 34560],
-      "speed_vs_reference_range": [18.0, 19.0],
-      "rss_vs_reference_range": [0.19, 0.21]
+      "rust_read_s_range": [
+        0.000358,
+        0.000471
+      ],
+      "rust_rss_kib_range": [
+        6720,
+        7040
+      ],
+      "reference_read_s_range": [
+        0.006836,
+        0.008807
+      ],
+      "reference_rss_kib_range": [
+        32320,
+        34560
+      ],
+      "speed_vs_reference_range": [
+        18.0,
+        19.0
+      ],
+      "rss_vs_reference_range": [
+        0.19,
+        0.21
+      ]
     },
     {
       "fixture": "generic-tiff-public-cmu-1",
       "reader": "generic-tiff",
       "status": "exact",
-      "rust_read_s": 0.02283,
+      "rust_read_s": 0.021107,
       "rust_rss_kib": 10880,
-      "reference_read_s": 0.049972,
-      "reference_rss_kib": 33920,
-      "speed_vs_reference": 2.19,
+      "reference_read_s": 0.04514,
+      "reference_rss_kib": 33892,
+      "speed_vs_reference": 2.14,
       "rss_vs_reference": 0.32
     },
     {
       "fixture": "aperio-public-cmu-1-small-region",
       "reader": "aperio",
       "status": "exact",
-      "rust_read_s": 0.003637,
-      "rust_rss_kib": 7360,
-      "reference_read_s": 0.005006,
-      "reference_rss_kib": 30680,
-      "speed_vs_reference": 1.38,
-      "rss_vs_reference": 0.24
+      "rust_read_s": 0.003545,
+      "rust_rss_kib": 7680,
+      "reference_read_s": 0.004874,
+      "reference_rss_kib": 30928,
+      "speed_vs_reference": 1.37,
+      "rss_vs_reference": 0.25
     },
     {
       "fixture": "mirax-public-cmu-1-saved-1-16",
       "reader": "mirax",
       "status": "exact",
-      "rust_read_s": 0.067614,
-      "rust_rss_kib": 20824,
-      "reference_read_s": 0.028177,
-      "reference_rss_kib": 33116,
-      "speed_vs_reference": 0.42,
-      "rss_vs_reference": 0.63
+      "rust_read_s": 0.006637,
+      "rust_rss_kib": 20424,
+      "reference_read_s": 0.023115,
+      "reference_rss_kib": 32960,
+      "speed_vs_reference": 3.48,
+      "rss_vs_reference": 0.62
     },
     {
       "fixture": "mirax-public-fluorescence-2",
       "reader": "mirax",
       "status": "exact",
-      "rust_read_s": 0.005396,
-      "rust_rss_kib": 11632,
-      "reference_read_s": 0.035314,
-      "reference_rss_kib": 31632,
-      "speed_vs_reference": 6.54,
+      "rust_read_s": 0.001197,
+      "rust_rss_kib": 11576,
+      "reference_read_s": 0.028447,
+      "reference_rss_kib": 31332,
+      "speed_vs_reference": 23.77,
       "rss_vs_reference": 0.37
     },
     {
       "fixture": "philips-public-philips-1",
       "reader": "philips",
       "status": "exact",
-      "rust_read_s": 0.033697,
-      "rust_rss_kib": 14484,
-      "reference_read_s": 0.057009,
-      "reference_rss_kib": 37440,
-      "speed_vs_reference": 1.69,
-      "rss_vs_reference": 0.39
+      "rust_read_s": 0.027797,
+      "rust_rss_kib": 14400,
+      "reference_read_s": 0.047869,
+      "reference_rss_kib": 38720,
+      "speed_vs_reference": 1.72,
+      "rss_vs_reference": 0.37
     },
     {
       "fixture": "trestle-public-cmu-1",
       "reader": "trestle",
       "status": "exact",
-      "rust_read_s": 0.2141,
-      "rust_rss_kib": 23360,
-      "reference_read_s": 0.052126,
-      "reference_rss_kib": 38720,
-      "speed_vs_reference": 0.24,
-      "rss_vs_reference": 0.60
+      "rust_read_s": 0.03407,
+      "rust_rss_kib": 23680,
+      "reference_read_s": 0.042403,
+      "reference_rss_kib": 40320,
+      "speed_vs_reference": 1.24,
+      "rss_vs_reference": 0.59
     },
     {
       "fixture": "zeiss-public-jxr-and-zstd",

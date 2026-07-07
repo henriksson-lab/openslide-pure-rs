@@ -1,4 +1,5 @@
 use std::collections::{hash_map::Entry, HashMap};
+#[cfg(test)]
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::SlideBackend;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+use crate::util::_openslide_format_double as format_float;
 
 const GROUP_VMS: &str = "Virtual Microscope Specimen";
 const GROUP_VMU: &str = "Uncompressed Virtual Microscope Specimen";
@@ -96,7 +98,6 @@ pub(crate) fn open_ndpi(path: &Path) -> Result<Box<dyn SlideBackend>> {
     Ok(Box::new(HamamatsuSlide::hamamatsu_ndpi_open(path)?))
 }
 
-#[derive(Debug)]
 struct HamamatsuSlide {
     properties: HashMap<String, String>,
     levels: Vec<Level>,
@@ -116,11 +117,14 @@ enum LevelSource {
     Unsupported,
     Vms {
         image_files: Vec<PathBuf>,
+        image_file_sizes: Vec<u64>,
+        tile_dimensions: Vec<(u32, u32)>,
         num_cols: u64,
         tile_w: u32,
         tile_h: u32,
         source_downsample: f64,
         restart_row_starts: Option<Vec<Option<Vec<u64>>>>,
+        restart_info: Option<Arc<JpegRestartInfo>>,
     },
     VmuNgr {
         path: PathBuf,
@@ -393,14 +397,18 @@ impl SlideBackend for HamamatsuSlide {
         match &level_data.source {
             LevelSource::Vms {
                 image_files,
+                image_file_sizes: _,
+                tile_dimensions,
                 num_cols,
                 tile_w,
                 tile_h,
                 source_downsample,
                 restart_row_starts: _,
+                restart_info: _,
             } => read_vms_region(
                 level_data,
                 image_files,
+                tile_dimensions,
                 *num_cols,
                 *tile_w,
                 *tile_h,
@@ -461,19 +469,25 @@ impl SlideBackend for HamamatsuSlide {
         match &level_data.source {
             LevelSource::Vms {
                 image_files,
+                image_file_sizes,
+                tile_dimensions,
                 num_cols,
                 tile_w,
                 tile_h,
                 source_downsample,
                 restart_row_starts,
+                restart_info,
             } => read_vms_region_rgba(
                 level_data,
                 image_files,
+                tile_dimensions,
                 *num_cols,
                 *tile_w,
                 *tile_h,
                 *source_downsample,
                 restart_row_starts.as_deref(),
+                restart_info.as_ref(),
+                image_file_sizes,
                 x,
                 y,
                 w,
@@ -730,11 +744,13 @@ fn hamamatsu_vms_part2(path: &Path, ini: &Ini, group: &str, dirname: &Path) -> R
     let first = image_files
         .first()
         .ok_or_else(|| OpenSlideError::Format("VMS file has no image files".into()))?;
-    let (tile_w, tile_h) = read_jpeg_dimensions(first)?;
+    let (tile_w, tile_h, first_size) = read_jpeg_dimensions_and_size(first)?;
     let mut dimensions = Vec::with_capacity(image_files.len());
+    let mut image_file_sizes = Vec::with_capacity(image_files.len());
     dimensions.push((tile_w, tile_h));
+    image_file_sizes.push(first_size);
     for (index, image_file) in image_files.iter().enumerate().skip(1) {
-        let (width, height) = read_jpeg_dimensions(image_file)?;
+        let (width, height, file_size) = read_jpeg_dimensions_and_size(image_file)?;
         let col = index as i64 % num_cols;
         let row = index as i64 / num_cols;
         if col != num_cols - 1 && width != tile_w {
@@ -748,11 +764,22 @@ fn hamamatsu_vms_part2(path: &Path, ini: &Ini, group: &str, dirname: &Path) -> R
             )));
         }
         dimensions.push((width, height));
+        image_file_sizes.push(file_size);
     }
     let tile_w_u32 = u32::try_from(tile_w)
         .map_err(|_| OpenSlideError::Format("VMS JPEG tile width is too large".into()))?;
     let tile_h_u32 = u32::try_from(tile_h)
         .map_err(|_| OpenSlideError::Format("VMS JPEG tile height is too large".into()))?;
+    let tile_dimensions = dimensions
+        .iter()
+        .map(|&(width, height)| {
+            let width = u32::try_from(width)
+                .map_err(|_| OpenSlideError::Format("VMS JPEG tile width is too large".into()))?;
+            let height = u32::try_from(height)
+                .map_err(|_| OpenSlideError::Format("VMS JPEG tile height is too large".into()))?;
+            Ok((width, height))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let width = (0..num_cols as usize).try_fold(0u64, |sum, col| {
         sum.checked_add(dimensions[col].0)
             .ok_or_else(|| OpenSlideError::Format("VMS width overflow".into()))
@@ -762,7 +789,7 @@ fn hamamatsu_vms_part2(path: &Path, ini: &Ini, group: &str, dirname: &Path) -> R
             .ok_or_else(|| OpenSlideError::Format("VMS height overflow".into()))
     })?;
 
-    let (map_w, map_h) = read_jpeg_dimensions(&map_file)?;
+    let (map_w, map_h, map_file_size) = read_jpeg_dimensions_and_size(&map_file)?;
     let map_w_u32 = u32::try_from(map_w)
         .map_err(|_| OpenSlideError::Format("VMS map JPEG width is too large".into()))?;
     let map_h_u32 = u32::try_from(map_h)
@@ -772,11 +799,14 @@ fn hamamatsu_vms_part2(path: &Path, ini: &Ini, group: &str, dirname: &Path) -> R
     let mut levels = Vec::new();
     let base_source = LevelSource::Vms {
         image_files,
+        image_file_sizes,
+        tile_dimensions,
         num_cols: num_cols as u64,
         tile_w: tile_w_u32,
         tile_h: tile_h_u32,
         source_downsample: 1.0,
         restart_row_starts,
+        restart_info: None,
     };
     levels.push(Level {
         width,
@@ -793,12 +823,15 @@ fn hamamatsu_vms_part2(path: &Path, ini: &Ini, group: &str, dirname: &Path) -> R
         });
     }
     let map_source = LevelSource::Vms {
-        image_files: vec![map_file],
+        image_files: vec![map_file.clone()],
+        image_file_sizes: vec![map_file_size],
+        tile_dimensions: vec![(map_w_u32, map_h_u32)],
         num_cols: 1,
         tile_w: map_w_u32,
         tile_h: map_h_u32,
         source_downsample: (width as f64 / map_w as f64).max(height as f64 / map_h as f64),
         restart_row_starts: None,
+        restart_info: jpeg_restart_info(&map_file, 0, map_file_size, None, None)?,
     };
     levels.push(Level {
         width: map_w,
@@ -844,15 +877,15 @@ fn vms_optimisation_row_starts(
         };
         let rows = usize::try_from(header.height.div_ceil(header.tile_h))
             .map_err(|_| OpenSlideError::Format("VMS optimisation row count overflow".into()))?;
-        let mut starts = Vec::with_capacity(rows);
-        for row in 0..rows {
-            let mut buf = [0; 40];
-            if crate::util::_openslide_fread_exact(&mut file, &mut buf).is_err() {
-                if row == 0 {
-                    starts.clear();
-                }
-                break;
-            }
+        let bytes_len = rows.checked_mul(40).ok_or_else(|| {
+            OpenSlideError::Format("VMS optimisation row byte count overflow".into())
+        })?;
+        let mut row_bytes = vec![0; bytes_len];
+        let bytes_read = crate::util::_openslide_fread(&mut file, &mut row_bytes)?;
+        let complete_rows = bytes_read / 40;
+        let mut starts = Vec::with_capacity(complete_rows);
+        for row in 0..complete_rows {
+            let buf = &row_bytes[row * 40..row * 40 + 40];
             let mut offset_bytes = [0; 8];
             offset_bytes.copy_from_slice(&buf[..8]);
             starts.push(u64::from_le_bytes(offset_bytes));
@@ -1151,7 +1184,7 @@ fn level_source_preference(source: &LevelSource) -> u8 {
     }
 }
 
-fn read_jpeg_dimensions(path: &Path) -> Result<(u64, u64)> {
+fn read_jpeg_dimensions_and_size(path: &Path) -> Result<(u64, u64, u64)> {
     let mut file = crate::util::_openslide_fopen(path)?;
     let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
         OpenSlideError::Format(format!("Negative file size for {}", path.display()))
@@ -1191,7 +1224,7 @@ fn read_jpeg_dimensions(path: &Path) -> Result<(u64, u64)> {
             let height = u16::from_be_bytes([data[pos + 3], data[pos + 4]]) as u64;
             let width = u16::from_be_bytes([data[pos + 5], data[pos + 6]]) as u64;
             if width > 0 && height > 0 {
-                return Ok((width, height));
+                return Ok((width, height, file_len));
             }
         }
         pos += len;
@@ -1278,11 +1311,6 @@ fn jpeg_restart_header(
         .map_err(|_| OpenSlideError::Format("JPEG restart header cache poisoned".into()))?
         .insert(key, header.clone());
     Ok(Some(header))
-}
-
-fn vms_restart_info(path: &Path) -> Result<Option<Arc<JpegRestartInfo>>> {
-    let file_stop = file_size(path)?;
-    jpeg_restart_info(path, 0, file_stop, None, None)
 }
 
 fn file_size(path: &Path) -> Result<u64> {
@@ -1843,6 +1871,7 @@ fn fix_offset_ndpi(diroff: u64, offset: u64) -> u64 {
 fn read_vms_region(
     level: &Level,
     image_files: &[PathBuf],
+    tile_dimensions: &[(u32, u32)],
     num_cols: u64,
     tile_w: u32,
     tile_h: u32,
@@ -1882,14 +1911,16 @@ fn read_vms_region(
             let path = image_files.get(tile_index).ok_or_else(|| {
                 OpenSlideError::Format("VMS tile index outside image file list".into())
             })?;
-            let (jpeg_w, jpeg_h) = read_jpeg_dimensions(path)?;
+            let &(jpeg_w, jpeg_h) = tile_dimensions.get(tile_index).ok_or_else(|| {
+                OpenSlideError::Format("VMS tile index outside dimension list".into())
+            })?;
             let tile_origin_x = col as f64 * tile_w as f64;
             let tile_origin_y = row as f64 * tile_h as f64;
             let Some((crop_x, crop_y, crop_w, crop_h)) = source_overlap_rect(
                 tile_origin_x,
                 tile_origin_y,
-                jpeg_w as u32,
-                jpeg_h as u32,
+                jpeg_w,
+                jpeg_h,
                 view_x,
                 view_y,
                 full_w,
@@ -1926,7 +1957,9 @@ fn read_vms_region(
 #[allow(clippy::too_many_arguments)]
 fn read_vms_restart_sampled_rgb_region(
     path: &Path,
+    file_stop: u64,
     restart_row_starts: Option<&[u64]>,
+    restart_info: Option<&Arc<JpegRestartInfo>>,
     crop_x: u32,
     crop_y: u32,
     crop_w: u32,
@@ -1937,16 +1970,21 @@ fn read_vms_restart_sampled_rgb_region(
     out_w: u32,
     out_h: u32,
 ) -> Result<Option<(Vec<u8>, u32, u32)>> {
-    let full_info;
+    let full_info: Option<Arc<JpegRestartInfo>>;
     let info = if restart_row_starts.is_some() {
-        let Some(header) = jpeg_restart_header(path, 0, file_size(path)?, None, None)? else {
+        let Some(header) = jpeg_restart_header(path, 0, file_stop, None, None)? else {
             return Ok(None);
         };
         full_info = None;
         (*header).clone()
     } else {
-        let Some(info) = vms_restart_info(path)? else {
-            return Ok(None);
+        let info = if let Some(info) = restart_info {
+            info.clone()
+        } else {
+            let Some(info) = jpeg_restart_info(path, 0, file_stop, None, None)? else {
+                return Ok(None);
+            };
+            info
         };
         let header = JpegRestartHeader {
             header_start: info.header_start,
@@ -2003,10 +2041,26 @@ fn read_vms_restart_sampled_rgb_region(
         "VMS",
     )?;
     let mut out = vec![0; out_w as usize * out_h as usize * 3];
-    let mut decoded_tiles: HashMap<usize, (Vec<u8>, u32, u32)> = HashMap::new();
+    let decoded_tile_capacity = sampled_restart_tile_capacity(&y_map, &x_map)?;
+    let mut decoded_tiles: HashMap<usize, (Vec<u8>, u32, u32)> =
+        HashMap::with_capacity(decoded_tile_capacity);
+    let mut range_file = crate::util::_openslide_fopen(path)?;
+    let mut optimised_restart_cache = if restart_row_starts.is_some() {
+        let rows = u64::from(info.height.div_ceil(info.tile_h));
+        let tile_count = rows
+            .checked_mul(info.tiles_across)
+            .ok_or_else(|| OpenSlideError::Format("VMS restart tile count overflow".into()))?;
+        let tile_count = usize::try_from(tile_count)
+            .map_err(|_| OpenSlideError::Format("VMS restart tile count overflow".into()))?;
+        Some(vec![None; tile_count])
+    } else {
+        None
+    };
 
-    for (out_y, &(tile_row, scaled_y)) in y_map.iter().enumerate() {
-        for (out_x, &(tile_col, scaled_x)) in x_map.iter().enumerate() {
+    if let Some(tile_col) = single_restart_tile_col(&x_map) {
+        let mut out_y = 0usize;
+        while out_y < y_map.len() {
+            let tile_row = y_map[out_y].0;
             let tile_no = tile_row
                 .checked_mul(info.tiles_across)
                 .and_then(|base| base.checked_add(tile_col))
@@ -2017,8 +2071,16 @@ fn read_vms_restart_sampled_rgb_region(
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
                     let (data_start, data_stop) = if let Some(row_starts) = restart_row_starts {
-                        match vms_optimised_restart_tile_range(path, &info, row_starts, tile_index)?
-                        {
+                        let Some(mcu_starts) = optimised_restart_cache.as_mut() else {
+                            return Ok(None);
+                        };
+                        match vms_optimised_restart_tile_range_cached(
+                            &mut range_file,
+                            &info,
+                            row_starts,
+                            mcu_starts,
+                            tile_index,
+                        )? {
                             Some(range) => range,
                             None => return Ok(None),
                         }
@@ -2035,8 +2097,74 @@ fn read_vms_restart_sampled_rgb_region(
                                 .unwrap_or(full_info.file_stop),
                         )
                     };
-                    entry.insert(decode::decode_jpeg_file_range_rgb(
-                        path,
+                    entry.insert(decode::decode_jpeg_open_file_range_rgb(
+                        &range_file,
+                        file_stop,
+                        info.header_start,
+                        info.sof_position,
+                        info.header_stop,
+                        data_start,
+                        data_stop,
+                        info.tile_w,
+                        info.tile_h,
+                        scale_denom,
+                    )?)
+                }
+            };
+            while out_y < y_map.len() && y_map[out_y].0 == tile_row {
+                let scaled_y = y_map[out_y].1;
+                for (out_x, &(_, scaled_x)) in x_map.iter().enumerate() {
+                    let src = (scaled_y as usize * *tile_rgb_w as usize + scaled_x as usize) * 3;
+                    let dst = (out_y * out_w as usize + out_x) * 3;
+                    out[dst..dst + 3].copy_from_slice(&tile_rgb[src..src + 3]);
+                }
+                out_y += 1;
+            }
+        }
+        return Ok(Some((out, out_w, out_h)));
+    }
+
+    for (out_y, &(tile_row, scaled_y)) in y_map.iter().enumerate() {
+        for (out_x, &(tile_col, scaled_x)) in x_map.iter().enumerate() {
+            let tile_no = tile_row
+                .checked_mul(info.tiles_across)
+                .and_then(|base| base.checked_add(tile_col))
+                .ok_or_else(|| OpenSlideError::Format("VMS restart tile index overflow".into()))?;
+            let tile_index = usize::try_from(tile_no)
+                .map_err(|_| OpenSlideError::Format("VMS restart tile index overflow".into()))?;
+            let (tile_rgb, tile_rgb_w, _tile_rgb_h) = match decoded_tiles.entry(tile_index) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let (data_start, data_stop) = if let Some(row_starts) = restart_row_starts {
+                        let Some(mcu_starts) = optimised_restart_cache.as_mut() else {
+                            return Ok(None);
+                        };
+                        match vms_optimised_restart_tile_range_cached(
+                            &mut range_file,
+                            &info,
+                            row_starts,
+                            mcu_starts,
+                            tile_index,
+                        )? {
+                            Some(range) => range,
+                            None => return Ok(None),
+                        }
+                    } else {
+                        let Some(full_info) = full_info.as_ref() else {
+                            return Ok(None);
+                        };
+                        (
+                            full_info.starts[tile_index],
+                            full_info
+                                .starts
+                                .get(tile_index + 1)
+                                .copied()
+                                .unwrap_or(full_info.file_stop),
+                        )
+                    };
+                    entry.insert(decode::decode_jpeg_open_file_range_rgb(
+                        &range_file,
+                        file_stop,
                         info.header_start,
                         info.sof_position,
                         info.header_stop,
@@ -2057,47 +2185,88 @@ fn read_vms_restart_sampled_rgb_region(
     Ok(Some((out, out_w, out_h)))
 }
 
-fn vms_optimised_restart_tile_range(
-    path: &Path,
+fn vms_optimised_restart_tile_range_cached(
+    file: &mut crate::util::OpenSlideFile,
     info: &JpegRestartHeader,
     row_starts: &[u64],
+    mcu_starts: &mut [Option<u64>],
     tile_index: usize,
 ) -> Result<Option<(u64, u64)>> {
     let tile_index_u64 = u64::try_from(tile_index)
         .map_err(|_| OpenSlideError::Format("VMS restart tile index overflow".into()))?;
-    let row = tile_index_u64 / info.tiles_across;
-    let col = tile_index_u64 % info.tiles_across;
-    let mut file = crate::util::_openslide_fopen(path)?;
-    let Some(row_start) = vms_optimised_row_start(&mut file, info, row_starts, row)? else {
+    let Some(data_start) =
+        vms_cached_restart_offset(file, info, row_starts, mcu_starts, tile_index_u64)?
+    else {
         return Ok(None);
     };
-    let data_start = if col == 0 {
-        row_start
-    } else {
-        let Some(offset) = find_nth_restart_after(&mut file, row_start, info.file_stop, col)?
-        else {
-            return Ok(None);
-        };
-        offset
-    };
-    let data_stop = if col + 1 < info.tiles_across {
-        let Some(offset) = find_nth_restart_after(&mut file, row_start, info.file_stop, col + 1)?
-        else {
-            return Ok(None);
-        };
-        offset
-    } else if row + 1 < info.height.div_ceil(info.tile_h) as u64 {
-        let Some(offset) = vms_optimised_row_start(&mut file, info, row_starts, row + 1)? else {
-            return Ok(None);
-        };
-        offset
-    } else {
-        info.file_stop
+    let Some(data_stop) =
+        vms_cached_restart_offset(file, info, row_starts, mcu_starts, tile_index_u64 + 1)?
+    else {
+        return Ok(None);
     };
     if data_start < info.header_stop || data_start >= data_stop || data_stop > info.file_stop {
         return Ok(None);
     }
     Ok(Some((data_start, data_stop)))
+}
+
+fn vms_cached_restart_offset(
+    file: &mut crate::util::OpenSlideFile,
+    info: &JpegRestartHeader,
+    row_starts: &[u64],
+    mcu_starts: &mut [Option<u64>],
+    target: u64,
+) -> Result<Option<u64>> {
+    let tile_count = u64::try_from(mcu_starts.len())
+        .map_err(|_| OpenSlideError::Format("VMS restart tile count overflow".into()))?;
+    if target == tile_count {
+        return Ok(Some(info.file_stop));
+    }
+    if target > tile_count {
+        return Ok(None);
+    }
+    let target_index = usize::try_from(target)
+        .map_err(|_| OpenSlideError::Format("VMS restart tile index overflow".into()))?;
+    if let Some(offset) = mcu_starts[target_index] {
+        return Ok(Some(offset));
+    }
+
+    let mut first_good = target;
+    loop {
+        let index = usize::try_from(first_good)
+            .map_err(|_| OpenSlideError::Format("VMS restart tile index overflow".into()))?;
+        if mcu_starts[index].is_some() {
+            break;
+        }
+        if first_good % info.tiles_across == 0 {
+            let row = first_good / info.tiles_across;
+            if let Some(offset) = vms_optimised_row_start(file, info, row_starts, row)? {
+                mcu_starts[index] = Some(offset);
+                break;
+            }
+        }
+        if first_good == 0 {
+            return Ok(None);
+        }
+        first_good -= 1;
+    }
+
+    while first_good < target {
+        let index = usize::try_from(first_good)
+            .map_err(|_| OpenSlideError::Format("VMS restart tile index overflow".into()))?;
+        let Some(start) = mcu_starts[index] else {
+            return Ok(None);
+        };
+        let Some(next) = find_nth_restart_after(file, start, info.file_stop, 1)? else {
+            return Ok(None);
+        };
+        first_good += 1;
+        let next_index = usize::try_from(first_good)
+            .map_err(|_| OpenSlideError::Format("VMS restart tile index overflow".into()))?;
+        mcu_starts[next_index] = Some(next);
+    }
+
+    Ok(mcu_starts[target_index])
 }
 
 fn vms_optimised_row_start(
@@ -2177,11 +2346,14 @@ fn find_nth_restart_after(
 fn read_vms_region_rgba(
     level: &Level,
     image_files: &[PathBuf],
+    tile_dimensions: &[(u32, u32)],
     num_cols: u64,
     tile_w: u32,
     tile_h: u32,
     source_downsample: f64,
     restart_row_starts: Option<&[Option<Vec<u64>>]>,
+    restart_info: Option<&Arc<JpegRestartInfo>>,
+    image_file_sizes: &[u64],
     x: i64,
     y: i64,
     w: u32,
@@ -2219,14 +2391,19 @@ fn read_vms_region_rgba(
             let path = image_files.get(tile_index).ok_or_else(|| {
                 OpenSlideError::Format("VMS tile index outside image file list".into())
             })?;
-            let (jpeg_w, jpeg_h) = read_jpeg_dimensions(path)?;
+            let &file_size = image_file_sizes.get(tile_index).ok_or_else(|| {
+                OpenSlideError::Format("VMS tile index outside file size list".into())
+            })?;
+            let &(jpeg_w, jpeg_h) = tile_dimensions.get(tile_index).ok_or_else(|| {
+                OpenSlideError::Format("VMS tile index outside dimension list".into())
+            })?;
             let tile_origin_x = col as f64 * tile_w as f64;
             let tile_origin_y = row as f64 * tile_h as f64;
             let Some((crop_x, crop_y, crop_w, crop_h)) = source_overlap_rect(
                 tile_origin_x,
                 tile_origin_y,
-                jpeg_w as u32,
-                jpeg_h as u32,
+                jpeg_w,
+                jpeg_h,
                 view_x,
                 view_y,
                 full_w,
@@ -2255,9 +2432,11 @@ fn read_vms_region_rgba(
             let out_h = dst_y1 - dst_y0;
             if let Some((rgb, rgb_w, _rgb_h)) = read_vms_restart_sampled_rgb_region(
                 path,
+                file_size,
                 restart_row_starts
                     .and_then(|starts| starts.get(tile_index))
                     .and_then(|starts| starts.as_deref()),
+                restart_info,
                 crop_x,
                 crop_y,
                 crop_w,
@@ -3422,6 +3601,32 @@ fn restart_sampled_x_map(
     Ok(map)
 }
 
+fn sampled_restart_tile_capacity(y_map: &[(u64, u32)], x_map: &[(u64, u32)]) -> Result<usize> {
+    fn consecutive_unique_count(map: &[(u64, u32)]) -> usize {
+        let mut count = 0usize;
+        let mut previous = None;
+        for &(tile, _) in map {
+            if previous != Some(tile) {
+                count += 1;
+                previous = Some(tile);
+            }
+        }
+        count
+    }
+
+    consecutive_unique_count(y_map)
+        .checked_mul(consecutive_unique_count(x_map))
+        .ok_or_else(|| OpenSlideError::Format("Sampled restart tile count overflow".into()))
+}
+
+fn single_restart_tile_col(x_map: &[(u64, u32)]) -> Option<u64> {
+    let first = x_map.first()?.0;
+    x_map
+        .iter()
+        .all(|&(tile_col, _)| tile_col == first)
+        .then_some(first)
+}
+
 fn decode_raw_channel(
     data: &[u8],
     width: u32,
@@ -4213,10 +4418,10 @@ fn ndpi_set_props(dir: &TiffDir, properties: &mut HashMap<String, String>) {
     if let Some(value) = dir.first_sint(NDPI_YOFFSET) {
         properties.insert("hamamatsu.YOffsetFromSlideCentre".into(), value.to_string());
     }
-    if let Some(value) = dir.first_string(NDPI_REFERENCE) {
+    if let Some(value) = dir.tiff_ascii_string(NDPI_REFERENCE) {
         properties.insert("hamamatsu.Reference".into(), value);
     }
-    if let Some(props) = dir.first_string(NDPI_PROPERTY_MAP) {
+    if let Some(props) = dir.tiff_ascii_string(NDPI_PROPERTY_MAP) {
         for record in props.split("\r\n") {
             if let Some((key, value)) = record.split_once('=') {
                 if !key.is_empty() && !value.is_empty() {
@@ -4258,10 +4463,6 @@ fn set_resolution_prop(
         property_name.into(),
         format_float(microns_per_unit / resolution),
     );
-}
-
-fn format_float(value: f64) -> String {
-    crate::util::_openslide_format_double(value)
 }
 
 #[derive(Debug)]
@@ -4363,8 +4564,8 @@ impl TiffDir {
             .and_then(|v| v.first().copied())
     }
 
-    fn first_string(&self, tag: u16) -> Option<String> {
-        self.entries.get(&tag)?.string()
+    fn tiff_ascii_string(&self, tag: u16) -> Option<String> {
+        self.entries.get(&tag)?.tiff_ascii_string()
     }
 
     fn bytes(&self, tag: u16) -> Option<Vec<u8>> {
@@ -4427,7 +4628,7 @@ impl TiffValue {
         }
     }
 
-    fn string(&self) -> Option<String> {
+    fn tiff_ascii_string(&self) -> Option<String> {
         if self.field_type != 2 {
             return None;
         }

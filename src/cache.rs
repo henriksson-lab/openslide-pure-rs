@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use lru::LruCache;
@@ -12,7 +13,7 @@ pub struct CachedTile {
     pub width: u32,
     pub height: u32,
     /// RGB data, 3 bytes per pixel.
-    pub rgb: Vec<u8>,
+    pub rgb: Arc<Vec<u8>>,
 }
 
 /// Cache key: (cache binding ID, filter_level_index, zoom_level, tile/record ID).
@@ -67,6 +68,14 @@ impl TileCache {
             .cache
             .get(&(binding_id, filter_level, level, imageno))
             .cloned()
+    }
+
+    pub fn contains(&self, binding_id: u64, filter_level: usize, level: u32, imageno: i64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .cache
+            .get(&(binding_id, filter_level, level, imageno))
+            .is_some()
     }
 
     pub fn put(
@@ -127,7 +136,7 @@ mod tests {
         CachedTile {
             width: w,
             height: h,
-            rgb: vec![0u8; w as usize * h as usize * 3],
+            rgb: vec![0u8; w as usize * h as usize * 3].into(),
         }
     }
 
@@ -148,6 +157,15 @@ mod tests {
         let cache = TileCache::new();
         let binding_id = cache.next_binding_id();
         assert!(cache.get(binding_id, 0, 0, 99).is_none());
+        assert!(!cache.contains(binding_id, 0, 0, 99));
+    }
+
+    #[test]
+    fn contains_touches_existing_entry_without_cloning_it() {
+        let cache = TileCache::new();
+        let binding_id = cache.next_binding_id();
+        cache.put(binding_id, 0, 0, 42, make_tile(4, 4));
+        assert!(cache.contains(binding_id, 0, 0, 42));
     }
 
     #[test]

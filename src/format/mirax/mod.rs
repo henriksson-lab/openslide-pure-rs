@@ -43,13 +43,14 @@ use crate::format::SlideBackend;
 use crate::grid::TileGrid;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+use crate::util::_openslide_format_double as format_float;
 
 use self::index::{HierEntry, IndexFile};
 use self::slidedat::SlideDat;
 use self::tile::{compute_base_dimensions, compute_zoom_level_params, Image, MiraxLevel, Tile};
 
 extern "C" {
-    fn osr_cairo_blit_rgb_to_rgba(
+    fn osr_cairo_blit_rgb_to_rgba_clipped_dst(
         src_rgb: *const u8,
         src_width: u32,
         src_height: u32,
@@ -207,6 +208,7 @@ fn read_record_data(path: &Path, offset: i64, size: i64) -> Result<Vec<u8>> {
     crate::util::read_file_range(path, offset as u64, size as u64)
 }
 
+#[cfg(test)]
 fn read_record_data_to_end(path: &Path, offset: i64) -> Result<Vec<u8>> {
     if offset < 0 {
         return Err(OpenSlideError::Format(format!(
@@ -868,9 +870,18 @@ impl MiraxSlide {
         filter_level_idx: usize,
         level: u32,
         image_format: ImageFormat,
+        image_width: u32,
+        image_height: u32,
         channel: u32,
     ) -> Result<GrayImage> {
-        let rgb_tile = self.decode_tile_rgb(tile, filter_level_idx, level, image_format)?;
+        let rgb_tile = self.decode_tile_rgb(
+            tile,
+            filter_level_idx,
+            level,
+            image_format,
+            image_width,
+            image_height,
+        )?;
 
         // Extract the requested channel
         let pixel_count = rgb_tile.width as usize * rgb_tile.height as usize;
@@ -892,6 +903,8 @@ impl MiraxSlide {
         filter_level_idx: usize,
         level: u32,
         image_format: ImageFormat,
+        image_width: u32,
+        image_height: u32,
     ) -> Result<CachedTile> {
         let imageno = tile.image.imageno;
         if let Some(cached) = self.cache.get(
@@ -911,9 +924,30 @@ impl MiraxSlide {
             )));
         }
         let datafile_path = &self.datafile_paths[fileno as usize];
-        let data = read_record_data_to_end(datafile_path, tile.image.offset as i64)?;
-        let (rgb, width, height) = decode::decode_rgb_libjpeg(image_format, &data)?;
-        let cached = CachedTile { width, height, rgb };
+        let (rgb, width, height) = match image_format {
+            ImageFormat::Jpeg => decode::decode_rgb_region_from_file(
+                image_format,
+                datafile_path,
+                tile.image.offset as u64,
+                0,
+                0,
+                image_width,
+                image_height,
+            )?,
+            _ => {
+                let data = read_record_data(
+                    datafile_path,
+                    tile.image.offset as i64,
+                    tile.image.length as i64,
+                )?;
+                decode::decode_rgb_libjpeg(image_format, &data)?
+            }
+        };
+        let cached = CachedTile {
+            width,
+            height,
+            rgb: rgb.into(),
+        };
         self.cache.put(
             self.cache_binding_id,
             filter_level_idx,
@@ -1019,6 +1053,8 @@ impl SlideBackend for MiraxSlide {
                 mapping.filter_level_idx,
                 level,
                 level_data.level.image_format,
+                level_data.level.image_width as u32,
+                level_data.level.image_height as u32,
                 mapping.rgb_channel,
             )?;
 
@@ -1084,6 +1120,8 @@ impl SlideBackend for MiraxSlide {
                     filter_level_idx,
                     level,
                     level_data.level.image_format,
+                    level_data.level.image_width as u32,
+                    level_data.level.image_height as u32,
                 )?;
                 let tile_origin_x = col as f64 * level_data.grid.tile_advance_x + entry.offset_x;
                 let tile_origin_y = row as f64 * level_data.grid.tile_advance_y + entry.offset_y;
@@ -1132,6 +1170,8 @@ impl SlideBackend for MiraxSlide {
                     mapping.filter_level_idx,
                     level,
                     level_data.level.image_format,
+                    level_data.level.image_width as u32,
+                    level_data.level.image_height as u32,
                     mapping.rgb_channel,
                 )?;
                 let tile_origin_x = col as f64 * level_data.grid.tile_advance_x + entry.offset_x;
@@ -1357,7 +1397,7 @@ fn cairo_blit_rgb_rgba(
     let channel = |idx: usize| -> c_int { channels[idx].map_or(-1, |channel| channel as c_int) };
     let mut err = vec![0i8; 256];
     let ok = unsafe {
-        osr_cairo_blit_rgb_to_rgba(
+        osr_cairo_blit_rgb_to_rgba_clipped_dst(
             src.rgb.as_ptr(),
             src.width,
             src.height,
@@ -1402,10 +1442,6 @@ fn unpremultiply_rgba(image: &mut RgbaImage) {
             *channel = value.min(255) as u8;
         }
     }
-}
-
-fn format_float(value: f64) -> String {
-    crate::util::_openslide_format_double(value)
 }
 
 fn format_mirax_background_color(fill: u32) -> String {
@@ -1603,8 +1639,9 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("openslide-rs-mirax-png-tile-{name}.dat"));
         let prefix = b"not-image-prefix";
+        let png = one_pixel_png_rgb([12, 34, 56]);
         let mut payload = prefix.to_vec();
-        payload.extend_from_slice(&one_pixel_png_rgb([12, 34, 56]));
+        payload.extend_from_slice(&png);
         fs::write(&path, payload).unwrap();
 
         let cache = Arc::new(TileCache::new());
@@ -1621,7 +1658,7 @@ mod tests {
             image: Arc::new(Image {
                 fileno: 0,
                 offset: prefix.len() as i32,
-                length: 0,
+                length: png.len() as i32,
                 imageno: 17,
             }),
             src_x: 0.0,
@@ -1629,13 +1666,13 @@ mod tests {
         };
 
         let decoded = slide
-            .decode_tile_rgb(&tile, 0, 0, ImageFormat::Png)
+            .decode_tile_rgb(&tile, 0, 0, ImageFormat::Png, 1, 1)
             .unwrap();
         assert_eq!(decoded.width, 1);
         assert_eq!(decoded.height, 1);
-        assert_eq!(decoded.rgb, vec![12, 34, 56]);
+        assert_eq!(decoded.rgb, vec![12, 34, 56].into());
 
-        let err = match slide.decode_tile_rgb(&tile, 1, 0, ImageFormat::Jpeg) {
+        let err = match slide.decode_tile_rgb(&tile, 1, 0, ImageFormat::Jpeg, 1, 1) {
             Ok(_) => panic!("expected PNG bytes declared as JPEG to fail"),
             Err(err) => err,
         };

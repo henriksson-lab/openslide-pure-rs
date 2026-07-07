@@ -8,6 +8,8 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+use crate::util::_openslide_format_double as format_float;
+use crate::util::unescape_xml_entities as unescape_xml;
 
 const PHILIPS_SOFTWARE: &str = "Philips";
 const XML_ROOT: &str = "DataObject";
@@ -203,9 +205,9 @@ impl FirstIfd {
         Ok(Self { entries })
     }
 
-    fn ascii(&self, tag: u16) -> Option<String> {
+    fn tiff_ascii_string(&self, tag: u16) -> Option<String> {
         let entry = self.entries.get(&tag)?;
-        entry.ascii()
+        entry.tiff_ascii_string()
     }
 
     fn uint(&self, tag: u16, endian: Endian) -> Option<u64> {
@@ -223,7 +225,7 @@ impl FirstIfd {
 }
 
 impl TiffEntry {
-    fn ascii(&self) -> Option<String> {
+    fn tiff_ascii_string(&self) -> Option<String> {
         if self.value_type != TYPE_ASCII {
             return None;
         }
@@ -310,15 +312,17 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     let mut associated_images = read_tiff_associated_images(tiff_endian, &tiff_directories)?;
     for (name, image_type) in [("label", "LABELIMAGE"), ("macro", "MACROIMAGE")] {
         if !associated_images.contains_key(name) {
-            let (data, width, height) = read_xml_associated_image(&root, name, image_type)?;
-            associated_images.insert(
-                name.to_string(),
-                AssociatedImage::Xml {
-                    data,
-                    width: u64::from(width),
-                    height: u64::from(height),
-                },
-            );
+            if let Some((data, width, height)) = read_xml_associated_image(&root, name, image_type)?
+            {
+                associated_images.insert(
+                    name.to_string(),
+                    AssociatedImage::Xml {
+                        data,
+                        width: u64::from(width),
+                        height: u64::from(height),
+                    },
+                );
+            }
         }
     }
     for (name, image) in &associated_images {
@@ -348,16 +352,18 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
 fn read_philips_description(path: &Path) -> Result<String> {
     let first_ifd = FirstIfd::open(path)?;
     let software = first_ifd
-        .ascii(TAG_SOFTWARE)
+        .tiff_ascii_string(TAG_SOFTWARE)
         .ok_or_else(|| OpenSlideError::UnsupportedFormat("Missing TIFF Software tag".into()))?;
     if !software.starts_with(PHILIPS_SOFTWARE) {
         return Err(OpenSlideError::UnsupportedFormat(
             "Not a Philips TIFF slide".into(),
         ));
     }
-    let description = first_ifd.ascii(TAG_IMAGEDESCRIPTION).ok_or_else(|| {
-        OpenSlideError::UnsupportedFormat("Missing TIFF ImageDescription tag".into())
-    })?;
+    let description = first_ifd
+        .tiff_ascii_string(TAG_IMAGEDESCRIPTION)
+        .ok_or_else(|| {
+            OpenSlideError::UnsupportedFormat("Missing TIFF ImageDescription tag".into())
+        })?;
     let root = parse_xml(&description)?;
     verify_philips_root(&root)?;
     Ok(description)
@@ -406,7 +412,7 @@ fn read_tiff_associated_images(
         if dir.is_tiled() {
             continue;
         }
-        let Some(description) = dir.ascii(TAG_IMAGEDESCRIPTION) else {
+        let Some(description) = dir.tiff_ascii_string(TAG_IMAGEDESCRIPTION) else {
             continue;
         };
         let name = if description.starts_with(LABEL_DESCRIPTION) {
@@ -988,49 +994,6 @@ fn parse_xml_name(s: &str, pos: &mut usize) -> Option<String> {
     (*pos > start).then(|| s[start..*pos].to_string())
 }
 
-fn unescape_xml(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(pos) = rest.find('&') {
-        out.push_str(&rest[..pos]);
-        let entity = &rest[pos..];
-        let Some(end) = entity.find(';') else {
-            out.push_str(entity);
-            return out;
-        };
-        let token = &entity[1..end];
-        match decode_xml_entity(token) {
-            Some(ch) => out.push(ch),
-            None => out.push_str(&entity[..=end]),
-        }
-        rest = &entity[end + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn decode_xml_entity(token: &str) -> Option<char> {
-    match token {
-        "quot" => Some('"'),
-        "apos" => Some('\''),
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "amp" => Some('&'),
-        _ => {
-            let code = token
-                .strip_prefix("#x")
-                .or_else(|| token.strip_prefix("#X"))
-                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-                .or_else(|| {
-                    token
-                        .strip_prefix('#')
-                        .and_then(|decimal| decimal.parse::<u32>().ok())
-                })?;
-            char::from_u32(code)
-        }
-    }
-}
-
 fn verify_philips_root(root: &XmlNode) -> Result<()> {
     if root.name != XML_ROOT {
         return Err(OpenSlideError::UnsupportedFormat(format!(
@@ -1201,7 +1164,7 @@ fn read_xml_associated_image(
     root: &XmlNode,
     name: &str,
     image_type: &str,
-) -> Result<(Vec<u8>, u32, u32)> {
+) -> Result<Option<(Vec<u8>, u32, u32)>> {
     for image in scanned_images_with_embedded_data(root) {
         let Some(candidate_type) = child_attribute_text_exact(image, "PIM_DP_IMAGE_TYPE") else {
             continue;
@@ -1223,11 +1186,9 @@ fn read_xml_associated_image(
         let image = decode::decode_to_rgba(format, &data).map_err(|err| {
             OpenSlideError::Format(format!("Can't decode {name} associated image: {err}"))
         })?;
-        return Ok((data, image.width, image.height));
+        return Ok(Some((data, image.width, image.height)));
     }
-    Err(OpenSlideError::Format(format!(
-        "Can't locate {name} associated image: Couldn't read associated image data"
-    )))
+    Ok(None)
 }
 
 fn scanned_images_with_embedded_data(root: &XmlNode) -> Vec<&XmlNode> {
@@ -1413,10 +1374,6 @@ fn parse_objective_power(derivation: &str) -> Option<u32> {
         }
     }
     None
-}
-
-fn format_float(value: f64) -> String {
-    crate::util::_openslide_format_double(value)
 }
 
 fn decode_base64(data: &str) -> Result<Vec<u8>> {
@@ -1731,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_needed_xml_associated_image_like_upstream() {
+    fn missing_xml_associated_image_is_absent_like_upstream() {
         let path = temp_path("philips-missing-xml-macro.tif");
         fs::write(
             &path,
@@ -1739,13 +1696,9 @@ mod tests {
         )
         .unwrap();
 
-        let err = match OpenSlide::open(&path) {
-            Ok(_) => panic!("expected missing Philips macro associated image error"),
-            Err(err) => err,
-        };
-        assert!(err
-            .to_string()
-            .contains("Can't locate macro associated image"));
+        let slide = OpenSlide::open(&path).unwrap();
+        assert_eq!(slide.associated_image_names(), vec!["label"]);
+        assert_eq!(slide.associated_image_dimensions("macro"), None);
 
         let _ = fs::remove_file(path);
     }
@@ -1951,9 +1904,13 @@ mod tests {
             .replace("__JPEG__", jpeg);
         let root = parse_xml(&xml).unwrap();
         let (label, label_width, label_height) =
-            read_xml_associated_image(&root, "label", "LABELIMAGE").unwrap();
+            read_xml_associated_image(&root, "label", "LABELIMAGE")
+                .unwrap()
+                .unwrap();
         let (macro_image, macro_width, macro_height) =
-            read_xml_associated_image(&root, "macro", "MACROIMAGE").unwrap();
+            read_xml_associated_image(&root, "macro", "MACROIMAGE")
+                .unwrap()
+                .unwrap();
 
         assert!(label.starts_with(&[0xff, 0xd8]));
         assert!(macro_image.starts_with(&[0xff, 0xd8]));
@@ -2052,7 +2009,11 @@ mod tests {
         </Attribute>
 </DataObject>"#;
         let padded_type_root = parse_xml(padded_type_xml).unwrap();
-        assert!(read_xml_associated_image(&padded_type_root, "label", "LABELIMAGE").is_err());
+        assert!(
+            read_xml_associated_image(&padded_type_root, "label", "LABELIMAGE")
+                .unwrap()
+                .is_none()
+        );
 
         let truncated_jpeg_root = parse_xml(
             r#"<DataObject ObjectType="DPUfsImport">

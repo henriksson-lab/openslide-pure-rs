@@ -11,6 +11,10 @@ pub struct TileGrid {
     pub tile_advance_x: f64,
     pub tile_advance_y: f64,
     tiles: HashMap<(i64, i64), TileEntry>,
+    min_offset_x: f64,
+    min_offset_y: f64,
+    max_extent_x: f64,
+    max_extent_y: f64,
 }
 
 #[derive(Debug)]
@@ -30,6 +34,10 @@ impl TileGrid {
             tile_advance_x,
             tile_advance_y,
             tiles: HashMap::new(),
+            min_offset_x: f64::INFINITY,
+            min_offset_y: f64::INFINITY,
+            max_extent_x: f64::NEG_INFINITY,
+            max_extent_y: f64::NEG_INFINITY,
         }
     }
 
@@ -44,6 +52,10 @@ impl TileGrid {
         h: f64,
         tile: Tile,
     ) {
+        self.min_offset_x = self.min_offset_x.min(offset_x);
+        self.min_offset_y = self.min_offset_y.min(offset_y);
+        self.max_extent_x = self.max_extent_x.max(offset_x + w);
+        self.max_extent_y = self.max_extent_y.max(offset_y + h);
         self.tiles.insert(
             (col, row),
             TileEntry {
@@ -92,13 +104,58 @@ impl TileGrid {
     /// Returns (col, row, entry) for each overlapping tile.
     pub fn tiles_in_region(&self, x: f64, y: f64, w: f64, h: f64) -> Vec<(i64, i64, &TileEntry)> {
         let mut result = Vec::new();
+        if self.tiles.is_empty() {
+            return result;
+        }
         let right = x + w;
         let bottom = y + h;
-        for (&(col, row), entry) in &self.tiles {
-            let tile_x = col as f64 * self.tile_advance_x + entry.offset_x;
-            let tile_y = row as f64 * self.tile_advance_y + entry.offset_y;
-            if tile_x < right && tile_x + entry.w > x && tile_y < bottom && tile_y + entry.h > y {
-                result.push((col, row, entry));
+
+        if self.tile_advance_x <= 0.0
+            || self.tile_advance_y <= 0.0
+            || !self.min_offset_x.is_finite()
+            || !self.min_offset_y.is_finite()
+            || !self.max_extent_x.is_finite()
+            || !self.max_extent_y.is_finite()
+        {
+            for (&(col, row), entry) in &self.tiles {
+                if tile_entry_overlaps(
+                    col,
+                    row,
+                    entry,
+                    self.tile_advance_x,
+                    self.tile_advance_y,
+                    x,
+                    y,
+                    right,
+                    bottom,
+                ) {
+                    result.push((col, row, entry));
+                }
+            }
+        } else {
+            let col_start = ((x - self.max_extent_x) / self.tile_advance_x).floor() as i64;
+            let col_end = ((right - self.min_offset_x) / self.tile_advance_x).ceil() as i64;
+            let row_start = ((y - self.max_extent_y) / self.tile_advance_y).floor() as i64;
+            let row_end = ((bottom - self.min_offset_y) / self.tile_advance_y).ceil() as i64;
+            for row in row_start..row_end {
+                for col in col_start..col_end {
+                    let Some(entry) = self.tiles.get(&(col, row)) else {
+                        continue;
+                    };
+                    if tile_entry_overlaps(
+                        col,
+                        row,
+                        entry,
+                        self.tile_advance_x,
+                        self.tile_advance_y,
+                        x,
+                        y,
+                        right,
+                        bottom,
+                    ) {
+                        result.push((col, row, entry));
+                    }
+                }
             }
         }
         result.sort_by_key(|&(col, row, _)| (row, col));
@@ -108,6 +165,23 @@ impl TileGrid {
     pub fn tile_count(&self) -> usize {
         self.tiles.len()
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tile_entry_overlaps(
+    col: i64,
+    row: i64,
+    entry: &TileEntry,
+    tile_advance_x: f64,
+    tile_advance_y: f64,
+    x: f64,
+    y: f64,
+    right: f64,
+    bottom: f64,
+) -> bool {
+    let tile_x = col as f64 * tile_advance_x + entry.offset_x;
+    let tile_y = row as f64 * tile_advance_y + entry.offset_y;
+    tile_x < right && tile_x + entry.w > x && tile_y < bottom && tile_y + entry.h > y
 }
 
 #[cfg(test)]

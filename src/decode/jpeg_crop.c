@@ -46,6 +46,18 @@ static int osr_jpeg_scale_denom(double sample_step) {
     return 0;
 }
 
+int osr_jpeg_memory_range_rgb(unsigned char *buffer,
+                              size_t total_len,
+                              unsigned long long sof_offset,
+                              unsigned int tile_w,
+                              unsigned int tile_h,
+                              unsigned int scale_denom,
+                              unsigned int expected_w,
+                              unsigned int expected_h,
+                              unsigned char *out,
+                              char *err,
+                              size_t err_len);
+
 int osr_jpeg_crop_channel(const unsigned char *data,
                           size_t len,
                           unsigned int channel,
@@ -328,9 +340,6 @@ int osr_jpeg_file_range_rgb(const char *path,
                             unsigned char *out,
                             char *err,
                             size_t err_len) {
-    struct jpeg_decompress_struct cinfo;
-    struct osr_jpeg_error jerr;
-    JSAMPARRAY rows = NULL;
     FILE *file = NULL;
     unsigned char *buffer = NULL;
     int result = 0;
@@ -370,20 +379,6 @@ int osr_jpeg_file_range_rgb(const char *path,
     size_t data_len = (size_t)data_len_u64;
     size_t total_len = (size_t)total_len_u64;
 
-    memset(&cinfo, 0, sizeof(cinfo));
-    cinfo.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit = osr_jpeg_error_exit;
-
-    if (setjmp(jerr.setjmp_buffer)) {
-        osr_set_error(err, err_len, jerr.message);
-        free(buffer);
-        if (file != NULL) {
-            fclose(file);
-        }
-        jpeg_destroy_decompress(&cinfo);
-        return 0;
-    }
-
     file = fopen(path, "rb");
     if (file == NULL) {
         osr_set_error(err, err_len, "failed to open JPEG file");
@@ -404,22 +399,78 @@ int osr_jpeg_file_range_rgb(const char *path,
         osr_set_error(err, err_len, "failed to read JPEG range");
         goto range_finish;
     }
+
+    result = osr_jpeg_memory_range_rgb(buffer,
+                                       total_len,
+                                       sof_position - header_start,
+                                       tile_w,
+                                       tile_h,
+                                       scale_denom,
+                                       expected_w,
+                                       expected_h,
+                                       out,
+                                       err,
+                                       err_len);
+
+range_finish:
+    free(buffer);
+    fclose(file);
+    return result;
+}
+
+int osr_jpeg_memory_range_rgb(unsigned char *buffer,
+                              size_t total_len,
+                              unsigned long long sof_offset,
+                              unsigned int tile_w,
+                              unsigned int tile_h,
+                              unsigned int scale_denom,
+                              unsigned int expected_w,
+                              unsigned int expected_h,
+                              unsigned char *out,
+                              char *err,
+                              size_t err_len) {
+    struct jpeg_decompress_struct cinfo;
+    struct osr_jpeg_error jerr;
+    JSAMPARRAY rows = NULL;
+    int result = 0;
+
+    if (buffer == NULL || out == NULL) {
+        osr_set_error(err, err_len, "invalid null JPEG memory range argument");
+        return 0;
+    }
+    if (tile_w == 0 || tile_h == 0 || expected_w == 0 || expected_h == 0) {
+        return 1;
+    }
+    if (total_len < 2) {
+        osr_set_error(err, err_len, "JPEG memory range is too small");
+        return 0;
+    }
     if (buffer[total_len - 2] != 0xff) {
         osr_set_error(err, err_len, "JPEG range does not end at a marker");
-        goto range_finish;
+        return 0;
     }
     buffer[total_len - 1] = JPEG_EOI;
 
-    unsigned long long size_offset_u64 = sof_position - header_start + 5;
-    if (size_offset_u64 + 4 > header_len_u64) {
+    unsigned long long size_offset_u64 = sof_offset + 5;
+    if (size_offset_u64 + 4 > (unsigned long long)total_len) {
         osr_set_error(err, err_len, "JPEG SOF is outside header range");
-        goto range_finish;
+        return 0;
     }
     size_t size_offset = (size_t)size_offset_u64;
     buffer[size_offset + 0] = (unsigned char)((tile_h >> 8) & 0xff);
     buffer[size_offset + 1] = (unsigned char)(tile_h & 0xff);
     buffer[size_offset + 2] = (unsigned char)((tile_w >> 8) & 0xff);
     buffer[size_offset + 3] = (unsigned char)(tile_w & 0xff);
+
+    memset(&cinfo, 0, sizeof(cinfo));
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = osr_jpeg_error_exit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        osr_set_error(err, err_len, jerr.message);
+        jpeg_destroy_decompress(&cinfo);
+        return 0;
+    }
 
     jpeg_create_decompress(&cinfo);
     jpeg_mem_src(&cinfo, buffer, (unsigned long)total_len);
@@ -459,8 +510,6 @@ int osr_jpeg_file_range_rgb(const char *path,
 range_finish:
     jpeg_abort_decompress(&cinfo);
     jpeg_destroy_decompress(&cinfo);
-    free(buffer);
-    fclose(file);
     return result;
 }
 

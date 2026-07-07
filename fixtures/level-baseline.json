@@ -7,6 +7,20 @@
   },
   "rows": [
     {
+      "fixture": "trestle-local-cmu-1",
+      "reader": "trestle",
+      "status": "exact",
+      "levels": [
+        {"level": 0, "width": 40000, "height": 27712, "downsample": 1, "regions": 1, "pixels": 16384, "rust_checksum": 15028751, "reference_checksum": 15028751, "rust_rgb_checksum": 10850831, "reference_rgb_checksum": 10850831},
+        {"level": 1, "width": 20000, "height": 13856, "downsample": 2, "regions": 1, "pixels": 16384, "rust_checksum": 14989688, "reference_checksum": 14989688, "rust_rgb_checksum": 10811768, "reference_rgb_checksum": 10811768},
+        {"level": 2, "width": 10000, "height": 6928, "downsample": 4, "regions": 1, "pixels": 16384, "rust_checksum": 14953043, "reference_checksum": 14953043, "rust_rgb_checksum": 10775123, "reference_rgb_checksum": 10775123},
+        {"level": 3, "width": 4992, "height": 3456, "downsample": 8.015669515669515, "regions": 1, "pixels": 16384, "rust_checksum": 14933401, "reference_checksum": 14933401, "rust_rgb_checksum": 10755481, "reference_rgb_checksum": 10755481},
+        {"level": 4, "width": 2496, "height": 1728, "downsample": 16.03133903133903, "regions": 1, "pixels": 16384, "rust_checksum": 14901346, "reference_checksum": 14901346, "rust_rgb_checksum": 10723426, "reference_rgb_checksum": 10723426},
+        {"level": 5, "width": 1248, "height": 864, "downsample": 32.06267806267806, "regions": 1, "pixels": 16384, "rust_checksum": 15352077, "reference_checksum": 15352077, "rust_rgb_checksum": 11174157, "reference_rgb_checksum": 11174157},
+        {"level": 6, "width": 624, "height": 432, "downsample": 64.12535612535612, "regions": 1, "pixels": 16384, "rust_checksum": 15958430, "reference_checksum": 15958430, "rust_rgb_checksum": 11780510, "reference_rgb_checksum": 11780510}
+      ]
+    },
+    {
       "fixture": "mirax-public-cmu-1-saved-1-16",
       "reader": "mirax",
       "status": "exact",

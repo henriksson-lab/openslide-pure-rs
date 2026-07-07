@@ -256,6 +256,33 @@ pub fn decode_jpeg_file_range_rgb(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_jpeg_open_file_range_rgb(
+    file: &crate::util::OpenSlideFile,
+    file_len: u64,
+    header_start: u64,
+    sof_position: u64,
+    header_stop: u64,
+    data_start: u64,
+    data_stop: u64,
+    tile_w: u32,
+    tile_h: u32,
+    scale_denom: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    jpeg::decode_jpeg_open_file_range_rgb(
+        file,
+        file_len,
+        header_start,
+        sof_position,
+        header_stop,
+        data_start,
+        data_stop,
+        tile_w,
+        tile_h,
+        scale_denom,
+    )
+}
+
 /// Decode image data and extract a single channel (0=R, 1=G, 2=B).
 pub fn decode_channel(format: ImageFormat, data: &[u8], channel: u32) -> Result<GrayImage> {
     match format {

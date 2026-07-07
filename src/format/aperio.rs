@@ -10,11 +10,12 @@ use crate::format::tiff::OpenslideHash;
 use crate::format::SlideBackend;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+use crate::util::_openslide_format_double as format_float;
 use crate::util::read_file_range;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 
 extern "C" {
-    fn osr_cairo_blit_rgb_to_rgba(
+    fn osr_cairo_blit_rgb_to_rgba_clipped_dst(
         src_rgb: *const u8,
         src_width: c_uint,
         src_height: c_uint,
@@ -52,6 +53,7 @@ const TIFFTAG_IMAGE_WIDTH: u16 = 256;
 const TIFFTAG_IMAGE_LENGTH: u16 = 257;
 const TIFFTAG_BITS_PER_SAMPLE: u16 = 258;
 const TIFFTAG_COMPRESSION: u16 = 259;
+#[cfg(test)]
 const TIFFTAG_SUBFILE_TYPE: u16 = 254;
 const TIFFTAG_PHOTOMETRIC: u16 = 262;
 const TIFFTAG_IMAGE_DESCRIPTION: u16 = 270;
@@ -102,7 +104,9 @@ const PHOTOMETRIC_RGB: u16 = 2;
 const PHOTOMETRIC_YCBCR: u16 = 6;
 const PLANARCONFIG_SEPARATE: u16 = 2;
 
+#[cfg(test)]
 const APERIO_SUBFILE_LABEL: u64 = 1;
+#[cfg(test)]
 const APERIO_SUBFILE_MACRO: u64 = 9;
 
 #[derive(Debug, Clone, Copy)]
@@ -189,7 +193,7 @@ impl TiffDirectory {
         self.values_u64(tag, endian)?.first().copied()
     }
 
-    fn string(&self, tag: u16) -> Option<String> {
+    fn tiff_ascii_string(&self, tag: u16) -> Option<String> {
         let entry = self.entries.get(&tag)?;
         if entry.field_type != 2 {
             return None;
@@ -401,7 +405,7 @@ pub(crate) fn detect(path: &Path) -> bool {
     };
     first.is_tiled()
         && first
-            .string(TIFFTAG_IMAGE_DESCRIPTION)
+            .tiff_ascii_string(TIFFTAG_IMAGE_DESCRIPTION)
             .is_some_and(|desc| desc.starts_with("Aperio"))
 }
 
@@ -413,7 +417,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
         ));
     };
     let description = first
-        .string(TIFFTAG_IMAGE_DESCRIPTION)
+        .tiff_ascii_string(TIFFTAG_IMAGE_DESCRIPTION)
         .ok_or_else(|| OpenSlideError::UnsupportedFormat("TIFF has no ImageDescription".into()))?;
     if !first.is_tiled() || !description.starts_with("Aperio") {
         return Err(OpenSlideError::UnsupportedFormat(
@@ -630,7 +634,7 @@ impl SlideBackend for AperioSlide {
             .max(0)
             .min(level.tiles_down as i64) as u64;
 
-        let mut file = crate::util::_openslide_fopen(&self.path)?;
+        let mut tile_jobs = Vec::new();
         for row in (start_row..end_row).rev() {
             for col in (start_col..end_col).rev() {
                 let tile_index = row
@@ -638,8 +642,65 @@ impl SlideBackend for AperioSlide {
                     .and_then(|v| v.checked_add(col))
                     .and_then(|v| usize::try_from(v).ok())
                     .ok_or_else(|| OpenSlideError::Format("Tile index overflow".into()))?;
-                let dst_x = col as f64 * level.tile_w as f64 - lx;
-                let dst_y = row as f64 * level.tile_h as f64 - ly;
+                tile_jobs.push((
+                    col,
+                    row,
+                    tile_index,
+                    col as f64 * level.tile_w as f64 - lx,
+                    row as f64 * level.tile_h as f64 - ly,
+                ));
+            }
+        }
+        if use_cairo_rgb && tile_jobs.len() > 1 {
+            let decoded_tiles = std::thread::scope(|scope| -> Result<Vec<_>> {
+                let mut handles = Vec::with_capacity(tile_jobs.len());
+                for &(_, _, tile_index, dst_x, dst_y) in &tile_jobs {
+                    handles.push(scope.spawn(move || -> Result<_> {
+                        let mut file = crate::util::_openslide_fopen(&self.path)?;
+                        let tile = self.read_tile_rgb(&mut file, level_index, level, tile_index)?;
+                        Ok((dst_x, dst_y, tile))
+                    }));
+                }
+
+                let mut decoded = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    match handle.join() {
+                        Ok(result) => decoded.push(result?),
+                        Err(_) => {
+                            return Err(OpenSlideError::Decode(
+                                "Aperio tile worker panicked".into(),
+                            ));
+                        }
+                    }
+                }
+                Ok(decoded)
+            })?;
+
+            let mut file = crate::util::_openslide_fopen(&self.path)?;
+            for ((col, row, _, _, _), (dst_x, dst_y, tile)) in
+                tile_jobs.into_iter().zip(decoded_tiles.into_iter())
+            {
+                if let Some(tile) = tile {
+                    cairo_blit_rgb_rgba(&tile, channels, &mut output, dst_x, dst_y)?;
+                } else {
+                    for (out_idx, ch_opt) in channels.iter().enumerate() {
+                        if let Some(channel) = ch_opt {
+                            let gray = self.read_tile_channel(
+                                &mut file,
+                                level_index,
+                                level,
+                                col,
+                                row,
+                                *channel,
+                            )?;
+                            blit_gray_into_rgba(&gray, out_idx, &mut output, dst_x, dst_y);
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut file = crate::util::_openslide_fopen(&self.path)?;
+            for (col, row, tile_index, dst_x, dst_y) in tile_jobs {
                 if let Some(tile) = self.read_tile_rgb(&mut file, level_index, level, tile_index)? {
                     if use_cairo_rgb {
                         cairo_blit_rgb_rgba(&tile, channels, &mut output, dst_x, dst_y)?;
@@ -1519,7 +1580,7 @@ fn associated_name(dir: &TiffDirectory, endian: Endian) -> Option<String> {
         return Some("thumbnail".to_string());
     }
     let _ = endian;
-    dir.string(TIFFTAG_IMAGE_DESCRIPTION)
+    dir.tiff_ascii_string(TIFFTAG_IMAGE_DESCRIPTION)
         .and_then(|description| associated_name_from_description(&description))
 }
 
@@ -1550,7 +1611,7 @@ fn aperio_thumbnail_icc_profile(
     thumbnail_dir: &TiffDirectory,
 ) -> Option<Vec<u8>> {
     let main_icc_name = base_properties.get("aperio.ICC Profile")?;
-    let thumbnail_description = thumbnail_dir.string(TIFFTAG_IMAGE_DESCRIPTION)?;
+    let thumbnail_description = thumbnail_dir.tiff_ascii_string(TIFFTAG_IMAGE_DESCRIPTION)?;
     let thumbnail_properties = read_properties(&thumbnail_description);
     let thumbnail_icc_name = thumbnail_properties.get("aperio.ICC Profile")?;
     (main_icc_name == thumbnail_icc_name)
@@ -1636,7 +1697,7 @@ fn store_and_hash_aperio_tiff_strings(
     quickhash1: &mut OpenslideHash,
     props: &mut HashMap<String, String>,
 ) {
-    if let Some(value) = dir.string(TIFFTAG_IMAGE_DESCRIPTION) {
+    if let Some(value) = dir.tiff_ascii_string(TIFFTAG_IMAGE_DESCRIPTION) {
         props.insert(properties::PROPERTY_COMMENT.to_string(), value);
     }
     for (name, tag) in [
@@ -1651,7 +1712,7 @@ fn store_and_hash_aperio_tiff_strings(
         ("tiff.DocumentName", TIFFTAG_DOCUMENT_NAME),
     ] {
         quickhash1.openslide_hash_string(Some(name));
-        let value = dir.string(tag);
+        let value = dir.tiff_ascii_string(tag);
         if let Some(value) = &value {
             props.insert(name.to_string(), value.clone());
         }
@@ -1689,10 +1750,6 @@ fn aperio_icc_profile(tiff: &TiffFile, dir_index: usize) -> Option<Vec<u8>> {
         .and_then(|dir| dir.entries.get(&TIFFTAG_ICC_PROFILE))
         .map(|entry| entry.data.clone())
         .filter(|profile| !profile.is_empty())
-}
-
-fn format_float(value: f64) -> String {
-    crate::util::_openslide_format_double(value)
 }
 
 fn read_directory_rgba(
@@ -3350,7 +3407,7 @@ fn cairo_blit_rgb_rgba(
     let channel = |idx: usize| -> c_int { channels[idx].map_or(-1, |channel| channel as c_int) };
     let mut err = vec![0i8; 256];
     let ok = unsafe {
-        osr_cairo_blit_rgb_to_rgba(
+        osr_cairo_blit_rgb_to_rgba_clipped_dst(
             src.rgb.as_ptr(),
             src.width,
             src.height,

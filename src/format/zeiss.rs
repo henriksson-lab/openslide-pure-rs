@@ -7,6 +7,8 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff::OpenslideHash, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+use crate::util::_openslide_format_double as format_float;
+use crate::util::unescape_xml_entities as unescape_xml;
 
 /// Decompress a complete Zstandard CZI subblock into a freshly allocated buffer.
 ///
@@ -1282,53 +1284,6 @@ fn duplicate_referenced_objective_power(properties: &mut HashMap<String, String>
     );
 }
 
-fn format_float(value: f64) -> String {
-    crate::util::_openslide_format_double(value)
-}
-
-fn unescape_xml(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(pos) = rest.find('&') {
-        out.push_str(&rest[..pos]);
-        let entity = &rest[pos..];
-        let Some(end) = entity.find(';') else {
-            out.push_str(entity);
-            return out;
-        };
-        let token = &entity[1..end];
-        match decode_xml_entity(token) {
-            Some(ch) => out.push(ch),
-            None => out.push_str(&entity[..=end]),
-        }
-        rest = &entity[end + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn decode_xml_entity(token: &str) -> Option<char> {
-    match token {
-        "quot" => Some('"'),
-        "apos" => Some('\''),
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "amp" => Some('&'),
-        _ => {
-            let code = token
-                .strip_prefix("#x")
-                .or_else(|| token.strip_prefix("#X"))
-                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-                .or_else(|| {
-                    token
-                        .strip_prefix('#')
-                        .and_then(|decimal| decimal.parse::<u32>().ok())
-                })?;
-            char::from_u32(code)
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct XmlElement<'a> {
     name: &'a str,
@@ -2161,6 +2116,18 @@ mod tests {
     fn formats_zeiss_properties_through_shared_openslide_formatter() {
         assert_eq!(format_float(1.0 / 3.0), "0.33333333333333331");
         assert_eq!(format_float(123456789012345670.0), "1.2345678901234566e+17");
+    }
+
+    #[test]
+    fn unescapes_zeiss_numeric_xml_entities_like_libxml() {
+        assert_eq!(
+            parse_simple_xml_text_exact("<SizeX>&#52;&#x30;</SizeX>", "SizeX").as_deref(),
+            Some("40")
+        );
+        assert_eq!(
+            xml_attributes(r#"<Distance Id="X&#50;&amp;Y">"#),
+            vec![("Id".to_string(), "X2&Y".to_string())]
+        );
     }
 
     #[test]

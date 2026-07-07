@@ -12,7 +12,7 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::SlideBackend;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
-use crate::util::read_file_range;
+use crate::util::{read_file_range, read_file_range_from_open_file};
 
 extern "C" {
     fn osr_cairo_blit_rgb_to_rgba(
@@ -618,7 +618,7 @@ impl TiffEntry {
         }
     }
 
-    fn c_string(&self) -> Option<String> {
+    fn tiff_ascii_string(&self) -> Option<String> {
         if self.value_type != TYPE_ASCII && self.value_type != TYPE_BYTE {
             return None;
         }
@@ -1022,6 +1022,8 @@ fn required_uints(tiff: &TiffFile, dir: &TiffDirectory, tag: u16) -> Result<Vec<
 /// so TIFF-like vendor modules can reuse the same directory/tag/tile handling.
 struct GenericTiffSlide {
     path: PathBuf,
+    tiff_file: Arc<crate::util::OpenSlideFile>,
+    tiff_file_len: u64,
     levels: Vec<TiffLevel>,
     properties: HashMap<String, String>,
     icc_profile: Option<Vec<u8>>,
@@ -1101,12 +1103,19 @@ impl GenericTiffSlide {
         let properties = build_properties(&tiff, &levels, property_dir)?;
         let icc_profile = tiff_icc_profile(&tiff, levels[0].dir);
         let path = tiff.path.clone();
+        let mut tiff_file = crate::util::_openslide_fopen(&path)?;
+        let tiff_file_len =
+            u64::try_from(crate::util::_openslide_fsize(&mut tiff_file)?).map_err(|_| {
+                OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+            })?;
 
         let cache = Arc::new(TileCache::new());
         let cache_binding_id = cache.next_binding_id();
 
         Ok(Self {
             path,
+            tiff_file: Arc::new(tiff_file),
+            tiff_file_len,
             levels,
             properties,
             icc_profile,
@@ -1155,7 +1164,7 @@ impl GenericTiffSlide {
                     return Ok(CachedTile {
                         width: actual_w,
                         height: actual_h,
-                        rgb: vec![0; actual_w as usize * actual_h as usize * 3],
+                        rgb: vec![0; actual_w as usize * actual_h as usize * 3].into(),
                     });
                 }
                 openslide_tiff_read_tile(&self.path, level, tile_no, actual_w, actual_h)?
@@ -1165,11 +1174,16 @@ impl GenericTiffSlide {
                     return Ok(CachedTile {
                         width: actual_w,
                         height: actual_h,
-                        rgb: vec![0; actual_w as usize * actual_h as usize * 3],
+                        rgb: vec![0; actual_w as usize * actual_h as usize * 3].into(),
                     });
                 }
                 let offset = level.tile_offsets[tile_no as usize];
-                let raw = read_file_range(&self.path, offset, byte_count)?;
+                let raw = read_file_range_from_open_file(
+                    &self.tiff_file,
+                    self.tiff_file_len,
+                    offset,
+                    byte_count,
+                )?;
                 match level.compression {
                     COMPRESSION_OLD_JPEG | COMPRESSION_JPEG => {
                         let jpeg = if level.compression == COMPRESSION_OLD_JPEG {
@@ -1193,7 +1207,11 @@ impl GenericTiffSlide {
                         } else {
                             decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
                         };
-                        CachedTile { width, height, rgb }
+                        CachedTile {
+                            width,
+                            height,
+                            rgb: rgb.into(),
+                        }
                     }
                     COMPRESSION_NONE => decode_uncompressed_tile(level, actual_w, actual_h, &raw)?,
                     COMPRESSION_PACKBITS => {
@@ -1240,7 +1258,11 @@ impl GenericTiffSlide {
                                     },
                                 ),
                             )?;
-                        CachedTile { width, height, rgb }
+                        CachedTile {
+                            width,
+                            height,
+                            rgb: rgb.into(),
+                        }
                     }
                     other => {
                         return Err(OpenSlideError::UnsupportedFormat(format!(
@@ -1466,16 +1488,27 @@ impl SlideBackend for GenericTiffSlide {
                         .min(level_data.tile_height as u64)
                         as u32;
 
-                    blit_rgb_rgba(
-                        &decoded,
-                        channels,
-                        default_opaque_alpha,
-                        visible_w,
-                        visible_h,
-                        &mut output,
-                        tile_origin_x - lx,
-                        tile_origin_y - ly,
-                    );
+                    if channels == [Some(0), Some(1), Some(2), None] {
+                        blit_rgb_opaque_rgba(
+                            &decoded,
+                            visible_w,
+                            visible_h,
+                            &mut output,
+                            tile_origin_x - lx,
+                            tile_origin_y - ly,
+                        );
+                    } else {
+                        blit_rgb_rgba(
+                            &decoded,
+                            channels,
+                            default_opaque_alpha,
+                            visible_w,
+                            visible_h,
+                            &mut output,
+                            tile_origin_x - lx,
+                            tile_origin_y - ly,
+                        );
+                    }
                 }
             }
         }
@@ -1633,7 +1666,7 @@ fn store_and_hash_properties(
     if let Some(value) = tiff
         .directory(dir)
         .and_then(|dir| dir.entry(TAG_IMAGEDESCRIPTION))
-        .and_then(TiffEntry::c_string)
+        .and_then(TiffEntry::tiff_ascii_string)
     {
         props.insert(properties::PROPERTY_COMMENT.to_string(), value);
     }
@@ -1653,7 +1686,7 @@ fn store_and_hash_properties(
         let value = tiff
             .directory(dir)
             .and_then(|dir| dir.entry(tag))
-            .and_then(TiffEntry::c_string);
+            .and_then(TiffEntry::tiff_ascii_string);
         if let Some(value) = &value {
             props.insert(name.to_string(), value.clone());
         }
@@ -2065,7 +2098,11 @@ fn tiff_read_region_planar(
         }
     }
 
-    Ok(CachedTile { width, height, rgb })
+    Ok(CachedTile {
+        width,
+        height,
+        rgb: rgb.into(),
+    })
 }
 
 enum PlanarDecodedChunk {
@@ -2145,7 +2182,11 @@ fn tiff_read_region(
         }
     }
 
-    Ok(CachedTile { width, height, rgb })
+    Ok(CachedTile {
+        width,
+        height,
+        rgb: rgb.into(),
+    })
 }
 
 fn tiff_decoded_sample_u8(image: &::tiff::decoder::DecodingResult, index: usize) -> u8 {
@@ -2248,7 +2289,11 @@ fn decode_uncompressed_tile(
         }
     }
 
-    Ok(CachedTile { width, height, rgb })
+    Ok(CachedTile {
+        width,
+        height,
+        rgb: rgb.into(),
+    })
 }
 
 fn contiguous_sample_bytes(level: &TiffLevel) -> Result<Vec<u8>> {
@@ -2435,7 +2480,7 @@ fn decode_subsampled_ycbcr_tile(
     Ok(CachedTile {
         width: width as u32,
         height: height as u32,
-        rgb,
+        rgb: rgb.into(),
     })
 }
 
@@ -2608,7 +2653,11 @@ fn decode_separate_tile(
         }
     }
 
-    Ok(CachedTile { width, height, rgb })
+    Ok(CachedTile {
+        width,
+        height,
+        rgb: rgb.into(),
+    })
 }
 
 fn decode_planar_old_jpeg_plane(
@@ -3311,6 +3360,40 @@ fn blit_rgb_rgba(
     }
 }
 
+fn blit_rgb_opaque_rgba(
+    src: &CachedTile,
+    visible_w: u32,
+    visible_h: u32,
+    dst: &mut RgbaImage,
+    dst_x: f64,
+    dst_y: f64,
+) {
+    let sw = visible_w.min(src.width) as i64;
+    let sh = visible_h.min(src.height) as i64;
+    let dx0 = dst_x.round() as i64;
+    let dy0 = dst_y.round() as i64;
+
+    for row in 0..sh {
+        let dy = dy0 + row;
+        if dy < 0 || dy >= dst.height as i64 {
+            continue;
+        }
+        let src_y = row as usize;
+        let dst_y = dy as usize;
+        for col in 0..sw {
+            let dx = dx0 + col;
+            if dx < 0 || dx >= dst.width as i64 {
+                continue;
+            }
+
+            let src_base = (src_y * src.width as usize + col as usize) * 3;
+            let dst_base = (dst_y * dst.width as usize + dx as usize) * 4;
+            dst.data[dst_base..dst_base + 3].copy_from_slice(&src.rgb[src_base..src_base + 3]);
+            dst.data[dst_base + 3] = 255;
+        }
+    }
+}
+
 fn cairo_blit_rgb_rgba(
     src: &CachedTile,
     channels: [Option<u32>; 4],
@@ -3409,7 +3492,7 @@ fn build_properties(
         ("tiff.Copyright", TAG_COPYRIGHT),
         ("tiff.DocumentName", TAG_DOCUMENTNAME),
     ] {
-        if let Some(value) = dir.entry(tag).and_then(TiffEntry::c_string) {
+        if let Some(value) = dir.entry(tag).and_then(TiffEntry::tiff_ascii_string) {
             props.insert(name.to_string(), value);
         }
     }
@@ -3760,7 +3843,7 @@ mod tests {
 
         let tile = decode_uncompressed_tile(&level, 2, 1, &[10, 200, 40, 255]).unwrap();
 
-        assert_eq!(tile.rgb, vec![10, 10, 10, 40, 40, 40]);
+        assert_eq!(tile.rgb, vec![10, 10, 10, 40, 40, 40].into());
     }
 
     #[test]
@@ -3790,7 +3873,7 @@ mod tests {
 
         let tile = decode_uncompressed_tile(&level, 2, 1, &[10, 200, 40, 255]).unwrap();
 
-        assert_eq!(tile.rgb, vec![245, 245, 245, 215, 215, 215]);
+        assert_eq!(tile.rgb, vec![245, 245, 245, 215, 215, 215].into());
     }
 
     #[test]
@@ -3822,7 +3905,7 @@ mod tests {
             decode_uncompressed_tile(&level, 2, 1, &[10, 0x34, 0x12, 30, 40, 0xcd, 0xab, 60])
                 .unwrap();
 
-        assert_eq!(tile.rgb, vec![10, 0x12, 30, 40, 0xab, 60]);
+        assert_eq!(tile.rgb, vec![10, 0x12, 30, 40, 0xab, 60].into());
     }
 
     #[test]
@@ -3949,7 +4032,7 @@ mod tests {
 
         assert_eq!(tile.width, 2);
         assert_eq!(tile.height, 1);
-        assert_eq!(tile.rgb, vec![10, 20, 30, 40, 50, 60]);
+        assert_eq!(tile.rgb, vec![10, 20, 30, 40, 50, 60].into());
         let _ = fs::remove_file(path);
     }
 
@@ -4229,7 +4312,7 @@ mod tests {
 
         assert_eq!(tile.width, 1);
         assert_eq!(tile.height, 1);
-        assert_eq!(tile.rgb, vec![expected, expected, expected]);
+        assert_eq!(tile.rgb, vec![expected, expected, expected].into());
         let _ = fs::remove_file(path);
     }
 
@@ -4275,7 +4358,7 @@ mod tests {
 
         assert_eq!(tile.width, 1);
         assert_eq!(tile.height, 1);
-        assert_eq!(tile.rgb, vec![expected, expected, expected]);
+        assert_eq!(tile.rgb, vec![expected, expected, expected].into());
         let _ = fs::remove_file(path);
     }
 

@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::Read;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::path::{Path, PathBuf};
@@ -12,10 +13,12 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
-use crate::util::read_file_range;
+use crate::util::_openslide_format_double as format_float;
+use crate::util::unescape_xml_entities as xml_unescape;
+use crate::util::{read_file_range, read_file_range_from_open_file};
 
 extern "C" {
-    fn osr_cairo_blit_rgb_to_rgba(
+    fn osr_cairo_blit_rgb_to_rgba_clipped_dst(
         src_rgb: *const u8,
         src_width: c_uint,
         src_height: c_uint,
@@ -126,7 +129,10 @@ pub(crate) fn detect(path: &Path) -> bool {
     let Ok(tiff) = TiffFile::open(path) else {
         return false;
     };
-    let Some(xml) = tiff.directory(0).and_then(|dir| dir.string(TAG_XMLPACKET)) else {
+    let Some(xml) = tiff
+        .directory(0)
+        .and_then(|dir| dir.tiff_ascii_string(TAG_XMLPACKET))
+    else {
         return false;
     };
     xml.contains("iScan") && parse_iscan_attributes(&xml).is_some()
@@ -136,7 +142,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     let tiff = TiffFile::open(path)?;
     let initial_xml = tiff
         .directory(0)
-        .and_then(|dir| dir.string(TAG_XMLPACKET))
+        .and_then(|dir| dir.tiff_ascii_string(TAG_XMLPACKET))
         .ok_or_else(|| OpenSlideError::UnsupportedFormat("Ventana TIFF has no XMLPacket".into()))?;
     let iscan_attrs = parse_iscan_attributes(&initial_xml).ok_or_else(|| {
         OpenSlideError::UnsupportedFormat("Ventana XMLPacket has no iScan element".into())
@@ -168,7 +174,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     let mut bif = None;
 
     for dir in &tiff.directories {
-        let Some(description) = dir.string(TAG_IMAGEDESCRIPTION) else {
+        let Some(description) = dir.tiff_ascii_string(TAG_IMAGEDESCRIPTION) else {
             continue;
         };
 
@@ -188,7 +194,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
                 });
 
             if level_no == 0 {
-                if let Some(xml) = dir.string(TAG_XMLPACKET) {
+                if let Some(xml) = dir.tiff_ascii_string(TAG_XMLPACKET) {
                     bif = Some(parse_bif_info(&xml, tile_width, tile_height)?);
                 }
             }
@@ -301,7 +307,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
     }
 
     let bif_tilemap = if let Some(bif) = &bif {
-        Some(BifTilemap::new(&tiff, bif, &levels)?)
+        Some(BifTilemap::new(path, &tiff, bif, &levels)?)
     } else {
         None
     };
@@ -586,8 +592,10 @@ impl SlideBackend for VentanaSlide {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct BifTilemap {
+    tiff_file: Arc<crate::util::OpenSlideFile>,
+    tiff_file_len: u64,
     areas: Vec<BifArea>,
     levels: Vec<Option<BifTilemapLevel>>,
     level_downsamples: Vec<f64>,
@@ -631,7 +639,7 @@ struct OldJpegTables {
 struct DecodedTile {
     width: u32,
     height: u32,
-    rgb: Vec<u8>,
+    rgb: Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -646,7 +654,7 @@ struct BifBlitOp {
 }
 
 impl BifTilemap {
-    fn new(tiff: &TiffFile, bif: &BifInfo, levels: &[Level]) -> Result<Self> {
+    fn new(path: &Path, tiff: &TiffFile, bif: &BifInfo, levels: &[Level]) -> Result<Self> {
         if bif
             .areas
             .iter()
@@ -683,7 +691,19 @@ impl BifTilemap {
             parsed_levels.push(Some(parsed));
         }
 
+        let tiff_file = Arc::new(crate::util::_openslide_fopen(path)?);
+        let tiff_file_len = fs::metadata(path)
+            .map_err(|err| {
+                OpenSlideError::Io(std::io::Error::new(
+                    err.kind(),
+                    format!("Couldn't stat {}: {err}", path.display()),
+                ))
+            })?
+            .len();
+
         Ok(Self {
+            tiff_file,
+            tiff_file_len,
             areas: bif.areas.clone(),
             levels: parsed_levels,
             level_downsamples: levels.iter().map(|level| level.downsample).collect(),
@@ -794,6 +814,8 @@ impl BifTilemap {
                     let tile_origin_x = area_origin_x + col as f64 * tile_advance_x;
                     let tile_origin_y = area_origin_y + row as f64 * tile_advance_y;
                     let tile = level_data.decode_tile_cached(
+                        &self.tiff_file,
+                        self.tiff_file_len,
                         path,
                         cache,
                         cache_binding_id,
@@ -865,7 +887,6 @@ impl BifTilemap {
         let subtile_w = level_data.tile_width as f64 / subtiles_per_tile as f64;
         let subtile_h = level_data.tile_height as f64 / subtiles_per_tile as f64;
         let mut output = RgbaImage::new(w, h);
-        let cache_full_tiles = true;
         let mut blit_ops = Vec::new();
 
         for area in &self.areas {
@@ -941,9 +962,23 @@ impl BifTilemap {
             }
         }
 
+        let cache_full_tiles = true;
+        predecode_bif_tiles_for_ops(
+            level_data,
+            &self.tiff_file,
+            self.tiff_file_len,
+            path,
+            cache,
+            cache_binding_id,
+            level,
+            &blit_ops,
+        )?;
+
         if cache_full_tiles
             && try_cairo_blit_single_tile_batch(
                 level_data,
+                &self.tiff_file,
+                self.tiff_file_len,
                 path,
                 cache,
                 cache_binding_id,
@@ -959,7 +994,36 @@ impl BifTilemap {
             return Ok(output);
         }
 
-        for op in blit_ops {
+        let mut op_index = 0;
+        while op_index < blit_ops.len() {
+            if cache_full_tiles {
+                let tile_no = blit_ops[op_index].tile_no;
+                let mut run_end = op_index + 1;
+                while run_end < blit_ops.len() && blit_ops[run_end].tile_no == tile_no {
+                    run_end += 1;
+                }
+                if run_end - op_index > 1
+                    && try_cairo_blit_single_tile_batch(
+                        level_data,
+                        &self.tiff_file,
+                        self.tiff_file_len,
+                        path,
+                        cache,
+                        cache_binding_id,
+                        level,
+                        channels,
+                        &mut output,
+                        &blit_ops[op_index..run_end],
+                        subtile_w.ceil() as u32,
+                        subtile_h.ceil() as u32,
+                    )?
+                {
+                    op_index = run_end;
+                    continue;
+                }
+            }
+
+            let op = &blit_ops[op_index];
             let tile_no = op.tile_no;
             let tile_col = op.tile_col;
             let tile_row = op.tile_row;
@@ -968,8 +1032,15 @@ impl BifTilemap {
             let dst_x = op.dst_x;
             let dst_y = op.dst_y;
             if cache_full_tiles {
-                let tile =
-                    level_data.decode_tile_cached(path, cache, cache_binding_id, level, tile_no)?;
+                let tile = level_data.decode_tile_cached(
+                    &self.tiff_file,
+                    self.tiff_file_len,
+                    path,
+                    cache,
+                    cache_binding_id,
+                    level,
+                    tile_no,
+                )?;
                 cairo_blit_decoded_tile_rgba_channels(
                     &tile,
                     channels,
@@ -983,6 +1054,7 @@ impl BifTilemap {
                     dst_x,
                     dst_y,
                 )?;
+                op_index += 1;
                 continue;
             }
             if let Some((crop_x, crop_y, crop_w, crop_h, crop_dst_x, crop_dst_y)) =
@@ -997,9 +1069,15 @@ impl BifTilemap {
                     h,
                 )
             {
-                if let Some(tile) =
-                    level_data.decode_tile_region(path, tile_no, crop_x, crop_y, crop_w, crop_h)?
-                {
+                if let Some(tile) = level_data.decode_tile_region(
+                    &self.tiff_file,
+                    self.tiff_file_len,
+                    tile_no,
+                    crop_x,
+                    crop_y,
+                    crop_w,
+                    crop_h,
+                )? {
                     blit_decoded_tile_rgba_channels(
                         &tile,
                         channels,
@@ -1011,10 +1089,12 @@ impl BifTilemap {
                         crop_dst_x,
                         crop_dst_y,
                     );
+                    op_index += 1;
                     continue;
                 }
             }
-            let tile = level_data.decode_tile(path, tile_no)?;
+            let tile =
+                level_data.decode_tile(&self.tiff_file, self.tiff_file_len, path, tile_no)?;
             cairo_blit_decoded_tile_rgba_channels(
                 &tile,
                 channels,
@@ -1028,6 +1108,7 @@ impl BifTilemap {
                 dst_x,
                 dst_y,
             )?;
+            op_index += 1;
         }
 
         unpremultiply_rgba(&mut output);
@@ -1046,6 +1127,8 @@ impl BifTilemap {
 impl BifTilemapLevel {
     fn decode_tile_cached(
         &self,
+        file: &crate::util::OpenSlideFile,
+        file_len: u64,
         path: &Path,
         cache: &TileCache,
         cache_binding_id: u64,
@@ -1061,7 +1144,7 @@ impl BifTilemapLevel {
                 rgb: tile.rgb,
             });
         }
-        let tile = self.decode_tile(path, tile_no)?;
+        let tile = self.decode_tile(file, file_len, path, tile_no)?;
         cache.put(
             cache_binding_id,
             0,
@@ -1223,16 +1306,22 @@ impl BifTilemapLevel {
         })
     }
 
-    fn decode_tile(&self, path: &Path, tile_no: usize) -> Result<DecodedTile> {
+    fn decode_tile(
+        &self,
+        file: &crate::util::OpenSlideFile,
+        file_len: u64,
+        path: &Path,
+        tile_no: usize,
+    ) -> Result<DecodedTile> {
         if self.planar_config == PLANARCONFIG_SEPARATE {
-            return self.decode_separate_tile(path, tile_no);
+            return self.decode_separate_tile(file, file_len, path, tile_no);
         }
         let byte_count = self.tile_byte_counts[tile_no];
         if byte_count == 0 {
             return Ok(DecodedTile {
                 width: self.tile_width,
                 height: self.tile_height,
-                rgb: vec![0; self.tile_width as usize * self.tile_height as usize * 3],
+                rgb: vec![0; self.tile_width as usize * self.tile_height as usize * 3].into(),
             });
         }
         if (self.predictor != 1
@@ -1250,7 +1339,8 @@ impl BifTilemapLevel {
                 self.tile_height,
             );
         }
-        let raw = read_file_range(path, self.tile_offsets[tile_no], byte_count)?;
+        let raw =
+            read_file_range_from_open_file(file, file_len, self.tile_offsets[tile_no], byte_count)?;
         match self.compression {
             COMPRESSION_OLD_JPEG | COMPRESSION_JPEG => {
                 let jpeg = if self.compression == COMPRESSION_OLD_JPEG {
@@ -1272,7 +1362,11 @@ impl BifTilemapLevel {
                     self.tile_height,
                     self.jpeg_color_space(),
                 )?;
-                Ok(DecodedTile { width, height, rgb })
+                Ok(DecodedTile {
+                    width,
+                    height,
+                    rgb: rgb.into(),
+                })
             }
             COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
                 let colorspace = match self.compression {
@@ -1306,7 +1400,11 @@ impl BifTilemapLevel {
                         tile_height: self.tile_height,
                     }),
                 )?;
-                Ok(DecodedTile { width, height, rgb })
+                Ok(DecodedTile {
+                    width,
+                    height,
+                    rgb: rgb.into(),
+                })
             }
             COMPRESSION_NONE => self.decode_uncompressed_tile(&raw),
             COMPRESSION_PACKBITS => {
@@ -1324,9 +1422,23 @@ impl BifTilemapLevel {
         }
     }
 
+    fn decode_tile_from_path(&self, path: &Path, tile_no: usize) -> Result<DecodedTile> {
+        let file = crate::util::_openslide_fopen(path)?;
+        let file_len = fs::metadata(path)
+            .map_err(|err| {
+                OpenSlideError::Io(std::io::Error::new(
+                    err.kind(),
+                    format!("Couldn't stat {}: {err}", path.display()),
+                ))
+            })?
+            .len();
+        self.decode_tile(&file, file_len, path, tile_no)
+    }
+
     fn decode_tile_region(
         &self,
-        path: &Path,
+        file: &crate::util::OpenSlideFile,
+        file_len: u64,
         tile_no: usize,
         x: u32,
         y: u32,
@@ -1341,10 +1453,11 @@ impl BifTilemapLevel {
             return Ok(Some(DecodedTile {
                 width: w,
                 height: h,
-                rgb: vec![0; w as usize * h as usize * 3],
+                rgb: vec![0; w as usize * h as usize * 3].into(),
             }));
         }
-        let raw = read_file_range(path, self.tile_offsets[tile_no], byte_count)?;
+        let raw =
+            read_file_range_from_open_file(file, file_len, self.tile_offsets[tile_no], byte_count)?;
         let (rgb, width, height) = decode::decode_tiff_bgra_rgb_region(
             ImageFormat::Jpeg,
             &raw,
@@ -1355,7 +1468,11 @@ impl BifTilemapLevel {
             h,
             self.jpeg_color_space(),
         )?;
-        Ok(Some(DecodedTile { width, height, rgb }))
+        Ok(Some(DecodedTile {
+            width,
+            height,
+            rgb: rgb.into(),
+        }))
     }
 
     fn channel_count(&self) -> u32 {
@@ -1431,11 +1548,17 @@ impl BifTilemapLevel {
         Ok(DecodedTile {
             width: self.tile_width,
             height: self.tile_height,
-            rgb,
+            rgb: rgb.into(),
         })
     }
 
-    fn decode_separate_tile(&self, path: &Path, tile_no: usize) -> Result<DecodedTile> {
+    fn decode_separate_tile(
+        &self,
+        file: &crate::util::OpenSlideFile,
+        file_len: u64,
+        path: &Path,
+        tile_no: usize,
+    ) -> Result<DecodedTile> {
         if self.compression == COMPRESSION_LZW
             || matches!(
                 self.compression,
@@ -1482,7 +1605,12 @@ impl BifTilemapLevel {
             let plane = if byte_count == 0 {
                 vec![0; expected_plane_bytes]
             } else {
-                let raw = read_file_range(path, self.tile_offsets[index], byte_count)?;
+                let raw = read_file_range_from_open_file(
+                    file,
+                    file_len,
+                    self.tile_offsets[index],
+                    byte_count,
+                )?;
                 match self.compression {
                     COMPRESSION_OLD_JPEG => {
                         self.decode_planar_old_jpeg_plane(path, &raw, sample, pixel_count)?
@@ -1553,7 +1681,7 @@ impl BifTilemapLevel {
         Ok(DecodedTile {
             width: self.tile_width,
             height: self.tile_height,
-            rgb,
+            rgb: rgb.into(),
         })
     }
 
@@ -1714,7 +1842,7 @@ impl BifTilemapLevel {
         Ok(DecodedTile {
             width: self.tile_width,
             height: self.tile_height,
-            rgb,
+            rgb: rgb.into(),
         })
     }
 
@@ -2312,7 +2440,7 @@ fn cairo_blit_decoded_tile_rgba_channels(
         |channel: Option<u32>| -> c_int { channel.map(|ch| ch.min(2) as c_int).unwrap_or(-1) };
     let mut err = [0i8; 256];
     let ok = unsafe {
-        osr_cairo_blit_rgb_to_rgba(
+        osr_cairo_blit_rgb_to_rgba_clipped_dst(
             src.rgb.as_ptr(),
             src.width,
             src.height,
@@ -2344,8 +2472,91 @@ fn cairo_blit_decoded_tile_rgba_channels(
     Ok(())
 }
 
+fn predecode_bif_tiles_for_ops(
+    level: &BifTilemapLevel,
+    file: &crate::util::OpenSlideFile,
+    file_len: u64,
+    path: &Path,
+    cache: &TileCache,
+    cache_binding_id: u64,
+    level_index: u32,
+    ops: &[BifBlitOp],
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut missing = Vec::new();
+    for op in ops {
+        if !seen.insert(op.tile_no) {
+            continue;
+        }
+        let cache_key = i64::try_from(op.tile_no)
+            .map_err(|_| OpenSlideError::Format("Ventana BIF tile index overflows i64".into()))?;
+        if !cache.contains(cache_binding_id, 0, level_index, cache_key) {
+            missing.push(op.tile_no);
+        }
+    }
+
+    if missing.len() < 4 || missing.len() > 64 {
+        return Ok(());
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(8)
+        .min(missing.len());
+    if workers <= 1 {
+        return Ok(());
+    }
+    let chunk_size = missing.len().div_ceil(workers);
+    let decoded = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in missing.chunks(chunk_size) {
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, DecodedTile)>> {
+                let mut tiles = Vec::with_capacity(chunk.len());
+                for &tile_no in chunk {
+                    tiles.push((tile_no, level.decode_tile(file, file_len, path, tile_no)?));
+                }
+                Ok(tiles)
+            }));
+        }
+
+        let mut decoded = Vec::with_capacity(missing.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(mut tiles)) => decoded.append(&mut tiles),
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(OpenSlideError::Decode(
+                        "Ventana BIF tile predecode worker panicked".into(),
+                    ));
+                }
+            }
+        }
+        Ok(decoded)
+    })?;
+
+    for (tile_no, tile) in decoded {
+        let cache_key = i64::try_from(tile_no)
+            .map_err(|_| OpenSlideError::Format("Ventana BIF tile index overflows i64".into()))?;
+        cache.put(
+            cache_binding_id,
+            0,
+            level_index,
+            cache_key,
+            CachedTile {
+                width: tile.width,
+                height: tile.height,
+                rgb: tile.rgb,
+            },
+        );
+    }
+    Ok(())
+}
+
 fn try_cairo_blit_single_tile_batch(
     level: &BifTilemapLevel,
+    file: &crate::util::OpenSlideFile,
+    file_len: u64,
     path: &Path,
     cache: &TileCache,
     cache_binding_id: u64,
@@ -2364,7 +2575,15 @@ fn try_cairo_blit_single_tile_batch(
         return Ok(false);
     }
 
-    let tile = level.decode_tile_cached(path, cache, cache_binding_id, level_index, tile_no)?;
+    let tile = level.decode_tile_cached(
+        file,
+        file_len,
+        path,
+        cache,
+        cache_binding_id,
+        level_index,
+        tile_no,
+    )?;
     let src_xs = ops.iter().map(|op| op.src_x).collect::<Vec<_>>();
     let src_ys = ops.iter().map(|op| op.src_y).collect::<Vec<_>>();
     let dst_xs = ops.iter().map(|op| op.dst_x).collect::<Vec<_>>();
@@ -2637,7 +2856,7 @@ fn read_associated_tiled_with_internal_decoder(
                 .ok_or_else(|| {
                     OpenSlideError::Format("Ventana associated tile index overflow".into())
                 })?;
-            let tile = level.decode_tile(path, tile_no)?;
+            let tile = level.decode_tile_from_path(path, tile_no)?;
             let visible_w = (u64::from(width) - col * u64::from(level.tile_width))
                 .min(u64::from(level.tile_width)) as u32;
             let visible_h = (u64::from(height) - row * u64::from(level.tile_height))
@@ -2890,7 +3109,11 @@ fn decoded_tiff_chunk_to_bif_tile(
         }
     }
 
-    Ok(DecodedTile { width, height, rgb })
+    Ok(DecodedTile {
+        width,
+        height,
+        rgb: rgb.into(),
+    })
 }
 
 fn tiff_decoded_sample_u8(image: &::tiff::decoder::DecodingResult, index: usize) -> u8 {
@@ -3342,52 +3565,6 @@ fn parse_attributes(raw: &str) -> HashMap<String, String> {
     attrs
 }
 
-fn xml_unescape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(start) = rest.find('&') {
-        out.push_str(&rest[..start]);
-        let after_amp = &rest[start + 1..];
-        if let Some(end) = after_amp.find(';') {
-            let token = &after_amp[..end];
-            match decode_xml_entity(token) {
-                Some(ch) => out.push(ch),
-                None => {
-                    out.push('&');
-                    out.push_str(token);
-                    out.push(';');
-                }
-            }
-            rest = &after_amp[end + 1..];
-        } else {
-            out.push_str(&rest[start..]);
-            rest = "";
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-fn decode_xml_entity(token: &str) -> Option<char> {
-    match token {
-        "amp" => Some('&'),
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "quot" => Some('"'),
-        "apos" => Some('\''),
-        _ => token
-            .strip_prefix("#x")
-            .or_else(|| token.strip_prefix("#X"))
-            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-            .or_else(|| {
-                token
-                    .strip_prefix('#')
-                    .and_then(|dec| dec.parse::<u32>().ok())
-            })
-            .and_then(char::from_u32),
-    }
-}
-
 fn parse_i64_attr(attrs: &HashMap<String, String>, key: &str) -> Result<i64> {
     let value = attrs
         .get(key)
@@ -3420,10 +3597,6 @@ fn required_uints(tiff: &TiffFile, dir: &TiffDirectory, tag: u16) -> Result<Vec<
             tag, dir.index
         ))
     })
-}
-
-fn format_float(value: f64) -> String {
-    crate::util::_openslide_format_double(value)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3670,8 +3843,8 @@ impl TiffDirectory {
         self.entry(tag)?.uints(endian)
     }
 
-    fn string(&self, tag: u16) -> Option<String> {
-        self.entry(tag)?.string()
+    fn tiff_ascii_string(&self, tag: u16) -> Option<String> {
+        self.entry(tag)?.tiff_ascii_string()
     }
 }
 
@@ -3691,7 +3864,7 @@ impl TiffEntry {
         }
     }
 
-    fn string(&self) -> Option<String> {
+    fn tiff_ascii_string(&self) -> Option<String> {
         if !matches!(self.value_type, TYPE_ASCII | TYPE_BYTE | TYPE_UNDEFINED) {
             return None;
         }
@@ -4312,7 +4485,7 @@ mod tests {
         let tile = read_bif_tile_with_tiff_crate(&path, 0, 0, 2, 2).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120].into()
         );
 
         let _ = fs::remove_file(path);
@@ -4356,10 +4529,10 @@ mod tests {
             old_jpeg: None,
         };
 
-        let tile = level.decode_tile(&path, 0).unwrap();
+        let tile = level.decode_tile_from_path(&path, 0).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120].into()
         );
 
         let _ = fs::remove_file(path);
@@ -4397,10 +4570,10 @@ mod tests {
             old_jpeg: None,
         };
 
-        let tile = level.decode_tile(&path, 0).unwrap();
+        let tile = level.decode_tile_from_path(&path, 0).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120].into()
         );
 
         let _ = fs::remove_file(path);
@@ -4633,7 +4806,7 @@ mod tests {
             old_jpeg: None,
         };
 
-        let tile = level.decode_tile(&path, 0).unwrap();
+        let tile = level.decode_tile_from_path(&path, 0).unwrap();
         assert_eq!(tile.width, 2);
         assert_eq!(tile.height, 2);
         assert_eq!(&tile.rgb[..6], &[100, 100, 100, 150, 150, 150]);
@@ -4677,10 +4850,10 @@ mod tests {
             old_jpeg: None,
         };
 
-        let tile = level.decode_tile(&path, 0).unwrap();
+        let tile = level.decode_tile_from_path(&path, 0).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![1, 10, 100, 2, 20, 110, 3, 30, 120, 4, 40, 130]
+            vec![1, 10, 100, 2, 20, 110, 3, 30, 120, 4, 40, 130].into()
         );
 
         let _ = fs::remove_file(path);
@@ -4721,10 +4894,10 @@ mod tests {
             old_jpeg: None,
         };
 
-        let tile = level.decode_tile(&path, 0).unwrap();
+        let tile = level.decode_tile_from_path(&path, 0).unwrap();
         assert_eq!(tile.width, 2);
         assert_eq!(tile.height, 1);
-        assert_eq!(tile.rgb, vec![10, 20, 30, 40, 50, 60]);
+        assert_eq!(tile.rgb, vec![10, 20, 30, 40, 50, 60].into());
 
         let _ = fs::remove_file(path);
     }
@@ -4764,10 +4937,10 @@ mod tests {
             old_jpeg: None,
         };
 
-        let tile = level.decode_tile(&path, 0).unwrap();
+        let tile = level.decode_tile_from_path(&path, 0).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![254, 0, 0, 150, 150, 150, 80, 80, 80, 10, 10, 10]
+            vec![254, 0, 0, 150, 150, 150, 80, 80, 80, 10, 10, 10].into()
         );
 
         let _ = fs::remove_file(path);
@@ -4811,10 +4984,10 @@ mod tests {
             old_jpeg: None,
         };
 
-        let tile = level.decode_tile(&path, 0).unwrap();
+        let tile = level.decode_tile_from_path(&path, 0).unwrap();
         assert_eq!(tile.width, 1);
         assert_eq!(tile.height, 1);
-        assert_eq!(tile.rgb, vec![expected, expected, expected]);
+        assert_eq!(tile.rgb, vec![expected, expected, expected].into());
 
         let _ = fs::remove_file(path);
     }
@@ -4857,10 +5030,10 @@ mod tests {
             old_jpeg: None,
         };
 
-        let tile = level.decode_tile(&path, 0).unwrap();
+        let tile = level.decode_tile_from_path(&path, 0).unwrap();
         assert_eq!(tile.width, 1);
         assert_eq!(tile.height, 1);
-        assert_eq!(tile.rgb, vec![expected, expected, expected]);
+        assert_eq!(tile.rgb, vec![expected, expected, expected].into());
 
         let _ = fs::remove_file(path);
     }
@@ -4898,12 +5071,12 @@ mod tests {
             old_jpeg: None,
         };
 
-        let tile = level.decode_tile(&path, 0).unwrap();
+        let tile = level.decode_tile_from_path(&path, 0).unwrap();
         assert_eq!(tile.width, 2);
         assert_eq!(tile.height, 2);
         assert_eq!(
             tile.rgb,
-            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120].into()
         );
 
         let _ = fs::remove_file(path);
@@ -4938,7 +5111,10 @@ mod tests {
         };
 
         let tile = level.decode_uncompressed_tile(&raw).unwrap();
-        assert_eq!(tile.rgb, vec![1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(
+            tile.rgb,
+            vec![1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15].into()
+        );
     }
 
     #[test]
@@ -4969,7 +5145,7 @@ mod tests {
             .decode_uncompressed_tile(&[10, 0x34, 0x12, 30, 40, 0xcd, 0xab, 60])
             .unwrap();
 
-        assert_eq!(tile.rgb, vec![10, 0x12, 30, 40, 0xab, 60]);
+        assert_eq!(tile.rgb, vec![10, 0x12, 30, 40, 0xab, 60].into());
     }
 
     #[test]
@@ -5003,7 +5179,7 @@ mod tests {
         let tile = level.decode_uncompressed_tile(&raw).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![254, 0, 0, 150, 150, 150, 80, 80, 80, 10, 10, 10]
+            vec![254, 0, 0, 150, 150, 150, 80, 80, 80, 10, 10, 10].into()
         );
     }
 
@@ -5033,7 +5209,7 @@ mod tests {
         };
 
         let tile = level.decode_uncompressed_tile(&raw).unwrap();
-        assert_eq!(tile.rgb, raw);
+        assert_eq!(tile.rgb, raw.into());
     }
 
     fn temp_path(name: &str) -> PathBuf {

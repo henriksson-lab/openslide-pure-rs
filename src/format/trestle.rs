@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+#[cfg(test)]
 use std::fs;
 use std::io::Read;
 use std::os::raw::{c_char, c_int, c_uint};
@@ -16,10 +17,11 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff::OpenslideHash, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
-use crate::util::read_file_range;
+use crate::util::_openslide_format_double as format_float;
+use crate::util::{read_file_range, read_file_range_from_open_file};
 
 extern "C" {
-    fn osr_cairo_blit_rgb_to_rgba(
+    fn osr_cairo_blit_rgb_to_rgba_clipped_dst(
         src_rgb: *const u8,
         src_width: c_uint,
         src_height: c_uint,
@@ -178,6 +180,7 @@ impl Endian {
 #[derive(Debug)]
 struct TiffFile {
     path: PathBuf,
+    file_len: u64,
     endian: Endian,
     directories: Vec<TiffDirectory>,
 }
@@ -270,6 +273,7 @@ impl TiffFile {
 
         Ok(Self {
             path: path.to_path_buf(),
+            file_len,
             endian,
             directories,
         })
@@ -494,7 +498,7 @@ impl TiffEntry {
         }
     }
 
-    fn c_string(&self) -> Option<String> {
+    fn tiff_ascii_string(&self) -> Option<String> {
         if self.value_type != TYPE_ASCII && self.value_type != TYPE_BYTE {
             return None;
         }
@@ -977,6 +981,8 @@ fn required_uints(tiff: &TiffFile, dir: &TiffDirectory, tag: u16) -> Result<Vec<
 
 struct TrestleSlide {
     tiff_path: PathBuf,
+    tiff_file: Arc<crate::util::OpenSlideFile>,
+    tiff_file_len: u64,
     levels: Vec<TrestleLevel>,
     properties: HashMap<String, String>,
     cache: Arc<TileCache>,
@@ -1005,7 +1011,7 @@ fn validate_trestle(tiff: &TiffFile) -> Result<()> {
         .ok_or_else(|| OpenSlideError::UnsupportedFormat("TIFF has no directories".into()))?;
     let software = first
         .entry(TAG_SOFTWARE)
-        .and_then(TiffEntry::c_string)
+        .and_then(TiffEntry::tiff_ascii_string)
         .ok_or_else(|| OpenSlideError::UnsupportedFormat("Missing TIFF Software tag".into()))?;
     if !software.starts_with(TRESTLE_SOFTWARE) {
         return Err(OpenSlideError::UnsupportedFormat(
@@ -1035,7 +1041,7 @@ impl TrestleSlide {
             .ok_or_else(|| OpenSlideError::Format("TIFF has no directories".into()))?;
         let image_description = first_dir
             .entry(TAG_IMAGEDESCRIPTION)
-            .and_then(TiffEntry::c_string)
+            .and_then(TiffEntry::tiff_ascii_string)
             .ok_or_else(|| OpenSlideError::Format("Missing TIFF ImageDescription tag".into()))?;
         let (mut properties, overlaps) = parse_trestle_image_description(&image_description, &tiff);
 
@@ -1100,12 +1106,16 @@ impl TrestleSlide {
                 (Some(path), Some(dimensions))
             });
         let tiff_path = tiff.path;
+        let tiff_file_len = tiff.file_len;
+        let tiff_file = Arc::new(crate::util::_openslide_fopen(&tiff_path)?);
 
         let cache = Arc::new(TileCache::new());
         let cache_binding_id = cache.next_binding_id();
 
         Ok(Self {
             tiff_path,
+            tiff_file,
+            tiff_file_len,
             levels,
             properties,
             cache,
@@ -1141,7 +1151,7 @@ impl TrestleSlide {
                 return Ok(CachedTile {
                     width: level.tile_width,
                     height: level.tile_height,
-                    rgb: vec![0; level.tile_width as usize * level.tile_height as usize * 3],
+                    rgb: vec![0; level.tile_width as usize * level.tile_height as usize * 3].into(),
                 });
             }
             match level.compression {
@@ -1165,7 +1175,12 @@ impl TrestleSlide {
                 }
                 COMPRESSION_OLD_JPEG | COMPRESSION_JPEG => {
                     let offset = level.tile_offsets[tile_no as usize];
-                    let raw = read_file_range(&self.tiff_path, offset, byte_count)?;
+                    let raw = read_file_range_from_open_file(
+                        &self.tiff_file,
+                        self.tiff_file_len,
+                        offset,
+                        byte_count,
+                    )?;
                     let jpeg = if level.compression == COMPRESSION_OLD_JPEG {
                         old_jpeg_interchange_stream(&self.tiff_path, level, &raw)?
                     } else {
@@ -1188,11 +1203,20 @@ impl TrestleSlide {
                         } else {
                             decode::decode_rgb_libjpeg(ImageFormat::Jpeg, &jpeg)?
                         };
-                    CachedTile { width, height, rgb }
+                    CachedTile {
+                        width,
+                        height,
+                        rgb: rgb.into(),
+                    }
                 }
                 COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
                     let offset = level.tile_offsets[tile_no as usize];
-                    let raw = read_file_range(&self.tiff_path, offset, byte_count)?;
+                    let raw = read_file_range_from_open_file(
+                        &self.tiff_file,
+                        self.tiff_file_len,
+                        offset,
+                        byte_count,
+                    )?;
                     let colorspace = match level.compression {
                         COMPRESSION_JP2K_YCBCR => "YCbCr",
                         COMPRESSION_JP2K_RGB => "RGB",
@@ -1224,22 +1248,41 @@ impl TrestleSlide {
                             tile_height: level.tile_height,
                         }),
                     )?;
-                    CachedTile { width, height, rgb }
+                    CachedTile {
+                        width,
+                        height,
+                        rgb: rgb.into(),
+                    }
                 }
                 COMPRESSION_NONE => {
                     let offset = level.tile_offsets[tile_no as usize];
-                    let raw = read_file_range(&self.tiff_path, offset, byte_count)?;
+                    let raw = read_file_range_from_open_file(
+                        &self.tiff_file,
+                        self.tiff_file_len,
+                        offset,
+                        byte_count,
+                    )?;
                     decode_uncompressed_tile(level, &raw)?
                 }
                 COMPRESSION_PACKBITS => {
                     let offset = level.tile_offsets[tile_no as usize];
-                    let raw = read_file_range(&self.tiff_path, offset, byte_count)?;
+                    let raw = read_file_range_from_open_file(
+                        &self.tiff_file,
+                        self.tiff_file_len,
+                        offset,
+                        byte_count,
+                    )?;
                     let decoded = unpack_packbits(&raw, expected_tile_bytes(level)?)?;
                     decode_uncompressed_tile(level, &decoded)?
                 }
                 COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => {
                     let offset = level.tile_offsets[tile_no as usize];
-                    let raw = read_file_range(&self.tiff_path, offset, byte_count)?;
+                    let raw = read_file_range_from_open_file(
+                        &self.tiff_file,
+                        self.tiff_file_len,
+                        offset,
+                        byte_count,
+                    )?;
                     let inflated = inflate_tiff_deflate(&raw)?;
                     decode_uncompressed_tile(level, &inflated)?
                 }
@@ -1262,6 +1305,63 @@ impl TrestleSlide {
             );
         }
         Ok(tile)
+    }
+
+    fn predecode_tiles(&self, level_index: u32, tile_nos: &[u64]) -> Result<()> {
+        let mut seen = HashSet::new();
+        let mut missing = Vec::new();
+        for &tile_no in tile_nos {
+            if !seen.insert(tile_no) {
+                continue;
+            }
+            let Ok(cache_key) = i64::try_from(tile_no) else {
+                continue;
+            };
+            if !self
+                .cache
+                .contains(self.cache_binding_id, 0, level_index, cache_key)
+            {
+                missing.push(tile_no);
+            }
+        }
+
+        if missing.len() < 4 || missing.len() > 64 {
+            return Ok(());
+        }
+
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .min(4)
+            .min(missing.len());
+        if workers <= 1 {
+            return Ok(());
+        }
+        let chunk_size = missing.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in missing.chunks(chunk_size) {
+                handles.push(scope.spawn(move || -> Result<()> {
+                    for &tile_no in chunk {
+                        self.decode_tile(level_index, tile_no)?;
+                    }
+                    Ok(())
+                }));
+            }
+
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => {
+                        return Err(OpenSlideError::Decode(
+                            "Trestle tile predecode worker panicked".into(),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1332,7 +1432,6 @@ impl SlideBackend for TrestleSlide {
         let row_end = ((ly + h as f64) / level_data.tile_advance_y)
             .ceil()
             .min(level_data.tiles_down as f64) as i64;
-
         for row in row_start..row_end {
             for col in col_start..col_end {
                 let tile_no = row as u64 * level_data.tiles_across + col as u64;
@@ -1407,7 +1506,13 @@ impl SlideBackend for TrestleSlide {
         let row_end = ((ly + h as f64) / level_data.tile_advance_y)
             .ceil()
             .min(level_data.tiles_down as f64) as i64;
-
+        let mut tile_nos = Vec::new();
+        for row in row_start..row_end {
+            for col in col_start..col_end {
+                tile_nos.push(row as u64 * level_data.tiles_across + col as u64);
+            }
+        }
+        self.predecode_tiles(level, &tile_nos)?;
         if use_cairo_rgb {
             for row in (row_start..row_end).rev() {
                 for col in (col_start..col_end).rev() {
@@ -1447,28 +1552,32 @@ impl SlideBackend for TrestleSlide {
                         (level_data.stored_height - row as u64 * level_data.tile_height as u64)
                             .min(level_data.tile_height as u64) as u32;
 
-                    blit_rgb_rgba(
-                        &decoded,
-                        channels,
-                        visible_w,
-                        visible_h,
-                        &mut output,
-                        tile_origin_x - lx,
-                        tile_origin_y - ly,
-                    );
+                    if channels == [Some(0), Some(1), Some(2), None] {
+                        blit_rgb_opaque_rgba(
+                            &decoded,
+                            visible_w,
+                            visible_h,
+                            &mut output,
+                            tile_origin_x - lx,
+                            tile_origin_y - ly,
+                        );
+                    } else {
+                        blit_rgb_rgba(
+                            &decoded,
+                            channels,
+                            visible_w,
+                            visible_h,
+                            &mut output,
+                            tile_origin_x - lx,
+                            tile_origin_y - ly,
+                        );
+                    }
                 }
             }
         }
 
         if use_cairo_rgb {
             unpremultiply_rgba(&mut output);
-            if channels[3].is_none() {
-                for pixel in output.data.chunks_exact_mut(4) {
-                    if pixel[3] != 0 {
-                        pixel[3] = 255;
-                    }
-                }
-            }
         }
 
         Ok(output)
@@ -1739,7 +1848,7 @@ fn store_string_property(
     name: &str,
     tag: u16,
 ) -> Option<String> {
-    let value = tiff.directory(dir)?.entry(tag)?.c_string()?;
+    let value = tiff.directory(dir)?.entry(tag)?.tiff_ascii_string()?;
     props.insert(name.to_string(), value.clone());
     Some(value)
 }
@@ -1979,7 +2088,11 @@ fn decoded_tiff_chunk_to_trestle_tile(
         }
     }
 
-    Ok(CachedTile { width, height, rgb })
+    Ok(CachedTile {
+        width,
+        height,
+        rgb: rgb.into(),
+    })
 }
 
 fn read_trestle_planar_tile_with_tiff_crate(
@@ -2045,7 +2158,7 @@ fn read_trestle_planar_tile_with_tiff_crate(
     Ok(CachedTile {
         width: level.tile_width,
         height: level.tile_height,
-        rgb,
+        rgb: rgb.into(),
     })
 }
 
@@ -2122,7 +2235,11 @@ fn decode_uncompressed_tile(level: &TrestleLevel, raw: &[u8]) -> Result<CachedTi
         }
     }
 
-    Ok(CachedTile { width, height, rgb })
+    Ok(CachedTile {
+        width,
+        height,
+        rgb: rgb.into(),
+    })
 }
 
 fn decode_separate_tile(
@@ -2250,7 +2367,7 @@ fn decode_separate_tile(
     Ok(CachedTile {
         width: level.tile_width,
         height: level.tile_height,
-        rgb,
+        rgb: rgb.into(),
     })
 }
 
@@ -2712,6 +2829,38 @@ fn blit_rgb_rgba(
     }
 }
 
+fn blit_rgb_opaque_rgba(
+    src: &CachedTile,
+    visible_w: u32,
+    visible_h: u32,
+    dst: &mut RgbaImage,
+    dst_x: f64,
+    dst_y: f64,
+) {
+    let sw = visible_w.min(src.width) as i64;
+    let sh = visible_h.min(src.height) as i64;
+    let dx0 = dst_x.round() as i64;
+    let dy0 = dst_y.round() as i64;
+
+    for row in 0..sh {
+        let dy = dy0 + row;
+        if dy < 0 || dy >= dst.height as i64 {
+            continue;
+        }
+        let src_y = row as usize;
+        let dst_y = dy as usize;
+        for col in 0..sw {
+            let dx = dx0 + col;
+            if dx < 0 || dx >= dst.width as i64 {
+                continue;
+            }
+            let src_base = (src_y * src.width as usize + col as usize) * 3;
+            let dst_base = (dst_y * dst.width as usize + dx as usize) * 4;
+            dst.data[dst_base..dst_base + 3].copy_from_slice(&src.rgb[src_base..src_base + 3]);
+        }
+    }
+}
+
 fn cairo_blit_rgb_rgba(
     src: &CachedTile,
     channels: [Option<u32>; 4],
@@ -2724,7 +2873,7 @@ fn cairo_blit_rgb_rgba(
     let channel = |idx: usize| -> c_int { channels[idx].map_or(-1, |channel| channel as c_int) };
     let mut err = vec![0i8; 256];
     let ok = unsafe {
-        osr_cairo_blit_rgb_to_rgba(
+        osr_cairo_blit_rgb_to_rgba_clipped_dst(
             src.rgb.as_ptr(),
             src.width,
             src.height,
@@ -2773,10 +2922,6 @@ fn unpremultiply_rgba(image: &mut RgbaImage) {
             *channel = value.min(255) as u8;
         }
     }
-}
-
-fn format_float(value: f64) -> String {
-    crate::util::_openslide_format_double(value)
 }
 
 #[cfg(test)]
@@ -2891,7 +3036,8 @@ mod tests {
             assert!(matches!(entry.value, TiffValue::OutOfLine { .. }));
         }
         assert_eq!(
-            dir.entry(TAG_SOFTWARE).and_then(TiffEntry::c_string),
+            dir.entry(TAG_SOFTWARE)
+                .and_then(TiffEntry::tiff_ascii_string),
             Some("MedScan 2.0".to_string())
         );
 
@@ -2916,6 +3062,8 @@ mod tests {
 
         let slide = TrestleSlide {
             tiff_path: path.clone(),
+            tiff_file: Arc::new(crate::util::_openslide_fopen(&path).unwrap()),
+            tiff_file_len: fs::metadata(&path).unwrap().len(),
             levels: vec![TrestleLevel {
                 width: 2,
                 height: 2,
@@ -2951,7 +3099,7 @@ mod tests {
         let tile = slide.decode_tile(0, 0).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120].into()
         );
 
         let _ = fs::remove_file(path);
@@ -2978,7 +3126,7 @@ mod tests {
         let tile = slide.decode_tile(0, 0).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120].into()
         );
 
         let _ = fs::remove_file(path);
@@ -2998,7 +3146,7 @@ mod tests {
         let tile = slide.decode_tile(0, 0).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120].into()
         );
 
         let _ = fs::remove_file(path);
@@ -3352,7 +3500,7 @@ mod tests {
         let tile =
             decode_uncompressed_tile(&level, &[10, 0x34, 0x12, 30, 40, 0xcd, 0xab, 60]).unwrap();
 
-        assert_eq!(tile.rgb, vec![10, 0x12, 30, 40, 0xab, 60]);
+        assert_eq!(tile.rgb, vec![10, 0x12, 30, 40, 0xab, 60].into());
     }
 
     #[test]
@@ -3443,7 +3591,7 @@ mod tests {
         let tile = decode_separate_tile(&path, 0, &level, 0).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![1, 10, 100, 2, 20, 110, 3, 30, 120, 4, 40, 130]
+            vec![1, 10, 100, 2, 20, 110, 3, 30, 120, 4, 40, 130].into()
         );
 
         let _ = fs::remove_file(path);
@@ -3490,7 +3638,7 @@ mod tests {
         let tile = decode_separate_tile(&path, 0, &level, 0).unwrap();
         assert_eq!(tile.width, 2);
         assert_eq!(tile.height, 1);
-        assert_eq!(tile.rgb, vec![10, 20, 30, 40, 50, 60]);
+        assert_eq!(tile.rgb, vec![10, 20, 30, 40, 50, 60].into());
 
         let _ = fs::remove_file(path);
     }
@@ -3536,7 +3684,7 @@ mod tests {
         let tile = decode_separate_tile(&path, 0, &level, 0).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![254, 0, 0, 150, 150, 150, 80, 80, 80, 10, 10, 10]
+            vec![254, 0, 0, 150, 150, 150, 80, 80, 80, 10, 10, 10].into()
         );
 
         let _ = fs::remove_file(path);
@@ -3586,7 +3734,7 @@ mod tests {
 
         assert_eq!(tile.width, 1);
         assert_eq!(tile.height, 1);
-        assert_eq!(tile.rgb, vec![expected, expected, expected]);
+        assert_eq!(tile.rgb, vec![expected, expected, expected].into());
         let _ = fs::remove_file(path);
     }
 
@@ -3634,7 +3782,7 @@ mod tests {
 
         assert_eq!(tile.width, 1);
         assert_eq!(tile.height, 1);
-        assert_eq!(tile.rgb, vec![expected, expected, expected]);
+        assert_eq!(tile.rgb, vec![expected, expected, expected].into());
         let _ = fs::remove_file(path);
     }
 
@@ -3680,7 +3828,7 @@ mod tests {
         assert_eq!(tile.height, 2);
         assert_eq!(
             tile.rgb,
-            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120].into()
         );
         let _ = fs::remove_file(path);
     }
@@ -3717,7 +3865,10 @@ mod tests {
         };
 
         let tile = decode_uncompressed_tile(&level, &raw).unwrap();
-        assert_eq!(tile.rgb, vec![1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(
+            tile.rgb,
+            vec![1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15].into()
+        );
     }
 
     #[test]
@@ -3754,7 +3905,7 @@ mod tests {
         let tile = decode_uncompressed_tile(&level, &raw).unwrap();
         assert_eq!(
             tile.rgb,
-            vec![254, 0, 0, 150, 150, 150, 80, 80, 80, 10, 10, 10]
+            vec![254, 0, 0, 150, 150, 150, 80, 80, 80, 10, 10, 10].into()
         );
     }
 
@@ -3780,6 +3931,31 @@ mod tests {
         0x9f, 0xdf, 0xff, 0xd9,
     ];
 
+    #[test]
+    fn fractional_cairo_rgba_preserves_edge_alpha() {
+        let path = temp_path("fractional-alpha-trestle.bin");
+        let mut raw = Vec::new();
+        for _ in 0..16 {
+            raw.extend_from_slice(&[120, 80, 40]);
+        }
+        fs::write(&path, &raw).unwrap();
+        let mut slide = trestle_test_slide(path.clone(), COMPRESSION_NONE, 4, 4);
+        slide.levels[0].downsample = 1.5;
+
+        let image = slide
+            .read_region_rgba([Some(0), Some(1), Some(2), None], 1, 0, 0, 4, 4)
+            .unwrap();
+        assert!(
+            image
+                .data
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] != 0 && pixel[3] != 255),
+            "fractional Cairo composition should preserve partially covered alpha"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
     fn trestle_test_slide(
         path: PathBuf,
         compression: u16,
@@ -3789,8 +3965,11 @@ mod tests {
         let byte_count = fs::metadata(&path)
             .map(|metadata| metadata.len())
             .unwrap_or(1);
+        let tiff_file = Arc::new(crate::util::_openslide_fopen(&path).unwrap());
         TrestleSlide {
             tiff_path: path,
+            tiff_file,
+            tiff_file_len: byte_count,
             levels: vec![TrestleLevel {
                 width: u64::from(tile_width),
                 height: u64::from(tile_height),
@@ -3856,6 +4035,7 @@ mod tests {
     fn empty_tiff_file() -> TiffFile {
         TiffFile {
             path: PathBuf::new(),
+            file_len: 0,
             endian: Endian::Little,
             directories: Vec::new(),
         }

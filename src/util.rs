@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, File, ReadDir};
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{OpenSlideError, Result};
@@ -193,9 +196,9 @@ pub fn _openslide_dir_open(path: &Path) -> Result<OpenSlideDir> {
     })
 }
 
-pub fn _openslide_dir_next(dir: &mut OpenSlideDir) -> Result<Option<String>> {
+pub fn _openslide_dir_next(dir: &mut OpenSlideDir) -> Result<Option<OsString>> {
     match dir.dir.next() {
-        Some(Ok(entry)) => Ok(Some(entry.file_name().to_string_lossy().into_owned())),
+        Some(Ok(entry)) => Ok(Some(entry.file_name())),
         Some(Err(err)) => Err(OpenSlideError::Io(std::io::Error::new(
             err.kind(),
             format!("Reading directory {}: {err}", dir.path.display()),
@@ -278,6 +281,35 @@ pub(crate) fn read_file_range(path: &Path, offset: u64, len: u64) -> Result<Vec<
     let file_len = u64::try_from(_openslide_fsize(&mut file)?).map_err(|_| {
         OpenSlideError::Format(format!("Negative file size for {}", path.display()))
     })?;
+    read_file_range_from_open_file(&file, file_len, offset, len)
+}
+
+pub(crate) fn read_file_range_from_open_file(
+    file: &OpenSlideFile,
+    file_len: u64,
+    offset: u64,
+    len: u64,
+) -> Result<Vec<u8>> {
+    let len = usize::try_from(len).map_err(|_| {
+        OpenSlideError::Format(format!("File range length does not fit memory: len={len}"))
+    })?;
+    let mut data = vec![0u8; len];
+    read_file_range_into_from_open_file(file, file_len, offset, &mut data)?;
+    Ok(data)
+}
+
+pub(crate) fn read_file_range_into_from_open_file(
+    file: &OpenSlideFile,
+    file_len: u64,
+    offset: u64,
+    data: &mut [u8],
+) -> Result<()> {
+    let len = u64::try_from(data.len()).map_err(|_| {
+        OpenSlideError::Format(format!(
+            "File range length does not fit file offset: len={}",
+            data.len()
+        ))
+    })?;
     let end = offset.checked_add(len).ok_or_else(|| {
         OpenSlideError::Format(format!(
             "File range overflows: offset={}, len={}",
@@ -290,18 +322,39 @@ pub(crate) fn read_file_range(path: &Path, offset: u64, len: u64) -> Result<Vec<
             offset, len, file_len
         )));
     }
-    let seek_offset = i64::try_from(offset).map_err(|_| {
-        OpenSlideError::Format(format!(
-            "File range offset does not fit OpenSlide seek: offset={offset}"
-        ))
-    })?;
-    let len = usize::try_from(len).map_err(|_| {
-        OpenSlideError::Format(format!("File range length does not fit memory: len={len}"))
-    })?;
-    _openslide_fseek(&mut file, seek_offset, OpenSlideSeekWhence::Set)?;
-    let mut data = vec![0u8; len];
-    _openslide_fread_exact(&mut file, &mut data)?;
-    Ok(data)
+    #[cfg(unix)]
+    {
+        file.file.read_exact_at(data, offset).map_err(|err| {
+            OpenSlideError::Io(std::io::Error::new(
+                err.kind(),
+                format!("Short read of file range: {err}"),
+            ))
+        })?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let seek_offset = i64::try_from(offset).map_err(|_| {
+            OpenSlideError::Format(format!(
+                "File range offset does not fit OpenSlide seek: offset={offset}"
+            ))
+        })?;
+        let mut file = _openslide_fclone(file)?;
+        file.seek(SeekFrom::Start(seek_offset as u64))
+            .map_err(|err| {
+                OpenSlideError::Io(std::io::Error::new(
+                    err.kind(),
+                    format!("Couldn't seek file range: {err}"),
+                ))
+            })?;
+        file.read_exact(data).map_err(|err| {
+            OpenSlideError::Io(std::io::Error::new(
+                err.kind(),
+                format!("Short read of file range: {err}"),
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 pub fn _openslide_parse_int64(value: &str) -> Option<i64> {
@@ -550,6 +603,54 @@ pub fn _openslide_clip_tile(
         tiledata[row..row + tile_w_usize].fill(0);
     }
     Ok(())
+}
+
+pub(crate) fn decode_xml_entity(token: &str) -> Option<char> {
+    match token {
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "amp" => Some('&'),
+        _ => {
+            let code = token
+                .strip_prefix("#x")
+                .or_else(|| token.strip_prefix("#X"))
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .or_else(|| {
+                    token
+                        .strip_prefix('#')
+                        .and_then(|decimal| decimal.parse::<u32>().ok())
+                })?;
+            char::from_u32(code)
+        }
+    }
+}
+
+pub(crate) fn unescape_xml_entities(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        if let Some(end) = after.find(';') {
+            let token = &after[..end];
+            match decode_xml_entity(token) {
+                Some(ch) => out.push(ch),
+                None => {
+                    out.push('&');
+                    out.push_str(token);
+                    out.push(';');
+                }
+            }
+            rest = &after[end + 1..];
+        } else {
+            out.push('&');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn decimal_exponent_is_out_of_f64_range(value: &str) -> bool {
@@ -906,12 +1007,41 @@ mod tests {
         }
         assert_eq!(
             names,
-            HashSet::from(["a.dat".to_string(), "b.dat".to_string()])
+            HashSet::from([OsString::from("a.dat"), OsString::from("b.dat")])
         );
         assert_eq!(_openslide_dir_next(&mut dir).unwrap(), None);
 
         fs::remove_file(dir_path.join("a.dat")).unwrap();
         fs::remove_file(dir_path.join("b.dat")).unwrap();
+        fs::remove_dir(dir_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_next_preserves_non_utf8_file_names() {
+        use std::collections::HashSet;
+        use std::fs;
+        use std::os::unix::ffi::OsStringExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir_path = std::env::temp_dir().join(format!("openslide-rs-dir-nonutf8-{name}"));
+        fs::create_dir(&dir_path).unwrap();
+
+        let file_name = OsString::from_vec(b"slide-\xff.dcm".to_vec());
+        fs::write(dir_path.join(&file_name), b"d").unwrap();
+
+        let mut dir = _openslide_dir_open(&dir_path).unwrap();
+        let mut names = HashSet::new();
+        while let Some(name) = _openslide_dir_next(&mut dir).unwrap() {
+            names.insert(name);
+        }
+        assert_eq!(names, HashSet::from([file_name.clone()]));
+
+        fs::remove_file(dir_path.join(file_name)).unwrap();
         fs::remove_dir(dir_path).unwrap();
     }
 
@@ -1026,6 +1156,29 @@ mod tests {
         assert_eq!(_openslide_parse_double("1e9999"), None);
         assert_eq!(_openslide_parse_double("1e-9999"), None);
         assert_eq!(_openslide_parse_double("20X"), None);
+    }
+
+    #[test]
+    fn decode_xml_entity_matches_reader_xml_unescape_shape() {
+        assert_eq!(decode_xml_entity("amp"), Some('&'));
+        assert_eq!(decode_xml_entity("lt"), Some('<'));
+        assert_eq!(decode_xml_entity("gt"), Some('>'));
+        assert_eq!(decode_xml_entity("quot"), Some('"'));
+        assert_eq!(decode_xml_entity("apos"), Some('\''));
+        assert_eq!(decode_xml_entity("#65"), Some('A'));
+        assert_eq!(decode_xml_entity("#x42"), Some('B'));
+        assert_eq!(decode_xml_entity("#X3c"), Some('<'));
+        assert_eq!(decode_xml_entity("#x0x41"), None);
+        assert_eq!(decode_xml_entity("#x"), None);
+        assert_eq!(decode_xml_entity("#1114112"), None);
+        assert_eq!(decode_xml_entity("AMP"), None);
+    }
+
+    #[test]
+    fn unescape_xml_entities_preserves_reader_fallback_shape() {
+        assert_eq!(unescape_xml_entities("A&amp;B&#32;&#x43;"), "A&B C");
+        assert_eq!(unescape_xml_entities("A&unknown;B"), "A&unknown;B");
+        assert_eq!(unescape_xml_entities("A&B"), "A&B");
     }
 
     #[test]

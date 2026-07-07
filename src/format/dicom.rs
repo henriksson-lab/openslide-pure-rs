@@ -9,6 +9,7 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+use crate::util::_openslide_format_double as format_float;
 
 const DICM_OFFSET: u64 = 128;
 const DICM_MAGIC: &[u8; 4] = b"DICM";
@@ -324,6 +325,7 @@ struct FrameMetadata {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 struct DimensionIndex {
     pointer: Tag,
     functional_group_pointer: Option<Tag>,
@@ -341,7 +343,20 @@ pub fn detect(path: &Path) -> bool {
 }
 
 fn has_lowercase_tiff_extension(path: &Path) -> bool {
-    let path = path.as_os_str().to_string_lossy();
+    has_lowercase_tiff_extension_os(path.as_os_str())
+}
+
+#[cfg(unix)]
+fn has_lowercase_tiff_extension_os(path: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = path.as_bytes();
+    path.ends_with(b".tif") || path.ends_with(b".tiff")
+}
+
+#[cfg(not(unix))]
+fn has_lowercase_tiff_extension_os(path: &std::ffi::OsStr) -> bool {
+    let path = path.to_string_lossy();
     path.ends_with(".tif") || path.ends_with(".tiff")
 }
 
@@ -3669,10 +3684,6 @@ fn insert_standard_optical_properties(
     }
 }
 
-fn format_float(value: f64) -> String {
-    crate::util::_openslide_format_double(value)
-}
-
 fn standard_objective_power_value(value: &str) -> Option<String> {
     crate::util::_openslide_parse_double(value).map(format_float)
 }
@@ -5002,6 +5013,19 @@ mod tests {
         assert_eq!(paths, vec![first, base, last]);
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lowercase_tiff_extension_check_preserves_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut raw = b"dicom-\xff".to_vec();
+        raw.extend_from_slice(b".tif");
+        let path = PathBuf::from(OsString::from_vec(raw));
+
+        assert!(has_lowercase_tiff_extension(&path));
     }
 
     #[test]

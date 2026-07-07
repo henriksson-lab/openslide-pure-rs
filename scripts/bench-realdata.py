@@ -143,30 +143,83 @@ def benchmark_slide(
     rust_bench: str,
     region_size: int,
     regions_per_level: int,
+    repeats: int,
+    cpu_list: str | None,
 ) -> tuple[dict, str]:
     row = {"slide": str(slide)}
     if not can_reference_open(slide):
         row["skipped"] = "reference OpenSlide could not open"
         return row, f"{slide.name}: SKIP ({row['skipped']})"
 
-    rust, rust_rss, rust_err = run_timed([rust_bench, str(slide), str(region_size), str(regions_per_level)])
-    ref, ref_rss, ref_err = run_timed(
-        [
-            sys.executable,
-            __file__,
-            "--ref-worker",
-            str(slide),
-            "--region-size",
-            str(region_size),
-            "--regions-per-level",
-            str(regions_per_level),
-        ]
-    )
+    def with_affinity(command: list[str]) -> list[str]:
+        if not cpu_list:
+            return command
+        return ["taskset", "-c", cpu_list, *command]
+
+    runs = []
+    for _ in range(repeats):
+        rust, rust_rss, rust_err = run_timed(
+            with_affinity([rust_bench, str(slide), str(region_size), str(regions_per_level)])
+        )
+        ref, ref_rss, ref_err = run_timed(
+            with_affinity(
+                [
+                    sys.executable,
+                    __file__,
+                    "--ref-worker",
+                    str(slide),
+                    "--region-size",
+                    str(region_size),
+                    "--regions-per-level",
+                    str(regions_per_level),
+                ]
+            )
+        )
+        runs.append(
+            {
+                "rust": rust,
+                "rust_rss_kb": rust_rss,
+                "rust_error": rust_err if rust is None or rust_rss is None else None,
+                "reference": ref,
+                "reference_rss_kb": ref_rss,
+                "reference_error": ref_err if ref is None or ref_rss is None else None,
+            }
+        )
+
+    selected_rust_index = 0
+    selected_reference_index = 0
+    complete_runs = [
+        (index, run)
+        for index, run in enumerate(runs)
+        if run["rust"] is not None
+        and run["rust_rss_kb"] is not None
+        and run["reference"] is not None
+        and run["reference_rss_kb"] is not None
+    ]
+    if complete_runs:
+        rust_runs = sorted(complete_runs, key=lambda item: item[1]["rust"]["read_secs"])
+        reference_runs = sorted(complete_runs, key=lambda item: item[1]["reference"]["read_secs"])
+        selected_rust_index = rust_runs[len(rust_runs) // 2][0]
+        selected_reference_index = reference_runs[len(reference_runs) // 2][0]
+
+    selected_rust = runs[selected_rust_index]
+    selected_reference = runs[selected_reference_index]
+    rust = selected_rust["rust"]
+    rust_rss = selected_rust["rust_rss_kb"]
+    rust_err = selected_rust["rust_error"]
+    ref = selected_reference["reference"]
+    ref_rss = selected_reference["reference_rss_kb"]
+    ref_err = selected_reference["reference_error"]
 
     row["rust"] = rust
     row["rust_rss_kb"] = rust_rss
     row["reference"] = ref
     row["reference_rss_kb"] = ref_rss
+    if repeats > 1:
+        row["repeat_count"] = repeats
+        row["selected_rust_repeat"] = selected_rust_index
+        row["selected_reference_repeat"] = selected_reference_index
+        row["repeats"] = runs
     if rust is None:
         row["rust_error"] = rust_err
     elif rust_rss is None:
@@ -182,9 +235,10 @@ def benchmark_slide(
 
     if rust and ref:
         speedup = ref["read_secs"] / rust["read_secs"] if rust["read_secs"] else float("inf")
+        repeat_note = f", median of {repeats}" if repeats > 1 else ""
         message = (
             f"{slide.name}: rust {rust['read_secs']:.3f}s / {rust_rss or 0} KiB, "
-            f"ref {ref['read_secs']:.3f}s / {ref_rss or 0} KiB, speedup {speedup:.2f}x"
+            f"ref {ref['read_secs']:.3f}s / {ref_rss or 0} KiB, speedup {speedup:.2f}x{repeat_note}"
         )
     else:
         message = f"{slide.name}: ERROR"
@@ -216,6 +270,17 @@ def main() -> int:
         default=int(os.environ.get("OPENSLIDE_AUDIT_JOBS", "1")),
         help="number of slides to benchmark concurrently; keep at 1 for stable RSS baselines",
     )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=int(os.environ.get("OPENSLIDE_AUDIT_REPEATS", "1")),
+        help="number of Rust/reference benchmark pairs to run per slide; reports the median pair",
+    )
+    parser.add_argument(
+        "--cpu-list",
+        default=os.environ.get("OPENSLIDE_AUDIT_CPU_LIST"),
+        help="optional taskset CPU list applied equally to Rust and reference commands, e.g. 0-3",
+    )
     parser.add_argument("--ref-worker", metavar="SLIDE", help=argparse.SUPPRESS)
     parser.add_argument("slides", nargs="*")
     args = parser.parse_args()
@@ -238,10 +303,18 @@ def main() -> int:
         return 2
 
     jobs = max(1, args.jobs)
+    repeats = max(1, args.repeats)
     rows = [None] * len(slides)
     if jobs == 1 or len(slides) == 1:
         for index, slide in enumerate(slides):
-            row, message = benchmark_slide(slide, args.rust_bench, args.region_size, args.regions_per_level)
+            row, message = benchmark_slide(
+                slide,
+                args.rust_bench,
+                args.region_size,
+                args.regions_per_level,
+                repeats,
+                args.cpu_list,
+            )
             rows[index] = row
             print(message)
     else:
@@ -253,6 +326,8 @@ def main() -> int:
                     args.rust_bench,
                     args.region_size,
                     args.regions_per_level,
+                    repeats,
+                    args.cpu_list,
                 ): (index, slide)
                 for index, slide in enumerate(slides)
             }
@@ -272,6 +347,8 @@ def main() -> int:
             "region_size": args.region_size,
             "regions_per_level": args.regions_per_level,
             "jobs": jobs,
+            "repeats": repeats,
+            "cpu_list": args.cpu_list,
             "runner_profile": args.runner_profile,
             "rust_bench": args.rust_bench,
             "data_dir": str(args.data_dir),

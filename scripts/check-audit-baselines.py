@@ -71,11 +71,14 @@ def path_matches(slide: str, fixture_path: str) -> bool:
 
 
 def match_fixture(slide: str, fixtures: dict[str, dict[str, Any]]) -> str | None:
+    best_match: tuple[int, str] | None = None
     for fixture_id, fixture in fixtures.items():
         for token in fixture_tokens(str(fixture.get("path", ""))):
             if path_matches(slide, token):
-                return fixture_id
-    return None
+                score = len(normalize_path(token))
+                if best_match is None or score > best_match[0]:
+                    best_match = (score, fixture_id)
+    return best_match[1] if best_match else None
 
 
 def checksum_pairs(row: dict[str, Any]) -> list[tuple[str, Any, Any]]:
@@ -1150,6 +1153,18 @@ def validate_bench_report(
             if expected_value is not None and current_value != expected_value:
                 errors.append(
                     f"{path}: benchmark {key}={current_value!r} does not match baseline {expected_value!r}"
+                )
+        try:
+            command_parts = shlex.split(str(bench_doc.get("command", "")))
+        except ValueError:
+            command_parts = []
+        if "--cpu-list" in command_parts:
+            index = command_parts.index("--cpu-list")
+            expected_cpu_list = command_parts[index + 1] if index + 1 < len(command_parts) else None
+            if report.get("cpu_list") != expected_cpu_list:
+                errors.append(
+                    f"{path}: benchmark cpu_list={report.get('cpu_list')!r} does not match "
+                    f"baseline {expected_cpu_list!r}"
                 )
         if report.get("schema_version") != 1:
             errors.append(f"{path}: unsupported benchmark report schema_version {report.get('schema_version')!r}")

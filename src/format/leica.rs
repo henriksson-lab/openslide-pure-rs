@@ -9,7 +9,9 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff::OpenslideHash, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+use crate::util::_openslide_format_double as format_float;
 use crate::util::read_file_range;
+use crate::util::unescape_xml_entities as xml_unescape;
 
 const LEICA_XMLNS_1: &str = "http://www.leica-microsystems.com/scn/2010/03/10";
 const LEICA_XMLNS_2: &str = "http://www.leica-microsystems.com/scn/2010/10/01";
@@ -244,8 +246,8 @@ impl TiffDirectory {
         self.entry(tag)?.floats(endian)?.first().copied()
     }
 
-    fn ascii(&self, tag: u16) -> Option<String> {
-        self.entry(tag)?.ascii()
+    fn trimmed_tiff_ascii_string(&self, tag: u16) -> Option<String> {
+        self.entry(tag)?.trimmed_tiff_ascii_string()
     }
 }
 
@@ -291,7 +293,7 @@ impl TiffEntry {
         }
     }
 
-    fn ascii(&self) -> Option<String> {
+    fn trimmed_tiff_ascii_string(&self) -> Option<String> {
         if self.value_type != TYPE_ASCII && self.value_type != 1 {
             return None;
         }
@@ -306,7 +308,7 @@ impl TiffEntry {
             .filter(|s| !s.is_empty())
     }
 
-    fn c_string(&self) -> Option<String> {
+    fn tiff_ascii_string(&self) -> Option<String> {
         if self.value_type != TYPE_ASCII && self.value_type != 1 {
             return None;
         }
@@ -700,7 +702,7 @@ fn leica_detect(path: &Path) -> bool {
     };
     first.is_tiled()
         && first
-            .ascii(TAG_IMAGEDESCRIPTION)
+            .trimmed_tiff_ascii_string(TAG_IMAGEDESCRIPTION)
             .is_some_and(|desc| is_leica_description(&desc) && has_leica_default_namespace(&desc))
 }
 
@@ -714,7 +716,7 @@ fn leica_open(path: &Path) -> Result<Box<dyn SlideBackend>> {
         .directory(0)
         .ok_or_else(|| OpenSlideError::UnsupportedFormat("TIFF has no directories".into()))?;
     let description = first
-        .ascii(TAG_IMAGEDESCRIPTION)
+        .trimmed_tiff_ascii_string(TAG_IMAGEDESCRIPTION)
         .ok_or_else(|| OpenSlideError::UnsupportedFormat("TIFF has no ImageDescription".into()))?;
     if !first.is_tiled()
         || !is_leica_description(&description)
@@ -1828,7 +1830,7 @@ fn add_tiff_properties(
         ("tiff.Copyright", TAG_COPYRIGHT),
         ("tiff.DocumentName", TAG_DOCUMENTNAME),
     ] {
-        if let Some(value) = dir.ascii(tag) {
+        if let Some(value) = dir.trimmed_tiff_ascii_string(tag) {
             props.insert(name.to_string(), value);
         }
     }
@@ -2452,7 +2454,7 @@ fn store_and_hash_properties(
         "openslide.comment".into(),
         tiff.directory(dir)
             .and_then(|dir| dir.entry(TAG_IMAGEDESCRIPTION))
-            .and_then(TiffEntry::c_string)
+            .and_then(TiffEntry::tiff_ascii_string)
             .unwrap_or_default(),
     );
     for (name, tag) in [
@@ -2470,7 +2472,7 @@ fn store_and_hash_properties(
         let value = tiff
             .directory(dir)
             .and_then(|dir| dir.entry(tag))
-            .and_then(TiffEntry::c_string);
+            .and_then(TiffEntry::tiff_ascii_string);
         if let Some(value) = &value {
             props.insert(name.to_string(), value.clone());
         }
@@ -3380,15 +3382,6 @@ fn text_until_end<'a>(xml: &'a str, from: usize, local: &str) -> Option<&'a str>
     Some(&search[..rel])
 }
 
-fn xml_unescape(value: &str) -> String {
-    value
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-}
-
 fn xml_text_value(value: &str) -> String {
     let text = value
         .strip_prefix("<![CDATA[")
@@ -3429,10 +3422,6 @@ fn ceil_div_f64(numerator: f64, denominator: f64) -> u64 {
 
 fn area_coordinate(level_coordinate: f64, area_offset: i64) -> f64 {
     (level_coordinate - area_offset as f64) as i64 as f64
-}
-
-fn format_float(value: f64) -> String {
-    crate::util::_openslide_format_double(value)
 }
 
 #[cfg(test)]
@@ -3674,6 +3663,20 @@ mod tests {
         );
         assert_eq!(collection.images[0].objective.as_deref(), Some("40"));
         assert_eq!(collection.images[0].aperture.as_deref(), Some("0.75"));
+    }
+
+    #[test]
+    fn unescapes_leica_numeric_xml_entities_like_libxml() {
+        let xml = minimal_leica_xml()
+            .replace(r#"model="AT2""#, r#"model="AT&#50;&amp;X""#)
+            .replace(
+                "<objective>40</objective>",
+                "<objective>&#52;&#x30;</objective>",
+            );
+        let collection = parse_xml_description(&xml).unwrap();
+
+        assert_eq!(collection.images[0].device_model.as_deref(), Some("AT2&X"));
+        assert_eq!(collection.images[0].objective.as_deref(), Some("40"));
     }
 
     #[test]

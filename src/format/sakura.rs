@@ -7,6 +7,7 @@ use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff::OpenslideHash, SlideBackend};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
+use crate::util::_openslide_format_double as format_float;
 
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const SAKURA_MAGIC: &[u8] = b"SVGigaPixelImage";
@@ -1386,10 +1387,6 @@ fn normalize_identifier(value: &str) -> String {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(|ch| ch.to_lowercase())
         .collect()
-}
-
-fn format_float(value: f64) -> String {
-    crate::util::_openslide_format_double(value)
 }
 
 fn sqlite3_text_to_double(value: &[u8]) -> f64 {

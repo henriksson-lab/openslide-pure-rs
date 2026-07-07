@@ -80,18 +80,21 @@ write a JSON report for CI artifacts.
 cargo build --release --example bench_real
 python3 scripts/bench-realdata.py --json .tmp/openslide-testdata/bench.json
 python3 scripts/bench-realdata.py --jobs 4 --json .tmp/openslide-testdata/bench.json
+python3 scripts/bench-realdata.py --cpu-list 0-3 --json .tmp/openslide-testdata/bench.json
 python3 scripts/bench-realdata.py --runner-profile openslide-audit-stable-v1 --json .tmp/openslide-testdata/bench.json
 ```
 
 `--jobs` runs slides concurrently. Keep `--jobs 1` when refreshing saved
 RSS/read-time baselines on a stable runner, because concurrent decoders can
-change timing and peak resident-set measurements. The Python reference worker
+change timing and peak resident-set measurements. `--cpu-list` applies the same
+`taskset -c` CPU affinity to Rust and reference commands; saved baseline
+comparisons use `--cpu-list 0-3`. The Python reference worker
 uses Rust-compatible half-away rounding for sampled level-0 coordinates so it
 compares the same integer regions as `examples/bench_real.rs`. JSON reports
 include the sampling parameters; `check-audit-baselines.py --bench-report`
-rejects reports whose `region_size` or `regions_per_level` does not match
-`fixtures/bench-baseline.json`. Strict threshold checks are automatic when the
-report `runner_profile` matches
+rejects reports whose `region_size`, `regions_per_level`, or `cpu_list` does
+not match `fixtures/bench-baseline.json`. Strict threshold checks are automatic
+when the report `runner_profile` matches
 `fixtures/bench-baseline.json.enforcement_policy.strict_runner_profile`.
 Passing `--enforce-bench` forces the same checks and also requires the strict
 profile.
