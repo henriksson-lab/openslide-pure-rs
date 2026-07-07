@@ -450,6 +450,13 @@ impl Jpeg2000DecoderBackend for DicomToolkitJpeg2000Decoder {
         }
         let components = bitmap.num_components as usize;
         let output_pixels = match request.options.output {
+            Jpeg2000OutputFormat::Rgb
+                if components == 3
+                    && request.options.component_color_space
+                        == Jpeg2000ComponentColorSpace::Rgb =>
+            {
+                pixels
+            }
             Jpeg2000OutputFormat::Rgb => {
                 jpeg2000_pixels_to_rgb(&pixels, components, request.options.component_color_space)?
             }
@@ -520,6 +527,7 @@ fn jpeg2000_pixels_to_rgb(
             }
             Ok(rgb)
         }
+        3 if color_space == Jpeg2000ComponentColorSpace::Rgb => Ok(pixels.to_vec()),
         components if components >= 3 => {
             let mut rgb = Vec::with_capacity(pixels.len() / components * 3);
             for pixel in pixels.chunks_exact(components) {

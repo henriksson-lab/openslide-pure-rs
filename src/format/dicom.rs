@@ -332,7 +332,7 @@ struct DimensionIndex {
 }
 
 pub fn detect(path: &Path) -> bool {
-    if has_lowercase_tiff_extension(path) && is_tiff_like(path) {
+    if is_tiff_like(path) {
         return false;
     }
     let Ok((meta, _dataset_offset)) = read_file_meta(path) else {
@@ -342,29 +342,11 @@ pub fn detect(path: &Path) -> bool {
         .is_some_and(|uid| uid == VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE)
 }
 
-fn has_lowercase_tiff_extension(path: &Path) -> bool {
-    has_lowercase_tiff_extension_os(path.as_os_str())
-}
-
-#[cfg(unix)]
-fn has_lowercase_tiff_extension_os(path: &std::ffi::OsStr) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = path.as_bytes();
-    path.ends_with(b".tif") || path.ends_with(b".tiff")
-}
-
-#[cfg(not(unix))]
-fn has_lowercase_tiff_extension_os(path: &std::ffi::OsStr) -> bool {
-    let path = path.to_string_lossy();
-    path.ends_with(".tif") || path.ends_with(".tiff")
-}
-
 fn is_tiff_like(path: &Path) -> bool {
     let Ok(header) = read_file_range(path, 0, 4) else {
         return false;
     };
-    matches!(header.as_slice(), b"II*\0" | b"MM\0*")
+    matches!(header.as_slice(), b"II*\0" | b"MM\0*" | b"II+\0" | b"MM\0+")
 }
 
 pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
@@ -458,7 +440,7 @@ impl DicomSlide {
             TS_EXPLICIT_VR_LE => photometric == "RGB",
             TS_JPEG_BASELINE => photometric == "RGB" || photometric == "YBR_FULL_422",
             TS_JPEG_2000_LOSSLESS | TS_JPEG_2000 => {
-                photometric == "RGB" || photometric == "YBR_ICT"
+                photometric == "RGB" || photometric == "YBR_ICT" || photometric == "YBR_RCT"
             }
             _ => false,
         };
@@ -5015,19 +4997,6 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn lowercase_tiff_extension_check_preserves_non_utf8_path_bytes() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        let mut raw = b"dicom-\xff".to_vec();
-        raw.extend_from_slice(b".tif");
-        let path = PathBuf::from(OsString::from_vec(raw));
-
-        assert!(has_lowercase_tiff_extension(&path));
-    }
-
     #[test]
     fn dicom_frame_ranges_use_shared_file_range_helper() {
         let path = test_path("dicom-frame-range-helper.bin");
@@ -5078,9 +5047,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dual_personality_dicom_tiff_with_tiff_extension_like_upstream() {
+    fn rejects_dual_personality_dicom_tiff_like_upstream() {
         let path = std::env::temp_dir().join(format!(
-            "openslide_rs_rejects_dual_personality_dicom_tiff_with_tiff_extension_{}.tif",
+            "openslide_rs_rejects_dual_personality_dicom_tiff_{}",
             std::process::id()
         ));
         let mut data = vec![0; DICM_OFFSET as usize];
@@ -5097,6 +5066,33 @@ mod tests {
         assert!(!detect(&path));
         let err = match open(&path) {
             Ok(_) => panic!("expected dual-personality DICOM-TIFF to be unsupported"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, OpenSlideError::UnsupportedFormat(_)));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_dual_personality_bigtiff_dicom_like_upstream() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_rejects_dual_personality_bigtiff_dicom_{}",
+            std::process::id()
+        ));
+        let mut data = vec![0; DICM_OFFSET as usize];
+        data[0..4].copy_from_slice(b"II+\0");
+        data.extend_from_slice(DICM_MAGIC);
+        write_explicit_element(
+            &mut data,
+            TAG_MEDIA_STORAGE_SOP_CLASS_UID,
+            b"UI",
+            VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE.as_bytes(),
+        );
+        fs::write(&path, data).unwrap();
+
+        assert!(!detect(&path));
+        let err = match open(&path) {
+            Ok(_) => panic!("expected dual-personality DICOM-BigTIFF to be unsupported"),
             Err(err) => err,
         };
         assert!(matches!(err, OpenSlideError::UnsupportedFormat(_)));
@@ -6574,6 +6570,21 @@ mod tests {
         assert_eq!(red.data, vec![1]);
         assert_eq!(green.data, vec![2]);
         assert_eq!(blue.data, vec![3]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn accepts_lossless_jpeg2000_ybr_rct_like_upstream() {
+        let path = test_path("accepts_lossless_jpeg2000_ybr_rct_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_JPEG_2000_LOSSLESS);
+        write_common_wsi_dataset(&mut data, TS_JPEG_2000_LOSSLESS, 1, 1, 1, 1, 1, "YBR_RCT");
+        let jpeg2000 = encoded_jpeg2000_codestream(&[10, 20, 30], 1, 1, 3);
+        write_encapsulated_pixel_data(&mut data, &[&jpeg2000]);
+        fs::write(&path, data).unwrap();
+
+        let slide = DicomSlide::open(&path).unwrap();
+        let red = slide.read_region(0, 0, 0, 0, 1, 1).unwrap();
+        assert_eq!(red.data, vec![10]);
         let _ = fs::remove_file(path);
     }
 
