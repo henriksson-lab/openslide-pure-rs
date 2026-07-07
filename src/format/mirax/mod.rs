@@ -219,13 +219,17 @@ fn read_record_data_to_end(path: &Path, offset: i64) -> Result<Vec<u8>> {
 
     let mut file = crate::util::_openslide_fopen(path)?;
     let file_len = crate::util::_openslide_fsize(&mut file)?;
+    let offset = u64::try_from(offset)
+        .map_err(|_| OpenSlideError::Format(format!("Negative record offset: offset={offset}")))?;
+    let file_len = u64::try_from(file_len)
+        .map_err(|_| OpenSlideError::Format(format!("Negative file size: file_len={file_len}")))?;
     let len = file_len.checked_sub(offset).ok_or_else(|| {
         OpenSlideError::Format(format!(
             "Record offset extends outside file: offset={}, file_len={}",
             offset, file_len
         ))
     })?;
-    crate::util::read_file_range(path, offset as u64, len as u64)
+    crate::util::read_file_range(path, offset, len)
 }
 
 fn validate_datafile_index(fileno: i32, datafile_count: usize, context: &str) -> Result<i32> {
