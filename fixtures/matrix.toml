@@ -81,7 +81,41 @@ area = "ndpi-layout-breadth"
 requirement = "Stripped/tiled NDPI, edge JPEGs, map levels, planar layouts, and additional recorded-MCU-start cases are fixture-backed."
 status = "pending"
 fixtures = []
-notes = "Need more NDPI fixtures beyond CMU-1/2/3 to cover non-DNL layouts, planar data, map levels, and edge tile behavior."
+notes = "Need more NDPI fixtures beyond CMU-1/2/3 for non-DNL layouts, planar data, map levels, and edge tile behavior. Distinct NDPI subtypes now on disk are split into the ndpi-jpegxr, ndpi-over-4gb-offset, and ndpi-fluorescence-ndpis cases below."
+
+[[case]]
+reader = "hamamatsu-ndpi"
+area = "ndpi-jpegxr"
+requirement = "JPEG-XR-compressed NDPI (TIFF compression 22610 / JPEGXR_NDPI) opens and reads through the jpegxr backend with parity or documented behavior."
+status = "pending"
+fixtures = ["hamamatsu-ndpi-local-jpegxr-1", "hamamatsu-ndpi-local-jpegxr-2"]
+notes = "Local DM0014 pair uses JPEG-XR tiles and a JPEG-XR macro image. Reference OpenSlide 3.4.1 also cannot open them (tag 278; OPENSLIDE_BUGS.md bug 3), so both are reference-blocked. Rust still fails because the jpegxr backend (src/decode/jpegxr.rs) is not wired into the NDPI tile/macro path; wiring it up is the remaining work."
+
+[[case]]
+reader = "hamamatsu-ndpi"
+area = "ndpi-over-4gb-offset"
+requirement = "NDPI files larger than 4 GB (32-bit-offset reuse trick) are detected and read without following unfixed IFD offsets into garbage."
+status = "pending"
+fixtures = [
+  "hamamatsu-ndpi-local-over4gb-1",
+  "hamamatsu-ndpi-local-over4gb-2",
+  "hamamatsu-ndpi-local-over4gb-3",
+  "hamamatsu-ndpi-local-over4gb-4",
+]
+notes = "Four local baseline-JPEG NDPI files (4.2-5.4 GB), all now readable. SR1274-908A/B (directory chain crosses 4 GB) read with spot-verified exact pixel parity and matching 10-level pyramids after the reader was made faithful to openslide-decode-tifflike.c (64-bit header offset, NDPI 8-byte next-directory offset, fix_offset_ndpi with first-IFD reuse). Dguok/Topors (directories >4 GB, JPEG at file start) are reference-blocked (OPENSLIDE_BUGS.md bug 1) but Rust reads real pixel data via SOI/EOI-validated offset and byte-count reconstruction. Formal harness checksums for the reference-readable pair are pending."
+
+[[case]]
+reader = "hamamatsu-ndpi"
+area = "ndpi-fluorescence-ndpis"
+requirement = "Fluorescence NDPI members and the .ndpis set descriptor are read as a multi-channel slide with parity or documented behavior."
+status = "pending"
+fixtures = [
+  "hamamatsu-ndpi-local-fluorescence-1",
+  "hamamatsu-ndpi-local-fluorescence-2",
+  "hamamatsu-ndpi-local-fluorescence-3",
+  "hamamatsu-ndpi-local-fluorescence-set",
+]
+notes = "Local test3 set: three single-channel fluorescence .ndpi members plus the test3.ndpis descriptor. The member .ndpi files read as RGB slides with spot-verified exact pixel parity and matching 7-level pyramids (formal harness checksums pending). The .ndpis set descriptor is reference-blocked (OPENSLIDE_BUGS.md bug 4); neither reader models the multi-channel set container."
 
 [[case]]
 reader = "leica"

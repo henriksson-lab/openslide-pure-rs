@@ -24,7 +24,18 @@ evidence = [
   "hamamatsu-ndpi-local-cmu-3",
   "hamamatsu-ndpi-public-cmu-1",
 ]
-blockers = []
+blockers = [
+  "hamamatsu-ndpi-local-jpegxr-1",
+  "hamamatsu-ndpi-local-jpegxr-2",
+  "hamamatsu-ndpi-local-over4gb-1",
+  "hamamatsu-ndpi-local-over4gb-2",
+  "hamamatsu-ndpi-local-over4gb-3",
+  "hamamatsu-ndpi-local-over4gb-4",
+  "hamamatsu-ndpi-local-fluorescence-1",
+  "hamamatsu-ndpi-local-fluorescence-2",
+  "hamamatsu-ndpi-local-fluorescence-3",
+  "hamamatsu-ndpi-local-fluorescence-set",
+]
 
 [[reader]]
 id = "hamamatsu-vms"

@@ -257,6 +257,13 @@ impl HamamatsuSlide {
         let mut fallback_levels = Vec::new();
         let mut associated_images = HashMap::new();
 
+        let file_len = {
+            let mut f = crate::util::_openslide_fopen(path)?;
+            u64::try_from(crate::util::_openslide_fsize(&mut f)?).map_err(|_| {
+                OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+            })?
+        };
+
         for (dir_index, dir) in tiff.dirs.iter().enumerate() {
             let width = match dir.first_uint(TIFFTAG_IMAGEWIDTH) {
                 Some(v) if v > 0 => v,
@@ -267,7 +274,8 @@ impl HamamatsuSlide {
                 _ => continue,
             };
 
-            let source = ndpi_level_source(path, tiff.endian, dir_index, dir, width, height)
+            let source =
+                ndpi_level_source(path, file_len, tiff.endian, dir_index, dir, width, height)
                 .map(LevelSource::Ndpi)
                 .unwrap_or(LevelSource::Unsupported);
             fallback_levels.push(Level {
@@ -950,6 +958,49 @@ fn hamamatsu_vms_vmu_detect(path: &Path) -> bool {
     }
 }
 
+/// Scan the directory at `first_ifd` for the NDPI format flag. Read errors
+/// (e.g. an offset past EOF from a wrong interpretation) count as "not found".
+fn ndpi_first_ifd_has_flag(
+    file: &mut crate::util::OpenSlideFile,
+    endian: Endian,
+    bigtiff: bool,
+    first_ifd: u64,
+) -> bool {
+    let scan = (|| -> Result<bool> {
+        let first_ifd = i64::try_from(first_ifd).map_err(|_| {
+            OpenSlideError::Format(format!(
+                "Hamamatsu NDPI first IFD offset does not fit OpenSlide seek: offset={first_ifd}"
+            ))
+        })?;
+        crate::util::_openslide_fseek(file, first_ifd, crate::util::OpenSlideSeekWhence::Set)?;
+
+        let count = if bigtiff {
+            let mut bytes = [0u8; 8];
+            crate::util::_openslide_fread_exact(file, &mut bytes)?;
+            read_u64_from_chunk(&bytes, endian)
+        } else {
+            let mut bytes = [0u8; 2];
+            crate::util::_openslide_fread_exact(file, &mut bytes)?;
+            u64::from(read_u16_from_chunk(&bytes, endian))
+        };
+        let count_usize = usize::try_from(count)
+            .map_err(|_| OpenSlideError::Format("BigTIFF entry count overflow".into()))?;
+        let entry_size = if bigtiff { 20usize } else { 12usize };
+
+        for _ in 0..count_usize {
+            let mut entry = vec![0u8; entry_size];
+            crate::util::_openslide_fread_exact(file, &mut entry)?;
+            let tag = read_u16_from_chunk(&entry[0..2], endian);
+            if tag == NDPI_FORMAT_FLAG {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    })();
+    scan.unwrap_or(false)
+}
+
 fn hamamatsu_ndpi_detect(path: &Path) -> bool {
     let result = (|| -> Result<bool> {
         let mut file = crate::util::_openslide_fopen(path)?;
@@ -962,43 +1013,33 @@ fn hamamatsu_ndpi_detect(path: &Path) -> bool {
             _ => return Err(OpenSlideError::Format("Not a TIFF file".into())),
         };
         let magic = read_u16_from_chunk(&header[2..4], endian);
-        let (bigtiff, first_ifd) = match magic {
-            42 => (false, read_u32_from_chunk(&header[4..8], endian) as u64),
+        // For classic TIFF, first try the NDPI 64-bit interpretation of the
+        // first-directory offset (high bits stashed in bytes 8..12), then fall
+        // back to the plain 32-bit offset. Mirrors the NDPI detection in
+        // openslide-decode-tifflike.c create().
+        let candidates: Vec<(bool, u64)> = match magic {
+            42 => {
+                crate::util::_openslide_fread_exact(&mut file, &mut header[8..12])?;
+                let off64 = read_u64_from_chunk(&header[4..12], endian);
+                let off32 = u64::from(read_u32_from_chunk(&header[4..8], endian));
+                if off64 == off32 {
+                    vec![(false, off32)]
+                } else {
+                    vec![(false, off64), (false, off32)]
+                }
+            }
             43 => {
                 crate::util::_openslide_fread_exact(&mut file, &mut header[8..16])?;
                 if read_u16_from_chunk(&header[4..6], endian) != 8 {
                     return Err(OpenSlideError::Format("Unsupported BigTIFF header".into()));
                 }
-                (true, read_u64_from_chunk(&header[8..16], endian))
+                vec![(true, read_u64_from_chunk(&header[8..16], endian))]
             }
             _ => return Err(OpenSlideError::Format("Not a TIFF file".into())),
         };
 
-        let first_ifd = i64::try_from(first_ifd).map_err(|_| {
-            OpenSlideError::Format(format!(
-                "Hamamatsu NDPI first IFD offset does not fit OpenSlide seek: offset={first_ifd}"
-            ))
-        })?;
-        crate::util::_openslide_fseek(&mut file, first_ifd, crate::util::OpenSlideSeekWhence::Set)?;
-
-        let count = if bigtiff {
-            let mut bytes = [0u8; 8];
-            crate::util::_openslide_fread_exact(&mut file, &mut bytes)?;
-            read_u64_from_chunk(&bytes, endian)
-        } else {
-            let mut bytes = [0u8; 2];
-            crate::util::_openslide_fread_exact(&mut file, &mut bytes)?;
-            u64::from(read_u16_from_chunk(&bytes, endian))
-        };
-        let count_usize = usize::try_from(count)
-            .map_err(|_| OpenSlideError::Format("BigTIFF entry count overflow".into()))?;
-        let entry_size = if bigtiff { 20usize } else { 12usize };
-
-        for _ in 0..count_usize {
-            let mut entry = vec![0u8; entry_size];
-            crate::util::_openslide_fread_exact(&mut file, &mut entry)?;
-            let tag = read_u16_from_chunk(&entry[0..2], endian);
-            if tag == NDPI_FORMAT_FLAG {
+        for (bigtiff, first_ifd) in candidates {
+            if ndpi_first_ifd_has_flag(&mut file, endian, bigtiff, first_ifd) {
                 return Ok(true);
             }
         }
@@ -1489,9 +1530,13 @@ fn add_ndpi_level_with_scaled(levels: &mut Vec<Level>, level: Level) {
     if !matches!(ndpi.compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG) {
         return;
     }
+    // Mirror create_scaled_jpeg_levels() in openslide-vendor-hamamatsu.c, which
+    // derives scale_denom 2, 4, and 8 levels from every real level (deduped by
+    // width in normalize_levels). Deriving only 2 and 4 dropped the smallest
+    // synthetic level relative to upstream.
     let mut width = level.width;
     let mut height = level.height;
-    for _ in 0..2 {
+    for _ in 0..3 {
         if width % 2 != 0 || height % 2 != 0 {
             break;
         }
@@ -2106,6 +2151,7 @@ fn jpeg_dimensions(data: &[u8]) -> Result<(u32, u32)> {
 
 fn ndpi_level_source(
     path: &Path,
+    file_len: u64,
     endian: Endian,
     dir_index: usize,
     dir: &TiffDir,
@@ -2146,11 +2192,11 @@ fn ndpi_level_source(
         if offsets.len() < tile_count_usize {
             return None;
         }
-        let mcu_starts = ndpi_recorded_mcu_starts(dir, offsets.first().copied()?);
-        let offsets = offsets
+        let offsets: Vec<u64> = offsets
             .into_iter()
-            .map(|offset| fix_offset_ndpi(dir.offset, offset))
+            .map(|offset| ndpi_resolve_value_offset(path, file_len, dir.offset, offset, compression))
             .collect();
+        let mcu_starts = ndpi_recorded_mcu_starts(dir, offsets.first().copied()?);
         return Some(NdpiLevel {
             path: path.to_path_buf(),
             dir_index: u32::try_from(dir_index).ok()?,
@@ -2180,11 +2226,31 @@ fn ndpi_level_source(
         return None;
     }
     let tile_count = height.div_ceil(rows_per_strip);
-    let mcu_starts = ndpi_recorded_mcu_starts(dir, offsets.first().copied()?);
     let offsets = offsets
         .into_iter()
-        .map(|offset| fix_offset_ndpi(dir.offset, offset))
+        .map(|offset| ndpi_resolve_value_offset(path, file_len, dir.offset, offset, compression))
         .collect::<Vec<_>>();
+    let mcu_starts = ndpi_recorded_mcu_starts(dir, offsets.first().copied()?);
+    // NDPI truncates the strip byte count to 32 bits; for a single >4 GB JPEG
+    // strip re-add the high bits so the strip covers its recorded MCU restarts.
+    let byte_counts = if offsets.len() == 1
+        && matches!(compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG)
+    {
+        let min_end = mcu_starts
+            .as_ref()
+            .and_then(|starts| starts.iter().copied().max())
+            .map(|last| last.saturating_add(1))
+            .unwrap_or_else(|| offsets[0].saturating_add(1));
+        vec![ndpi_resolve_strip_byte_count(
+            path,
+            file_len,
+            offsets[0],
+            byte_counts[0],
+            min_end,
+        )]
+    } else {
+        byte_counts
+    };
     Some(NdpiLevel {
         path: path.to_path_buf(),
         dir_index: u32::try_from(dir_index).ok()?,
@@ -2207,16 +2273,102 @@ fn ndpi_level_source(
     })
 }
 
-fn ndpi_recorded_mcu_starts(dir: &TiffDir, first_offset: u64) -> Option<Vec<u64>> {
+fn ndpi_recorded_mcu_starts(dir: &TiffDir, start_in_file: u64) -> Option<Vec<u64>> {
     let values = dir.uints(NDPI_MCU_STARTS)?;
     if values.is_empty() {
         return None;
     }
-    let start_in_file = fix_offset_ndpi(dir.offset, first_offset);
     values
         .into_iter()
         .map(|value| start_in_file.checked_add(value))
         .collect()
+}
+
+/// Reconstruct the full 64-bit file offset of an NDPI strip/tile value.
+///
+/// NDPI stores 32-bit offsets and re-adds the high-order bits with the
+/// `fix_offset_ndpi` heuristic, which assumes the data sits just below the
+/// directory. Some writers instead place the level-0 JPEG near the start of a
+/// file larger than 4 GB, where the heuristic (and upstream OpenSlide, which
+/// cannot read these files) reconstructs the wrong offset. For JPEG-compressed
+/// levels we therefore validate candidate offsets against the JPEG SOI marker
+/// and fall back to scanning each 4 GB half of the file. Non-JPEG levels keep
+/// the plain heuristic, matching upstream exactly.
+fn ndpi_resolve_value_offset(
+    path: &Path,
+    file_len: u64,
+    diroff: u64,
+    raw_offset: u64,
+    compression: u16,
+) -> u64 {
+    let heuristic = fix_offset_ndpi(diroff, raw_offset);
+    if !matches!(compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG) {
+        return heuristic;
+    }
+    if ndpi_offset_has_jpeg_soi(path, file_len, heuristic) {
+        return heuristic;
+    }
+    let low = raw_offset & u64::from(u32::MAX);
+    let mut high = 0u64;
+    while high < file_len {
+        let candidate = high | low;
+        if candidate != heuristic && ndpi_offset_has_jpeg_soi(path, file_len, candidate) {
+            return candidate;
+        }
+        high += 1u64 << 32;
+    }
+    heuristic
+}
+
+fn ndpi_offset_has_jpeg_soi(path: &Path, file_len: u64, offset: u64) -> bool {
+    ndpi_offset_has_marker(path, file_len, offset, 0xD8)
+}
+
+/// Check for a two-byte `0xFF <second>` JPEG marker at `offset`.
+fn ndpi_offset_has_marker(path: &Path, file_len: u64, offset: u64, second: u8) -> bool {
+    if offset.checked_add(2).is_none_or(|end| end > file_len) {
+        return false;
+    }
+    matches!(
+        crate::util::read_file_range(path, offset, 2).as_deref(),
+        Ok([0xFF, b]) if *b == second
+    )
+}
+
+/// Reconstruct the full byte length of an NDPI JPEG strip.
+///
+/// NDPI writes the strip byte count as a 32-bit value; for strips larger than
+/// 4 GB the high bits are lost, so the recorded count can point far short of the
+/// real end of the JPEG (upstream OpenSlide cannot read these files at all). We
+/// only re-add high bits when the stored length demonstrably fails to cover the
+/// recorded MCU restarts, and we confirm each candidate end against the JPEG EOI
+/// marker, so well-formed strips keep their original length untouched.
+fn ndpi_resolve_strip_byte_count(
+    path: &Path,
+    file_len: u64,
+    start: u64,
+    raw_byte_count: u64,
+    min_end: u64,
+) -> u64 {
+    let low = raw_byte_count & u64::from(u32::MAX);
+    let base_end = start.saturating_add(low);
+    if base_end <= file_len && base_end >= min_end {
+        return low;
+    }
+    let mut high = 1u64 << 32;
+    while let Some(count) = low.checked_add(high) {
+        let Some(end) = start.checked_add(count) else {
+            break;
+        };
+        if end > file_len {
+            break;
+        }
+        if end >= min_end && ndpi_offset_has_marker(path, file_len, end - 2, 0xD9) {
+            return count;
+        }
+        high += 1u64 << 32;
+    }
+    low
 }
 
 fn fix_offset_ndpi(diroff: u64, offset: u64) -> u64 {
@@ -4843,6 +4995,10 @@ struct TiffValue {
     field_type: u16,
     data: Vec<u8>,
     endian: Endian,
+    /// Fixed file offset of an out-of-line value, or `None` when the value is
+    /// stored inline. Retained so later NDPI directories can reuse an identical
+    /// offset from the first directory (see `entry_value`).
+    offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4868,8 +5024,15 @@ impl TiffFile {
             _ => return Err(OpenSlideError::Format("Not a TIFF file".into())),
         };
         let magic = read_u16_from_chunk(&header[2..4], endian);
+        // For classic TIFF, read the first-directory offset as a 64-bit value.
+        // NDPI is classic TIFF pretending to be BigTIFF: it stashes the high 32
+        // bits of a (possibly >4 GB) offset in the four bytes following the
+        // classic 32-bit offset field. Mirrors openslide-decode-tifflike.c.
         let (bigtiff, mut offset) = match magic {
-            42 => (false, read_u32_from_chunk(&header[4..8], endian) as u64),
+            42 => {
+                crate::util::_openslide_fread_exact(&mut file, &mut header[8..12])?;
+                (false, read_u64_from_chunk(&header[4..12], endian))
+            }
             43 => {
                 crate::util::_openslide_fread_exact(&mut file, &mut header[8..16])?;
                 if read_u16_from_chunk(&header[4..6], endian) != 8 {
@@ -4880,13 +5043,40 @@ impl TiffFile {
             _ => return Err(OpenSlideError::Format("Not a TIFF file".into())),
         };
 
-        let mut dirs = Vec::new();
+        let mut dirs: Vec<TiffDir> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+
+        // NDPI detection: for classic TIFF, treat the offset as 64-bit and try
+        // parsing the first directory in NDPI mode. If it parses and carries the
+        // NDPI format flag, this is NDPI; otherwise fall back to a 32-bit offset
+        // and plain classic-TIFF parsing (openslide-decode-tifflike.c create()).
+        let mut ndpi = false;
+        if !bigtiff && offset != 0 {
+            if let Ok((mut dir, next)) =
+                parse_tiff_dir(path, file_len, offset, endian, false, true, None)
+            {
+                if dir.contains(NDPI_FORMAT_FLAG) {
+                    ndpi = true;
+                    dir.offset = offset;
+                    seen.insert(offset);
+                    dirs.push(dir);
+                    offset = next;
+                }
+            }
+            if !ndpi {
+                // Classic TIFF: the offset is only 32 bits. Discard the high bits.
+                offset &= u64::from(u32::MAX);
+            }
+        }
+
         while offset != 0 {
             if !seen.insert(offset) {
                 return Err(OpenSlideError::Format("TIFF directory loop".into()));
             }
-            let (mut dir, next) = parse_tiff_dir(path, file_len, offset, endian, bigtiff)?;
+            let (mut dir, next) = {
+                let first_dir = dirs.first();
+                parse_tiff_dir(path, file_len, offset, endian, bigtiff, ndpi, first_dir)?
+            };
             dir.offset = offset;
             dirs.push(dir);
             offset = next;
@@ -5004,6 +5194,8 @@ fn parse_tiff_dir(
     offset: u64,
     endian: Endian,
     bigtiff: bool,
+    ndpi: bool,
+    first_dir: Option<&TiffDir>,
 ) -> Result<(TiffDir, u64)> {
     if bigtiff {
         let count_bytes = read_file_range_exact(path, file_len, offset, 8)?;
@@ -5036,6 +5228,9 @@ fn parse_tiff_dir(
                 endian,
                 field_type,
                 value_count,
+                false,
+                offset,
+                None,
             )?;
             entries.insert(tag, value);
         }
@@ -5054,7 +5249,11 @@ fn parse_tiff_dir(
         let next_offset_pos = entries_start
             .checked_add(table_len as u64)
             .ok_or_else(|| OpenSlideError::Format("TIFF entry table overflow".into()))?;
-        ensure_file_range(file_len, next_offset_pos, 4)?;
+        // NDPI stores the next-directory offset as a full 64-bit value, even
+        // though it is otherwise a classic 32-bit TIFF (openslide-decode-tifflike.c
+        // read_directory()). Reading only 32 bits truncates offsets past 4 GB.
+        let next_width: usize = if ndpi { 8 } else { 4 };
+        ensure_file_range(file_len, next_offset_pos, next_width)?;
         let table = read_file_range_exact(path, file_len, entries_start, table_len)?;
 
         let mut entries = HashMap::new();
@@ -5063,6 +5262,9 @@ fn parse_tiff_dir(
             let tag = read_u16_from_chunk(&table[pos..pos + 2], endian);
             let field_type = read_u16_from_chunk(&table[pos + 2..pos + 4], endian);
             let value_count = read_u32_from_chunk(&table[pos + 4..pos + 8], endian) as u64;
+            let first_dir_offset = first_dir
+                .and_then(|d| d.entries.get(&tag))
+                .and_then(|v| v.offset);
             let value = entry_value(
                 path,
                 file_len,
@@ -5071,15 +5273,23 @@ fn parse_tiff_dir(
                 endian,
                 field_type,
                 value_count,
+                ndpi,
+                offset,
+                first_dir_offset,
             )?;
             entries.insert(tag, value);
         }
-        let next_bytes = read_file_range_exact(path, file_len, next_offset_pos, 4)?;
-        let next = read_u32_from_chunk(&next_bytes, endian) as u64;
+        let next_bytes = read_file_range_exact(path, file_len, next_offset_pos, next_width)?;
+        let next = if next_width == 8 {
+            read_u64_from_chunk(&next_bytes, endian)
+        } else {
+            read_u32_from_chunk(&next_bytes, endian) as u64
+        };
         Ok((TiffDir { offset: 0, entries }, next))
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn entry_value(
     path: &Path,
     file_len: u64,
@@ -5088,6 +5298,9 @@ fn entry_value(
     endian: Endian,
     field_type: u16,
     count: u64,
+    ndpi: bool,
+    diroff: u64,
+    first_dir_offset: Option<u64>,
 ) -> Result<TiffValue> {
     let type_size = tiff_type_size(field_type).ok_or_else(|| {
         OpenSlideError::Format(format!("Unsupported TIFF field type {field_type}"))
@@ -5096,21 +5309,36 @@ fn entry_value(
         .checked_mul(type_size as u64)
         .and_then(|v| usize::try_from(v).ok())
         .ok_or_else(|| OpenSlideError::Format("TIFF value size overflow".into()))?;
-    let data = if byte_count <= inline_width {
-        value_field[..byte_count].to_vec()
+    let (data, offset) = if byte_count <= inline_width {
+        (value_field[..byte_count].to_vec(), None)
     } else {
-        let offset = if inline_width == 8 {
+        let raw_offset = if inline_width == 8 {
             read_u64_from_chunk(value_field, endian)
         } else {
             read_u32_from_chunk(value_field, endian) as u64
         };
+        // NDPI value offsets are 32 bits; re-add the implied high-order bits.
+        // If the first directory referenced the same tag at the same offset,
+        // reuse it unchanged (openslide-decode-tifflike.c read_directory()).
+        let offset = if ndpi {
+            match first_dir_offset {
+                Some(fixed) if fixed == raw_offset => raw_offset,
+                _ => fix_offset_ndpi(diroff, raw_offset),
+            }
+        } else {
+            raw_offset
+        };
         ensure_file_range(file_len, offset, byte_count)?;
-        read_file_range_exact(path, file_len, offset, byte_count)?
+        (
+            read_file_range_exact(path, file_len, offset, byte_count)?,
+            Some(offset),
+        )
     };
     Ok(TiffValue {
         field_type,
         data,
         endian,
+        offset,
     })
 }
 
@@ -5814,6 +6042,7 @@ mod tests {
                     field_type: 2,
                     data: b"CustomOne=alpha\nCustomTwo=beta\0".to_vec(),
                     endian: Endian::Little,
+                    offset: None,
                 },
             )]),
         };
@@ -5825,6 +6054,69 @@ mod tests {
             Some(&"alpha\nCustomTwo=beta".to_string())
         );
         assert!(properties.get("hamamatsu.CustomTwo").is_none());
+    }
+
+    #[test]
+    fn ndpi_marker_detection_matches_soi_and_eoi() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-marker");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("markers.bin");
+        // SOI at 0, EOI at 4, plain bytes at 2.
+        fs::write(&path, [0xff, 0xd8, 0x12, 0x34, 0xff, 0xd9]).unwrap();
+        let len = 6;
+        assert!(ndpi_offset_has_jpeg_soi(&path, len, 0));
+        assert!(ndpi_offset_has_marker(&path, len, 4, 0xd9));
+        assert!(!ndpi_offset_has_jpeg_soi(&path, len, 2));
+        // Out-of-range reads never panic and report "no marker".
+        assert!(!ndpi_offset_has_marker(&path, len, 5, 0xd9));
+        assert!(!ndpi_offset_has_marker(&path, len, u64::MAX, 0xd8));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ndpi_value_offset_keeps_heuristic_for_valid_and_non_jpeg() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-value-offset");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.bin");
+        // JPEG SOI at offset 8.
+        let mut bytes = vec![0u8; 32];
+        bytes[8] = 0xff;
+        bytes[9] = 0xd8;
+        fs::write(&path, &bytes).unwrap();
+        let len = 32;
+        // Sub-4 GB directory: the heuristic is the identity, and the SOI is
+        // present, so the offset is returned unchanged.
+        assert_eq!(
+            ndpi_resolve_value_offset(&path, len, 0x100, 8, COMPRESSION_JPEG),
+            8
+        );
+        // Non-JPEG levels always keep the plain heuristic without touching the file.
+        assert_eq!(
+            ndpi_resolve_value_offset(&path, len, 0x100, 20, COMPRESSION_NONE),
+            20
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ndpi_strip_byte_count_trusts_covering_length() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-byte-count");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("strip.bin");
+        fs::write(&path, vec![0u8; 4096]).unwrap();
+        let len = 4096;
+        // Stored length already reaches past the recorded restarts (min_end): keep it.
+        assert_eq!(
+            ndpi_resolve_strip_byte_count(&path, len, 100, 3000, 3000),
+            3000
+        );
+        // Length falls short of min_end but the 4 GB-shifted candidate is beyond
+        // the file, so we fall back to the stored low value rather than inventing one.
+        assert_eq!(
+            ndpi_resolve_strip_byte_count(&path, len, 100, 200, 4000),
+            200
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

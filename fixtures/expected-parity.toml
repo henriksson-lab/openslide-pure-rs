@@ -76,6 +76,66 @@ reference_rgb_checksum = 92102477
 notes = "DNL/zero-width JPEG fixture is exact after using TIFF dimensions plus recorded MCU restart offsets and exact-halving synthetic NDPI level generation."
 
 [[expectation]]
+fixture = "hamamatsu-ndpi-local-jpegxr-1"
+reader = "hamamatsu-ndpi"
+status = "blocked"
+notes = "JPEG-XR NDPI. Reference OpenSlide 3.4.1 cannot open it (tag 278; OPENSLIDE_BUGS.md bug 3), so parity is not measurable; Rust's jpegxr NDPI path is also unwired."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-jpegxr-2"
+reader = "hamamatsu-ndpi"
+status = "blocked"
+notes = "JPEG-XR NDPI. Same as hamamatsu-ndpi-local-jpegxr-1: reference-blocked (tag 278) and Rust jpegxr NDPI path unwired."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-over4gb-1"
+reader = "hamamatsu-ndpi"
+status = "blocked"
+notes = "4.2 GB baseline-JPEG NDPI. Reference OpenSlide 3.4.1 cannot open it (OPENSLIDE_BUGS.md bug 1), so parity is not measurable. Rust now reads real pixel data via SOI/EOI-validated offset and byte-count reconstruction."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-over4gb-2"
+reader = "hamamatsu-ndpi"
+status = "blocked"
+notes = "4.3 GB baseline-JPEG NDPI. Reference-blocked (bug 1); Rust now reads real pixel data after 64-bit header detection and offset/byte-count reconstruction."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-over4gb-3"
+reader = "hamamatsu-ndpi"
+status = "pending"
+notes = "5.4 GB baseline-JPEG NDPI. Now reads with spot-verified exact pixel parity and a matching 10-level pyramid; formal harness checksums pending."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-over4gb-4"
+reader = "hamamatsu-ndpi"
+status = "pending"
+notes = "4.7 GB baseline-JPEG NDPI. Now reads with spot-verified exact pixel parity and a matching 10-level pyramid; formal harness checksums pending."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-fluorescence-1"
+reader = "hamamatsu-ndpi"
+status = "pending"
+notes = "Single-channel fluorescence NDPI (DAPI). Reads as RGB with spot-verified exact pixel parity and a matching 7-level pyramid; formal harness checksums pending."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-fluorescence-2"
+reader = "hamamatsu-ndpi"
+status = "pending"
+notes = "Single-channel fluorescence NDPI (FITC). Reads as RGB, 7-level pyramid matching reference; formal harness checksums pending."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-fluorescence-3"
+reader = "hamamatsu-ndpi"
+status = "pending"
+notes = "Single-channel fluorescence NDPI (TRITC). Reads as RGB, 7-level pyramid matching reference; formal harness checksums pending."
+
+[[expectation]]
+fixture = "hamamatsu-ndpi-local-fluorescence-set"
+reader = "hamamatsu-ndpi"
+status = "blocked"
+notes = "The test3.ndpis fluorescence set descriptor. Reference OpenSlide 3.4.1 cannot open it (OPENSLIDE_BUGS.md bug 4); neither reader models the set container."
+
+[[expectation]]
 fixture = "hamamatsu-vmu-ngr-missing"
 reader = "hamamatsu-vmu-ngr"
 status = "missing-fixture"

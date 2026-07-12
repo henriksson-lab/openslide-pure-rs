@@ -71,6 +71,106 @@ status = "exact"
 notes = "DNL/zero-width JPEG fixture now reads RGBA and single-channel regions through recorded MCU restart offsets with exact sampled checksum parity and OpenSlide-matching synthetic levels."
 
 [[fixture]]
+id = "hamamatsu-ndpi-local-jpegxr-1"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/hamamatsu/DM0014 - 2020-04-02 10.25.21.ndpi"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "blocked"
+notes = "JPEG-XR NDPI (TIFF compression 22610 / JPEGXR_NDPI), 2.7 GB. Reference OpenSlide 3.4.1 cannot open it either ('No such value: directory 0, tag 278'; see OPENSLIDE_BUGS.md bug 3), so parity is not measurable. Rust also fails today because the jpegxr backend is not wired into the NDPI tile/macro path."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-jpegxr-2"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/hamamatsu/DM0014 - 2020-04-02 11.10.47.ndpi"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "blocked"
+notes = "JPEG-XR NDPI (TIFF compression 22610 / JPEGXR_NDPI), 2.0 GB. Same as hamamatsu-ndpi-local-jpegxr-1: reference OpenSlide 3.4.1 cannot open it (tag 278; OPENSLIDE_BUGS.md bug 3) and Rust's jpegxr NDPI path is not wired yet."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-over4gb-1"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/imagesc-84874/Dguok_A_6275_Con_OV_01.ndpi"
+source = "local audit data (image.sc thread 84874)"
+access = "private"
+license = "unknown"
+status = "blocked"
+notes = "Baseline-JPEG NDPI, 4.2 GB, with directories above 4 GB and the level-0 JPEG at the file start. Reference OpenSlide 3.4.1 cannot open it ('Can't validate JPEG for directory 0: Expected marker at 4294976264'; OPENSLIDE_BUGS.md bug 1), so parity is not measurable. The Rust reader now opens it (234240x81664, 7 levels) and reads real pixel data via SOI/EOI-validated NDPI offset and byte-count reconstruction."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-over4gb-2"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/imagesc-84874/Topors_A-2634_OV_03.ndpi"
+source = "local audit data (image.sc thread 84874)"
+access = "private"
+license = "unknown"
+status = "blocked"
+notes = "Baseline-JPEG NDPI, 4.3 GB, first directory at 4.33 GB and level-0 JPEG at the file start. Reference OpenSlide 3.4.1 cannot open it (same bug 1 as over4gb-1), so parity is not measurable. The Rust reader now opens it (211200x95744, 7 levels) and reads real pixel data after 64-bit header detection plus SOI/EOI-validated offset and byte-count reconstruction."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-over4gb-3"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/imagesc-86248/SR1274-908A.ndpi"
+source = "local audit data (image.sc thread 86248)"
+access = "private"
+license = "unknown"
+status = "pending"
+notes = "Baseline-JPEG NDPI, 5.4 GB, first directory below 4 GB but the directory chain crosses 4 GB. Now reads with spot-verified exact pixel parity against reference OpenSlide and a matching 10-level pyramid, after reading the NDPI 8-byte next-directory offset. Formal parity-harness checksums still pending."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-over4gb-4"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/imagesc-86248/SR1274-908B.ndpi"
+source = "local audit data (image.sc thread 86248)"
+access = "private"
+license = "unknown"
+status = "pending"
+notes = "Baseline-JPEG NDPI, 4.7 GB, directory chain crosses 4 GB. Now reads with spot-verified exact pixel parity against reference OpenSlide and a matching 10-level pyramid, after reading the NDPI 8-byte next-directory offset. Formal parity-harness checksums still pending."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-fluorescence-1"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/manuel/test3-DAPI 2 (387) .ndpi"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "pending"
+notes = "Single-channel fluorescence NDPI (DAPI), baseline JPEG, 3.4 MB, 3968x4864. Reads as a 3-channel RGB slide with spot-verified exact pixel parity against reference OpenSlide and a matching 7-level pyramid; one member of the test3.ndpis fluorescence set. Formal parity-harness checksums still pending."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-fluorescence-2"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/manuel/test3-FITC 2 (485).ndpi"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "pending"
+notes = "Single-channel fluorescence NDPI (FITC), baseline JPEG, 4.3 MB. Reads as an RGB slide, 7-level pyramid matching reference; member of the test3.ndpis set. Formal parity-harness checksums still pending."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-fluorescence-3"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/manuel/test3-TRITC 2 (560).ndpi"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "pending"
+notes = "Single-channel fluorescence NDPI (TRITC), baseline JPEG, 3.0 MB. Reads as an RGB slide, 7-level pyramid matching reference; member of the test3.ndpis set. Formal parity-harness checksums still pending."
+
+[[fixture]]
+id = "hamamatsu-ndpi-local-fluorescence-set"
+reader = "hamamatsu-ndpi"
+path = "/big/henriksson/ome_images/Hamamatsu-NDPI/manuel/test3.ndpis"
+source = "local audit data"
+access = "private"
+license = "unknown"
+status = "blocked"
+notes = "The .ndpis fluorescence set descriptor (INI text) binding the three test3-*.ndpi members into one multi-channel slide. Reference OpenSlide 3.4.1 cannot open it either ('Unsupported or missing image file'; OPENSLIDE_BUGS.md bug 4), so parity is not measurable. Neither reader models the .ndpis set container; the member .ndpi files read individually with exact parity."
+
+[[fixture]]
 id = "hamamatsu-vmu-ngr-missing"
 reader = "hamamatsu-vmu-ngr"
 path = ""
