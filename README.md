@@ -308,6 +308,12 @@ details and OME-Zarr caveats. A runnable example is available at
 cargo run --example compressed_extraction -- slide.svs
 ```
 
+To write a standalone JPEG for one derived, jpegtran-style crop tile:
+
+```sh
+cargo run --example jpegtran_crop -- slide.mrxs 0 0 0 crop.jpg
+```
+
 ### CLI
 
 #### Slide info
