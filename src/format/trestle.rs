@@ -12,6 +12,11 @@ use std::sync::Arc;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 
 use crate::cache::{CachedTile, TileCache};
+use crate::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedLevelInfo, CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace,
+    LossyCodec,
+};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff::OpenslideHash, SlideBackend};
@@ -1363,6 +1368,293 @@ impl TrestleSlide {
             Ok(())
         })
     }
+
+    fn compressed_level_info_impl(&self, level_index: u32) -> Result<CompressedExtractionSupport> {
+        let level = self.level(level_index)?;
+        let codec = match self.lossy_level_codec(level, 0)? {
+            Some(codec) => codec,
+            None => {
+                return Ok(CompressedExtractionSupport::NotSupported {
+                    reason: trestle_compressed_unsupported_reason(level),
+                });
+            }
+        };
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                level: level_index,
+                width: level.width,
+                height: level.height,
+                tile_width: level.tile_width,
+                tile_height: level.tile_height,
+                tiles_across: level.tiles_across,
+                tiles_down: level.tiles_down,
+                codec,
+                modes: trestle_compressed_modes(level),
+                constraints: vec![
+                    CompressedExtractionConstraint::RequiresCustomZarrCodec,
+                    CompressedExtractionConstraint::EdgeTilesMayBePartial,
+                ],
+            },
+        ))
+    }
+
+    fn lossy_level_codec(&self, level: &TrestleLevel, tile_no: u64) -> Result<Option<LossyCodec>> {
+        if !trestle_level_is_simple_tile_grid(level)
+            || level.planar_config != PLANARCONFIG_CONTIG
+            || level.old_jpeg.is_some()
+            || level.samples_per_pixel != level.channel_count() as u16
+            || level.bits_per_sample.iter().any(|&bits| bits != 8)
+        {
+            return Ok(None);
+        }
+        match level.compression {
+            COMPRESSION_JPEG => Ok(Some(LossyCodec::Jpeg {
+                color_space: trestle_jpeg_color_space(level.photometric),
+                subsampling: None,
+            })),
+            COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+                let byte_count = *level.tile_byte_counts.get(tile_no as usize).unwrap_or(&0);
+                if byte_count == 0 {
+                    return Ok(None);
+                }
+                let offset = *level.tile_offsets.get(tile_no as usize).unwrap_or(&0);
+                let raw = read_file_range_from_open_file(
+                    &self.tiff_file,
+                    self.tiff_file_len,
+                    offset,
+                    byte_count,
+                )?;
+                let info = decode::jpeg2000::inspect(&raw)?;
+                if info.coding_style.as_ref().is_some_and(|style| {
+                    style.transformation == decode::jpeg2000::WaveletTransform::Irreversible9x7
+                }) {
+                    Ok(Some(LossyCodec::Jpeg2000 {
+                        container: if info.is_jp2_container {
+                            Jpeg2000Container::Jp2
+                        } else {
+                            Jpeg2000Container::Codestream
+                        },
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn read_compressed_tile_impl(
+        &self,
+        level_index: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        let level = self.level(level_index)?;
+        let mode = trestle_compressed_modes(level)
+            .into_iter()
+            .find(|mode| mode_allowed(preferred_modes, *mode))
+            .ok_or_else(|| {
+                OpenSlideError::UnsupportedFormat(
+                    "requested compressed tile modes are not available for Trestle".into(),
+                )
+            })?;
+        if col >= level.tiles_across || row >= level.tiles_down {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid compressed tile coordinates ({col}, {row}) for level {level_index}"
+            )));
+        }
+        let tile_no = row
+            .checked_mul(level.tiles_across)
+            .and_then(|base| base.checked_add(col))
+            .ok_or_else(|| OpenSlideError::InvalidArgument("Trestle tile index overflow".into()))?;
+        let Some(codec) = self.lossy_level_codec(level, tile_no)? else {
+            return Err(OpenSlideError::UnsupportedFormat(
+                trestle_compressed_unsupported_reason(level),
+            ));
+        };
+        let byte_count = *level
+            .tile_byte_counts
+            .get(tile_no as usize)
+            .ok_or_else(|| OpenSlideError::Format("Trestle tile byte count is missing".into()))?;
+        if byte_count == 0 {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "Trestle tile is missing and cannot be emitted as original lossy bytes".into(),
+            ));
+        }
+        let offset = *level
+            .tile_offsets
+            .get(tile_no as usize)
+            .ok_or_else(|| OpenSlideError::Format("Trestle tile offset is missing".into()))?;
+        let (width, height) = trestle_tile_visible_size(level, tile_no)?;
+        Ok(CompressedTile {
+            level: level_index,
+            col,
+            row,
+            origin_x: col * u64::from(level.tile_width),
+            origin_y: row * u64::from(level.tile_height),
+            width,
+            height,
+            nominal_tile_width: level.tile_width,
+            nominal_tile_height: level.tile_height,
+            codec,
+            mode,
+            bytes: match mode {
+                CompressedTileMode::OriginalBytes => CompressedBytes::FileRange {
+                    path: self.tiff_path.clone(),
+                    offset,
+                    length: byte_count,
+                },
+                CompressedTileMode::DerivedLosslessJpeg => {
+                    let raw = read_file_range_from_open_file(
+                        &self.tiff_file,
+                        self.tiff_file_len,
+                        offset,
+                        byte_count,
+                    )?;
+                    CompressedBytes::Owned(merge_jpeg_tables(&raw, level.jpeg_tables.as_deref())?)
+                }
+            },
+        })
+    }
+}
+
+fn trestle_level_is_simple_tile_grid(level: &TrestleLevel) -> bool {
+    (level.tile_advance_x - f64::from(level.tile_width)).abs() <= 1e-9
+        && (level.tile_advance_y - f64::from(level.tile_height)).abs() <= 1e-9
+        && level.width == level.stored_width
+        && level.height == level.stored_height
+}
+
+fn trestle_compressed_unsupported_reason(level: &TrestleLevel) -> String {
+    if !trestle_level_is_simple_tile_grid(level) {
+        return "Trestle level uses overlap-aware placement; use read_region instead".into();
+    }
+    if level.planar_config != PLANARCONFIG_CONTIG {
+        return "Trestle level uses planar separate storage; use read_region instead".into();
+    }
+    if level.old_jpeg.is_some() {
+        return "Trestle level uses old JPEG; derived lossless JPEG is not implemented".into();
+    }
+    if level.bits_per_sample.iter().any(|&bits| bits != 8) {
+        return "Trestle level is not 8-bit lossy data; use read_region instead".into();
+    }
+    match level.compression {
+        COMPRESSION_NONE => "Trestle level is uncompressed; use read_region instead".into(),
+        COMPRESSION_LZW => "Trestle level uses lossless LZW; use read_region instead".into(),
+        COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => {
+            "Trestle level uses lossless Deflate; use read_region instead".into()
+        }
+        COMPRESSION_PACKBITS => {
+            "Trestle level uses lossless PackBits; use read_region instead".into()
+        }
+        COMPRESSION_JPEG => "Trestle JPEG level is not supported for compressed extraction".into(),
+        COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+            "Trestle JPEG 2000 level is not known to be lossy; use read_region instead".into()
+        }
+        other => format!("Trestle compression {other} is not supported for compressed extraction"),
+    }
+}
+
+fn trestle_jpeg_color_space(photometric: u16) -> JpegColorSpace {
+    match photometric {
+        PHOTOMETRIC_RGB => JpegColorSpace::Rgb,
+        PHOTOMETRIC_YCBCR => JpegColorSpace::YCbCr,
+        PHOTOMETRIC_WHITE_IS_ZERO | PHOTOMETRIC_BLACK_IS_ZERO => JpegColorSpace::Gray,
+        _ => JpegColorSpace::Unknown,
+    }
+}
+
+fn trestle_compressed_modes(level: &TrestleLevel) -> Vec<CompressedTileMode> {
+    match (level.compression, level.jpeg_tables.is_some()) {
+        (COMPRESSION_JPEG, true) => vec![CompressedTileMode::DerivedLosslessJpeg],
+        _ => vec![CompressedTileMode::OriginalBytes],
+    }
+}
+
+fn trestle_tile_visible_size(level: &TrestleLevel, tile_no: u64) -> Result<(u32, u32)> {
+    let col = tile_no % level.tiles_across;
+    let row = tile_no / level.tiles_across;
+    if row >= level.tiles_down {
+        return Err(OpenSlideError::Format(
+            "Trestle tile index outside level".into(),
+        ));
+    }
+    let visible_w =
+        (level.width - col * u64::from(level.tile_width)).min(u64::from(level.tile_width)) as u32;
+    let visible_h = (level.height - row * u64::from(level.tile_height))
+        .min(u64::from(level.tile_height)) as u32;
+    Ok((visible_w, visible_h))
+}
+
+fn merge_jpeg_tables(tile: &[u8], tables: Option<&[u8]>) -> Result<Vec<u8>> {
+    if !starts_with_soi(tile) {
+        return Err(OpenSlideError::Decode(
+            "Trestle JPEG data does not contain an interchange JPEG stream".into(),
+        ));
+    }
+    let Some(tables) = tables else {
+        return Ok(tile.to_vec());
+    };
+    if tables.is_empty() || has_jpeg_marker(tile, 0xdb) && has_jpeg_marker(tile, 0xc4) {
+        return Ok(tile.to_vec());
+    }
+    let Some(payload) = jpeg_tables_payload(tables) else {
+        return Ok(tile.to_vec());
+    };
+    if payload.is_empty() {
+        return Ok(tile.to_vec());
+    }
+
+    let mut merged = Vec::with_capacity(tile.len() + payload.len());
+    merged.extend_from_slice(&tile[..2]);
+    merged.extend_from_slice(payload);
+    merged.extend_from_slice(&tile[2..]);
+    Ok(merged)
+}
+
+fn jpeg_tables_payload(data: &[u8]) -> Option<&[u8]> {
+    if !starts_with_soi(data) {
+        return None;
+    }
+    let mut end = data.len();
+    if end >= 4 && data[end - 2] == 0xff && data[end - 1] == 0xd9 {
+        end -= 2;
+    }
+    Some(&data[2..end])
+}
+
+fn has_jpeg_marker(data: &[u8], wanted: u8) -> bool {
+    let mut idx = if starts_with_soi(data) { 2 } else { 0 };
+    while idx + 4 <= data.len() {
+        if data[idx] != 0xff {
+            idx += 1;
+            continue;
+        }
+        while idx < data.len() && data[idx] == 0xff {
+            idx += 1;
+        }
+        if idx >= data.len() {
+            return false;
+        }
+        let marker = data[idx];
+        idx += 1;
+        if marker == wanted {
+            return true;
+        }
+        if marker == 0xd8 || marker == 0xd9 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        if idx + 2 > data.len() {
+            return false;
+        }
+        let len = u16::from_be_bytes([data[idx], data[idx + 1]]) as usize;
+        if len < 2 || idx + len > data.len() {
+            return false;
+        }
+        idx += len;
+    }
+    false
 }
 
 impl SlideBackend for TrestleSlide {
@@ -1398,6 +1690,20 @@ impl SlideBackend for TrestleSlide {
         self.levels
             .get(level as usize)
             .map(|level| (u64::from(level.tile_width), u64::from(level.tile_height)))
+    }
+
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        self.compressed_level_info_impl(level)
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        self.read_compressed_tile_impl(level, col, row, preferred_modes)
     }
 
     fn read_region(
@@ -3148,6 +3454,116 @@ mod tests {
             tile.rgb,
             vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120].into()
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_returns_simple_trestle_jpeg_file_range() {
+        let path = temp_path("trestle-compressed-jpeg.bin");
+        fs::write(&path, [0xff, 0xd8, 0xff, 0xd9, 99]).unwrap();
+        let slide = trestle_test_slide(path.clone(), COMPRESSION_JPEG, 2, 1);
+
+        let support = slide.compressed_level_info(0).unwrap();
+        assert!(matches!(
+            support,
+            crate::compressed::CompressedExtractionSupport::Supported(_)
+        ));
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+
+        assert_eq!(
+            tile.codec,
+            crate::compressed::LossyCodec::Jpeg {
+                color_space: crate::compressed::JpegColorSpace::Rgb,
+                subsampling: None,
+            }
+        );
+        assert_eq!(
+            tile.mode,
+            crate::compressed::CompressedTileMode::OriginalBytes
+        );
+        assert_eq!(tile.width, 2);
+        assert_eq!(tile.height, 1);
+        assert_eq!(
+            tile.bytes,
+            crate::compressed::CompressedBytes::FileRange {
+                path: path.clone(),
+                offset: 0,
+                length: 5,
+            }
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_merges_trestle_jpeg_tables_as_derived_jpeg() {
+        let path = temp_path("trestle-compressed-jpeg-tables.bin");
+        let tile_jpeg = [0xff, 0xd8, 0xff, 0xd9];
+        fs::write(&path, tile_jpeg).unwrap();
+        let mut table_payload = vec![0xff, 0xdb, 0x00, 0x43, 0x00];
+        table_payload.extend([1u8; 64]);
+        let mut jpeg_tables = vec![0xff, 0xd8];
+        jpeg_tables.extend_from_slice(&table_payload);
+        jpeg_tables.extend_from_slice(&[0xff, 0xd9]);
+        let mut slide = trestle_test_slide(path.clone(), COMPRESSION_JPEG, 2, 1);
+        slide.levels[0].jpeg_tables = Some(jpeg_tables);
+        slide.levels[0].tile_byte_counts = vec![tile_jpeg.len() as u64];
+
+        let crate::compressed::CompressedExtractionSupport::Supported(info) =
+            slide.compressed_level_info(0).unwrap()
+        else {
+            panic!("expected Trestle JPEG level with JPEGTables to be supported");
+        };
+        assert_eq!(
+            info.modes,
+            vec![crate::compressed::CompressedTileMode::DerivedLosslessJpeg]
+        );
+        let err = slide
+            .read_compressed_tile(
+                0,
+                0,
+                0,
+                &[crate::compressed::CompressedTileMode::OriginalBytes],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("requested compressed tile modes"));
+
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+        let mut expected = vec![0xff, 0xd8];
+        expected.extend_from_slice(&table_payload);
+        expected.extend_from_slice(&tile_jpeg[2..]);
+        assert_eq!(
+            tile.mode,
+            crate::compressed::CompressedTileMode::DerivedLosslessJpeg
+        );
+        assert_eq!(
+            tile.bytes,
+            crate::compressed::CompressedBytes::Owned(expected)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_rejects_trestle_overlap_levels() {
+        let path = temp_path("trestle-compressed-overlap.bin");
+        fs::write(&path, [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+        let mut slide = trestle_test_slide(path.clone(), COMPRESSION_JPEG, 2, 1);
+        slide.levels[0].width = 3;
+        slide.levels[0].stored_width = 4;
+        slide.levels[0].tile_advance_x = 1.0;
+        slide.levels[0].tiles_across = 2;
+        slide.levels[0].tile_offsets = vec![0, 0];
+        slide.levels[0].tile_byte_counts = vec![4, 4];
+
+        let support = slide.compressed_level_info(0).unwrap();
+        assert!(matches!(
+            support,
+            crate::compressed::CompressedExtractionSupport::NotSupported { .. }
+        ));
+        let err = slide.read_compressed_tile(0, 0, 0, &[]).unwrap_err();
+        assert!(format!("{err}").contains("overlap-aware placement"));
 
         let _ = fs::remove_file(path);
     }

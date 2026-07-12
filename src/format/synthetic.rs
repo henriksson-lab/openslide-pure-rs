@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::Path;
 
+use crate::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
 use crate::debug::{self, OPENSLIDE_DEBUG_SYNTHETIC};
 use crate::decode;
 use crate::error::{OpenSlideError, Result};
@@ -200,6 +201,34 @@ impl SlideBackend for SyntheticSlide {
 
     fn level_tile_dimensions(&self, level: u32) -> Option<(u64, u64)> {
         (level == 0).then_some((u64::from(IMAGE_PIXELS), u64::from(IMAGE_PIXELS)))
+    }
+
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        if level != 0 {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid level {level}"
+            )));
+        }
+        Ok(CompressedExtractionSupport::NotSupported {
+            reason: "synthetic slides do not expose source lossy compressed blocks".into(),
+        })
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        _col: u64,
+        _row: u64,
+        _preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        if level != 0 {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid level {level}"
+            )));
+        }
+        Err(OpenSlideError::UnsupportedFormat(
+            "synthetic slides do not expose source lossy compressed blocks".into(),
+        ))
     }
 
     fn read_region(

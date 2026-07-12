@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cache::TileCache;
+use crate::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff, SlideBackend};
@@ -710,6 +711,21 @@ impl SlideBackend for PhilipsTiffSlide {
 
     fn level_tile_dimensions(&self, level: u32) -> Option<(u64, u64)> {
         self.inner.level_tile_dimensions(level)
+    }
+
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        self.inner.compressed_level_info(level)
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        self.inner
+            .read_compressed_tile(level, col, row, preferred_modes)
     }
 
     fn read_region(

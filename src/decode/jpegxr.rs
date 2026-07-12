@@ -288,6 +288,16 @@ pub fn validate_request(request: JpegXrDecodeRequest<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Inspect a JPEG XR codestream or TIFF-like `.jxr` wrapper and report whether
+/// the first image plane is lossy. This parses only the bounded header prefix
+/// needed to reach JPEG XR's scaled-arithmetic lossless flag.
+pub fn is_lossy_jpegxr(data: &[u8]) -> Result<bool> {
+    let start = find_jpegxr_codestream(data).ok_or_else(|| {
+        OpenSlideError::Decode("JPEG XR codestream signature WMPHOTO was not found".into())
+    })?;
+    parse_jpegxr_codestream_lossiness(&data[start..])
+}
+
 fn validate_backend_support(
     request: JpegXrDecodeRequest<'_>,
     channel: Option<u32>,
@@ -314,6 +324,196 @@ fn validate_backend_support(
         )));
     }
     Ok(())
+}
+
+fn find_jpegxr_codestream(data: &[u8]) -> Option<usize> {
+    const SIGNATURE: &[u8; 8] = b"WMPHOTO\0";
+    if data.starts_with(SIGNATURE) {
+        return Some(0);
+    }
+    data.windows(SIGNATURE.len())
+        .position(|window| window == SIGNATURE)
+}
+
+fn parse_jpegxr_codestream_lossiness(data: &[u8]) -> Result<bool> {
+    const SIGNATURE_LEN: usize = 8;
+    const CODEC_VERSION: u32 = 1;
+    const CODEC_SUBVERSION: u32 = 0;
+    const CODEC_SUBVERSION_NEWSCALING_SOFT_TILES: u32 = 1;
+    const CODEC_SUBVERSION_NEWSCALING_HARD_TILES: u32 = 9;
+    const LOG_MAX_TILES: u32 = 12;
+    const Y_ONLY: u32 = 0;
+    const YUV_420: u32 = 1;
+    const YUV_422: u32 = 2;
+    const YUV_444: u32 = 3;
+    const CMYK: u32 = 4;
+    const NCOMPONENT: u32 = 6;
+    const BD_16: u32 = 2;
+    const BD_16S: u32 = 3;
+    const BD_32: u32 = 5;
+    const BD_32S: u32 = 6;
+    const BD_32F: u32 = 7;
+
+    if !data.starts_with(b"WMPHOTO\0") {
+        return Err(OpenSlideError::Decode(
+            "JPEG XR codestream has an invalid signature".into(),
+        ));
+    }
+    let mut bits = JpegXrBitReader::new(&data[SIGNATURE_LEN..]);
+
+    let version = bits.read(4)?;
+    if version != CODEC_VERSION {
+        return Err(OpenSlideError::Decode(format!(
+            "JPEG XR codec version {version} is unsupported"
+        )));
+    }
+    let subversion = bits.read(4)?;
+    if !matches!(
+        subversion,
+        CODEC_SUBVERSION
+            | CODEC_SUBVERSION_NEWSCALING_SOFT_TILES
+            | CODEC_SUBVERSION_NEWSCALING_HARD_TILES
+    ) {
+        return Err(OpenSlideError::Decode(format!(
+            "JPEG XR codec subversion {subversion} is unsupported"
+        )));
+    }
+
+    let tiling_present = bits.read(1)? != 0;
+    let bitstream_format = bits.read(1)?;
+    bits.skip(3)?; // presentation orientation
+    let index_table = bits.read(1)? != 0;
+    let overlap = bits.read(2)?;
+    if overlap == 3 {
+        return Err(OpenSlideError::Decode(
+            "JPEG XR overlap mode 3 is invalid".into(),
+        ));
+    }
+
+    let abbreviated_header = bits.read(1)? != 0;
+    bits.skip(1)?; // internal bit-depth word size
+    let inscribed = bits.read(1)? != 0;
+    bits.skip(1)?; // trim flexbits flag
+    let tile_stretch = bits.read(1)? != 0;
+    bits.skip(1)?; // red/blue swap
+    bits.skip(1)?; // reserved
+    bits.skip(1)?; // alpha present
+
+    bits.skip(4)?; // source color format
+    let source_bit_depth = bits.read(4)?;
+    bits.skip(if abbreviated_header { 16 } else { 32 })?; // width - 1
+    bits.skip(if abbreviated_header { 16 } else { 32 })?; // height - 1
+
+    let mut vertical_slices = 0;
+    let mut horizontal_slices = 0;
+    if tiling_present {
+        vertical_slices = bits.read(LOG_MAX_TILES)?;
+        horizontal_slices = bits.read(LOG_MAX_TILES)?;
+    }
+    if !index_table && (bitstream_format != 0 || vertical_slices + horizontal_slices > 0) {
+        return Err(OpenSlideError::Decode(
+            "JPEG XR frequency or tiled streams require an index table".into(),
+        ));
+    }
+    let tile_size_bits = if abbreviated_header { 8 } else { 16 };
+    for _ in 0..vertical_slices {
+        bits.skip(tile_size_bits)?;
+    }
+    for _ in 0..horizontal_slices {
+        bits.skip(tile_size_bits)?;
+    }
+    if tile_stretch {
+        for _ in 0..((vertical_slices + 1) * (horizontal_slices + 1)) {
+            bits.skip(8)?;
+        }
+    }
+    if inscribed {
+        bits.skip(24)?;
+    }
+    bits.byte_align();
+
+    let internal_color_format = bits.read(3)?;
+    if !(Y_ONLY..=NCOMPONENT).contains(&internal_color_format) || internal_color_format == 5 {
+        return Err(OpenSlideError::Decode(format!(
+            "JPEG XR internal color format {internal_color_format} is unsupported"
+        )));
+    }
+    let lossless_scaled_arithmetic = bits.read(1)? != 0;
+    bits.skip(4)?; // subband
+    match internal_color_format {
+        Y_ONLY => {}
+        YUV_420 => bits.skip(8)?,
+        YUV_422 | YUV_444 => bits.skip(8)?,
+        NCOMPONENT => {
+            bits.skip(4)?;
+            bits.skip(4)?;
+        }
+        CMYK => {}
+        _ => unreachable!(),
+    }
+    match source_bit_depth {
+        BD_16 | BD_16S | BD_32 | BD_32S => bits.skip(8)?,
+        BD_32F => bits.skip(16)?,
+        _ => {}
+    }
+
+    Ok(!lossless_scaled_arithmetic)
+}
+
+struct JpegXrBitReader<'a> {
+    data: &'a [u8],
+    byte: usize,
+    bit_left: u8,
+    accumulator: u8,
+}
+
+impl<'a> JpegXrBitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            byte: 0,
+            bit_left: 0,
+            accumulator: 0,
+        }
+    }
+
+    fn read(&mut self, mut bits: u32) -> Result<u32> {
+        if bits > 32 {
+            return Err(OpenSlideError::Decode(format!(
+                "JPEG XR bit read is too large: {bits}"
+            )));
+        }
+        let mut value = 0u32;
+        while bits > 0 {
+            if self.bit_left == 0 {
+                self.accumulator = *self.data.get(self.byte).ok_or_else(|| {
+                    OpenSlideError::Decode("JPEG XR header ended unexpectedly".into())
+                })?;
+                self.byte += 1;
+                self.bit_left = 8;
+            }
+            let take = bits.min(u32::from(self.bit_left)) as u8;
+            value <<= take;
+            value |= u32::from(self.accumulator >> (8 - take));
+            if take == 8 {
+                self.accumulator = 0;
+            } else {
+                self.accumulator <<= take;
+            }
+            self.bit_left -= take;
+            bits -= u32::from(take);
+        }
+        Ok(value)
+    }
+
+    fn skip(&mut self, bits: u32) -> Result<()> {
+        self.read(bits).map(|_| ())
+    }
+
+    fn byte_align(&mut self) {
+        self.bit_left = 0;
+        self.accumulator = 0;
+    }
 }
 
 fn extract_gray_channel(image: &JpegXrImage, channel: u32) -> GrayImage {
@@ -712,6 +912,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("zero-sized"));
+    }
+
+    #[test]
+    fn lossiness_probe_accepts_lossy_codestream_header() {
+        let data = minimal_jpegxr_codestream(false);
+        assert!(is_lossy_jpegxr(&data).unwrap());
+    }
+
+    #[test]
+    fn lossiness_probe_rejects_lossless_codestream_header() {
+        let data = minimal_jpegxr_codestream(true);
+        assert!(!is_lossy_jpegxr(&data).unwrap());
+    }
+
+    #[test]
+    fn lossiness_probe_finds_codestream_in_jxr_wrapper() {
+        let mut data = b"II\xbc\x01wrapper".to_vec();
+        data.extend_from_slice(&minimal_jpegxr_codestream(false));
+        assert!(is_lossy_jpegxr(&data).unwrap());
+    }
+
+    #[test]
+    fn lossiness_probe_rejects_missing_signature() {
+        let err = is_lossy_jpegxr(&[0; 16]).unwrap_err();
+        assert!(format!("{err}").contains("WMPHOTO"));
     }
 
     #[test]
@@ -1184,5 +1409,82 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("payload is empty"));
+    }
+
+    fn minimal_jpegxr_codestream(lossless: bool) -> Vec<u8> {
+        let mut writer = BitWriter::new();
+        writer.write(1, 4); // codec version
+        writer.write(0, 4); // codec subversion
+        writer.write(0, 1); // tiling present
+        writer.write(0, 1); // spatial bitstream
+        writer.write(0, 3); // orientation
+        writer.write(0, 1); // no index table
+        writer.write(0, 2); // no overlap
+        writer.write(1, 1); // abbreviated header
+        writer.write(0, 1); // short internal bit depth marker
+        writer.write(0, 1); // no inscribed window
+        writer.write(0, 1); // no trim flexbits flag
+        writer.write(0, 1); // no tile stretch
+        writer.write(0, 1); // no red/blue swap
+        writer.write(0, 1); // reserved
+        writer.write(0, 1); // no alpha
+        writer.write(0, 4); // source Y_ONLY
+        writer.write(1, 4); // source BD_8
+        writer.write(0, 16); // width - 1
+        writer.write(0, 16); // height - 1
+        writer.byte_align();
+        writer.write(0, 3); // internal Y_ONLY
+        writer.write(u32::from(lossless), 1);
+        writer.write(3, 4); // DC-only subband
+        writer.write(1, 1); // DC uniform
+        writer.write(1, 8); // QP index; ignored by the probe
+        writer.byte_align();
+
+        let mut data = b"WMPHOTO\0".to_vec();
+        data.extend_from_slice(&writer.finish());
+        data
+    }
+
+    struct BitWriter {
+        bytes: Vec<u8>,
+        current: u8,
+        used: u8,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                current: 0,
+                used: 0,
+            }
+        }
+
+        fn write(&mut self, value: u32, bits: u8) {
+            for bit in (0..bits).rev() {
+                self.current <<= 1;
+                self.current |= ((value >> bit) & 1) as u8;
+                self.used += 1;
+                if self.used == 8 {
+                    self.bytes.push(self.current);
+                    self.current = 0;
+                    self.used = 0;
+                }
+            }
+        }
+
+        fn byte_align(&mut self) {
+            if self.used > 0 {
+                self.current <<= 8 - self.used;
+                self.bytes.push(self.current);
+                self.current = 0;
+                self.used = 0;
+            }
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            self.byte_align();
+            self.bytes
+        }
     }
 }

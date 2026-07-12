@@ -286,6 +286,28 @@ let rgba = slide.read_region_rgba(
 )?;
 ```
 
+### Lossy compressed tile extraction
+
+For already-lossy source data, `compressed_level_info()` and
+`read_compressed_tile()` can expose compressed blocks without decoding pixels
+and recompressing them. This is intentionally not a general compressed export
+API: lossless or uncompressed source data reports `NotSupported`, and callers
+should use `read_region*` for those cases.
+
+Returned tiles use either `CompressedTileMode::OriginalBytes`, which points at
+exact source bytes, or `CompressedTileMode::DerivedLosslessJpeg`, which emits a
+standalone JPEG stream by table merge or coefficient-domain crop/repack without
+pixel-domain recompression. `CompressedBytes` may be in memory, a single file
+range, or multiple source file ranges for fragmented data.
+
+See [docs/compressed-extraction.md](docs/compressed-extraction.md) for support
+details and OME-Zarr caveats. A runnable example is available at
+[examples/compressed_extraction.rs](examples/compressed_extraction.rs):
+
+```sh
+cargo run --example compressed_extraction -- slide.svs
+```
+
 ### CLI
 
 #### Slide info
@@ -391,6 +413,8 @@ openslide-pure-rs read slide.mrxs 33024 78720 256 256 --rgb 0,1,2 --out composit
 | `slide.read_region_argb_into(buf, x, y, level, w, h)` | Copy default RGB premultiplied ARGB into a buffer |
 | `slide.read_region_argb_into_i64(buf, x, y, level, w, h)` | Signed OpenSlide-style ARGB region copy |
 | `openslide_read_region(slide, buf, x, y, level, w, h)` | C API-shaped premultiplied ARGB region copy |
+| `slide.compressed_level_info(level)` | Report whether a level can expose source lossy-compressed tiles |
+| `slide.read_compressed_tile(level, col, row, preferred_modes)` | Return one lossy compressed tile as original source bytes or derived lossless JPEG bytes |
 | `slide.properties()` | All metadata as HashMap |
 | `slide.property_names()` | Sorted property names |
 | `slide.property_names_null_terminated()` | OpenSlide-style NULL-terminated property-name array |

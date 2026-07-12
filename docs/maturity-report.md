@@ -1,0 +1,67 @@
+# Reader Maturity Report
+
+Generated from `fixtures/reader-status.toml`, `fixtures/matrix.toml`, `fixtures/manifest.toml`, `fixtures/bench-baseline.json`, and `fixtures/runner-status.toml`.
+
+This report is a tracking view. The authoritative gate remains `scripts/check-audit-baselines.py`.
+
+| Reader | README status | Promotion ceiling | Matrix coverage | Evidence | Blockers | Bench evidence | Next promotion blocker |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Aperio | Fixture-verified (SVS subset) | Fixture-verified | 2 covered, 0 drift, 0 blocked, 0 missing, 2 pending | aperio-local-77917 (exact)<br>aperio-public-cmu-1-small-region (exact) | none | 2 exact, 0 limited, 0 drift, 0 no bench | codec-layout-breadth: Need broader SVS fixtures that isolate raw/JPEG/JPEG2000, planar/contiguous, tiled/stripped, edge-tile, and unsupported layout behavior. |
+| DICOM | Experimental (limited exact data) | Experimental | 1 covered, 0 drift, 1 blocked, 0 missing, 5 pending | dicom-local-readable-single-level (exact-limited) | dicom-public-leica-4 (blocked) | 0 exact, 1 limited, 0 drift, 0 no bench | full-pyramid-wsi: Installed reference OpenSlide 3.4.1 cannot open the public Leica-4 DICOM set, so full-pyramid DICOM parity is still unproven. |
+| Hamamatsu NDPI | Fixture-verified (CMU-1/2/3 subset) | Fixture-verified | 2 covered, 0 drift, 0 blocked, 0 missing, 1 pending | hamamatsu-ndpi-local-cmu-1 (exact)<br>hamamatsu-ndpi-local-cmu-2 (exact)<br>hamamatsu-ndpi-local-cmu-3 (exact)<br>hamamatsu-ndpi-public-cmu-1 (exact) | none | 4 exact, 0 limited, 0 drift, 0 no bench | ndpi-layout-breadth: Need more NDPI fixtures beyond CMU-1/2/3 to cover non-DNL layouts, planar data, map levels, and edge tile behavior. |
+| Hamamatsu VMS | Fixture-verified (CMU-1/2/3 subset) | Fixture-verified | 1 covered, 0 drift, 0 blocked, 0 missing, 1 pending | hamamatsu-vms-local-cmu-1 (exact)<br>hamamatsu-vms-local-cmu-2 (exact)<br>hamamatsu-vms-local-cmu-3 (exact)<br>hamamatsu-vms-public-cmu-1 (exact) | none | 4 exact, 0 limited, 0 drift, 0 no bench | vms-layout-breadth: CMU-1/2/3 cover the current verified VMS subset; broader VMS sidecar naming, edge geometry, and restart-row variants need more fixtures before conditional maturity. |
+| Hamamatsu VMU/NGR | Experimental (no real fixture) | Experimental | 0 covered, 0 drift, 0 blocked, 1 missing, 0 pending | none | hamamatsu-vmu-ngr-missing (missing-fixture) | 0 exact, 0 limited, 0 drift, 0 no bench | real-fixture: No local or public VMU/NGR fixture is available yet; promotion is blocked on locating real data. |
+| Leica | Fixture-verified (SCN subset) | Fixture-verified | 2 covered, 0 drift, 1 blocked, 0 missing, 2 pending | leica-local-leica-1 (exact)<br>leica-local-leica-2 (exact) | leica-local-leica-3 (blocked)<br>leica-public-fluorescence-1 (blocked) | 2 exact, 0 limited, 0 drift, 0 no bench | reference-blocked-fluorescence: Current local/public blockers are reference-stack failures. |
+| MIRAX / 3DHISTECH | Fixture-verified (brightfield and fluorescence public fixtures) | Fixture-verified | 2 covered, 0 drift, 0 blocked, 0 missing, 1 pending | mirax-public-cmu-1-saved-1-16 (exact)<br>mirax-public-fluorescence-2 (exact) | none | 2 exact, 0 limited, 0 drift, 0 no bench | broader-mrxs-breadth: Public brightfield and fluorescence fixtures are exact; broader MRXS layouts need additional fixtures before conditional maturity. |
+| Philips | Fixture-verified (Philips-1) | Fixture-verified | 1 covered, 0 drift, 0 blocked, 0 missing, 1 pending | philips-public-philips-1 (exact) | none | 1 exact, 0 limited, 0 drift, 0 no bench | philips-wsi-breadth: Need more Philips fixtures beyond public Philips-1, including associated-image XML/base64 payloads and objective/pixel-spacing metadata variants. |
+| Sakura | Experimental (no fixture) | Experimental | 0 covered, 0 drift, 0 blocked, 1 missing, 0 pending | none | sakura-missing (missing) | 0 exact, 0 limited, 0 drift, 0 no bench | real-fixture: No Sakura .svslide fixture was found locally or in the OpenSlide public testdata index. |
+| Trestle | Fixture-verified (CMU-1) | Fixture-verified | 1 covered, 0 drift, 0 blocked, 0 missing, 1 pending | trestle-local-cmu-1 (exact)<br>trestle-public-cmu-1 (exact) | none | 2 exact, 0 limited, 0 drift, 0 no bench | overlap-sidecar-codecs: Need Trestle fixtures that isolate overlap composition, sidecar lookup, codec/layout breadth, and edge-tile behavior. |
+| Ventana | Fixture-verified (BIF AOI subset) | Fixture-verified | 1 covered, 0 drift, 1 blocked, 0 missing, 1 pending | ventana-local-os-1 (exact)<br>ventana-local-os-2 (exact) | ventana-local-ventana-1 (blocked)<br>ventana-public-ventana-1 (blocked) | 2 exact, 0 limited, 0 drift, 0 no bench | reference-blocked-ventana-1: Local/public Ventana-1 are reference-stack blocked with the installed OpenSlide 3.4.1 stack. |
+| Zeiss | Experimental (reference blocked) | Experimental | 0 covered, 0 drift, 1 blocked, 0 missing, 4 pending | none | zeiss-public-jxr-and-zstd (blocked) | 0 exact, 0 limited, 0 drift, 0 no bench | public-czi: Installed reference is blocked for public CZI. Rust reads Zstd0/Zstd1 preview regions and the JXR slide-preview fixture with the optional jpegxr backend; full-slide Bgr24 JXR is wired through that backend but still needs isolated validation after a native jxrlib crash probe. |
+| Generic tiled TIFF | Fixture-verified (CMU-1.tiff) | Fixture-verified | 1 covered, 0 drift, 1 blocked, 0 missing, 3 pending | generic-tiff-public-cmu-1 (exact) | generic-tiff-local-zackthecat (blocked) | 1 exact, 0 limited, 0 drift, 0 no bench | shared-codec-layout-matrix: Local compression-6 old-JPEG TIFF is Rust-readable but reference-blocked, so it remains a non-comparable smoke witness; broader matrix still needs fixtures. |
+
+Promotion rule of thumb: `Conditionally mature` and `Mature` remain blocked while a reader has any drift, blocked, missing, or pending matrix cases.
+
+## Execution Focus
+
+Generated from non-covered `fixtures/matrix.toml` cases. Priorities: missing fixture/data, reference or unsupported blockers, known drift, then pending breadth coverage.
+
+| Priority | Reader | Matrix status | Area | Required next evidence |
+| ---: | --- | --- | --- | --- |
+| 1 | hamamatsu-vmu-ngr | missing-fixture | real-fixture | No local or public VMU/NGR fixture is available yet; promotion is blocked on locating real data. |
+| 1 | sakura | missing-fixture | real-fixture | No Sakura .svslide fixture was found locally or in the OpenSlide public testdata index. |
+| 2 | dicom | blocked | full-pyramid-wsi | Installed reference OpenSlide 3.4.1 cannot open the public Leica-4 DICOM set, so full-pyramid DICOM parity is still unproven. |
+| 2 | generic-tiff | blocked | shared-codec-layout-matrix | Local compression-6 old-JPEG TIFF is Rust-readable but reference-blocked, so it remains a non-comparable smoke witness; broader matrix still needs fixtures. |
+| 2 | leica | blocked | reference-blocked-fluorescence | Current local/public blockers are reference-stack failures. |
+| 2 | ventana | blocked | reference-blocked-ventana-1 | Local/public Ventana-1 are reference-stack blocked with the installed OpenSlide 3.4.1 stack. |
+| 2 | zeiss | blocked | public-czi | Installed reference is blocked for public CZI. Rust reads Zstd0/Zstd1 preview regions and the JXR slide-preview fixture with the optional jpegxr backend; full-slide Bgr24 JXR is wired through that backend but still needs isolated validation after a native jxrlib crash probe. |
+| 4 | aperio | pending | codec-layout-breadth | Need broader SVS fixtures that isolate raw/JPEG/JPEG2000, planar/contiguous, tiled/stripped, edge-tile, and unsupported layout behavior. |
+| 4 | aperio | pending | metadata-associated-images | Need fixtures for macro/label/thumbnail names, ICC/profile export, quickhash, and metadata formatting variants before moving beyond fixture-verified. |
+| 4 | dicom | pending | encapsulated-codecs | Need reference-readable encapsulated DICOM WSI fixtures; JPEG 2000 backend policy remains a promotion blocker. |
+| 4 | dicom | pending | multi-file-series | Need a reference-readable DICOM WSI series that exercises same-series discovery and concatenation diagnostics. |
+| 4 | dicom | pending | multi-plane-optical-path | Current reader exposes a selected 2D view; fixture-backed policy is still needed for multiple optical paths and z-planes. |
+| 4 | dicom | pending | native-rgb-monochrome-palette | Need reference-readable WSI fixtures for native RGB, monochrome with window/rescale behavior, and palette-color data; current readable local witnesses are single-level generic-tiff paths. |
+| 4 | dicom | pending | sparse-tiles-associated-images-tpm | Need reference-readable fixtures that exercise sparse tiles, associated-image roles, and TotalPixelMatrixOrigin/geometry metadata. |
+| 4 | generic-tiff | pending | compression-codecs | Need reference-readable TIFF fixtures for each codec family; compression 6 is currently represented by zackthecat only as a Rust-readable, reference-blocked smoke witness. |
+| 4 | generic-tiff | pending | sample-layouts | Need broader TIFF fixtures that isolate sample layout and bit-depth behavior beyond the public CMU-1 baseline. |
+| 4 | generic-tiff | pending | storage-geometry | Synthetic coverage now exercises zero-byte missing-tile RGBA transparency and description-named label/macro/thumbnail/overview associated TIFF directories. Need real fixtures that cover edge geometry, metadata/property export, associated directories, and missing tile behavior before Generic TIFF can become the shared mature core. |
+| 4 | hamamatsu-ndpi | pending | ndpi-layout-breadth | Need more NDPI fixtures beyond CMU-1/2/3 to cover non-DNL layouts, planar data, map levels, and edge tile behavior. |
+| 4 | hamamatsu-vms | pending | vms-layout-breadth | CMU-1/2/3 cover the current verified VMS subset; broader VMS sidecar naming, edge geometry, and restart-row variants need more fixtures before conditional maturity. |
+| 4 | leica | pending | area-layout-breadth | Need reference-readable fixtures for stripped/tiled area combinations, planar data, associated macro/label images, and XML hierarchy/format variants. |
+| 4 | leica | pending | z-plane-non-brightfield | Current fluorescence and Leica-3 witnesses are reference blocked; need usable fixtures or a documented exclusion policy. |
+| 4 | mirax | pending | broader-mrxs-breadth | Public brightfield and fluorescence fixtures are exact; broader MRXS layouts need additional fixtures before conditional maturity. |
+| 4 | philips | pending | philips-wsi-breadth | Need more Philips fixtures beyond public Philips-1, including associated-image XML/base64 payloads and objective/pixel-spacing metadata variants. |
+| 4 | trestle | pending | overlap-sidecar-codecs | Need Trestle fixtures that isolate overlap composition, sidecar lookup, codec/layout breadth, and edge-tile behavior. |
+| 4 | ventana | pending | non-aoi-associated-codecs | Need reference-readable Ventana fixtures beyond OS-1/OS-2 to cover non-AOI TIFF paths, associated-image fallback order, codec breadth, and high-downsample AOI stress. |
+| 4 | zeiss | pending | attachments-and-metadata | Synthetic coverage now exercises JPEG/PNG/BMP attachment decoding and upstream-style single-subblock embedded-CZI associated images. Need reference-readable CZI fixtures with label/preview/macro/navigation attachments and nontrivial metadata dimensions. |
+| 4 | zeiss | pending | external-file-parts | Need public or private multifile CZI fixtures with external file parts; current public CZI blockers are single-file reference failures. |
+| 4 | zeiss | pending | pixel-types-and-compression | Rust reads public Zstd preview regions and feature-gated JXR slide-preview pixels. Reference parity is blocked; full-slide Bgr24 JXR is wired through the optional backend but still needs a safer backend or isolation strategy for fixture validation after a native jxrlib crash probe. |
+| 4 | zeiss | pending | scene-z-t-c-selection | Need reference-readable CZI fixtures that exercise multiple scenes, z-slices, timepoints, and channel layouts. |
+
+## Runner Status
+
+Generated from `fixtures/runner-status.toml`. `external-pending` means the repository contract is ready, but the self-hosted runner has not yet produced validated preflight and strict benchmark artifacts.
+
+| Profile | Status | Fixture root | Preflight artifact | Benchmark artifact | Last validated UTC | Next action |
+| --- | --- | --- | --- | --- | --- | --- |
+| openslide-audit-stable-v1 | external-pending | /big/henriksson/ome_images | stable-runner-preflight.json | bench-stable.json | n/a | Register and maintain a self-hosted GitHub Actions runner with read access to /big/henriksson/ome_images. |

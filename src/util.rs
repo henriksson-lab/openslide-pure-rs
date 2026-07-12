@@ -330,7 +330,7 @@ pub(crate) fn read_file_range_into_from_open_file(
                 format!("Short read of file range: {err}"),
             ))
         })?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(unix))]
     {

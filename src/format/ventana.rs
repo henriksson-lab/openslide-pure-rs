@@ -8,6 +8,7 @@ use std::sync::Arc;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 
 use crate::cache::{CachedTile, TileCache};
+use crate::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff, SlideBackend};
@@ -425,6 +426,42 @@ impl SlideBackend for VentanaSlide {
         self.levels
             .get(level as usize)
             .map(|level| (level.tile_width, level.tile_height))
+    }
+
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        if level as usize >= self.levels.len() {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid level {level}"
+            )));
+        }
+        if let Some(delegate) = &self.delegate {
+            return delegate.compressed_level_info(level);
+        }
+        Ok(CompressedExtractionSupport::NotSupported {
+            reason: "Ventana BIF AOI tilemap compressed extraction is not implemented; use read_region instead"
+                .into(),
+        })
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        if level as usize >= self.levels.len() {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid level {level}"
+            )));
+        }
+        if let Some(delegate) = &self.delegate {
+            return delegate.read_compressed_tile(level, col, row, preferred_modes);
+        }
+        Err(OpenSlideError::UnsupportedFormat(
+            "Ventana BIF AOI tilemap compressed extraction is not implemented; use read_region instead"
+                .into(),
+        ))
     }
 
     fn read_region(
@@ -3909,6 +3946,7 @@ fn tiff_type_size(value_type: u16) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compressed::{CompressedBytes, CompressedLevelInfo, JpegColorSpace, LossyCodec};
     use crate::OpenSlide;
     extern crate tiff as tiff_crate;
     use std::fs;
@@ -3954,6 +3992,56 @@ mod tests {
             h: u32,
         ) -> Result<GrayImage> {
             Ok(GrayImage::new(w, h))
+        }
+
+        fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+            assert_eq!(level, 0);
+            Ok(CompressedExtractionSupport::Supported(
+                CompressedLevelInfo {
+                    level,
+                    width: 1,
+                    height: 1,
+                    tile_width: 1,
+                    tile_height: 1,
+                    tiles_across: 1,
+                    tiles_down: 1,
+                    codec: LossyCodec::Jpeg {
+                        color_space: JpegColorSpace::Rgb,
+                        subsampling: None,
+                    },
+                    modes: vec![CompressedTileMode::OriginalBytes],
+                    constraints: Vec::new(),
+                },
+            ))
+        }
+
+        fn read_compressed_tile(
+            &self,
+            level: u32,
+            col: u64,
+            row: u64,
+            _preferred_modes: &[CompressedTileMode],
+        ) -> Result<CompressedTile> {
+            assert_eq!(level, 0);
+            assert_eq!(col, 0);
+            assert_eq!(row, 0);
+            Ok(CompressedTile {
+                level,
+                col,
+                row,
+                origin_x: 0,
+                origin_y: 0,
+                width: 1,
+                height: 1,
+                nominal_tile_width: 1,
+                nominal_tile_height: 1,
+                codec: LossyCodec::Jpeg {
+                    color_space: JpegColorSpace::Rgb,
+                    subsampling: None,
+                },
+                mode: CompressedTileMode::OriginalBytes,
+                bytes: CompressedBytes::Owned(vec![1, 2, 3]),
+            })
         }
 
         fn properties(&self) -> &HashMap<String, String> {
@@ -4015,6 +4103,35 @@ mod tests {
         slide.set_cache(Arc::new(TileCache::with_capacity(1024)));
 
         assert_eq!(VENTANA_DELEGATE_SET_CACHE_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn compressed_extraction_delegates_simple_ventana_tiff_backend() {
+        let cache = Arc::new(TileCache::with_capacity(1024));
+        let slide = VentanaSlide {
+            path: PathBuf::new(),
+            properties: HashMap::new(),
+            levels: vec![Level {
+                dir_index: 0,
+                width: 1,
+                height: 1,
+                downsample: 1.0,
+                tile_width: 1,
+                tile_height: 1,
+                tile_count: 1,
+            }],
+            associated_images: HashMap::new(),
+            icc_profile: None,
+            bif_tilemap: None,
+            delegate: Some(Box::new(CountingBackend)),
+            cache_binding_id: cache.next_binding_id(),
+            cache,
+        };
+
+        let support = slide.compressed_level_info(0).unwrap();
+        assert!(matches!(support, CompressedExtractionSupport::Supported(_)));
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+        assert_eq!(tile.bytes, CompressedBytes::Owned(vec![1, 2, 3]));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::cache::TileCache;
+use crate::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
 use crate::error::Result;
 use crate::pixel::{GrayImage, RgbaImage};
 
@@ -29,6 +30,22 @@ pub(crate) trait SlideBackend: Send + Sync {
     fn level_downsample(&self, level: u32) -> Option<f64>;
     fn level_tile_dimensions(&self, _level: u32) -> Option<(u64, u64)> {
         None
+    }
+    fn compressed_level_info(&self, _level: u32) -> Result<CompressedExtractionSupport> {
+        Ok(CompressedExtractionSupport::NotSupported {
+            reason: "backend does not expose lossy compressed blocks".into(),
+        })
+    }
+    fn read_compressed_tile(
+        &self,
+        _level: u32,
+        _col: u64,
+        _row: u64,
+        _preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        Err(crate::error::OpenSlideError::UnsupportedFormat(
+            "compressed tile extraction is not supported".into(),
+        ))
     }
     fn read_region(
         &self,

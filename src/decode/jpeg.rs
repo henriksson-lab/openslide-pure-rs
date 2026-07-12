@@ -1,6 +1,6 @@
 use std::ffi::CString;
 use std::io::{BufReader, Cursor};
-use std::os::raw::{c_char, c_double, c_int, c_uchar, c_uint};
+use std::os::raw::{c_char, c_double, c_int, c_uchar, c_uint, c_ulong};
 use std::path::Path;
 
 use crate::error::{OpenSlideError, Result};
@@ -154,6 +154,30 @@ extern "C" {
         err: *mut c_char,
         err_len: usize,
     ) -> c_int;
+    fn osr_jpeg_lossless_crop(
+        data: *const c_uchar,
+        len: usize,
+        x: c_uint,
+        y: c_uint,
+        w: c_uint,
+        h: c_uint,
+        out: *mut *mut c_uchar,
+        out_len: *mut c_ulong,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    #[cfg(test)]
+    fn osr_jpeg_encode_rgb_for_test(
+        rgb: *const c_uchar,
+        width: c_uint,
+        height: c_uint,
+        quality: c_uint,
+        out: *mut *mut c_uchar,
+        out_len: *mut c_ulong,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn osr_jpeg_free_buffer(buffer: *mut c_uchar);
 }
 
 /// Decode JPEG data into an RGBA image.
@@ -744,6 +768,85 @@ pub fn decode_jpeg_sampled_rgb_region_from_file(
     }
 }
 
+/// Produce a standalone JPEG crop using libjpeg's coefficient-domain
+/// transcoding path. The crop origin must be aligned to the source MCU grid.
+pub(crate) fn lossless_crop_jpeg(data: &[u8], x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    let mut out = std::ptr::null_mut();
+    let mut out_len = 0 as c_ulong;
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        osr_jpeg_lossless_crop(
+            data.as_ptr(),
+            data.len(),
+            x,
+            y,
+            w,
+            h,
+            &mut out,
+            &mut out_len,
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok == 0 {
+        return Err(OpenSlideError::Decode(format!(
+            "JPEG lossless crop failed: {}",
+            jpeg_crop_error_message(&err)
+        )));
+    }
+    if out.is_null() {
+        return Err(OpenSlideError::Decode(
+            "JPEG lossless crop returned a null buffer".into(),
+        ));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(out, out_len as usize).to_vec() };
+    unsafe {
+        osr_jpeg_free_buffer(out);
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+fn encode_test_jpeg_rgb(rgb: &[u8], width: u32, height: u32, quality: u32) -> Result<Vec<u8>> {
+    if rgb.len() != width as usize * height as usize * 3 {
+        return Err(OpenSlideError::InvalidArgument(
+            "test JPEG RGB buffer has the wrong length".into(),
+        ));
+    }
+
+    let mut out = std::ptr::null_mut();
+    let mut out_len = 0 as c_ulong;
+    let mut err = vec![0i8; 512];
+    let ok = unsafe {
+        osr_jpeg_encode_rgb_for_test(
+            rgb.as_ptr(),
+            width,
+            height,
+            quality,
+            &mut out,
+            &mut out_len,
+            err.as_mut_ptr(),
+            err.len(),
+        )
+    };
+    if ok == 0 {
+        return Err(OpenSlideError::Decode(format!(
+            "test JPEG encode failed: {}",
+            jpeg_crop_error_message(&err)
+        )));
+    }
+    if out.is_null() {
+        return Err(OpenSlideError::Decode(
+            "test JPEG encode returned a null buffer".into(),
+        ));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(out, out_len as usize).to_vec() };
+    unsafe {
+        osr_jpeg_free_buffer(out);
+    }
+    Ok(bytes)
+}
+
 fn jpeg_crop_error_message(err: &[i8]) -> String {
     let nul = err.iter().position(|&byte| byte == 0).unwrap_or(err.len());
     let bytes = err[..nul]
@@ -874,6 +977,36 @@ mod tests {
         assert!(format!("{err}").contains("JPEG dimensions decode failed"));
     }
 
+    #[test]
+    fn lossless_crop_jpeg_transcodes_full_image() {
+        let cropped = lossless_crop_jpeg(ONE_PIXEL_JPEG, 0, 0, 1, 1).unwrap();
+        assert_eq!(decode_jpeg_dimensions(&cropped).unwrap(), (1, 1));
+        let (src, src_w, src_h) = decode_jpeg_rgb_libjpeg(ONE_PIXEL_JPEG).unwrap();
+        let (dst, dst_w, dst_h) = decode_jpeg_rgb_libjpeg(&cropped).unwrap();
+        assert_eq!((dst_w, dst_h), (src_w, src_h));
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn lossless_crop_jpeg_extracts_mcu_aligned_region() {
+        let (jpeg, _) = generated_multimcu_jpeg();
+        let cropped = lossless_crop_jpeg(&jpeg, 16, 0, 16, 16).unwrap();
+        assert_eq!(decode_jpeg_dimensions(&cropped).unwrap(), (16, 16));
+
+        let (expected, expected_w, expected_h) =
+            decode_jpeg_rgb_region(&jpeg, 16, 0, 16, 16).unwrap();
+        let (actual, actual_w, actual_h) = decode_jpeg_rgb_libjpeg(&cropped).unwrap();
+        assert_eq!((actual_w, actual_h), (expected_w, expected_h));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn lossless_crop_jpeg_rejects_non_mcu_aligned_origin() {
+        let (jpeg, _) = generated_multimcu_jpeg();
+        let err = lossless_crop_jpeg(&jpeg, 1, 0, 16, 16).unwrap_err();
+        assert!(format!("{err}").contains("MCU-aligned"));
+    }
+
     fn jpeg_range_positions(data: &[u8]) -> (u64, u64) {
         let mut pos = 2usize;
         let mut sof_position = None;
@@ -896,5 +1029,20 @@ mod tests {
             pos += len;
         }
         panic!("test JPEG has no SOF/SOS range");
+    }
+
+    fn generated_multimcu_jpeg() -> (Vec<u8>, Vec<u8>) {
+        let width = 32u32;
+        let height = 16u32;
+        let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+        for y in 0..height {
+            for x in 0..width {
+                rgb.push((x * 7 + y * 3) as u8);
+                rgb.push((x * 5 + 31) as u8);
+                rgb.push((y * 11 + 17) as u8);
+            }
+        }
+        let jpeg = encode_test_jpeg_rgb(&rgb, width, height, 90).unwrap();
+        (jpeg, rgb)
     }
 }

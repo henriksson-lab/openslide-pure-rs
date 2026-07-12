@@ -2,6 +2,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedLevelInfo, CompressedTile, CompressedTileMode, JpegColorSpace, LossyCodec,
+};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff::OpenslideHash, SlideBackend};
@@ -267,6 +271,16 @@ struct ZeissLevel {
     downsample: f64,
 }
 
+#[derive(Debug, Clone)]
+struct ZeissCompressedGrid {
+    tile_width: u32,
+    tile_height: u32,
+    tiles_across: u64,
+    tiles_down: u64,
+    codec: LossyCodec,
+    block_indices: Vec<Option<usize>>,
+}
+
 struct ZeissSlide {
     path: PathBuf,
     levels: Vec<ZeissLevel>,
@@ -423,6 +437,106 @@ impl SlideBackend for ZeissSlide {
             .map(|level| level.downsample)
     }
 
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        let Some(level_data) = self.levels.get(level as usize) else {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid level {level}"
+            )));
+        };
+        let grid = match zeiss_compressed_grid(
+            &self.path,
+            level_data,
+            &self.subblocks,
+            self.channel_count(),
+        ) {
+            Ok(grid) => grid,
+            Err(reason) => return Ok(CompressedExtractionSupport::NotSupported { reason }),
+        };
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                level,
+                width: level_data.width,
+                height: level_data.height,
+                tile_width: grid.tile_width,
+                tile_height: grid.tile_height,
+                tiles_across: grid.tiles_across,
+                tiles_down: grid.tiles_down,
+                codec: grid.codec,
+                modes: vec![CompressedTileMode::OriginalBytes],
+                constraints: vec![
+                    CompressedExtractionConstraint::RequiresCustomZarrCodec,
+                    CompressedExtractionConstraint::EdgeTilesMayBePartial,
+                ],
+            },
+        ))
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        if !mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "requested compressed tile modes are not available for Zeiss CZI".into(),
+            ));
+        }
+        let Some(level_data) = self.levels.get(level as usize) else {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid level {level}"
+            )));
+        };
+        let grid = zeiss_compressed_grid(
+            &self.path,
+            level_data,
+            &self.subblocks,
+            self.channel_count(),
+        )
+        .map_err(OpenSlideError::UnsupportedFormat)?;
+        if col >= grid.tiles_across || row >= grid.tiles_down {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid compressed tile coordinates ({col}, {row}) for level {level}"
+            )));
+        }
+        let cell = usize::try_from(row * grid.tiles_across + col)
+            .map_err(|_| OpenSlideError::Format("Zeiss compressed tile index overflow".into()))?;
+        let block_index = grid
+            .block_indices
+            .get(cell)
+            .and_then(|index| *index)
+            .ok_or_else(|| {
+                OpenSlideError::UnsupportedFormat(
+                    "Zeiss CZI compressed tile cell has no source subblock".into(),
+                )
+            })?;
+        let block = &self.subblocks[block_index];
+        let (offset, length) = zeiss_subblock_data_range_from_path(&self.path, block)?;
+        let width = (level_data.width - col * u64::from(grid.tile_width))
+            .min(u64::from(block.width)) as u32;
+        let height = (level_data.height - row * u64::from(grid.tile_height))
+            .min(u64::from(block.height)) as u32;
+        Ok(CompressedTile {
+            level,
+            col,
+            row,
+            origin_x: col * u64::from(grid.tile_width),
+            origin_y: row * u64::from(grid.tile_height),
+            width,
+            height,
+            nominal_tile_width: grid.tile_width,
+            nominal_tile_height: grid.tile_height,
+            codec: grid.codec,
+            mode: CompressedTileMode::OriginalBytes,
+            bytes: CompressedBytes::FileRange {
+                path: self.path.clone(),
+                offset,
+                length,
+            },
+        })
+    }
+
     fn read_region(
         &self,
         channel: u32,
@@ -537,6 +651,181 @@ impl SlideBackend for ZeissSlide {
                     .count()
             })
             .unwrap_or(0)
+    }
+}
+
+fn zeiss_compressed_grid(
+    path: &Path,
+    level: &ZeissLevel,
+    subblocks: &[CziSubBlock],
+    channel_count: u32,
+) -> std::result::Result<ZeissCompressedGrid, String> {
+    if channel_count != 1 && channel_count != 3 {
+        return Err(
+            "Zeiss CZI compressed extraction requires one gray or one RGB block per tile".into(),
+        );
+    }
+    let downsample = level.downsample.round().max(1.0) as u64;
+    let candidates = subblocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| zeiss_block_is_default_view(block) && block.downsample == downsample)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err(
+            "Zeiss CZI has no default-view subblocks for compressed extraction level".into(),
+        );
+    }
+    let (first_index, first) = candidates[0];
+    let tile_width = first.width;
+    let tile_height = first.height;
+    if tile_width == 0 || tile_height == 0 {
+        return Err("Zeiss CZI subblock has zero dimensions".into());
+    }
+    let codec = zeiss_lossy_codec(path, first)?;
+    let tiles_across = level.width.div_ceil(u64::from(tile_width));
+    let tiles_down = level.height.div_ceil(u64::from(tile_height));
+    let cell_count = tiles_across
+        .checked_mul(tiles_down)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| "Zeiss CZI compressed tile grid is too large".to_string())?;
+    let mut block_indices = vec![None; cell_count];
+
+    for (index, block) in candidates {
+        let block_codec = zeiss_lossy_codec(path, block)?;
+        if block_codec != codec {
+            return Err("Zeiss CZI compressed extraction requires one codec per level".into());
+        }
+        if block.width != tile_width || block.height != tile_height {
+            return Err(
+                "Zeiss CZI compressed extraction requires uniform subblock dimensions".into(),
+            );
+        }
+        let (col, row) = zeiss_compressed_block_cell(block, downsample, tile_width, tile_height)?;
+        if col >= tiles_across || row >= tiles_down {
+            return Err("Zeiss CZI compressed subblock lies outside the level grid".into());
+        }
+        let cell = usize::try_from(row * tiles_across + col)
+            .map_err(|_| "Zeiss CZI compressed tile index overflow".to_string())?;
+        if block_indices[cell].is_some() {
+            return Err(
+                "Zeiss CZI compressed extraction does not support duplicate subblocks per tile"
+                    .into(),
+            );
+        }
+        block_indices[cell] = Some(index);
+    }
+
+    if block_indices.iter().all(Option::is_none) {
+        block_indices[0] = Some(first_index);
+    }
+    Ok(ZeissCompressedGrid {
+        tile_width,
+        tile_height,
+        tiles_across,
+        tiles_down,
+        codec,
+        block_indices,
+    })
+}
+
+fn zeiss_block_is_default_view(block: &CziSubBlock) -> bool {
+    block.z == 0
+        && block.t == 0
+        && block.acquisition == 0
+        && block.angle == 0
+        && block.illumination == 0
+        && block.phase == 0
+        && block.rotation == 0
+}
+
+fn zeiss_compressed_block_cell(
+    block: &CziSubBlock,
+    downsample: u64,
+    tile_width: u32,
+    tile_height: u32,
+) -> std::result::Result<(u64, u64), String> {
+    if block.x < 0 || block.y < 0 {
+        return Err("Zeiss CZI compressed extraction requires non-negative origins".into());
+    }
+    let x = u64::try_from(block.x)
+        .map_err(|_| "Zeiss CZI compressed subblock X origin is negative".to_string())?;
+    let y = u64::try_from(block.y)
+        .map_err(|_| "Zeiss CZI compressed subblock Y origin is negative".to_string())?;
+    if x % downsample != 0 || y % downsample != 0 {
+        return Err(
+            "Zeiss CZI compressed subblock origin is not aligned to level downsample".into(),
+        );
+    }
+    let level_x = x / downsample;
+    let level_y = y / downsample;
+    if level_x % u64::from(tile_width) != 0 || level_y % u64::from(tile_height) != 0 {
+        return Err("Zeiss CZI compressed subblock origin is not tile-aligned".into());
+    }
+    Ok((
+        level_x / u64::from(tile_width),
+        level_y / u64::from(tile_height),
+    ))
+}
+
+fn zeiss_lossy_codec(path: &Path, block: &CziSubBlock) -> std::result::Result<LossyCodec, String> {
+    match block.compression {
+        CZI_COMPRESSION_JPEG => Ok(LossyCodec::Jpeg {
+            color_space: zeiss_jpeg_color_space(block.pixel_type),
+            subsampling: None,
+        }),
+        CZI_COMPRESSION_JPEG_XR => zeiss_jpeg_xr_lossy_codec(path, block),
+        _ => Err(zeiss_compressed_unsupported_reason(block)),
+    }
+}
+
+fn zeiss_jpeg_xr_lossy_codec(
+    path: &Path,
+    block: &CziSubBlock,
+) -> std::result::Result<LossyCodec, String> {
+    jpeg_xr_pixel_format(block.pixel_type).map_err(|err| err.to_string())?;
+    let raw = read_subblock_data_from_path(path, block).map_err(|err| err.to_string())?;
+    match decode::jpegxr::is_lossy_jpegxr(&raw) {
+        Ok(true) => Ok(LossyCodec::JpegXr),
+        Ok(false) => {
+            Err("Zeiss CZI JPEG XR subblocks are lossless; use read_region instead".into())
+        }
+        Err(err) => Err(format!(
+            "Zeiss CZI JPEG XR lossiness could not be verified: {err}"
+        )),
+    }
+}
+
+fn zeiss_jpeg_color_space(pixel_type: i32) -> JpegColorSpace {
+    match pixel_type {
+        CZI_PIXEL_GRAY8
+        | CZI_PIXEL_GRAY16
+        | CZI_PIXEL_GRAY_FLOAT
+        | CZI_PIXEL_GRAY32
+        | CZI_PIXEL_GRAY_DOUBLE => JpegColorSpace::Gray,
+        CZI_PIXEL_BGR24 | CZI_PIXEL_BGR48 | CZI_PIXEL_BGR_FLOAT | CZI_PIXEL_BGRA32 => {
+            JpegColorSpace::Rgb
+        }
+        _ => JpegColorSpace::Unknown,
+    }
+}
+
+fn zeiss_compressed_unsupported_reason(block: &CziSubBlock) -> String {
+    match block.compression {
+        CZI_COMPRESSION_UNCOMPRESSED => {
+            "Zeiss CZI subblocks are uncompressed; use read_region instead".into()
+        }
+        CZI_COMPRESSION_ZSTD0 | CZI_COMPRESSION_ZSTD1 => {
+            "Zeiss CZI subblocks use lossless Zstd; use read_region instead".into()
+        }
+        CZI_COMPRESSION_JPEG_XR => {
+            "Zeiss CZI JPEG XR subblocks are not verified lossy blocks; use read_region instead"
+                .into()
+        }
+        other => format!(
+            "Zeiss CZI compression {} is not supported for compressed extraction",
+            czi_compression_name(other).unwrap_or("unknown")
+        ),
     }
 }
 
@@ -1848,6 +2137,21 @@ fn read_subblock_data_from_path(path: &Path, block: &CziSubBlock) -> Result<Vec<
     crate::util::read_file_range(path, data_offset, data_size)
 }
 
+fn zeiss_subblock_data_range_from_path(path: &Path, block: &CziSubBlock) -> Result<(u64, u64)> {
+    let hdr = crate::util::read_file_range(path, block.file_position, ZISRAW_SEGMENT_HDR_LEN)?;
+    if !sid_matches(&hdr[0..16], b"ZISRAWSUBBLOCK") {
+        return Err(OpenSlideError::Format(
+            "Missing Zeiss ZISRAWSUBBLOCK segment".into(),
+        ));
+    }
+    let prefix = crate::util::read_file_range(
+        path,
+        block.file_position + ZISRAW_SEGMENT_HDR_LEN,
+        ZISRAW_SUBBLK_MIN_DATA_LEN,
+    )?;
+    zeiss_subblock_data_offset_and_size(&prefix, block)
+}
+
 fn read_subblock_data_from_reader(
     file: &mut impl ZeissReadAt,
     block: &CziSubBlock,
@@ -2169,6 +2473,196 @@ mod tests {
         assert_eq!(green.data, vec![11, 14, 17]);
         let blue = slide.read_region(2, -1, 0, 0, 2, 1).unwrap();
         assert_eq!(blue.data, vec![0, 3]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_returns_zeiss_jpeg_subblock_file_range() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_compressed_zeiss_jpeg_{}",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            make_test_czi(1, 1, CZI_PIXEL_BGR24, CZI_COMPRESSION_JPEG, ONE_PIXEL_JPEG),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        let crate::compressed::CompressedExtractionSupport::Supported(info) =
+            slide.compressed_level_info(0).unwrap()
+        else {
+            panic!("expected Zeiss JPEG subblock level to be supported");
+        };
+        assert_eq!(info.tile_width, 1);
+        assert_eq!(info.tile_height, 1);
+        assert_eq!(info.tiles_across, 1);
+        assert_eq!(info.tiles_down, 1);
+        assert_eq!(
+            info.codec,
+            crate::compressed::LossyCodec::Jpeg {
+                color_space: crate::compressed::JpegColorSpace::Rgb,
+                subsampling: None,
+            }
+        );
+
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+        assert_eq!(
+            tile.mode,
+            crate::compressed::CompressedTileMode::OriginalBytes
+        );
+        let crate::compressed::CompressedBytes::FileRange {
+            path: range_path,
+            offset,
+            length,
+        } = tile.bytes
+        else {
+            panic!("expected Zeiss compressed tile to be a file range");
+        };
+        assert_eq!(range_path, path);
+        assert_eq!(
+            crate::util::read_file_range(&range_path, offset, length).unwrap(),
+            ONE_PIXEL_JPEG
+        );
+        let err = slide
+            .read_compressed_tile(
+                0,
+                0,
+                0,
+                &[crate::compressed::CompressedTileMode::DerivedLosslessJpeg],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("requested compressed tile modes"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_returns_lossy_zeiss_jpeg_xr_subblock_file_range() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_compressed_zeiss_lossy_jpegxr_{}",
+            std::process::id()
+        ));
+        let payload = minimal_jpegxr_codestream(false);
+        fs::write(
+            &path,
+            make_test_czi(1, 1, CZI_PIXEL_BGR24, CZI_COMPRESSION_JPEG_XR, &payload),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        let crate::compressed::CompressedExtractionSupport::Supported(info) =
+            slide.compressed_level_info(0).unwrap()
+        else {
+            panic!("expected lossy Zeiss JPEG XR subblock level to be supported");
+        };
+        assert_eq!(info.codec, crate::compressed::LossyCodec::JpegXr);
+        assert_eq!(
+            info.modes,
+            vec![crate::compressed::CompressedTileMode::OriginalBytes]
+        );
+
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+        assert_eq!(tile.codec, crate::compressed::LossyCodec::JpegXr);
+        assert_eq!(
+            tile.mode,
+            crate::compressed::CompressedTileMode::OriginalBytes
+        );
+        let crate::compressed::CompressedBytes::FileRange {
+            path: range_path,
+            offset,
+            length,
+        } = tile.bytes
+        else {
+            panic!("expected Zeiss JPEG XR compressed tile to be a file range");
+        };
+        assert_eq!(
+            crate::util::read_file_range(&range_path, offset, length).unwrap(),
+            payload
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_rejects_lossless_zeiss_jpeg_xr_subblocks() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_compressed_zeiss_lossless_jpegxr_{}",
+            std::process::id()
+        ));
+        let payload = minimal_jpegxr_codestream(true);
+        fs::write(
+            &path,
+            make_test_czi(1, 1, CZI_PIXEL_BGR24, CZI_COMPRESSION_JPEG_XR, &payload),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        let crate::compressed::CompressedExtractionSupport::NotSupported { reason } =
+            slide.compressed_level_info(0).unwrap()
+        else {
+            panic!("expected lossless Zeiss JPEG XR subblock level to be unsupported");
+        };
+        assert!(reason.contains("JPEG XR subblocks are lossless"));
+        let err = slide.read_compressed_tile(0, 0, 0, &[]).unwrap_err();
+        assert!(format!("{err}").contains("JPEG XR subblocks are lossless"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_rejects_unverified_zeiss_jpeg_xr_subblocks() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_compressed_zeiss_unverified_jpegxr_{}",
+            std::process::id()
+        ));
+        let payload = [1, 2, 3, 4, 5, 6, 7, 8];
+        fs::write(
+            &path,
+            make_test_czi(1, 1, CZI_PIXEL_BGR24, CZI_COMPRESSION_JPEG_XR, &payload),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        let crate::compressed::CompressedExtractionSupport::NotSupported { reason } =
+            slide.compressed_level_info(0).unwrap()
+        else {
+            panic!("expected unverifiable Zeiss JPEG XR subblock level to be unsupported");
+        };
+        assert!(reason.contains("JPEG XR lossiness could not be verified"));
+        let err = slide.read_compressed_tile(0, 0, 0, &[]).unwrap_err();
+        assert!(format!("{err}").contains("JPEG XR lossiness could not be verified"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_rejects_zeiss_uncompressed_subblocks() {
+        let path = std::env::temp_dir().join(format!(
+            "openslide_rs_compressed_zeiss_uncompressed_{}",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            make_test_czi(
+                1,
+                1,
+                CZI_PIXEL_BGR24,
+                CZI_COMPRESSION_UNCOMPRESSED,
+                &[3, 2, 1],
+            ),
+        )
+        .unwrap();
+
+        let slide = ZeissSlide::open(&path).unwrap();
+        let support = slide.compressed_level_info(0).unwrap();
+        assert!(matches!(
+            support,
+            crate::compressed::CompressedExtractionSupport::NotSupported { .. }
+        ));
+        let err = slide.read_compressed_tile(0, 0, 0, &[]).unwrap_err();
+        assert!(format!("{err}").contains("uncompressed"));
 
         let _ = fs::remove_file(path);
     }
@@ -3559,6 +4053,83 @@ mod tests {
         );
         czi[data_pos..data_pos + data.len()].copy_from_slice(data);
         add_test_metadata(czi, &minimal_test_metadata_xml(width, height, 1))
+    }
+
+    fn minimal_jpegxr_codestream(lossless: bool) -> Vec<u8> {
+        let mut writer = BitWriter::new();
+        writer.write(1, 4); // codec version
+        writer.write(0, 4); // codec subversion
+        writer.write(0, 1); // tiling present
+        writer.write(0, 1); // spatial bitstream
+        writer.write(0, 3); // orientation
+        writer.write(0, 1); // no index table
+        writer.write(0, 2); // no overlap
+        writer.write(1, 1); // abbreviated header
+        writer.write(0, 1); // short internal bit depth marker
+        writer.write(0, 1); // no inscribed window
+        writer.write(0, 1); // no trim flexbits flag
+        writer.write(0, 1); // no tile stretch
+        writer.write(0, 1); // no red/blue swap
+        writer.write(0, 1); // reserved
+        writer.write(0, 1); // no alpha
+        writer.write(0, 4); // source Y_ONLY
+        writer.write(1, 4); // source BD_8
+        writer.write(0, 16); // width - 1
+        writer.write(0, 16); // height - 1
+        writer.byte_align();
+        writer.write(0, 3); // internal Y_ONLY
+        writer.write(u32::from(lossless), 1);
+        writer.write(3, 4); // DC-only subband
+        writer.write(1, 1); // DC uniform
+        writer.write(1, 8); // QP index; ignored by the probe
+        writer.byte_align();
+
+        let mut data = b"WMPHOTO\0".to_vec();
+        data.extend_from_slice(&writer.finish());
+        data
+    }
+
+    struct BitWriter {
+        bytes: Vec<u8>,
+        current: u8,
+        used: u8,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                current: 0,
+                used: 0,
+            }
+        }
+
+        fn write(&mut self, value: u32, bits: u8) {
+            for bit in (0..bits).rev() {
+                self.current <<= 1;
+                self.current |= ((value >> bit) & 1) as u8;
+                self.used += 1;
+                if self.used == 8 {
+                    self.bytes.push(self.current);
+                    self.current = 0;
+                    self.used = 0;
+                }
+            }
+        }
+
+        fn byte_align(&mut self) {
+            if self.used > 0 {
+                self.current <<= 8 - self.used;
+                self.bytes.push(self.current);
+                self.current = 0;
+                self.used = 0;
+            }
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            self.byte_align();
+            self.bytes
+        }
     }
 
     fn minimal_zeiss_block(scene: i32, downsample: u64) -> CziSubBlock {

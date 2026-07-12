@@ -58,6 +58,223 @@ int osr_jpeg_memory_range_rgb(unsigned char *buffer,
                               char *err,
                               size_t err_len);
 
+static JDIMENSION osr_jpeg_div_round_up(unsigned long value, unsigned long divisor) {
+    return (JDIMENSION)((value + divisor - 1) / divisor);
+}
+
+int osr_jpeg_lossless_crop(const unsigned char *data,
+                           size_t len,
+                           unsigned int x,
+                           unsigned int y,
+                           unsigned int w,
+                           unsigned int h,
+                           unsigned char **out,
+                           unsigned long *out_len,
+                           char *err,
+                           size_t err_len) {
+    struct jpeg_decompress_struct srcinfo;
+    struct jpeg_compress_struct dstinfo;
+    struct osr_jpeg_error srcerr;
+    struct osr_jpeg_error dsterr;
+    jvirt_barray_ptr *src_coef_arrays = NULL;
+    jvirt_barray_ptr *dst_coef_arrays = NULL;
+    unsigned char *mem = NULL;
+    unsigned long mem_len = 0;
+    int result = 0;
+    int dst_created = 0;
+
+    if (data == NULL || out == NULL || out_len == NULL) {
+        osr_set_error(err, err_len, "invalid null JPEG lossless crop argument");
+        return 0;
+    }
+    *out = NULL;
+    *out_len = 0;
+    if (w == 0 || h == 0) {
+        osr_set_error(err, err_len, "JPEG lossless crop rectangle is empty");
+        return 0;
+    }
+
+    memset(&srcinfo, 0, sizeof(srcinfo));
+    memset(&dstinfo, 0, sizeof(dstinfo));
+    srcinfo.err = jpeg_std_error(&srcerr.pub);
+    srcerr.pub.error_exit = osr_jpeg_error_exit;
+    dstinfo.err = jpeg_std_error(&dsterr.pub);
+    dsterr.pub.error_exit = osr_jpeg_error_exit;
+
+    if (setjmp(srcerr.setjmp_buffer)) {
+        osr_set_error(err, err_len, srcerr.message);
+        goto finish;
+    }
+    if (setjmp(dsterr.setjmp_buffer)) {
+        osr_set_error(err, err_len, dsterr.message);
+        goto finish;
+    }
+
+    jpeg_create_decompress(&srcinfo);
+    jpeg_mem_src(&srcinfo, data, (unsigned long)len);
+    jpeg_read_header(&srcinfo, TRUE);
+    src_coef_arrays = jpeg_read_coefficients(&srcinfo);
+
+    if ((unsigned long)x + (unsigned long)w > srcinfo.image_width ||
+        (unsigned long)y + (unsigned long)h > srcinfo.image_height) {
+        osr_set_error(err, err_len, "JPEG lossless crop rectangle is outside image bounds");
+        goto finish;
+    }
+    if (srcinfo.max_h_samp_factor <= 0 || srcinfo.max_v_samp_factor <= 0) {
+        osr_set_error(err, err_len, "JPEG lossless crop has invalid sampling factors");
+        goto finish;
+    }
+    unsigned int mcu_w = (unsigned int)srcinfo.max_h_samp_factor * DCTSIZE;
+    unsigned int mcu_h = (unsigned int)srcinfo.max_v_samp_factor * DCTSIZE;
+    if (x % mcu_w != 0 || y % mcu_h != 0) {
+        osr_set_error(err, err_len, "JPEG lossless crop origin is not MCU-aligned");
+        goto finish;
+    }
+    if (((unsigned long)x + (unsigned long)w < srcinfo.image_width && w % mcu_w != 0) ||
+        ((unsigned long)y + (unsigned long)h < srcinfo.image_height && h % mcu_h != 0)) {
+        osr_set_error(err, err_len, "JPEG lossless crop size is not MCU-compatible");
+        goto finish;
+    }
+
+    jpeg_create_compress(&dstinfo);
+    dst_created = 1;
+    jpeg_mem_dest(&dstinfo, &mem, &mem_len);
+    jpeg_copy_critical_parameters(&srcinfo, &dstinfo);
+    dstinfo.image_width = w;
+    dstinfo.image_height = h;
+    dstinfo.jpeg_width = w;
+    dstinfo.jpeg_height = h;
+
+    dst_coef_arrays = (jvirt_barray_ptr *)(*dstinfo.mem->alloc_small)(
+        (j_common_ptr)&dstinfo,
+        JPOOL_IMAGE,
+        srcinfo.num_components * sizeof(jvirt_barray_ptr));
+    for (int ci = 0; ci < srcinfo.num_components; ci++) {
+        jpeg_component_info *srccompptr = srcinfo.comp_info + ci;
+        jpeg_component_info *dstcompptr = dstinfo.comp_info + ci;
+        JDIMENSION dst_width_blocks = osr_jpeg_div_round_up(
+            (unsigned long)dstinfo.jpeg_width * (unsigned long)dstcompptr->h_samp_factor,
+            (unsigned long)srcinfo.max_h_samp_factor * DCTSIZE);
+        JDIMENSION dst_height_blocks = osr_jpeg_div_round_up(
+            (unsigned long)dstinfo.jpeg_height * (unsigned long)dstcompptr->v_samp_factor,
+            (unsigned long)srcinfo.max_v_samp_factor * DCTSIZE);
+        dstcompptr->width_in_blocks = dst_width_blocks;
+        dstcompptr->height_in_blocks = dst_height_blocks;
+        dst_coef_arrays[ci] = (*dstinfo.mem->request_virt_barray)(
+            (j_common_ptr)&dstinfo,
+            JPOOL_IMAGE,
+            TRUE,
+            dst_width_blocks,
+            dst_height_blocks,
+            (JDIMENSION)dstcompptr->v_samp_factor);
+        (void)srccompptr;
+    }
+
+    jpeg_write_coefficients(&dstinfo, dst_coef_arrays);
+    for (int ci = 0; ci < srcinfo.num_components; ci++) {
+        jpeg_component_info *srccompptr = srcinfo.comp_info + ci;
+        jpeg_component_info *dstcompptr = dstinfo.comp_info + ci;
+        JDIMENSION src_col = (JDIMENSION)((unsigned long)x / mcu_w *
+                                         (unsigned long)srccompptr->h_samp_factor);
+        JDIMENSION src_row = (JDIMENSION)((unsigned long)y / mcu_h *
+                                         (unsigned long)srccompptr->v_samp_factor);
+        for (JDIMENSION row = 0; row < dstcompptr->height_in_blocks; row++) {
+            JBLOCKARRAY src_buffer = (*srcinfo.mem->access_virt_barray)(
+                (j_common_ptr)&srcinfo,
+                src_coef_arrays[ci],
+                src_row + row,
+                1,
+                FALSE);
+            JBLOCKARRAY dst_buffer = (*dstinfo.mem->access_virt_barray)(
+                (j_common_ptr)&dstinfo,
+                dst_coef_arrays[ci],
+                row,
+                1,
+                TRUE);
+            memcpy(dst_buffer[0],
+                   src_buffer[0] + src_col,
+                   (size_t)dstcompptr->width_in_blocks * sizeof(JBLOCK));
+        }
+    }
+
+    jpeg_finish_compress(&dstinfo);
+    jpeg_finish_decompress(&srcinfo);
+    *out = mem;
+    *out_len = mem_len;
+    mem = NULL;
+    result = 1;
+
+finish:
+    if (dst_created) {
+        jpeg_destroy_compress(&dstinfo);
+    }
+    jpeg_destroy_decompress(&srcinfo);
+    if (mem != NULL) {
+        free(mem);
+    }
+    return result;
+}
+
+void osr_jpeg_free_buffer(unsigned char *buffer) {
+    free(buffer);
+}
+
+int osr_jpeg_encode_rgb_for_test(const unsigned char *rgb,
+                                 unsigned int width,
+                                 unsigned int height,
+                                 unsigned int quality,
+                                 unsigned char **out,
+                                 unsigned long *out_len,
+                                 char *err,
+                                 size_t err_len) {
+    struct jpeg_compress_struct cinfo;
+    struct osr_jpeg_error jerr;
+    JSAMPROW row_pointer[1];
+    unsigned char *mem = NULL;
+    unsigned long mem_len = 0;
+    int result = 0;
+
+    if (rgb == NULL || out == NULL || out_len == NULL || width == 0 || height == 0) {
+        osr_set_error(err, err_len, "invalid null JPEG encode argument");
+        return 0;
+    }
+    *out = NULL;
+    *out_len = 0;
+
+    memset(&cinfo, 0, sizeof(cinfo));
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = osr_jpeg_error_exit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        osr_set_error(err, err_len, jerr.message);
+        jpeg_destroy_compress(&cinfo);
+        if (mem != NULL) {
+            free(mem);
+        }
+        return 0;
+    }
+
+    jpeg_create_compress(&cinfo);
+    jpeg_mem_dest(&cinfo, &mem, &mem_len);
+    cinfo.image_width = width;
+    cinfo.image_height = height;
+    cinfo.input_components = 3;
+    cinfo.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality > 100 ? 100 : (int)quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+    while (cinfo.next_scanline < cinfo.image_height) {
+        row_pointer[0] = (JSAMPROW)&rgb[(size_t)cinfo.next_scanline * width * 3];
+        jpeg_write_scanlines(&cinfo, row_pointer, 1);
+    }
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    *out = mem;
+    *out_len = mem_len;
+    result = 1;
+    return result;
+}
+
 int osr_jpeg_crop_channel(const unsigned char *data,
                           size_t len,
                           unsigned int channel,

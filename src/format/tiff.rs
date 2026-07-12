@@ -7,6 +7,11 @@ use std::sync::Arc;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 
 use crate::cache::{CachedTile, TileCache};
+use crate::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedLevelInfo, CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace,
+    JpegSubsampling, LossyCodec,
+};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::SlideBackend;
@@ -1282,6 +1287,252 @@ impl GenericTiffSlide {
             .get(level as usize)
             .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {}", level)))
     }
+
+    fn compressed_level_info_impl(&self, level_index: u32) -> Result<CompressedExtractionSupport> {
+        let level = self.level(level_index)?;
+        let Some(codec) = self.lossy_level_codec(level, 0)? else {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: compressed_level_unsupported_reason(level),
+            });
+        };
+        let modes = match self.compressed_level_modes(level) {
+            Some(modes) => modes,
+            None => {
+                return Ok(CompressedExtractionSupport::NotSupported {
+                    reason: compressed_level_unsupported_reason(level),
+                });
+            }
+        };
+
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                level: level_index,
+                width: level.width,
+                height: level.height,
+                tile_width: level.tile_width,
+                tile_height: level.tile_height,
+                tiles_across: level.tiles_across,
+                tiles_down: level.tiles_down,
+                codec,
+                modes,
+                constraints: vec![
+                    CompressedExtractionConstraint::RequiresCustomZarrCodec,
+                    CompressedExtractionConstraint::EdgeTilesMayBePartial,
+                ],
+            },
+        ))
+    }
+
+    fn compressed_level_modes(&self, level: &TiffLevel) -> Option<Vec<CompressedTileMode>> {
+        if level.planar_config != PLANARCONFIG_CONTIG
+            || level.old_jpeg.is_some()
+            || level.samples_per_pixel != level.channel_count() as u16
+            || level.bits_per_sample_value().ok()? != 8
+        {
+            return None;
+        }
+        match (level.compression, level.jpeg_tables.is_some()) {
+            (COMPRESSION_JPEG, false) => Some(vec![CompressedTileMode::OriginalBytes]),
+            (COMPRESSION_JPEG, true) => Some(vec![CompressedTileMode::DerivedLosslessJpeg]),
+            (COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K, false) => {
+                Some(vec![CompressedTileMode::OriginalBytes])
+            }
+            _ => None,
+        }
+    }
+
+    fn lossy_level_codec(&self, level: &TiffLevel, tile_no: u64) -> Result<Option<LossyCodec>> {
+        if level.planar_config != PLANARCONFIG_CONTIG {
+            return Ok(None);
+        }
+        if level.old_jpeg.is_some() {
+            return Ok(None);
+        }
+        if level.samples_per_pixel != level.channel_count() as u16 {
+            return Ok(None);
+        }
+        if level.bits_per_sample_value()? != 8 {
+            return Ok(None);
+        }
+
+        match level.compression {
+            COMPRESSION_JPEG => Ok(Some(LossyCodec::Jpeg {
+                color_space: jpeg_color_space_metadata(level.photometric),
+                subsampling: Some(jpeg_subsampling_metadata(level.ycbcr_subsampling)),
+            })),
+            COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+                if level.jpeg_tables.is_some() {
+                    return Ok(None);
+                }
+                let byte_count = *level.tile_byte_counts.get(tile_no as usize).unwrap_or(&0);
+                if byte_count == 0 {
+                    return Ok(None);
+                }
+                let offset = *level.tile_offsets.get(tile_no as usize).unwrap_or(&0);
+                let raw = read_file_range_from_open_file(
+                    &self.tiff_file,
+                    self.tiff_file_len,
+                    offset,
+                    byte_count,
+                )?;
+                let info = decode::jpeg2000::inspect(&raw)?;
+                if info.coding_style.as_ref().is_some_and(|style| {
+                    style.transformation == decode::jpeg2000::WaveletTransform::Irreversible9x7
+                }) {
+                    Ok(Some(LossyCodec::Jpeg2000 {
+                        container: if info.is_jp2_container {
+                            Jpeg2000Container::Jp2
+                        } else {
+                            Jpeg2000Container::Codestream
+                        },
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn compressed_tile_mode(
+        &self,
+        level: &TiffLevel,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTileMode> {
+        let modes = self.compressed_level_modes(level).ok_or_else(|| {
+            OpenSlideError::UnsupportedFormat(compressed_level_unsupported_reason(level))
+        })?;
+        modes
+            .into_iter()
+            .find(|mode| mode_allowed(preferred_modes, *mode))
+            .ok_or_else(|| {
+                OpenSlideError::UnsupportedFormat(
+                    "requested compressed tile modes are not available for TIFF".into(),
+                )
+            })
+    }
+
+    fn read_compressed_tile_impl(
+        &self,
+        level_index: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        let level = self.level(level_index)?;
+        let mode = self.compressed_tile_mode(level, preferred_modes)?;
+        if col >= level.tiles_across || row >= level.tiles_down {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid compressed tile coordinates ({col}, {row}) for level {level_index}"
+            )));
+        }
+        let tile_no = row
+            .checked_mul(level.tiles_across)
+            .and_then(|base| base.checked_add(col))
+            .ok_or_else(|| OpenSlideError::InvalidArgument("TIFF tile index overflow".into()))?;
+        let Some(codec) = self.lossy_level_codec(level, tile_no)? else {
+            return Err(OpenSlideError::UnsupportedFormat(
+                compressed_level_unsupported_reason(level),
+            ));
+        };
+        let byte_count = *level
+            .tile_byte_counts
+            .get(tile_no as usize)
+            .ok_or_else(|| OpenSlideError::Format("TIFF tile byte count is missing".into()))?;
+        if byte_count == 0 {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "TIFF tile is missing and cannot be emitted as lossy compressed bytes".into(),
+            ));
+        }
+        let offset = *level
+            .tile_offsets
+            .get(tile_no as usize)
+            .ok_or_else(|| OpenSlideError::Format("TIFF tile offset is missing".into()))?;
+        let (width, height) = tile_visible_size(level, tile_no)?;
+        let bytes = match mode {
+            CompressedTileMode::OriginalBytes => CompressedBytes::FileRange {
+                path: self.path.clone(),
+                offset,
+                length: byte_count,
+            },
+            CompressedTileMode::DerivedLosslessJpeg => {
+                let raw = read_file_range_from_open_file(
+                    &self.tiff_file,
+                    self.tiff_file_len,
+                    offset,
+                    byte_count,
+                )?;
+                CompressedBytes::Owned(merge_jpeg_tables(&raw, level.jpeg_tables.as_deref())?)
+            }
+        };
+        Ok(CompressedTile {
+            level: level_index,
+            col,
+            row,
+            origin_x: col * u64::from(level.tile_width),
+            origin_y: row * u64::from(level.tile_height),
+            width,
+            height,
+            nominal_tile_width: level.tile_width,
+            nominal_tile_height: level.tile_height,
+            codec,
+            mode,
+            bytes,
+        })
+    }
+}
+
+fn compressed_level_unsupported_reason(level: &TiffLevel) -> String {
+    if level.planar_config != PLANARCONFIG_CONTIG {
+        return "TIFF level uses planar separate storage; use read_region instead".into();
+    }
+    if level.old_jpeg.is_some() {
+        return "TIFF level uses old JPEG tables; derived lossless JPEG is not implemented".into();
+    }
+    if level.bits_per_sample_value().ok() != Some(8) {
+        return "TIFF level is not 8-bit lossy data; use read_region instead".into();
+    }
+    match level.compression {
+        COMPRESSION_NONE => "TIFF level is uncompressed; use read_region instead".into(),
+        COMPRESSION_LZW => {
+            "TIFF level uses lossless LZW compression; use read_region instead".into()
+        }
+        COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => {
+            "TIFF level uses lossless Deflate compression; use read_region instead".into()
+        }
+        COMPRESSION_PACKBITS => {
+            "TIFF level uses lossless PackBits compression; use read_region instead".into()
+        }
+        COMPRESSION_OLD_JPEG => {
+            "TIFF level uses old JPEG; derived lossless JPEG is not implemented".into()
+        }
+        COMPRESSION_JPEG => "TIFF JPEG level is not supported for compressed extraction".into(),
+        COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+            "TIFF JPEG 2000 level is not known to be lossy; use read_region instead".into()
+        }
+        other => format!("TIFF compression {other} is not supported for compressed extraction"),
+    }
+}
+
+fn jpeg_color_space_metadata(photometric: u16) -> JpegColorSpace {
+    match photometric {
+        PHOTOMETRIC_RGB => JpegColorSpace::Rgb,
+        PHOTOMETRIC_YCBCR => JpegColorSpace::YCbCr,
+        PHOTOMETRIC_WHITE_IS_ZERO | PHOTOMETRIC_BLACK_IS_ZERO => JpegColorSpace::Gray,
+        _ => JpegColorSpace::Unknown,
+    }
+}
+
+fn jpeg_subsampling_metadata(subsampling: (u16, u16)) -> JpegSubsampling {
+    match subsampling {
+        (1, 1) => JpegSubsampling::Cs444,
+        (2, 1) => JpegSubsampling::Cs422,
+        (2, 2) => JpegSubsampling::Cs420,
+        (horizontal, vertical) => JpegSubsampling::Other {
+            horizontal,
+            vertical,
+        },
+    }
 }
 
 fn should_use_tiff_decoder_for_contiguous(level: &TiffLevel) -> bool {
@@ -1339,6 +1590,20 @@ impl SlideBackend for GenericTiffSlide {
         self.levels
             .get(level as usize)
             .map(|level| (u64::from(level.tile_width), u64::from(level.tile_height)))
+    }
+
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        self.compressed_level_info_impl(level)
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        self.read_compressed_tile_impl(level, col, row, preferred_modes)
     }
 
     fn read_region(
@@ -3570,6 +3835,177 @@ mod tests {
     }
 
     #[test]
+    fn compressed_extraction_rejects_uncompressed_tiff_level() {
+        let path = temp_path("compressed-uncompressed.bin");
+        fs::write(&path, [1, 2, 3]).unwrap();
+        let slide = generic_tiff_test_slide(
+            path.clone(),
+            TiffLevel {
+                dir: 0,
+                width: 1,
+                height: 1,
+                downsample: 1.0,
+                tile_width: 1,
+                tile_height: 1,
+                tiles_across: 1,
+                tiles_down: 1,
+                compression: COMPRESSION_NONE,
+                photometric: PHOTOMETRIC_RGB,
+                samples_per_pixel: 3,
+                planar_config: PLANARCONFIG_CONTIG,
+                predictor: 1,
+                bits_per_sample: vec![8, 8, 8],
+                ycbcr_subsampling: (1, 1),
+                tile_offsets: vec![0],
+                tile_byte_counts: vec![3],
+                jpeg_tables: None,
+                old_jpeg: None,
+                endian: Endian::Little,
+            },
+        );
+
+        let support = slide.compressed_level_info(0).unwrap();
+
+        assert!(matches!(
+            support,
+            crate::compressed::CompressedExtractionSupport::NotSupported { .. }
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_returns_simple_tiff_jpeg_file_range() {
+        let path = temp_path("compressed-jpeg.bin");
+        fs::write(&path, [0xff, 0xd8, 0xff, 0xd9, 99]).unwrap();
+        let slide = generic_tiff_test_slide(
+            path.clone(),
+            TiffLevel {
+                dir: 0,
+                width: 2,
+                height: 1,
+                downsample: 1.0,
+                tile_width: 2,
+                tile_height: 1,
+                tiles_across: 1,
+                tiles_down: 1,
+                compression: COMPRESSION_JPEG,
+                photometric: PHOTOMETRIC_YCBCR,
+                samples_per_pixel: 3,
+                planar_config: PLANARCONFIG_CONTIG,
+                predictor: 1,
+                bits_per_sample: vec![8, 8, 8],
+                ycbcr_subsampling: (2, 2),
+                tile_offsets: vec![0],
+                tile_byte_counts: vec![4],
+                jpeg_tables: None,
+                old_jpeg: None,
+                endian: Endian::Little,
+            },
+        );
+
+        let support = slide.compressed_level_info(0).unwrap();
+        assert!(matches!(
+            support,
+            crate::compressed::CompressedExtractionSupport::Supported(_)
+        ));
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+
+        assert_eq!(
+            tile.codec,
+            crate::compressed::LossyCodec::Jpeg {
+                color_space: crate::compressed::JpegColorSpace::YCbCr,
+                subsampling: Some(crate::compressed::JpegSubsampling::Cs420),
+            }
+        );
+        assert_eq!(
+            tile.mode,
+            crate::compressed::CompressedTileMode::OriginalBytes
+        );
+        assert_eq!(tile.width, 2);
+        assert_eq!(tile.height, 1);
+        assert_eq!(
+            tile.bytes,
+            crate::compressed::CompressedBytes::FileRange {
+                path: path.clone(),
+                offset: 0,
+                length: 4,
+            }
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_merges_tiff_jpeg_tables_as_derived_jpeg() {
+        let path = temp_path("compressed-jpeg-tables.bin");
+        let tile_jpeg = [0xff, 0xd8, 0xff, 0xd9];
+        fs::write(&path, tile_jpeg).unwrap();
+        let mut table_payload = vec![0xff, 0xdb, 0x00, 0x43, 0x00];
+        table_payload.extend([1u8; 64]);
+        let mut jpeg_tables = vec![0xff, 0xd8];
+        jpeg_tables.extend_from_slice(&table_payload);
+        jpeg_tables.extend_from_slice(&[0xff, 0xd9]);
+        let slide = generic_tiff_test_slide(
+            path.clone(),
+            TiffLevel {
+                dir: 0,
+                width: 2,
+                height: 1,
+                downsample: 1.0,
+                tile_width: 2,
+                tile_height: 1,
+                tiles_across: 1,
+                tiles_down: 1,
+                compression: COMPRESSION_JPEG,
+                photometric: PHOTOMETRIC_YCBCR,
+                samples_per_pixel: 3,
+                planar_config: PLANARCONFIG_CONTIG,
+                predictor: 1,
+                bits_per_sample: vec![8, 8, 8],
+                ycbcr_subsampling: (2, 2),
+                tile_offsets: vec![0],
+                tile_byte_counts: vec![tile_jpeg.len() as u64],
+                jpeg_tables: Some(jpeg_tables),
+                old_jpeg: None,
+                endian: Endian::Little,
+            },
+        );
+
+        let support = slide.compressed_level_info(0).unwrap();
+        let crate::compressed::CompressedExtractionSupport::Supported(info) = support else {
+            panic!("expected TIFF JPEG level with JPEGTables to be supported");
+        };
+        assert_eq!(
+            info.modes,
+            vec![crate::compressed::CompressedTileMode::DerivedLosslessJpeg]
+        );
+        let err = slide
+            .read_compressed_tile(
+                0,
+                0,
+                0,
+                &[crate::compressed::CompressedTileMode::OriginalBytes],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("requested compressed tile modes"));
+
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+
+        let mut expected = vec![0xff, 0xd8];
+        expected.extend_from_slice(&table_payload);
+        expected.extend_from_slice(&tile_jpeg[2..]);
+        assert_eq!(
+            tile.mode,
+            crate::compressed::CompressedTileMode::DerivedLosslessJpeg
+        );
+        assert_eq!(
+            tile.bytes,
+            crate::compressed::CompressedBytes::Owned(expected)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn hash_file_part_reads_through_shared_file_helpers() {
         let path = temp_path("hash-file-part.bin");
         fs::write(&path, b"0123456789").unwrap();
@@ -4659,6 +5095,25 @@ mod tests {
             value_type: TYPE_ASCII,
             count: value.len() as u64 + 1,
             raw: format!("{value}\0").into_bytes(),
+        }
+    }
+
+    fn generic_tiff_test_slide(path: PathBuf, level: TiffLevel) -> GenericTiffSlide {
+        let mut file = crate::util::_openslide_fopen(&path).unwrap();
+        let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file).unwrap()).unwrap();
+        let channel_count = level.channel_count();
+        let cache = Arc::new(TileCache::new());
+        let cache_binding_id = cache.next_binding_id();
+        GenericTiffSlide {
+            path,
+            tiff_file: Arc::new(file),
+            tiff_file_len: file_len,
+            levels: vec![level],
+            properties: HashMap::new(),
+            icc_profile: None,
+            cache,
+            cache_binding_id,
+            channel_count,
         }
     }
 

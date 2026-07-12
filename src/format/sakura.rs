@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff::OpenslideHash, SlideBackend};
@@ -251,6 +252,36 @@ impl SlideBackend for SakuraSlide {
         self.levels
             .get(level as usize)
             .map(|level| (u64::from(level.tile_size), u64::from(level.tile_size)))
+    }
+
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        if level as usize >= self.levels.len() {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid level {level}"
+            )));
+        }
+        Ok(CompressedExtractionSupport::NotSupported {
+            reason: "Sakura stores RGB tiles as separate per-channel JPEG blobs; use read_region instead"
+                .into(),
+        })
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        _col: u64,
+        _row: u64,
+        _preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        if level as usize >= self.levels.len() {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid level {level}"
+            )));
+        }
+        Err(OpenSlideError::UnsupportedFormat(
+            "Sakura stores RGB tiles as separate per-channel JPEG blobs; use read_region instead"
+                .into(),
+        ))
     }
 
     fn read_region(

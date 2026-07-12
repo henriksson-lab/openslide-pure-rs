@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::DeflateDecoder;
 
+use crate::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedFileRange, CompressedLevelInfo, CompressedTile, CompressedTileMode,
+    Jpeg2000Container, JpegColorSpace, LossyCodec,
+};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff, SlideBackend};
@@ -1189,6 +1194,161 @@ impl DicomSlide {
         }
     }
 
+    fn compressed_level_info_impl(&self, level_index: u32) -> Result<CompressedExtractionSupport> {
+        if let Some(Some(slide)) = self.level_slides.get(level_index as usize) {
+            return match slide.compressed_level_info_impl(0)? {
+                CompressedExtractionSupport::Supported(mut info) => {
+                    info.level = level_index;
+                    Ok(CompressedExtractionSupport::Supported(info))
+                }
+                unsupported => Ok(unsupported),
+            };
+        }
+        let Some(level) = self.levels.get(level_index as usize) else {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid level {level_index}"
+            )));
+        };
+        let Some(codec) = self.lossy_compressed_codec_for_level(level)? else {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: dicom_compressed_unsupported_reason(&self.transfer_syntax),
+            });
+        };
+
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                level: level_index,
+                width: level.width,
+                height: level.height,
+                tile_width: level.tile_width,
+                tile_height: level.tile_height,
+                tiles_across: level.tiles_across,
+                tiles_down: level.tiles_down,
+                codec,
+                modes: vec![CompressedTileMode::OriginalBytes],
+                constraints: vec![
+                    CompressedExtractionConstraint::RequiresCustomZarrCodec,
+                    CompressedExtractionConstraint::EdgeTilesMayBePartial,
+                    CompressedExtractionConstraint::FragmentedSource,
+                ],
+            },
+        ))
+    }
+
+    fn lossy_compressed_codec_for_level(&self, level: &DicomLevel) -> Result<Option<LossyCodec>> {
+        let Some(PixelData::Encapsulated { frames }) = &self.pixel_data else {
+            return Ok(None);
+        };
+        match self.transfer_syntax.as_str() {
+            TS_JPEG_BASELINE => Ok(Some(LossyCodec::Jpeg {
+                color_space: match self.photometric.as_str() {
+                    "RGB" => JpegColorSpace::Rgb,
+                    "YBR_FULL_422" => JpegColorSpace::YCbCr,
+                    "MONOCHROME1" | "MONOCHROME2" => JpegColorSpace::Gray,
+                    _ => JpegColorSpace::Unknown,
+                },
+                subsampling: None,
+            })),
+            TS_JPEG_2000 => {
+                let Some(frame_index) = self.frame_index_for_tile(level, 0, 0) else {
+                    return Ok(None);
+                };
+                let Some(frame) = frames.get(frame_index as usize) else {
+                    return Ok(None);
+                };
+                let data = read_file_fragments(&frame.path, &frame.fragments)?;
+                let info = decode::jpeg2000::inspect(&data)?;
+                if info.coding_style.as_ref().is_some_and(|style| {
+                    style.transformation == decode::jpeg2000::WaveletTransform::Irreversible9x7
+                }) {
+                    Ok(Some(LossyCodec::Jpeg2000 {
+                        container: if info.is_jp2_container {
+                            Jpeg2000Container::Jp2
+                        } else {
+                            Jpeg2000Container::Codestream
+                        },
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn read_compressed_tile_impl(
+        &self,
+        level_index: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        if let Some(Some(slide)) = self.level_slides.get(level_index as usize) {
+            let mut tile = slide.read_compressed_tile_impl(0, col, row, preferred_modes)?;
+            tile.level = level_index;
+            return Ok(tile);
+        }
+        if !mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "requested compressed tile modes are not available for DICOM".into(),
+            ));
+        }
+        let level = self.levels.get(level_index as usize).ok_or_else(|| {
+            OpenSlideError::InvalidArgument(format!("Invalid level {level_index}"))
+        })?;
+        if col >= level.tiles_across || row >= level.tiles_down {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid compressed tile coordinates ({col}, {row}) for level {level_index}"
+            )));
+        }
+        let Some(codec) = self.lossy_compressed_codec_for_level(level)? else {
+            return Err(OpenSlideError::UnsupportedFormat(
+                dicom_compressed_unsupported_reason(&self.transfer_syntax),
+            ));
+        };
+        let Some(frame_index) = self.frame_index_for_tile(level, col, row) else {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "DICOM tile has no frame mapping for compressed extraction".into(),
+            ));
+        };
+        let Some(PixelData::Encapsulated { frames }) = &self.pixel_data else {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "DICOM pixel data is not encapsulated lossy compressed data".into(),
+            ));
+        };
+        let frame = frames.get(frame_index as usize).ok_or_else(|| {
+            OpenSlideError::Format(format!("DICOM encapsulated frame {frame_index} missing"))
+        })?;
+        let width = (level.width - col * u64::from(level.tile_width))
+            .min(u64::from(level.tile_width)) as u32;
+        let height = (level.height - row * u64::from(level.tile_height))
+            .min(u64::from(level.tile_height)) as u32;
+        Ok(CompressedTile {
+            level: level_index,
+            col,
+            row,
+            origin_x: col * u64::from(level.tile_width),
+            origin_y: row * u64::from(level.tile_height),
+            width,
+            height,
+            nominal_tile_width: level.tile_width,
+            nominal_tile_height: level.tile_height,
+            codec,
+            mode: CompressedTileMode::OriginalBytes,
+            bytes: CompressedBytes::FileRanges {
+                ranges: frame
+                    .fragments
+                    .iter()
+                    .map(|fragment| CompressedFileRange {
+                        path: frame.path.clone(),
+                        offset: fragment.offset,
+                        length: fragment.len,
+                    })
+                    .collect(),
+            },
+        })
+    }
+
     fn read_region_rgb(&self, x: i64, y: i64, level: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         if let Some(Some(slide)) = self.level_slides.get(level as usize) {
             let Some(level_data) = self.levels.get(level as usize) else {
@@ -1500,6 +1660,20 @@ impl SlideBackend for DicomSlide {
         self.levels
             .get(level as usize)
             .map(|level| (u64::from(level.tile_width), u64::from(level.tile_height)))
+    }
+
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        self.compressed_level_info_impl(level)
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        self.read_compressed_tile_impl(level, col, row, preferred_modes)
     }
 
     fn read_region(
@@ -3723,6 +3897,36 @@ fn read_file_fragments(path: &Path, fragments: &[FileRange]) -> Result<Vec<u8>> 
         data.extend_from_slice(&read_file_range(path, fragment.offset, fragment.len)?);
     }
     Ok(data)
+}
+
+fn dicom_compressed_unsupported_reason(transfer_syntax: &str) -> String {
+    match transfer_syntax {
+        TS_IMPLICIT_VR_LE | TS_EXPLICIT_VR_LE | TS_EXPLICIT_VR_BE => {
+            "DICOM pixel data is uncompressed; use read_region instead".into()
+        }
+        TS_DEFLATED_EXPLICIT_VR_LE => {
+            "DICOM pixel data uses lossless deflate; use read_region instead".into()
+        }
+        TS_RLE_LOSSLESS => "DICOM pixel data uses lossless RLE; use read_region instead".into(),
+        TS_JPEG_LOSSLESS_PROCESS14 | TS_JPEG_LOSSLESS_SV1 => {
+            "DICOM pixel data uses lossless JPEG; use read_region instead".into()
+        }
+        TS_JPEG_LS_LOSSLESS | TS_JPEG_LS_NEAR_LOSSLESS => {
+            "DICOM pixel data uses JPEG-LS; use read_region instead".into()
+        }
+        TS_JPEG_2000_LOSSLESS => {
+            "DICOM pixel data uses lossless JPEG 2000; use read_region instead".into()
+        }
+        TS_JPEG_2000 => {
+            "DICOM JPEG 2000 frame is not known to be lossy; use read_region instead".into()
+        }
+        TS_HTJ2K_LOSSLESS | TS_HTJ2K_LOSSLESS_RPCL | TS_HTJ2K => {
+            "DICOM HTJ2K compressed extraction is not implemented".into()
+        }
+        _ => format!(
+            "DICOM transfer syntax {transfer_syntax} is not supported for compressed extraction"
+        ),
+    }
 }
 
 fn decode_rle_lossless_frame(

@@ -8,6 +8,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use configparser::ini::Ini;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 
+use crate::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedLevelInfo, CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace,
+    JpegSubsampling, LossyCodec,
+};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::SlideBackend;
@@ -57,8 +62,11 @@ const COMPRESSION_LZW: u16 = 5;
 const COMPRESSION_OLD_JPEG: u16 = 6;
 const COMPRESSION_JPEG: u16 = 7;
 const COMPRESSION_ADOBE_DEFLATE: u16 = 8;
+const COMPRESSION_JP2K_YCBCR: u16 = 33003;
+const COMPRESSION_JP2K_RGB: u16 = 33005;
 const COMPRESSION_DEFLATE: u16 = 32946;
 const COMPRESSION_PACKBITS: u16 = 32773;
+const COMPRESSION_JP2K: u16 = 34712;
 
 const PHOTOMETRIC_WHITE_IS_ZERO: u16 = 0;
 const PHOTOMETRIC_BLACK_IS_ZERO: u16 = 1;
@@ -374,6 +382,113 @@ impl SlideBackend for HamamatsuSlide {
         }
     }
 
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        let level_data = self
+            .levels
+            .get(level as usize)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {level}")))?;
+        match &level_data.source {
+            LevelSource::Vms {
+                image_files,
+                num_cols,
+                tile_w,
+                tile_h,
+                ..
+            } => {
+                if image_files.is_empty() || *num_cols == 0 {
+                    return Ok(CompressedExtractionSupport::NotSupported {
+                        reason: "Hamamatsu VMS level has no JPEG tile files".into(),
+                    });
+                }
+                Ok(CompressedExtractionSupport::Supported(
+                    CompressedLevelInfo {
+                        level,
+                        width: level_data.width,
+                        height: level_data.height,
+                        tile_width: *tile_w,
+                        tile_height: *tile_h,
+                        tiles_across: *num_cols,
+                        tiles_down: (image_files.len() as u64).div_ceil(*num_cols),
+                        codec: LossyCodec::Jpeg {
+                            color_space: JpegColorSpace::YCbCr,
+                            subsampling: None,
+                        },
+                        modes: vec![CompressedTileMode::OriginalBytes],
+                        constraints: vec![
+                            CompressedExtractionConstraint::RequiresCustomZarrCodec,
+                            CompressedExtractionConstraint::EdgeTilesMayBePartial,
+                        ],
+                    },
+                ))
+            }
+            LevelSource::Ndpi(ndpi) => compressed_ndpi_level_info(level, level_data, ndpi),
+            LevelSource::NdpiScaled(_) => Ok(CompressedExtractionSupport::NotSupported {
+                reason: "Hamamatsu scaled NDPI levels are derived; use read_region instead".into(),
+            }),
+            LevelSource::VmuNgr { .. } => Ok(CompressedExtractionSupport::NotSupported {
+                reason: "Hamamatsu VMU/NGR data is uncompressed; use read_region instead".into(),
+            }),
+            LevelSource::Unsupported => Ok(CompressedExtractionSupport::NotSupported {
+                reason: "Hamamatsu level source is unsupported".into(),
+            }),
+        }
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        let level_data = self
+            .levels
+            .get(level as usize)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {level}")))?;
+        match &level_data.source {
+            LevelSource::Vms {
+                image_files,
+                image_file_sizes,
+                tile_dimensions,
+                num_cols,
+                tile_w,
+                tile_h,
+                ..
+            } => {
+                if !mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
+                    return Err(OpenSlideError::UnsupportedFormat(
+                        "requested compressed tile modes are not available for Hamamatsu VMS"
+                            .into(),
+                    ));
+                }
+                read_compressed_vms_tile(
+                    level,
+                    level_data,
+                    image_files,
+                    image_file_sizes,
+                    tile_dimensions,
+                    *num_cols,
+                    *tile_w,
+                    *tile_h,
+                    col,
+                    row,
+                )
+            }
+            LevelSource::Ndpi(ndpi) => {
+                read_compressed_ndpi_tile(level, level_data, ndpi, col, row, preferred_modes)
+            }
+            LevelSource::NdpiScaled(_) => Err(OpenSlideError::UnsupportedFormat(
+                "Hamamatsu scaled NDPI levels are derived; use read_region instead".into(),
+            )),
+            LevelSource::VmuNgr { .. } => Err(OpenSlideError::UnsupportedFormat(
+                "Hamamatsu VMU/NGR data is uncompressed; use read_region instead".into(),
+            )),
+            LevelSource::Unsupported => Err(OpenSlideError::UnsupportedFormat(
+                "Hamamatsu level source is unsupported".into(),
+            )),
+        }
+    }
+
     fn read_region(
         &self,
         channel: u32,
@@ -573,6 +688,252 @@ impl SlideBackend for HamamatsuSlide {
 
     fn debug_grid_tile_count(&self, _channel: u32, _level: u32) -> usize {
         0
+    }
+}
+
+fn compressed_ndpi_level_info(
+    level_index: u32,
+    level: &Level,
+    ndpi: &NdpiLevel,
+) -> Result<CompressedExtractionSupport> {
+    let codec = match ndpi_lossy_codec(ndpi, 0)? {
+        Some(codec) => codec,
+        None => {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: ndpi_compressed_unsupported_reason(ndpi),
+            });
+        }
+    };
+    Ok(CompressedExtractionSupport::Supported(
+        CompressedLevelInfo {
+            level: level_index,
+            width: level.width,
+            height: level.height,
+            tile_width: ndpi.tile_w,
+            tile_height: ndpi.tile_h,
+            tiles_across: ndpi.tiles_across,
+            tiles_down: ndpi.tiles_down,
+            codec,
+            modes: ndpi_compressed_modes(ndpi),
+            constraints: vec![
+                CompressedExtractionConstraint::RequiresCustomZarrCodec,
+                CompressedExtractionConstraint::EdgeTilesMayBePartial,
+            ],
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_compressed_vms_tile(
+    level_index: u32,
+    level: &Level,
+    image_files: &[PathBuf],
+    image_file_sizes: &[u64],
+    tile_dimensions: &[(u32, u32)],
+    num_cols: u64,
+    tile_w: u32,
+    tile_h: u32,
+    col: u64,
+    row: u64,
+) -> Result<CompressedTile> {
+    if num_cols == 0 {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "Hamamatsu VMS level has zero tile columns".into(),
+        ));
+    }
+    let tiles_down = (image_files.len() as u64).div_ceil(num_cols);
+    if col >= num_cols || row >= tiles_down {
+        return Err(OpenSlideError::InvalidArgument(format!(
+            "Invalid compressed tile coordinates ({col}, {row}) for level {level_index}"
+        )));
+    }
+    let tile_index = usize::try_from(row * num_cols + col)
+        .map_err(|_| OpenSlideError::Format("VMS tile index overflow".into()))?;
+    let path = image_files
+        .get(tile_index)
+        .ok_or_else(|| OpenSlideError::Format("VMS JPEG tile path missing".into()))?;
+    let length = *image_file_sizes
+        .get(tile_index)
+        .ok_or_else(|| OpenSlideError::Format("VMS JPEG tile size missing".into()))?;
+    let (tile_file_w, tile_file_h) = *tile_dimensions
+        .get(tile_index)
+        .ok_or_else(|| OpenSlideError::Format("VMS JPEG tile dimensions missing".into()))?;
+    let visible_w = (level.width - col * u64::from(tile_w)).min(u64::from(tile_w)) as u32;
+    let visible_h = (level.height - row * u64::from(tile_h)).min(u64::from(tile_h)) as u32;
+    Ok(CompressedTile {
+        level: level_index,
+        col,
+        row,
+        origin_x: col * u64::from(tile_w),
+        origin_y: row * u64::from(tile_h),
+        width: tile_file_w.min(visible_w),
+        height: tile_file_h.min(visible_h),
+        nominal_tile_width: tile_w,
+        nominal_tile_height: tile_h,
+        codec: LossyCodec::Jpeg {
+            color_space: JpegColorSpace::YCbCr,
+            subsampling: None,
+        },
+        mode: CompressedTileMode::OriginalBytes,
+        bytes: CompressedBytes::FileRange {
+            path: path.clone(),
+            offset: 0,
+            length,
+        },
+    })
+}
+
+fn read_compressed_ndpi_tile(
+    level_index: u32,
+    level: &Level,
+    ndpi: &NdpiLevel,
+    col: u64,
+    row: u64,
+    preferred_modes: &[CompressedTileMode],
+) -> Result<CompressedTile> {
+    if col >= ndpi.tiles_across || row >= ndpi.tiles_down {
+        return Err(OpenSlideError::InvalidArgument(format!(
+            "Invalid compressed tile coordinates ({col}, {row}) for level {level_index}"
+        )));
+    }
+    let tile_index = usize::try_from(row * ndpi.tiles_across + col)
+        .map_err(|_| OpenSlideError::Format("NDPI tile index overflow".into()))?;
+    let Some(codec) = ndpi_lossy_codec(ndpi, tile_index)? else {
+        return Err(OpenSlideError::UnsupportedFormat(
+            ndpi_compressed_unsupported_reason(ndpi),
+        ));
+    };
+    let mode = ndpi_compressed_modes(ndpi)
+        .into_iter()
+        .find(|mode| mode_allowed(preferred_modes, *mode))
+        .ok_or_else(|| {
+            OpenSlideError::UnsupportedFormat(
+                "requested compressed tile modes are not available for Hamamatsu NDPI".into(),
+            )
+        })?;
+    let offset = *ndpi
+        .offsets
+        .get(tile_index)
+        .ok_or_else(|| OpenSlideError::Format("NDPI tile offset missing".into()))?;
+    let byte_count = *ndpi
+        .byte_counts
+        .get(tile_index)
+        .ok_or_else(|| OpenSlideError::Format("NDPI tile byte count missing".into()))?;
+    if byte_count == 0 {
+        return Err(OpenSlideError::UnsupportedFormat(
+            "NDPI tile is missing and cannot be emitted as original lossy bytes".into(),
+        ));
+    }
+    let width = (level.width - col * u64::from(ndpi.tile_w)).min(u64::from(ndpi.tile_w)) as u32;
+    let height = (level.height - row * u64::from(ndpi.tile_h)).min(u64::from(ndpi.tile_h)) as u32;
+    Ok(CompressedTile {
+        level: level_index,
+        col,
+        row,
+        origin_x: col * u64::from(ndpi.tile_w),
+        origin_y: row * u64::from(ndpi.tile_h),
+        width,
+        height,
+        nominal_tile_width: ndpi.tile_w,
+        nominal_tile_height: ndpi.tile_h,
+        codec,
+        mode,
+        bytes: match mode {
+            CompressedTileMode::OriginalBytes => CompressedBytes::FileRange {
+                path: ndpi.path.clone(),
+                offset,
+                length: byte_count,
+            },
+            CompressedTileMode::DerivedLosslessJpeg => {
+                let raw = read_span(&ndpi.path, offset, byte_count)?;
+                CompressedBytes::Owned(merge_jpeg_tables(&raw, ndpi.jpeg_tables.as_deref())?)
+            }
+        },
+    })
+}
+
+fn ndpi_lossy_codec(ndpi: &NdpiLevel, tile_index: usize) -> Result<Option<LossyCodec>> {
+    if ndpi.planar_config != PLANARCONFIG_CONTIG {
+        return Ok(None);
+    }
+    if ndpi.mcu_starts.is_some() {
+        return Ok(None);
+    }
+    if ndpi.bits_per_sample.iter().any(|&bits| bits != 8) {
+        return Ok(None);
+    }
+    match ndpi.compression {
+        COMPRESSION_JPEG => Ok(Some(LossyCodec::Jpeg {
+            color_space: match ndpi.photometric {
+                PHOTOMETRIC_RGB => JpegColorSpace::Rgb,
+                PHOTOMETRIC_YCBCR => JpegColorSpace::YCbCr,
+                PHOTOMETRIC_WHITE_IS_ZERO | PHOTOMETRIC_BLACK_IS_ZERO => JpegColorSpace::Gray,
+                _ => JpegColorSpace::Unknown,
+            },
+            subsampling: Some(JpegSubsampling::Cs420),
+        })),
+        COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+            let byte_count = *ndpi.byte_counts.get(tile_index).unwrap_or(&0);
+            if byte_count == 0 {
+                return Ok(None);
+            }
+            let offset = *ndpi.offsets.get(tile_index).unwrap_or(&0);
+            let raw = read_span(&ndpi.path, offset, byte_count)?;
+            let info = decode::jpeg2000::inspect(&raw)?;
+            if info.coding_style.as_ref().is_some_and(|style| {
+                style.transformation == decode::jpeg2000::WaveletTransform::Irreversible9x7
+            }) {
+                Ok(Some(LossyCodec::Jpeg2000 {
+                    container: if info.is_jp2_container {
+                        Jpeg2000Container::Jp2
+                    } else {
+                        Jpeg2000Container::Codestream
+                    },
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn ndpi_compressed_unsupported_reason(ndpi: &NdpiLevel) -> String {
+    if ndpi.planar_config != PLANARCONFIG_CONTIG {
+        return "Hamamatsu NDPI uses planar separate storage; use read_region instead".into();
+    }
+    if ndpi.mcu_starts.is_some() {
+        return "Hamamatsu NDPI MCU restart subranges are not standalone chunks".into();
+    }
+    if ndpi.bits_per_sample.iter().any(|&bits| bits != 8) {
+        return "Hamamatsu NDPI level is not 8-bit lossy data; use read_region instead".into();
+    }
+    match ndpi.compression {
+        COMPRESSION_OLD_JPEG => {
+            "Hamamatsu NDPI old JPEG requires derived lossless JPEG support".into()
+        }
+        COMPRESSION_NONE => "Hamamatsu NDPI level is uncompressed; use read_region instead".into(),
+        COMPRESSION_LZW => "Hamamatsu NDPI level uses lossless LZW; use read_region instead".into(),
+        COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => {
+            "Hamamatsu NDPI level uses lossless Deflate; use read_region instead".into()
+        }
+        COMPRESSION_PACKBITS => {
+            "Hamamatsu NDPI level uses lossless PackBits; use read_region instead".into()
+        }
+        COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+            "Hamamatsu NDPI JPEG 2000 level is not known to be lossy; use read_region instead"
+                .into()
+        }
+        other => {
+            format!("Hamamatsu NDPI compression {other} is not supported for compressed extraction")
+        }
+    }
+}
+
+fn ndpi_compressed_modes(ndpi: &NdpiLevel) -> Vec<CompressedTileMode> {
+    match (ndpi.compression, ndpi.jpeg_tables.is_some()) {
+        (COMPRESSION_JPEG, true) => vec![CompressedTileMode::DerivedLosslessJpeg],
+        _ => vec![CompressedTileMode::OriginalBytes],
     }
 }
 
@@ -5488,6 +5849,145 @@ mod tests {
     }
 
     #[test]
+    fn compressed_extraction_returns_ndpi_irreversible_jpeg2000_file_range() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-compressed-jp2k");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tile.jp2k");
+        let jp2k = encoded_jpeg2000_codestream_lossy(&[10, 20, 30], 1, 1, 3);
+        fs::write(&path, &jp2k).unwrap();
+        let slide = HamamatsuSlide {
+            properties: HashMap::new(),
+            associated_images: HashMap::new(),
+            levels: vec![Level {
+                width: 1,
+                height: 1,
+                downsample: 1.0,
+                source: LevelSource::Ndpi(NdpiLevel {
+                    path: path.clone(),
+                    dir_index: 0,
+                    endian: Endian::Little,
+                    width: 1,
+                    height: 1,
+                    tile_w: 1,
+                    tile_h: 1,
+                    tiles_across: 1,
+                    tiles_down: 1,
+                    offsets: vec![0],
+                    byte_counts: vec![jp2k.len() as u64],
+                    compression: COMPRESSION_JP2K_RGB,
+                    samples_per_pixel: 3,
+                    bits_per_sample: vec![8, 8, 8],
+                    photometric: PHOTOMETRIC_RGB,
+                    planar_config: PLANARCONFIG_CONTIG,
+                    jpeg_tables: None,
+                    mcu_starts: None,
+                }),
+            }],
+        };
+
+        let support = slide.compressed_level_info(0).unwrap();
+        assert!(matches!(
+            support,
+            crate::compressed::CompressedExtractionSupport::Supported(_)
+        ));
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+
+        assert_eq!(
+            tile.codec,
+            crate::compressed::LossyCodec::Jpeg2000 {
+                container: crate::compressed::Jpeg2000Container::Codestream,
+            }
+        );
+        assert_eq!(
+            tile.bytes,
+            crate::compressed::CompressedBytes::FileRange {
+                path: path.clone(),
+                offset: 0,
+                length: jp2k.len() as u64,
+            }
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compressed_extraction_merges_ndpi_jpeg_tables_as_derived_jpeg() {
+        let dir = unique_temp_dir("hamamatsu-ndpi-compressed-jpeg-tables");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tile.ndpi");
+        let tile_jpeg = [0xff, 0xd8, 0xff, 0xd9];
+        fs::write(&path, tile_jpeg).unwrap();
+        let mut table_payload = vec![0xff, 0xdb, 0x00, 0x43, 0x00];
+        table_payload.extend([1u8; 64]);
+        let mut jpeg_tables = vec![0xff, 0xd8];
+        jpeg_tables.extend_from_slice(&table_payload);
+        jpeg_tables.extend_from_slice(&[0xff, 0xd9]);
+        let slide = HamamatsuSlide {
+            properties: HashMap::new(),
+            associated_images: HashMap::new(),
+            levels: vec![Level {
+                width: 1,
+                height: 1,
+                downsample: 1.0,
+                source: LevelSource::Ndpi(NdpiLevel {
+                    path: path.clone(),
+                    dir_index: 0,
+                    endian: Endian::Little,
+                    width: 1,
+                    height: 1,
+                    tile_w: 1,
+                    tile_h: 1,
+                    tiles_across: 1,
+                    tiles_down: 1,
+                    offsets: vec![0],
+                    byte_counts: vec![tile_jpeg.len() as u64],
+                    compression: COMPRESSION_JPEG,
+                    samples_per_pixel: 3,
+                    bits_per_sample: vec![8, 8, 8],
+                    photometric: PHOTOMETRIC_YCBCR,
+                    planar_config: PLANARCONFIG_CONTIG,
+                    jpeg_tables: Some(jpeg_tables),
+                    mcu_starts: None,
+                }),
+            }],
+        };
+
+        let crate::compressed::CompressedExtractionSupport::Supported(info) =
+            slide.compressed_level_info(0).unwrap()
+        else {
+            panic!("expected NDPI JPEG level with JPEGTables to be supported");
+        };
+        assert_eq!(
+            info.modes,
+            vec![crate::compressed::CompressedTileMode::DerivedLosslessJpeg]
+        );
+        let err = slide
+            .read_compressed_tile(
+                0,
+                0,
+                0,
+                &[crate::compressed::CompressedTileMode::OriginalBytes],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("requested compressed tile modes"));
+
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+        let mut expected = vec![0xff, 0xd8];
+        expected.extend_from_slice(&table_payload);
+        expected.extend_from_slice(&tile_jpeg[2..]);
+        assert_eq!(
+            tile.mode,
+            crate::compressed::CompressedTileMode::DerivedLosslessJpeg
+        );
+        assert_eq!(
+            tile.bytes,
+            crate::compressed::CompressedBytes::Owned(expected)
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn ndpi_detect_ignores_malformed_later_ifd_after_flag() {
         let dir = unique_temp_dir("hamamatsu-ndpi-detect-malformed");
         fs::create_dir_all(&dir).unwrap();
@@ -6044,6 +6544,21 @@ mod tests {
         data.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
         data.extend_from_slice(&[0xff, 0xd9]);
         data
+    }
+
+    fn encoded_jpeg2000_codestream_lossy(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        components: u8,
+    ) -> Vec<u8> {
+        let options = dicom_toolkit_jpeg2000::EncodeOptions {
+            num_decomposition_levels: 0,
+            reversible: false,
+            ..dicom_toolkit_jpeg2000::EncodeOptions::default()
+        };
+        dicom_toolkit_jpeg2000::encode(pixels, width, height, components, 8, false, &options)
+            .unwrap()
     }
 
     fn ndpi_pixel_data() -> Vec<u8> {

@@ -3,6 +3,11 @@ use std::io::Read;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::path::{Path, PathBuf};
 
+use crate::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedLevelInfo, CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace,
+    LossyCodec,
+};
 use crate::decode;
 use crate::decode::ImageFormat;
 use crate::error::{OpenSlideError, Result};
@@ -531,6 +536,121 @@ impl SlideBackend for AperioSlide {
             .map(|level| (u64::from(level.tile_w), u64::from(level.tile_h)))
     }
 
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        let level_data = self
+            .levels
+            .get(level as usize)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {level}")))?;
+        let codec = match aperio_lossy_codec(&self.path, level_data, 0)? {
+            Some(codec) => codec,
+            None => {
+                return Ok(CompressedExtractionSupport::NotSupported {
+                    reason: aperio_compressed_unsupported_reason(level_data),
+                })
+            }
+        };
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                level,
+                width: level_data.width,
+                height: level_data.height,
+                tile_width: level_data.tile_w,
+                tile_height: level_data.tile_h,
+                tiles_across: level_data.tiles_across,
+                tiles_down: level_data.tiles_down,
+                codec,
+                modes: aperio_compressed_modes(level_data),
+                constraints: vec![
+                    CompressedExtractionConstraint::RequiresCustomZarrCodec,
+                    CompressedExtractionConstraint::EdgeTilesMayBePartial,
+                ],
+            },
+        ))
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        let level_data = self
+            .levels
+            .get(level as usize)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {level}")))?;
+        let mode = aperio_compressed_modes(level_data)
+            .into_iter()
+            .find(|mode| mode_allowed(preferred_modes, *mode))
+            .ok_or_else(|| {
+                OpenSlideError::UnsupportedFormat(
+                    "requested compressed tile modes are not available for Aperio".into(),
+                )
+            })?;
+        if col >= level_data.tiles_across || row >= level_data.tiles_down {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid compressed tile coordinates ({col}, {row}) for level {level}"
+            )));
+        }
+        let tile_index = usize::try_from(row * level_data.tiles_across + col)
+            .map_err(|_| OpenSlideError::Format("Aperio tile index overflow".into()))?;
+        if level_data.missing_tiles.contains(&tile_index) {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "Aperio tile is missing/synthesized and cannot be emitted as original lossy bytes"
+                    .into(),
+            ));
+        }
+        let Some(codec) = aperio_lossy_codec(&self.path, level_data, tile_index)? else {
+            return Err(OpenSlideError::UnsupportedFormat(
+                aperio_compressed_unsupported_reason(level_data),
+            ));
+        };
+        let offset = *level_data
+            .tile_offsets
+            .get(tile_index)
+            .ok_or_else(|| OpenSlideError::Format("Aperio tile offset missing".into()))?;
+        let byte_count = *level_data
+            .tile_byte_counts
+            .get(tile_index)
+            .ok_or_else(|| OpenSlideError::Format("Aperio tile byte count missing".into()))?;
+        if byte_count == 0 {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "Aperio tile is missing and cannot be emitted as original lossy bytes".into(),
+            ));
+        }
+        let width = (level_data.width - col * u64::from(level_data.tile_w))
+            .min(u64::from(level_data.tile_w)) as u32;
+        let height = (level_data.height - row * u64::from(level_data.tile_h))
+            .min(u64::from(level_data.tile_h)) as u32;
+        Ok(CompressedTile {
+            level,
+            col,
+            row,
+            origin_x: col * u64::from(level_data.tile_w),
+            origin_y: row * u64::from(level_data.tile_h),
+            width,
+            height,
+            nominal_tile_width: level_data.tile_w,
+            nominal_tile_height: level_data.tile_h,
+            codec,
+            mode,
+            bytes: match mode {
+                CompressedTileMode::OriginalBytes => CompressedBytes::FileRange {
+                    path: self.path.clone(),
+                    offset,
+                    length: byte_count,
+                },
+                CompressedTileMode::DerivedLosslessJpeg => {
+                    let raw = read_file_range(&self.path, offset, byte_count)?;
+                    CompressedBytes::Owned(merge_jpeg_tables(
+                        &raw,
+                        level_data.jpeg_tables.as_deref(),
+                    )?)
+                }
+            },
+        })
+    }
+
     fn read_region(
         &self,
         channel: u32,
@@ -791,6 +911,87 @@ impl SlideBackend for AperioSlide {
             .associated_images
             .get(name)
             .and_then(|image| image.icc_profile.clone()))
+    }
+}
+
+fn aperio_lossy_codec(
+    path: &Path,
+    level: &AperioLevel,
+    tile_index: usize,
+) -> Result<Option<LossyCodec>> {
+    if level.planar_config != 1
+        || level.old_jpeg.is_some()
+        || level.bits_per_sample.iter().any(|&bits| bits != 8)
+        || level.missing_tiles.contains(&tile_index)
+    {
+        return Ok(None);
+    }
+    match level.compression {
+        COMPRESSION_JPEG => Ok(Some(LossyCodec::Jpeg {
+            color_space: match level.photometric {
+                PHOTOMETRIC_RGB => JpegColorSpace::Rgb,
+                PHOTOMETRIC_YCBCR => JpegColorSpace::YCbCr,
+                _ => JpegColorSpace::Unknown,
+            },
+            subsampling: None,
+        })),
+        COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB => {
+            let byte_count = *level.tile_byte_counts.get(tile_index).unwrap_or(&0);
+            if byte_count == 0 {
+                return Ok(None);
+            }
+            let offset = *level.tile_offsets.get(tile_index).unwrap_or(&0);
+            let data = read_file_range(path, offset, byte_count)?;
+            let info = decode::jpeg2000::inspect(&data)?;
+            if info.coding_style.as_ref().is_some_and(|style| {
+                style.transformation == decode::jpeg2000::WaveletTransform::Irreversible9x7
+            }) {
+                Ok(Some(LossyCodec::Jpeg2000 {
+                    container: if info.is_jp2_container {
+                        Jpeg2000Container::Jp2
+                    } else {
+                        Jpeg2000Container::Codestream
+                    },
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn aperio_compressed_unsupported_reason(level: &AperioLevel) -> String {
+    if level.planar_config != 1 {
+        return "Aperio level uses planar separate storage; use read_region instead".into();
+    }
+    if level.old_jpeg.is_some() {
+        return "Aperio level uses old JPEG; derived lossless JPEG is not implemented".into();
+    }
+    if level.bits_per_sample.iter().any(|&bits| bits != 8) {
+        return "Aperio level is not 8-bit lossy data; use read_region instead".into();
+    }
+    match level.compression {
+        COMPRESSION_NONE => "Aperio level is uncompressed; use read_region instead".into(),
+        COMPRESSION_LZW => "Aperio level uses lossless LZW; use read_region instead".into(),
+        COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => {
+            "Aperio level uses lossless Deflate; use read_region instead".into()
+        }
+        COMPRESSION_PACKBITS => {
+            "Aperio level uses lossless PackBits; use read_region instead".into()
+        }
+        COMPRESSION_JPEG => "Aperio JPEG level is not supported for compressed extraction".into(),
+        COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB => {
+            "Aperio JPEG 2000 level is not known to be lossy; use read_region instead".into()
+        }
+        other => format!("Aperio compression {other} is not supported for compressed extraction"),
+    }
+}
+
+fn aperio_compressed_modes(level: &AperioLevel) -> Vec<CompressedTileMode> {
+    match (level.compression, level.jpeg_tables.is_some()) {
+        (COMPRESSION_JPEG, true) => vec![CompressedTileMode::DerivedLosslessJpeg],
+        _ => vec![CompressedTileMode::OriginalBytes],
     }
 }
 
@@ -4546,6 +4747,83 @@ mod tests {
         assert_eq!(red.data, vec![10]);
         assert_eq!(green.data, vec![20]);
         assert_eq!(blue.data, vec![30]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_merges_aperio_jpeg_tables_as_derived_jpeg() {
+        let path = temp_path("aperio-compressed-jpeg-tables.bin");
+        let tile_jpeg = [0xff, 0xd8, 0xff, 0xd9];
+        fs::write(&path, tile_jpeg).unwrap();
+        let mut table_payload = vec![0xff, 0xdb, 0x00, 0x43, 0x00];
+        table_payload.extend([1u8; 64]);
+        let mut jpeg_tables = vec![0xff, 0xd8];
+        jpeg_tables.extend_from_slice(&table_payload);
+        jpeg_tables.extend_from_slice(&[0xff, 0xd9]);
+        let slide = AperioSlide {
+            path: path.clone(),
+            endian: Endian::Little,
+            levels: vec![AperioLevel {
+                dir_index: 0,
+                width: 2,
+                height: 1,
+                downsample: 1.0,
+                tile_w: 2,
+                tile_h: 1,
+                tiles_across: 1,
+                tiles_down: 1,
+                compression: COMPRESSION_JPEG,
+                photometric: PHOTOMETRIC_YCBCR,
+                samples_per_pixel: 3,
+                planar_config: 1,
+                predictor: 1,
+                endian: Endian::Little,
+                bits_per_sample: vec![8, 8, 8],
+                ycbcr_subsampling: (2, 2),
+                tile_offsets: vec![0],
+                tile_byte_counts: vec![tile_jpeg.len() as u64],
+                missing_tiles: HashSet::new(),
+                jpeg_tables: Some(jpeg_tables),
+                old_jpeg: None,
+            }],
+            directories: Vec::new(),
+            properties: HashMap::new(),
+            associated_images: HashMap::new(),
+            icc_profile: None,
+        };
+
+        let crate::compressed::CompressedExtractionSupport::Supported(info) =
+            slide.compressed_level_info(0).unwrap()
+        else {
+            panic!("expected Aperio JPEG level with JPEGTables to be supported");
+        };
+        assert_eq!(
+            info.modes,
+            vec![crate::compressed::CompressedTileMode::DerivedLosslessJpeg]
+        );
+        let err = slide
+            .read_compressed_tile(
+                0,
+                0,
+                0,
+                &[crate::compressed::CompressedTileMode::OriginalBytes],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("requested compressed tile modes"));
+
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+        let mut expected = vec![0xff, 0xd8];
+        expected.extend_from_slice(&table_payload);
+        expected.extend_from_slice(&tile_jpeg[2..]);
+        assert_eq!(
+            tile.mode,
+            crate::compressed::CompressedTileMode::DerivedLosslessJpeg
+        );
+        assert_eq!(
+            tile.bytes,
+            crate::compressed::CompressedBytes::Owned(expected)
+        );
 
         let _ = fs::remove_file(path);
     }

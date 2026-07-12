@@ -107,11 +107,10 @@ OPENSLIDE_AUDIT_JOBS=1 \
 scripts/run-stable-benchmark.sh
 ```
 
-The runner contract and baseline-refresh rules are documented in
-`docs/benchmark-runner.md`, with registration and maintenance steps in
-`docs/stable-runner-ops.md`. The manual `Stable Benchmark` workflow dispatches
-the same script on a self-hosted runner labeled `openslide-audit-stable-v1` and
-uploads `bench-stable.json`.
+The runner contract, registration, maintenance, and baseline-refresh rules are
+documented in `docs/benchmark-runner.md`. The manual `Stable Benchmark`
+workflow dispatches the same script on a self-hosted runner labeled
+`openslide-audit-stable-v1` and uploads `bench-stable.json`.
 
 Run the stable-runner preflight before strict baseline refreshes:
 

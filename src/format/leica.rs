@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 
+use crate::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedLevelInfo, CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace,
+    JpegSubsampling, LossyCodec,
+};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff::OpenslideHash, SlideBackend};
@@ -803,6 +808,118 @@ impl SlideBackend for LeicaSlide {
         Some((u64::from(area.tile_width), u64::from(area.tile_height)))
     }
 
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        let level_data = self
+            .levels
+            .get(level as usize)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {level}")))?;
+        let codec = match leica_lossy_level_codec(&self.path, level_data, 0)? {
+            Some(codec) => codec,
+            None => {
+                return Ok(CompressedExtractionSupport::NotSupported {
+                    reason: leica_compressed_unsupported_reason(level_data),
+                });
+            }
+        };
+        let area = &level_data.areas[0];
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                level,
+                width: level_data.width,
+                height: level_data.height,
+                tile_width: area.tile_width,
+                tile_height: area.tile_height,
+                tiles_across: area.tiles_across,
+                tiles_down: area.tiles_down,
+                codec,
+                modes: leica_compressed_modes(area),
+                constraints: vec![
+                    CompressedExtractionConstraint::RequiresCustomZarrCodec,
+                    CompressedExtractionConstraint::EdgeTilesMayBePartial,
+                ],
+            },
+        ))
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        let level_data = self
+            .levels
+            .get(level as usize)
+            .ok_or_else(|| OpenSlideError::InvalidArgument(format!("Invalid level {level}")))?;
+        let area = leica_simple_area(level_data).ok_or_else(|| {
+            OpenSlideError::UnsupportedFormat(leica_compressed_unsupported_reason(level_data))
+        })?;
+        let mode = leica_compressed_modes(area)
+            .into_iter()
+            .find(|mode| mode_allowed(preferred_modes, *mode))
+            .ok_or_else(|| {
+                OpenSlideError::UnsupportedFormat(
+                    "requested compressed tile modes are not available for Leica".into(),
+                )
+            })?;
+        if col >= area.tiles_across || row >= area.tiles_down {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid compressed tile coordinates ({col}, {row}) for level {level}"
+            )));
+        }
+        let tile_no = row
+            .checked_mul(area.tiles_across)
+            .and_then(|base| base.checked_add(col))
+            .ok_or_else(|| OpenSlideError::InvalidArgument("Leica tile index overflow".into()))?;
+        let Some(codec) = leica_lossy_level_codec(&self.path, level_data, tile_no)? else {
+            return Err(OpenSlideError::UnsupportedFormat(
+                leica_compressed_unsupported_reason(level_data),
+            ));
+        };
+        let tile_index = usize::try_from(tile_no)
+            .map_err(|_| OpenSlideError::Format("Leica tile index overflow".into()))?;
+        let byte_count = *area.tile_byte_counts.get(tile_index).ok_or_else(|| {
+            OpenSlideError::Format(format!("Leica tile {tile_no} has no byte count"))
+        })?;
+        if byte_count == 0 {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "Leica tile is missing and cannot be emitted as original lossy bytes".into(),
+            ));
+        }
+        let offset = *area.tile_offsets.get(tile_index).ok_or_else(|| {
+            OpenSlideError::Format(format!("Leica tile {tile_no} has no file offset"))
+        })?;
+        let width =
+            (area.width - col * u64::from(area.tile_width)).min(u64::from(area.tile_width)) as u32;
+        let height = (area.height - row * u64::from(area.tile_height))
+            .min(u64::from(area.tile_height)) as u32;
+        Ok(CompressedTile {
+            level,
+            col,
+            row,
+            origin_x: col * u64::from(area.tile_width),
+            origin_y: row * u64::from(area.tile_height),
+            width,
+            height,
+            nominal_tile_width: area.tile_width,
+            nominal_tile_height: area.tile_height,
+            codec,
+            mode,
+            bytes: match mode {
+                CompressedTileMode::OriginalBytes => CompressedBytes::FileRange {
+                    path: self.path.clone(),
+                    offset,
+                    length: byte_count,
+                },
+                CompressedTileMode::DerivedLosslessJpeg => {
+                    let raw = read_file_range(&self.path, offset, byte_count)?;
+                    CompressedBytes::Owned(merge_jpeg_tables(&raw, area.jpeg_tables.as_deref())?)
+                }
+            },
+        })
+    }
+
     fn read_region(
         &self,
         channel: u32,
@@ -975,6 +1092,131 @@ impl SlideBackend for LeicaSlide {
     }
 }
 
+fn leica_simple_area(level: &LeicaLevel) -> Option<&Area> {
+    let [area] = level.areas.as_slice() else {
+        return None;
+    };
+    (!area.is_stripped
+        && area.offset_x == 0
+        && area.offset_y == 0
+        && area.width == level.width
+        && area.height == level.height)
+        .then_some(area)
+}
+
+fn leica_lossy_level_codec(
+    path: &Path,
+    level: &LeicaLevel,
+    tile_no: u64,
+) -> Result<Option<LossyCodec>> {
+    let Some(area) = leica_simple_area(level) else {
+        return Ok(None);
+    };
+    if area.planar_config != PLANARCONFIG_CONTIG
+        || area.old_jpeg.is_some()
+        || area.samples_per_pixel != area_channel_count(area)
+        || area.bits_per_sample.iter().any(|&bits| bits != 8)
+    {
+        return Ok(None);
+    }
+    match area.compression {
+        COMPRESSION_JPEG => Ok(Some(LossyCodec::Jpeg {
+            color_space: leica_jpeg_color_space(area.photometric),
+            subsampling: Some(leica_jpeg_subsampling(area.ycbcr_subsampling)),
+        })),
+        COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+            let tile_index = usize::try_from(tile_no)
+                .map_err(|_| OpenSlideError::Format("Leica tile index overflow".into()))?;
+            let byte_count = *area.tile_byte_counts.get(tile_index).unwrap_or(&0);
+            if byte_count == 0 {
+                return Ok(None);
+            }
+            let offset = *area.tile_offsets.get(tile_index).unwrap_or(&0);
+            let raw = read_file_range(path, offset, byte_count)?;
+            let info = decode::jpeg2000::inspect(&raw)?;
+            if info.coding_style.as_ref().is_some_and(|style| {
+                style.transformation == decode::jpeg2000::WaveletTransform::Irreversible9x7
+            }) {
+                Ok(Some(LossyCodec::Jpeg2000 {
+                    container: if info.is_jp2_container {
+                        Jpeg2000Container::Jp2
+                    } else {
+                        Jpeg2000Container::Codestream
+                    },
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn leica_compressed_unsupported_reason(level: &LeicaLevel) -> String {
+    let Some(area) = leica_simple_area(level) else {
+        if level.areas.len() != 1 {
+            return "Leica level has multiple areas; compressed extraction requires one 1:1 tiled area"
+                .into();
+        }
+        if level.areas.first().is_some_and(|area| area.is_stripped) {
+            return "Leica level uses stripped storage; use read_region instead".into();
+        }
+        return "Leica level area does not map 1:1 to the logical tile grid; use read_region instead"
+            .into();
+    };
+    if area.planar_config != PLANARCONFIG_CONTIG {
+        return "Leica level uses planar separate storage; use read_region instead".into();
+    }
+    if area.old_jpeg.is_some() {
+        return "Leica level uses old JPEG; derived lossless JPEG is not implemented".into();
+    }
+    if area.bits_per_sample.iter().any(|&bits| bits != 8) {
+        return "Leica level is not 8-bit lossy data; use read_region instead".into();
+    }
+    match area.compression {
+        COMPRESSION_NONE => "Leica level is uncompressed; use read_region instead".into(),
+        COMPRESSION_ADOBE_DEFLATE | COMPRESSION_DEFLATE => {
+            "Leica level uses lossless Deflate; use read_region instead".into()
+        }
+        COMPRESSION_PACKBITS => {
+            "Leica level uses lossless PackBits; use read_region instead".into()
+        }
+        COMPRESSION_JPEG => "Leica JPEG level is not supported for compressed extraction".into(),
+        COMPRESSION_JP2K_YCBCR | COMPRESSION_JP2K_RGB | COMPRESSION_JP2K => {
+            "Leica JPEG 2000 level is not known to be lossy; use read_region instead".into()
+        }
+        other => format!("Leica compression {other} is not supported for compressed extraction"),
+    }
+}
+
+fn leica_compressed_modes(area: &Area) -> Vec<CompressedTileMode> {
+    match (area.compression, area.jpeg_tables.is_some()) {
+        (COMPRESSION_JPEG, true) => vec![CompressedTileMode::DerivedLosslessJpeg],
+        _ => vec![CompressedTileMode::OriginalBytes],
+    }
+}
+
+fn leica_jpeg_color_space(photometric: u16) -> JpegColorSpace {
+    match photometric {
+        PHOTOMETRIC_RGB => JpegColorSpace::Rgb,
+        PHOTOMETRIC_YCBCR => JpegColorSpace::YCbCr,
+        PHOTOMETRIC_WHITE_IS_ZERO | PHOTOMETRIC_BLACK_IS_ZERO => JpegColorSpace::Gray,
+        _ => JpegColorSpace::Unknown,
+    }
+}
+
+fn leica_jpeg_subsampling(subsampling: (u16, u16)) -> JpegSubsampling {
+    match subsampling {
+        (1, 1) => JpegSubsampling::Cs444,
+        (2, 1) => JpegSubsampling::Cs422,
+        (2, 2) => JpegSubsampling::Cs420,
+        (horizontal, vertical) => JpegSubsampling::Other {
+            horizontal,
+            vertical,
+        },
+    }
+}
+
 fn is_leica_description(description: &str) -> bool {
     description.contains(LEICA_XMLNS_1) || description.contains(LEICA_XMLNS_2)
 }
@@ -1021,7 +1263,7 @@ fn parse_xml_description(xml: &str) -> Result<Collection> {
         let tag = tag.trim();
         if tag.starts_with('/') {
             let name = local_name(tag.trim_start_matches('/').trim());
-            if !path.last().is_some_and(|current| current == name) {
+            if path.last().is_none_or(|current| current != name) {
                 return Err(OpenSlideError::Format(format!(
                     "Mismatched Leica XML end tag: {name}"
                 )));
@@ -3460,6 +3702,146 @@ mod tests {
     }
 
     #[test]
+    fn compressed_extraction_returns_simple_leica_jpeg_file_range() {
+        let path = temp_path("leica-compressed-jpeg.scn");
+        fs::write(&path, [0xff, 0xd8, 0xff, 0xd9, 99]).unwrap();
+        let slide = LeicaSlide {
+            path: path.clone(),
+            levels: vec![LeicaLevel {
+                width: 2,
+                height: 1,
+                downsample: 1.0,
+                nm_per_pixel: 500.0,
+                areas: vec![leica_test_area(2, 1, COMPRESSION_JPEG, vec![0], vec![5])],
+            }],
+            properties: HashMap::new(),
+            associated_images: HashMap::new(),
+        };
+
+        let support = slide.compressed_level_info(0).unwrap();
+        assert!(matches!(
+            support,
+            crate::compressed::CompressedExtractionSupport::Supported(_)
+        ));
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+
+        assert_eq!(
+            tile.codec,
+            crate::compressed::LossyCodec::Jpeg {
+                color_space: crate::compressed::JpegColorSpace::YCbCr,
+                subsampling: Some(crate::compressed::JpegSubsampling::Cs420),
+            }
+        );
+        assert_eq!(
+            tile.bytes,
+            crate::compressed::CompressedBytes::FileRange {
+                path: path.clone(),
+                offset: 0,
+                length: 5,
+            }
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_merges_leica_jpeg_tables_as_derived_jpeg() {
+        let path = temp_path("leica-compressed-jpeg-tables.scn");
+        let tile_jpeg = [0xff, 0xd8, 0xff, 0xd9];
+        fs::write(&path, tile_jpeg).unwrap();
+        let mut table_payload = vec![0xff, 0xdb, 0x00, 0x43, 0x00];
+        table_payload.extend([1u8; 64]);
+        let mut jpeg_tables = vec![0xff, 0xd8];
+        jpeg_tables.extend_from_slice(&table_payload);
+        jpeg_tables.extend_from_slice(&[0xff, 0xd9]);
+        let mut area = leica_test_area(
+            2,
+            1,
+            COMPRESSION_JPEG,
+            vec![0],
+            vec![tile_jpeg.len() as u64],
+        );
+        area.jpeg_tables = Some(jpeg_tables);
+        let slide = LeicaSlide {
+            path: path.clone(),
+            levels: vec![LeicaLevel {
+                width: 2,
+                height: 1,
+                downsample: 1.0,
+                nm_per_pixel: 500.0,
+                areas: vec![area],
+            }],
+            properties: HashMap::new(),
+            associated_images: HashMap::new(),
+        };
+
+        let crate::compressed::CompressedExtractionSupport::Supported(info) =
+            slide.compressed_level_info(0).unwrap()
+        else {
+            panic!("expected Leica JPEG level with JPEGTables to be supported");
+        };
+        assert_eq!(
+            info.modes,
+            vec![crate::compressed::CompressedTileMode::DerivedLosslessJpeg]
+        );
+        let err = slide
+            .read_compressed_tile(
+                0,
+                0,
+                0,
+                &[crate::compressed::CompressedTileMode::OriginalBytes],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("requested compressed tile modes"));
+
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+        let mut expected = vec![0xff, 0xd8];
+        expected.extend_from_slice(&table_payload);
+        expected.extend_from_slice(&tile_jpeg[2..]);
+        assert_eq!(
+            tile.mode,
+            crate::compressed::CompressedTileMode::DerivedLosslessJpeg
+        );
+        assert_eq!(
+            tile.bytes,
+            crate::compressed::CompressedBytes::Owned(expected)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_rejects_multi_area_leica_level() {
+        let path = temp_path("leica-compressed-multiarea.scn");
+        fs::write(&path, [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+        let slide = LeicaSlide {
+            path: path.clone(),
+            levels: vec![LeicaLevel {
+                width: 4,
+                height: 1,
+                downsample: 1.0,
+                nm_per_pixel: 500.0,
+                areas: vec![
+                    leica_test_area(2, 1, COMPRESSION_JPEG, vec![0], vec![4]),
+                    leica_test_area(2, 1, COMPRESSION_JPEG, vec![0], vec![4]),
+                ],
+            }],
+            properties: HashMap::new(),
+            associated_images: HashMap::new(),
+        };
+
+        let support = slide.compressed_level_info(0).unwrap();
+        assert!(matches!(
+            support,
+            crate::compressed::CompressedExtractionSupport::NotSupported { .. }
+        ));
+        let err = slide.read_compressed_tile(0, 0, 0, &[]).unwrap_err();
+        assert!(format!("{err}").contains("multiple areas"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn rejects_case_variant_brightfield_illumination() {
         let path = temp_path("leica-brightfield-case.scn");
         fs::write(&path, make_leica_tiff()).unwrap();
@@ -4440,6 +4822,39 @@ mod tests {
             raw.extend_from_slice(&sample.to_le_bytes());
         }
         raw
+    }
+
+    fn leica_test_area(
+        width: u64,
+        height: u64,
+        compression: u16,
+        tile_offsets: Vec<u64>,
+        tile_byte_counts: Vec<u64>,
+    ) -> Area {
+        Area {
+            dir: 0,
+            endian: Endian::Little,
+            width,
+            height,
+            tile_width: width as u32,
+            tile_height: height as u32,
+            tiles_across: 1,
+            tiles_down: 1,
+            is_stripped: false,
+            offset_x: 0,
+            offset_y: 0,
+            tile_offsets,
+            tile_byte_counts,
+            compression,
+            photometric: PHOTOMETRIC_YCBCR,
+            samples_per_pixel: 3,
+            bits_per_sample: vec![8, 8, 8],
+            planar_config: PLANARCONFIG_CONTIG,
+            predictor: 1,
+            ycbcr_subsampling: (2, 2),
+            jpeg_tables: None,
+            old_jpeg: None,
+        }
     }
 
     const ONE_PIXEL_JPEG: &[u8] = &[

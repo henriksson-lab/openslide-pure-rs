@@ -18,6 +18,7 @@
 // `cargo clippy -- -D warnings` still catches new correctness-adjacent warnings.
 
 pub mod cache;
+pub mod compressed;
 pub mod debug;
 pub mod decode;
 pub mod error;
@@ -387,6 +388,43 @@ impl OpenSlide {
     /// Get the dimensions (width, height) of a zoom level.
     pub fn level_dimensions(&self, level: u32) -> Option<(u64, u64)> {
         self.backend.level_dimensions(level)
+    }
+
+    /// Get lossy compressed-block extraction metadata for a level.
+    ///
+    /// This API is intentionally narrow: lossless or uncompressed source data
+    /// reports `NotSupported` and should be read through the normal pixel API.
+    pub fn compressed_level_info(
+        &self,
+        level: u32,
+    ) -> Result<compressed::CompressedExtractionSupport> {
+        if self.has_terminal_error() {
+            return Ok(compressed::CompressedExtractionSupport::NotSupported {
+                reason: "slide is in terminal error state".into(),
+            });
+        }
+        self.backend
+            .compressed_level_info(level)
+            .map_err(|err| self.record_terminal_error(err))
+    }
+
+    /// Read one lossy compressed source tile/frame without pixel-domain
+    /// recompression.
+    pub fn read_compressed_tile(
+        &self,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[compressed::CompressedTileMode],
+    ) -> Result<compressed::CompressedTile> {
+        if self.has_terminal_error() {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "slide is in terminal error state".into(),
+            ));
+        }
+        self.backend
+            .read_compressed_tile(level, col, row, preferred_modes)
+            .map_err(|err| self.record_terminal_error(err))
     }
 
     /// Get level dimensions with OpenSlide C API sentinel semantics.
@@ -1412,6 +1450,20 @@ mod tests {
         fn debug_grid_tile_count(&self, _channel: u32, _level: u32) -> usize {
             0
         }
+    }
+
+    #[test]
+    fn compressed_extraction_defaults_to_not_supported() {
+        let slide = OpenSlide::from_backend(Box::new(DummyBackend::default())).unwrap();
+
+        let support = slide.compressed_level_info(0).unwrap();
+
+        assert!(matches!(
+            support,
+            crate::compressed::CompressedExtractionSupport::NotSupported { .. }
+        ));
+        let err = slide.read_compressed_tile(0, 0, 0, &[]).unwrap_err();
+        assert!(format!("{err}").contains("compressed tile extraction is not supported"));
     }
 
     struct FailingReadBackend;

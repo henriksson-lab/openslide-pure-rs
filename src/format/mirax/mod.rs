@@ -36,11 +36,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cache::{CachedTile, TileCache};
+use crate::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedLevelInfo, CompressedTile, CompressedTileMode, JpegColorSpace, LossyCodec,
+};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::tiff::OpenslideHash;
 use crate::format::SlideBackend;
-use crate::grid::TileGrid;
+use crate::grid::{TileEntry, TileGrid};
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
 use crate::util::_openslide_format_double as format_float;
@@ -961,6 +965,231 @@ impl MiraxSlide {
         );
         Ok(cached)
     }
+
+    fn compressed_level_info_impl(&self, level_index: u32) -> Result<CompressedExtractionSupport> {
+        let Some(level_data) = self
+            .filter_level_grids
+            .first()
+            .and_then(|levels| levels.get(level_index as usize))
+        else {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid level {level_index}"
+            )));
+        };
+        if level_data.level.image_format != ImageFormat::Jpeg {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: mirax_compressed_unsupported_reason(level_data),
+            });
+        }
+        let Some((tile_width, tile_height)) = mirax_level_tile_dimensions(&level_data.level) else {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "MIRAX level has invalid tile dimensions; use read_region instead".into(),
+            });
+        };
+        let width = u64::try_from(level_data.level.width)
+            .map_err(|_| OpenSlideError::Format("MIRAX level has negative width".into()))?;
+        let height = u64::try_from(level_data.level.height)
+            .map_err(|_| OpenSlideError::Format("MIRAX level has negative height".into()))?;
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                level: level_index,
+                width,
+                height,
+                tile_width,
+                tile_height,
+                tiles_across: width.div_ceil(u64::from(tile_width)),
+                tiles_down: height.div_ceil(u64::from(tile_height)),
+                codec: LossyCodec::Jpeg {
+                    color_space: JpegColorSpace::YCbCr,
+                    subsampling: None,
+                },
+                modes: vec![
+                    CompressedTileMode::OriginalBytes,
+                    CompressedTileMode::DerivedLosslessJpeg,
+                ],
+                constraints: vec![
+                    CompressedExtractionConstraint::RequiresCustomZarrCodec,
+                    CompressedExtractionConstraint::EdgeTilesMayBePartial,
+                ],
+            },
+        ))
+    }
+
+    fn read_compressed_tile_impl(
+        &self,
+        level_index: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        let level_data = self
+            .filter_level_grids
+            .first()
+            .and_then(|levels| levels.get(level_index as usize))
+            .ok_or_else(|| {
+                OpenSlideError::InvalidArgument(format!("Invalid level {level_index}"))
+            })?;
+        if level_data.level.image_format != ImageFormat::Jpeg {
+            return Err(OpenSlideError::UnsupportedFormat(
+                mirax_compressed_unsupported_reason(level_data),
+            ));
+        }
+        let col_i64 = i64::try_from(col)
+            .map_err(|_| OpenSlideError::InvalidArgument("MIRAX tile column overflow".into()))?;
+        let row_i64 = i64::try_from(row)
+            .map_err(|_| OpenSlideError::InvalidArgument("MIRAX tile row overflow".into()))?;
+        let Some(entry) = level_data.grid.get_tile(col_i64, row_i64) else {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "MIRAX tile is missing and cannot be emitted as original lossy bytes".into(),
+            ));
+        };
+        let mode = mirax_compressed_tile_mode(level_data, entry, preferred_modes)?;
+        let image = &entry.tile.image;
+        if image.fileno < 0 || image.fileno as usize >= self.datafile_paths.len() {
+            return Err(OpenSlideError::Format(format!(
+                "Invalid data file number {}",
+                image.fileno
+            )));
+        }
+        if image.offset < 0 || image.length <= 0 {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "MIRAX tile has no bounded JPEG record range".into(),
+            ));
+        }
+        let (tile_width, tile_height) =
+            mirax_level_tile_dimensions(&level_data.level).ok_or_else(|| {
+                OpenSlideError::UnsupportedFormat(
+                    "MIRAX level has invalid tile dimensions; use read_region instead".into(),
+                )
+            })?;
+        let record_width = u32::try_from(level_data.level.image_width)
+            .map_err(|_| OpenSlideError::Format("MIRAX JPEG record has negative width".into()))?;
+        let record_height = u32::try_from(level_data.level.image_height)
+            .map_err(|_| OpenSlideError::Format("MIRAX JPEG record has negative height".into()))?;
+        let (width, height) = match mode {
+            CompressedTileMode::OriginalBytes => (record_width, record_height),
+            CompressedTileMode::DerivedLosslessJpeg => (
+                mirax_f64_to_u32(entry.w, "width")?,
+                mirax_f64_to_u32(entry.h, "height")?,
+            ),
+        };
+        Ok(CompressedTile {
+            level: level_index,
+            col,
+            row,
+            origin_x: mirax_tile_origin(
+                col_i64,
+                level_data.grid.tile_advance_x,
+                entry.offset_x,
+                "x",
+            )?,
+            origin_y: mirax_tile_origin(
+                row_i64,
+                level_data.grid.tile_advance_y,
+                entry.offset_y,
+                "y",
+            )?,
+            width,
+            height,
+            nominal_tile_width: tile_width,
+            nominal_tile_height: tile_height,
+            codec: LossyCodec::Jpeg {
+                color_space: JpegColorSpace::YCbCr,
+                subsampling: None,
+            },
+            mode,
+            bytes: match mode {
+                CompressedTileMode::OriginalBytes => CompressedBytes::FileRange {
+                    path: self.datafile_paths[image.fileno as usize].clone(),
+                    offset: image.offset as u64,
+                    length: image.length as u64,
+                },
+                CompressedTileMode::DerivedLosslessJpeg => {
+                    let path = &self.datafile_paths[image.fileno as usize];
+                    let data = read_record_data(path, image.offset as i64, image.length as i64)?;
+                    CompressedBytes::Owned(decode::jpeg::lossless_crop_jpeg(
+                        &data,
+                        mirax_f64_to_u32(entry.tile.src_x, "source x")?,
+                        mirax_f64_to_u32(entry.tile.src_y, "source y")?,
+                        mirax_f64_to_u32(entry.w, "width")?,
+                        mirax_f64_to_u32(entry.h, "height")?,
+                    )?)
+                }
+            },
+        })
+    }
+}
+
+fn mirax_level_tile_dimensions(level: &MiraxLevel) -> Option<(u32, u32)> {
+    if level.tile_w <= 0.0 || level.tile_h <= 0.0 {
+        return None;
+    }
+    let width = level.tile_w.ceil();
+    let height = level.tile_h.ceil();
+    if width > f64::from(u32::MAX) || height > f64::from(u32::MAX) {
+        return None;
+    }
+    Some((width as u32, height as u32))
+}
+
+fn mirax_compressed_unsupported_reason(level_data: &MiraxLevelData) -> String {
+    match level_data.level.image_format {
+        ImageFormat::Jpeg => "MIRAX JPEG level is not supported for compressed extraction".into(),
+        ImageFormat::Png => "MIRAX level uses lossless PNG; use read_region instead".into(),
+        ImageFormat::Bmp => "MIRAX level is uncompressed BMP; use read_region instead".into(),
+    }
+}
+
+fn mirax_tile_is_whole_jpeg_record(level_data: &MiraxLevelData, entry: &TileEntry) -> bool {
+    approx_eq(entry.tile.src_x, 0.0)
+        && approx_eq(entry.tile.src_y, 0.0)
+        && approx_eq(entry.w, f64::from(level_data.level.image_width))
+        && approx_eq(entry.h, f64::from(level_data.level.image_height))
+}
+
+fn mirax_compressed_tile_mode(
+    level_data: &MiraxLevelData,
+    entry: &TileEntry,
+    preferred_modes: &[CompressedTileMode],
+) -> Result<CompressedTileMode> {
+    if mirax_tile_is_whole_jpeg_record(level_data, entry) {
+        if mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
+            return Ok(CompressedTileMode::OriginalBytes);
+        }
+    } else if mode_allowed(preferred_modes, CompressedTileMode::DerivedLosslessJpeg) {
+        return Ok(CompressedTileMode::DerivedLosslessJpeg);
+    }
+    Err(OpenSlideError::UnsupportedFormat(
+        "requested compressed tile modes are not available for MIRAX".into(),
+    ))
+}
+
+fn mirax_f64_to_u32(value: f64, field: &str) -> Result<u32> {
+    if !value.is_finite() || value < 0.0 || !approx_eq(value, value.round()) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "MIRAX JPEG crop {field} is not an integer"
+        )));
+    }
+    if value > f64::from(u32::MAX) {
+        return Err(OpenSlideError::Format(format!(
+            "MIRAX JPEG crop {field} is too large"
+        )));
+    }
+    Ok(value.round() as u32)
+}
+
+fn approx_eq(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 0.001
+}
+
+fn mirax_tile_origin(col_or_row: i64, advance: f64, offset: f64, axis: &str) -> Result<u64> {
+    let origin = col_or_row as f64 * advance + offset;
+    if !origin.is_finite() || origin < 0.0 || !approx_eq(origin, origin.round()) {
+        return Err(OpenSlideError::UnsupportedFormat(format!(
+            "MIRAX tile {axis} origin is not block-aligned"
+        )));
+    }
+    Ok(origin.round() as u64)
 }
 
 impl SlideBackend for MiraxSlide {
@@ -994,10 +1223,21 @@ impl SlideBackend for MiraxSlide {
 
     fn level_tile_dimensions(&self, level: u32) -> Option<(u64, u64)> {
         let level = self.filter_level_grids.first()?.get(level as usize)?;
-        Some((
-            level.level.tile_w.ceil() as u64,
-            level.level.tile_h.ceil() as u64,
-        ))
+        mirax_level_tile_dimensions(&level.level).map(|(w, h)| (u64::from(w), u64::from(h)))
+    }
+
+    fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
+        self.compressed_level_info_impl(level)
+    }
+
+    fn read_compressed_tile(
+        &self,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        self.read_compressed_tile_impl(level, col, row, preferred_modes)
     }
 
     fn level_downsample(&self, level: u32) -> Option<f64> {
@@ -1456,6 +1696,20 @@ fn format_mirax_background_color(fill: u32) -> String {
 mod tests {
     use super::*;
 
+    const ONE_PIXEL_JPEG: &[u8] = &[
+        0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07,
+        0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b, 0x0c, 0x19, 0x12,
+        0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20, 0x24, 0x2e, 0x27,
+        0x20, 0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31, 0x34, 0x34, 0x34,
+        0x1f, 0x27, 0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff, 0xc0, 0x00, 0x11,
+        0x08, 0x00, 0x01, 0x00, 0x01, 0x03, 0x52, 0x11, 0x00, 0x47, 0x11, 0x00, 0x42, 0x11, 0x00,
+        0xff, 0xc4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+        0xda, 0x00, 0x0c, 0x03, 0x52, 0x00, 0x47, 0x00, 0x42, 0x00, 0x00, 0x3f, 0x00, 0x7f, 0x3f,
+        0x9f, 0xdf, 0xff, 0xd9,
+    ];
+
     #[test]
     fn formats_mirax_properties_through_shared_openslide_formatter() {
         assert_eq!(format_float(1.0 / 3.0), "0.33333333333333331");
@@ -1630,6 +1884,184 @@ mod tests {
 
         assert_eq!(slide.level_tile_dimensions(0), Some((257, 129)));
         assert_eq!(slide.level_tile_dimensions(1), None);
+    }
+
+    #[test]
+    fn compressed_extraction_returns_whole_mirax_jpeg_record_range() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("openslide-rs-mirax-compressed-{name}.dat"));
+        let prefix = b"record-prefix";
+        let jpeg = [0xff, 0xd8, 0xff, 0xd9];
+        let mut payload = prefix.to_vec();
+        payload.extend_from_slice(&jpeg);
+        payload.extend_from_slice(b"record-suffix");
+        fs::write(&path, payload).unwrap();
+
+        let image = Arc::new(Image {
+            fileno: 0,
+            offset: prefix.len() as i32,
+            length: jpeg.len() as i32,
+            imageno: 7,
+        });
+        let mut grid = TileGrid::new(16.0, 8.0);
+        grid.add_tile(
+            0,
+            0,
+            0.0,
+            0.0,
+            16.0,
+            8.0,
+            Tile {
+                image,
+                src_x: 0.0,
+                src_y: 0.0,
+            },
+        );
+        let cache = Arc::new(TileCache::new());
+        let slide = MiraxSlide {
+            filter_level_grids: vec![vec![MiraxLevelData {
+                level: MiraxLevel {
+                    width: 16,
+                    height: 8,
+                    downsample: 1.0,
+                    image_width: 16,
+                    image_height: 8,
+                    tile_w: 16.0,
+                    tile_h: 8.0,
+                    image_format: ImageFormat::Jpeg,
+                    params: tile::ZoomLevelParams {
+                        image_concat: 1,
+                        tile_count_divisor: 1,
+                        tiles_per_image: 1,
+                        positions_per_tile: 1,
+                        tile_advance_x: 16.0,
+                        tile_advance_y: 8.0,
+                    },
+                },
+                grid,
+            }]],
+            channels: Vec::new(),
+            properties: HashMap::new(),
+            datafile_paths: vec![path.clone()],
+            associated_images: HashMap::new(),
+            cache_binding_id: cache.next_binding_id(),
+            cache,
+        };
+
+        let support = slide.compressed_level_info(0).unwrap();
+        assert!(matches!(
+            support,
+            crate::compressed::CompressedExtractionSupport::Supported(_)
+        ));
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+
+        assert_eq!(tile.level, 0);
+        assert_eq!(tile.width, 16);
+        assert_eq!(tile.height, 8);
+        assert_eq!(
+            tile.bytes,
+            crate::compressed::CompressedBytes::FileRange {
+                path: path.clone(),
+                offset: prefix.len() as u64,
+                length: jpeg.len() as u64,
+            }
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn compressed_extraction_derives_mirax_jpeg_subregion_tiles() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("openslide-rs-mirax-derived-compressed-{name}.dat"));
+        fs::write(&path, ONE_PIXEL_JPEG).unwrap();
+        let image = Arc::new(Image {
+            fileno: 0,
+            offset: 0,
+            length: ONE_PIXEL_JPEG.len() as i32,
+            imageno: 7,
+        });
+        let mut grid = TileGrid::new(1.0, 1.0);
+        grid.add_tile(
+            0,
+            0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            Tile {
+                image,
+                src_x: 0.0,
+                src_y: 0.0,
+            },
+        );
+        let cache = Arc::new(TileCache::new());
+        let slide = MiraxSlide {
+            filter_level_grids: vec![vec![MiraxLevelData {
+                level: MiraxLevel {
+                    width: 8,
+                    height: 8,
+                    downsample: 1.0,
+                    image_width: 2,
+                    image_height: 1,
+                    tile_w: 1.0,
+                    tile_h: 1.0,
+                    image_format: ImageFormat::Jpeg,
+                    params: tile::ZoomLevelParams {
+                        image_concat: 1,
+                        tile_count_divisor: 1,
+                        tiles_per_image: 2,
+                        positions_per_tile: 1,
+                        tile_advance_x: 1.0,
+                        tile_advance_y: 1.0,
+                    },
+                },
+                grid,
+            }]],
+            channels: Vec::new(),
+            properties: HashMap::new(),
+            datafile_paths: vec![path.clone()],
+            associated_images: HashMap::new(),
+            cache_binding_id: cache.next_binding_id(),
+            cache,
+        };
+
+        let err = slide
+            .read_compressed_tile(
+                0,
+                0,
+                0,
+                &[crate::compressed::CompressedTileMode::OriginalBytes],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("requested compressed tile modes"));
+
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+        assert_eq!(
+            tile.mode,
+            crate::compressed::CompressedTileMode::DerivedLosslessJpeg
+        );
+        assert_eq!(tile.width, 1);
+        assert_eq!(tile.height, 1);
+        let crate::compressed::CompressedBytes::Owned(jpeg) = tile.bytes else {
+            panic!("expected derived MIRAX JPEG to be owned bytes");
+        };
+        assert_eq!(decode::jpeg::decode_jpeg_dimensions(&jpeg).unwrap(), (1, 1));
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
