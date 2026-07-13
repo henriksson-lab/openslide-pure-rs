@@ -6213,9 +6213,8 @@ mod tests {
         )
         .unwrap();
 
-        match OpenSlide::open(&vmu) {
-            Ok(_) => panic!("expected case-variant VMU group/key rejection"),
-            Err(_) => {}
+        if OpenSlide::open(&vmu).is_ok() {
+            panic!("expected case-variant VMU group/key rejection");
         }
     }
 

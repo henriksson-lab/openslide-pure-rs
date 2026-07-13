@@ -1042,12 +1042,11 @@ mod tests {
             );
         }
 
-        for pixel_format in [JpegXrPixelFormat::GrayDouble] {
-            assert!(
-                !backend.supports_pixel_format(pixel_format),
-                "{pixel_format:?} should stay disabled until the native backend exposes it"
-            );
-        }
+        let pixel_format = JpegXrPixelFormat::GrayDouble;
+        assert!(
+            !backend.supports_pixel_format(pixel_format),
+            "{pixel_format:?} should stay disabled until the native backend exposes it"
+        );
     }
 
     #[cfg(feature = "jpegxr")]
