@@ -78,7 +78,7 @@ source = "local audit data"
 access = "private"
 license = "unknown"
 status = "blocked"
-notes = "JPEG-XR NDPI (TIFF compression 22610 / JPEGXR_NDPI), 2.7 GB. Reference OpenSlide 3.4.1 cannot open it either ('No such value: directory 0, tag 278'; see OPENSLIDE_BUGS.md bug 3), so parity is not measurable. Rust also fails today because the jpegxr backend is not wired into the NDPI tile/macro path."
+notes = "JPEG-XR NDPI (TIFF compression 22610 / JPEGXR_NDPI), 2.7 GB. Reference OpenSlide (3.4.1 and 4.x) cannot open it ('No such value: directory 0, tag 278'; see OPENSLIDE_BUGS.md bug 3), so parity is not measurable. Rust now opens it with --features jpegxr (69888x34944, 4 levels, macro decoded) and reads 16-bit grayscale tiles; pixel correctness is unverifiable (no reference reader exists)."
 
 [[fixture]]
 id = "hamamatsu-ndpi-local-jpegxr-2"
@@ -88,7 +88,7 @@ source = "local audit data"
 access = "private"
 license = "unknown"
 status = "blocked"
-notes = "JPEG-XR NDPI (TIFF compression 22610 / JPEGXR_NDPI), 2.0 GB. Same as hamamatsu-ndpi-local-jpegxr-1: reference OpenSlide 3.4.1 cannot open it (tag 278; OPENSLIDE_BUGS.md bug 3) and Rust's jpegxr NDPI path is not wired yet."
+notes = "JPEG-XR NDPI (TIFF compression 22610 / JPEGXR_NDPI), 2.0 GB. Same as hamamatsu-ndpi-local-jpegxr-1: reference OpenSlide (3.4.1 and 4.x) cannot open it (tag 278; OPENSLIDE_BUGS.md bug 3). Rust now opens it with --features jpegxr (66304x32256, 5 levels) and reads 16-bit grayscale; correctness unverifiable."
 
 [[fixture]]
 id = "hamamatsu-ndpi-local-over4gb-1"
@@ -98,7 +98,7 @@ source = "local audit data (image.sc thread 84874)"
 access = "private"
 license = "unknown"
 status = "blocked"
-notes = "Baseline-JPEG NDPI, 4.2 GB, with directories above 4 GB and the level-0 JPEG at the file start. Reference OpenSlide 3.4.1 cannot open it ('Can't validate JPEG for directory 0: Expected marker at 4294976264'; OPENSLIDE_BUGS.md bug 1), so parity is not measurable. The Rust reader now opens it (234240x81664, 7 levels) and reads real pixel data via SOI/EOI-validated NDPI offset and byte-count reconstruction."
+notes = "Baseline-JPEG NDPI, 4.2 GB, with directories above 4 GB and the level-0 JPEG at the file start. The 3.4.1 runtime and our vendored 4.0.0-377 reference cannot open it ('Expected marker at 4294976264'; OPENSLIDE_BUGS.md bug 1); newer upstream (v4.0.0-378, commit 3181ac95) fixed it. The Rust reader opens it (234240x81664, 8 levels) and reads real pixel data via the NDPI value-extension mechanism (matching the fixed upstream)."
 
 [[fixture]]
 id = "hamamatsu-ndpi-local-over4gb-2"
@@ -108,7 +108,7 @@ source = "local audit data (image.sc thread 84874)"
 access = "private"
 license = "unknown"
 status = "blocked"
-notes = "Baseline-JPEG NDPI, 4.3 GB, first directory at 4.33 GB and level-0 JPEG at the file start. Reference OpenSlide 3.4.1 cannot open it (same bug 1 as over4gb-1), so parity is not measurable. The Rust reader now opens it (211200x95744, 7 levels) and reads real pixel data after 64-bit header detection plus SOI/EOI-validated offset and byte-count reconstruction."
+notes = "Baseline-JPEG NDPI, 4.3 GB, first directory at 4.33 GB and level-0 JPEG at the file start. The 3.4.1 runtime and our vendored 4.0.0-377 reference cannot open it (same bug 1 as over4gb-1; fixed upstream in v4.0.0-378). The Rust reader opens it (211200x95744, 8 levels) and reads real pixel data via 64-bit header detection plus the NDPI value-extension mechanism."
 
 [[fixture]]
 id = "hamamatsu-ndpi-local-over4gb-3"
@@ -168,7 +168,7 @@ source = "local audit data"
 access = "private"
 license = "unknown"
 status = "blocked"
-notes = "The .ndpis fluorescence set descriptor (INI text) binding the three test3-*.ndpi members into one multi-channel slide. Reference OpenSlide 3.4.1 cannot open it either ('Unsupported or missing image file'; OPENSLIDE_BUGS.md bug 4), so parity is not measurable. Neither reader models the .ndpis set container; the member .ndpi files read individually with exact parity."
+notes = "The .ndpis fluorescence set descriptor (INI text) binding the three test3-*.ndpi members into one multi-channel slide. Reference OpenSlide (3.4.1 and 4.x) cannot open it ('Unsupported or missing image file'; OPENSLIDE_BUGS.md bug 4), so parity is not measurable. Rust now opens it as a single 3968x4864 / 7-level / 3-channel (DAPI/FITC/TRITC) slide via a NdpiSetSlide backend; the member .ndpi files also read individually with exact parity."
 
 [[fixture]]
 id = "hamamatsu-vmu-ngr-missing"
@@ -272,6 +272,17 @@ download = "scripts/download-openslide-testdata.py --format generic-tiff"
 notes = "Public Generic TIFF fixture with exact sampled checksum parity."
 
 [[fixture]]
+id = "argos-public-stacked"
+reader = "argos"
+path = "Argos/Argos-1-Stacked.avs"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "blocked"
+download = "scripts/download-openslide-testdata.py --format argos"
+notes = "Public ARGOS Z-stack fixture is present and Rust-readable, but the installed OpenSlide 3.4.1 reference stack predates ARGOS support and opens it as generic-tiff."
+
+[[fixture]]
 id = "aperio-public-cmu-1-small-region"
 reader = "aperio"
 path = "Aperio/CMU-1-Small-Region.svs"
@@ -314,6 +325,39 @@ license = "CC0-1.0"
 status = "exact"
 download = "scripts/download-openslide-testdata.py --format hamamatsu-vms --extract"
 notes = "Public VMS fixture with exact sampled checksum parity. Extraction preserves the source path to avoid CMU-1.zip collisions."
+
+[[fixture]]
+id = "huron-public-huron-1"
+reader = "huron"
+path = "Huron/Huron-1.tif"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "blocked"
+download = "scripts/download-openslide-testdata.py --format huron"
+notes = "Public Huron JPEG fixture is present and Rust-readable, but the installed OpenSlide 3.4.1 reference stack predates Huron support and opens it as generic-tiff."
+
+[[fixture]]
+id = "huron-public-huron-1-40x"
+reader = "huron"
+path = "Huron/Huron-1-40x.tif"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "blocked"
+download = "scripts/download-openslide-testdata.py --format huron"
+notes = "Public Huron 40x JPEG fixture is present and Rust-readable, but the installed OpenSlide 3.4.1 reference stack predates Huron support and opens it as generic-tiff."
+
+[[fixture]]
+id = "huron-public-huron-1-uncompressed"
+reader = "huron"
+path = "Huron/Huron-1-Uncompressed.tif"
+source = "OpenSlide testdata"
+access = "public"
+license = "CC0-1.0"
+status = "blocked"
+download = "scripts/download-openslide-testdata.py --format huron"
+notes = "Public Huron uncompressed fixture is present and Rust-readable, but the installed OpenSlide 3.4.1 reference stack predates Huron support and opens it as generic-tiff."
 
 [[fixture]]
 id = "leica-public-fluorescence-1"

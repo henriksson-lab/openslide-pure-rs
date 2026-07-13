@@ -1523,6 +1523,11 @@ fn create_levels_from_collection(
         "leica.barcode",
         collection.barcode.as_deref(),
     );
+    set_prop(
+        &mut properties,
+        properties::PROPERTY_BARCODE,
+        collection.barcode.as_deref(),
+    );
     let legacy_quickhash = should_use_legacy_quickhash(collection);
     let mut quickhash_dir = None;
 
@@ -3679,6 +3684,7 @@ mod tests {
         let collection = parse_xml_description(&minimal_leica_xml()).unwrap();
         assert_eq!(collection.nm_across, 4000);
         assert_eq!(collection.nm_down, 2000);
+        assert_eq!(collection.barcode.as_deref(), Some("ABC123"));
         assert_eq!(collection.images.len(), 1);
         assert_eq!(
             collection.images[0].illumination_source.as_deref(),
@@ -3686,6 +3692,22 @@ mod tests {
         );
         assert_eq!(collection.images[0].dimensions[0].dir, 0);
         assert_eq!(collection.images[0].dimensions[0].nm_per_pixel, 500.0);
+    }
+
+    #[test]
+    fn duplicates_leica_barcode_to_common_property() {
+        let path = temp_path("leica-barcode.scn");
+        fs::write(&path, make_leica_tiff()).unwrap();
+        let slide = open(&path).unwrap();
+        assert_eq!(
+            slide.properties().get("leica.barcode"),
+            Some(&"ABC123".to_string())
+        );
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_BARCODE),
+            Some(&"ABC123".to_string())
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

@@ -8,6 +8,13 @@ evidence = ["aperio-local-77917", "aperio-public-cmu-1-small-region"]
 blockers = []
 
 [[reader]]
+id = "argos"
+name = "ARGOS"
+status = "Experimental (reference blocked)"
+evidence = []
+blockers = ["argos-public-stacked"]
+
+[[reader]]
 id = "dicom"
 name = "DICOM"
 status = "Experimental (limited exact data)"
@@ -55,6 +62,17 @@ name = "Hamamatsu VMU/NGR"
 status = "Experimental (no real fixture)"
 evidence = []
 blockers = ["hamamatsu-vmu-ngr-missing"]
+
+[[reader]]
+id = "huron"
+name = "Huron"
+status = "Experimental (reference blocked)"
+evidence = []
+blockers = [
+  "huron-public-huron-1",
+  "huron-public-huron-1-40x",
+  "huron-public-huron-1-uncompressed",
+]
 
 [[reader]]
 id = "leica"

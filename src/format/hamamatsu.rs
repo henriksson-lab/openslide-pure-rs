@@ -67,6 +67,8 @@ const COMPRESSION_JP2K_RGB: u16 = 33005;
 const COMPRESSION_DEFLATE: u16 = 32946;
 const COMPRESSION_PACKBITS: u16 = 32773;
 const COMPRESSION_JP2K: u16 = 34712;
+/// NDPI JPEG XR tiles/strips (TIFF compression `JPEGXR_NDPI`).
+const COMPRESSION_JPEGXR_NDPI: u16 = 22610;
 
 const PHOTOMETRIC_WHITE_IS_ZERO: u16 = 0;
 const PHOTOMETRIC_BLACK_IS_ZERO: u16 = 1;
@@ -81,8 +83,10 @@ const NDPI_SOURCELENS: u16 = 65421;
 const NDPI_XOFFSET: u16 = 65422;
 const NDPI_YOFFSET: u16 = 65423;
 const NDPI_FOCAL_PLANE: u16 = 65424;
-const NDPI_MCU_STARTS: u16 = 65426;
+const NDPI_MCU_STARTS_LOW: u16 = 65426;
+const NDPI_MCU_STARTS_HIGH: u16 = 65432;
 const NDPI_REFERENCE: u16 = 65427;
+const TIFF_TYPE_ASCII: u16 = 2;
 const NDPI_PROPERTY_MAP: u16 = 65449;
 
 /// Check whether a path looks like a Hamamatsu VMS, VMU, or NDPI slide.
@@ -104,6 +108,160 @@ pub(crate) fn detect_ndpi(path: &Path) -> bool {
 
 pub(crate) fn open_ndpi(path: &Path) -> Result<Box<dyn SlideBackend>> {
     Ok(Box::new(HamamatsuSlide::hamamatsu_ndpi_open(path)?))
+}
+
+pub(crate) fn detect_ndpis(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ndpis"))
+}
+
+pub(crate) fn open_ndpis(path: &Path) -> Result<Box<dyn SlideBackend>> {
+    Ok(Box::new(NdpiSetSlide::open(path)?))
+}
+
+/// A NanoZoomer `.ndpis` set: several single-channel `.ndpi` members exposed as
+/// one multi-channel slide (one channel per member). Reference OpenSlide (incl.
+/// 4.x) does not read `.ndpis`; this is an openslide-pure-rs extension.
+struct NdpiSetSlide {
+    members: Vec<HamamatsuSlide>,
+    channel_names: Vec<String>,
+    properties: HashMap<String, String>,
+}
+
+impl NdpiSetSlide {
+    fn open(path: &Path) -> Result<Self> {
+        let text = String::from_utf8_lossy(&crate::util::_openslide_read_key_file_data(
+            path,
+            KEY_FILE_MAX_SIZE,
+        )?)
+        .into_owned();
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+        // Parse "ImageN=<filename>" entries (INI-ish; keys are case-insensitive).
+        let mut entries: Vec<(usize, String)> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().to_ascii_lowercase();
+            if let Some(index) = key.strip_prefix("image") {
+                if let Ok(index) = index.trim().parse::<usize>() {
+                    entries.push((index, value.trim().to_string()));
+                }
+            }
+        }
+        entries.sort_by_key(|(index, _)| *index);
+        if entries.is_empty() {
+            return Err(OpenSlideError::Format(
+                "NDPI set descriptor lists no member images".into(),
+            ));
+        }
+
+        let mut members = Vec::with_capacity(entries.len());
+        let mut channel_names = Vec::with_capacity(entries.len());
+        for (index, filename) in &entries {
+            let member_path = dir.join(filename);
+            let member = HamamatsuSlide::hamamatsu_ndpi_open(&member_path).map_err(|err| {
+                OpenSlideError::Format(format!(
+                    "NDPI set member '{filename}' failed to open: {err}"
+                ))
+            })?;
+            members.push(member);
+            channel_names.push(ndpis_channel_name(filename, *index));
+        }
+
+        let mut properties = HashMap::new();
+        properties.insert(properties::PROPERTY_VENDOR.into(), "hamamatsu".into());
+        properties.insert("hamamatsu.ndpis.NoImages".into(), members.len().to_string());
+        Ok(Self {
+            members,
+            channel_names,
+            properties,
+        })
+    }
+}
+
+/// Derive a channel name from a member filename, e.g.
+/// "test3-DAPI 2 (387) .ndpi" -> "DAPI". Falls back to "Channel{index}".
+fn ndpis_channel_name(filename: &str, index: usize) -> String {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    // The dye token follows the last '-' and precedes any whitespace/number.
+    let tail = stem.rsplit_once('-').map(|(_, t)| t).unwrap_or(stem).trim();
+    let token = tail.split_whitespace().next().unwrap_or("").trim();
+    if token.is_empty() {
+        format!("Channel{index}")
+    } else {
+        token.to_string()
+    }
+}
+
+impl SlideBackend for NdpiSetSlide {
+    fn vendor(&self) -> &'static str {
+        "hamamatsu"
+    }
+
+    fn channel_count(&self) -> u32 {
+        self.members.len() as u32
+    }
+
+    fn channel_name(&self, channel: u32) -> Option<&str> {
+        self.channel_names.get(channel as usize).map(String::as_str)
+    }
+
+    fn level_count(&self) -> u32 {
+        self.members[0].level_count()
+    }
+
+    fn level_dimensions(&self, level: u32) -> Option<(u64, u64)> {
+        self.members[0].level_dimensions(level)
+    }
+
+    fn level_downsample(&self, level: u32) -> Option<f64> {
+        self.members[0].level_downsample(level)
+    }
+
+    fn read_region(
+        &self,
+        channel: u32,
+        x: i64,
+        y: i64,
+        level: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<GrayImage> {
+        let member = self.members.get(channel as usize).ok_or_else(|| {
+            OpenSlideError::InvalidArgument(format!("NDPI set has no channel {channel}"))
+        })?;
+        // Each member is a pseudo-coloured single-dye RGB image; take the max of
+        // its channels as the dye intensity so the colour choice is irrelevant.
+        let rgba = member.read_region_rgba([Some(0), Some(1), Some(2), None], x, y, level, w, h)?;
+        let mut gray = GrayImage::new(w, h);
+        for (dst, px) in gray.data.iter_mut().zip(rgba.data.chunks_exact(4)) {
+            *dst = px[0].max(px[1]).max(px[2]);
+        }
+        Ok(gray)
+    }
+
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.properties
+    }
+
+    fn associated_image_names(&self) -> Vec<&str> {
+        self.members[0].associated_image_names()
+    }
+
+    fn read_associated_image(&self, name: &str) -> Result<RgbaImage> {
+        self.members[0].read_associated_image(name)
+    }
+
+    fn debug_grid_tile_count(&self, _channel: u32, _level: u32) -> usize {
+        0
+    }
 }
 
 struct HamamatsuSlide {
@@ -178,6 +336,9 @@ enum AssociatedImage {
         length: u64,
         width: u32,
         height: u32,
+        /// True when the payload is a JPEG XR codestream (NDPI compression 22610)
+        /// rather than baseline JPEG, so it is decoded through the JPEG XR backend.
+        jpegxr: bool,
     },
 }
 
@@ -257,13 +418,6 @@ impl HamamatsuSlide {
         let mut fallback_levels = Vec::new();
         let mut associated_images = HashMap::new();
 
-        let file_len = {
-            let mut f = crate::util::_openslide_fopen(path)?;
-            u64::try_from(crate::util::_openslide_fsize(&mut f)?).map_err(|_| {
-                OpenSlideError::Format(format!("Negative file size for {}", path.display()))
-            })?
-        };
-
         for (dir_index, dir) in tiff.dirs.iter().enumerate() {
             let width = match dir.first_uint(TIFFTAG_IMAGEWIDTH) {
                 Some(v) if v > 0 => v,
@@ -274,8 +428,12 @@ impl HamamatsuSlide {
                 _ => continue,
             };
 
-            let source =
-                ndpi_level_source(path, file_len, tiff.endian, dir_index, dir, width, height)
+            // For non-tiled NDPI levels the JPEG and TIFF dimensions can disagree
+            // at high downsamples; the JPEG dimensions are authoritative
+            // (openslide-vendor-hamamatsu.c ec8d09a2 / ba332811).
+            let (width, height) = ndpi_override_level_dims(path, dir, width, height);
+
+            let source = ndpi_level_source(path, tiff.endian, dir_index, dir, width, height)
                 .map(LevelSource::Ndpi)
                 .unwrap_or(LevelSource::Unsupported);
             fallback_levels.push(Level {
@@ -304,11 +462,27 @@ impl HamamatsuSlide {
                     dir.first_uint(TIFFTAG_STRIPOFFSETS),
                     dir.first_uint(TIFFTAG_STRIPBYTECOUNTS),
                 ) {
-                    let offset = fix_offset_ndpi(dir.offset, offset);
-                    let data = crate::util::read_file_range(path, offset, length)?;
-                    let (macro_width, macro_height) = jpeg_dimensions(&data).map_err(|err| {
-                        OpenSlideError::Format(format!("Can't read macro associated image: {err}"))
-                    })?;
+                    // STRIPOFFSETS already carries its full 64-bit value via the
+                    // NDPI value extension read in parse_tiff_dir; no fixup needed.
+                    let compression =
+                        dir.first_uint(TIFFTAG_COMPRESSION)
+                            .unwrap_or(COMPRESSION_NONE as u64) as u16;
+                    let jpegxr = compression == COMPRESSION_JPEGXR_NDPI;
+                    let (macro_width, macro_height) = if jpegxr {
+                        // The JPEG XR macro carries no JPEG SOI; take its size from
+                        // the TIFF directory instead of parsing the codestream.
+                        (
+                            u32::try_from(width).ok().unwrap_or(0),
+                            u32::try_from(height).ok().unwrap_or(0),
+                        )
+                    } else {
+                        let data = crate::util::read_file_range(path, offset, length)?;
+                        jpeg_dimensions(&data).map_err(|err| {
+                            OpenSlideError::Format(format!(
+                                "Can't read macro associated image: {err}"
+                            ))
+                        })?
+                    };
                     associated_images.insert(
                         "macro".into(),
                         AssociatedImage::FileRange {
@@ -317,6 +491,7 @@ impl HamamatsuSlide {
                             length,
                             width: macro_width,
                             height: macro_height,
+                            jpegxr,
                         },
                     );
                 }
@@ -682,8 +857,17 @@ impl SlideBackend for HamamatsuSlide {
                 path,
                 offset,
                 length,
-                ..
-            }) => crate::util::read_file_range(path, *offset, *length)?,
+                width,
+                height,
+                jpegxr,
+            }) => {
+                let data = crate::util::read_file_range(path, *offset, *length)?;
+                if *jpegxr {
+                    // JPEG XR macro: decode BGR through the JPEG XR backend.
+                    return decode_ndpi_jpegxr_bgr_to_rgba(&data, *width, *height);
+                }
+                data
+            }
             None => {
                 return Err(OpenSlideError::InvalidArgument(format!(
                     "No associated image '{}'",
@@ -2149,9 +2333,94 @@ fn jpeg_dimensions(data: &[u8]) -> Result<(u32, u32)> {
     ))
 }
 
+/// For a non-tiled NDPI JPEG level, return the JPEG SOF dimensions if they are
+/// valid (nonzero). Non-tiled means the JPEG has no restart markers
+/// (`restart_interval == 0`); tiled levels keep their TIFF dimensions.
+///
+/// Mirrors `ec8d09a2` / `ba332811` in openslide-vendor-hamamatsu.c: the JPEG and
+/// TIFF dimensions of a non-tiled level can disagree at high downsamples, and the
+/// JPEG dimensions are authoritative. (Tiled levels can't hit this because both
+/// dimensions stay divisible by 8.)
+fn ndpi_nontiled_jpeg_dims(data: &[u8]) -> Option<(u64, u64)> {
+    if data.len() < 4 || data[0] != 0xff || data[1] != 0xd8 {
+        return None;
+    }
+    let mut pos = 2usize;
+    let mut dims: Option<(u64, u64)> = None;
+    let mut restart_interval = 0u32;
+    while pos + 4 <= data.len() {
+        while pos < data.len() && data[pos] == 0xff {
+            pos += 1;
+        }
+        if pos >= data.len() {
+            break;
+        }
+        let marker = data[pos];
+        pos += 1;
+        if marker == 0xd9 || marker == 0xda {
+            break; // EOI / start of scan
+        }
+        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        if pos + 2 > data.len() {
+            break;
+        }
+        let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        if len < 2 || pos + len > data.len() {
+            break;
+        }
+        if marker == 0xdd && len >= 4 {
+            // DRI: define restart interval
+            restart_interval = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as u32;
+        }
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            if len < 7 {
+                break;
+            }
+            let h = u16::from_be_bytes([data[pos + 3], data[pos + 4]]) as u64;
+            let w = u16::from_be_bytes([data[pos + 5], data[pos + 6]]) as u64;
+            if w != 0 && h != 0 {
+                dims = Some((w, h));
+            }
+        }
+        pos += len;
+    }
+    // Only override for non-tiled (no restart markers); tiled levels keep TIFF dims.
+    if restart_interval == 0 {
+        dims
+    } else {
+        None
+    }
+}
+
+/// Apply the non-tiled NDPI JPEG-dimension override to a level's TIFF dimensions.
+fn ndpi_override_level_dims(path: &Path, dir: &TiffDir, width: u64, height: u64) -> (u64, u64) {
+    let compression = dir
+        .first_uint(TIFFTAG_COMPRESSION)
+        .unwrap_or(COMPRESSION_NONE as u64) as u16;
+    if !matches!(compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG) {
+        return (width, height);
+    }
+    let (Some(offset), Some(len)) = (
+        dir.first_uint(TIFFTAG_STRIPOFFSETS),
+        dir.first_uint(TIFFTAG_STRIPBYTECOUNTS),
+    ) else {
+        return (width, height);
+    };
+    // A JPEG header comfortably fits in the first 64 KiB of the strip.
+    let prefix = len.min(64 * 1024);
+    let Ok(data) = crate::util::read_file_range(path, offset, prefix) else {
+        return (width, height);
+    };
+    match ndpi_nontiled_jpeg_dims(&data) {
+        Some((jw, jh)) if jw != width || jh != height => (jw, jh),
+        _ => (width, height),
+    }
+}
+
 fn ndpi_level_source(
     path: &Path,
-    file_len: u64,
     endian: Endian,
     dir_index: usize,
     dir: &TiffDir,
@@ -2161,16 +2430,24 @@ fn ndpi_level_source(
     let compression = dir
         .first_uint(TIFFTAG_COMPRESSION)
         .unwrap_or(COMPRESSION_NONE as u64) as u16;
-    let samples_per_pixel = dir.first_uint(TIFFTAG_SAMPLESPERPIXEL).unwrap_or(3) as u16;
+    let photometric = dir
+        .first_uint(TIFFTAG_PHOTOMETRIC)
+        .unwrap_or(PHOTOMETRIC_RGB as u64) as u16;
+    // SamplesPerPixel is often omitted on grayscale NDPI levels (e.g. 16-bit
+    // JPEG XR); fall back by photometric rather than assuming RGB's 3.
+    let default_samples = match photometric {
+        PHOTOMETRIC_RGB | PHOTOMETRIC_YCBCR => 3,
+        _ => 1,
+    };
+    let samples_per_pixel = dir
+        .first_uint(TIFFTAG_SAMPLESPERPIXEL)
+        .unwrap_or(default_samples) as u16;
     let bits_per_sample = dir
         .uints(TIFFTAG_BITSPERSAMPLE)
         .unwrap_or_else(|| vec![8; samples_per_pixel as usize])
         .into_iter()
         .map(|v| v as u16)
         .collect::<Vec<_>>();
-    let photometric = dir
-        .first_uint(TIFFTAG_PHOTOMETRIC)
-        .unwrap_or(PHOTOMETRIC_RGB as u64) as u16;
     let planar_config = dir
         .first_uint(TIFFTAG_PLANARCONFIG)
         .unwrap_or(PLANARCONFIG_CONTIG as u64) as u16;
@@ -2192,10 +2469,6 @@ fn ndpi_level_source(
         if offsets.len() < tile_count_usize {
             return None;
         }
-        let offsets: Vec<u64> = offsets
-            .into_iter()
-            .map(|offset| ndpi_resolve_value_offset(path, file_len, dir.offset, offset, compression))
-            .collect();
         let mcu_starts = ndpi_recorded_mcu_starts(dir, offsets.first().copied()?);
         return Some(NdpiLevel {
             path: path.to_path_buf(),
@@ -2226,31 +2499,7 @@ fn ndpi_level_source(
         return None;
     }
     let tile_count = height.div_ceil(rows_per_strip);
-    let offsets = offsets
-        .into_iter()
-        .map(|offset| ndpi_resolve_value_offset(path, file_len, dir.offset, offset, compression))
-        .collect::<Vec<_>>();
     let mcu_starts = ndpi_recorded_mcu_starts(dir, offsets.first().copied()?);
-    // NDPI truncates the strip byte count to 32 bits; for a single >4 GB JPEG
-    // strip re-add the high bits so the strip covers its recorded MCU restarts.
-    let byte_counts = if offsets.len() == 1
-        && matches!(compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG)
-    {
-        let min_end = mcu_starts
-            .as_ref()
-            .and_then(|starts| starts.iter().copied().max())
-            .map(|last| last.saturating_add(1))
-            .unwrap_or_else(|| offsets[0].saturating_add(1));
-        vec![ndpi_resolve_strip_byte_count(
-            path,
-            file_len,
-            offsets[0],
-            byte_counts[0],
-            min_end,
-        )]
-    } else {
-        byte_counts
-    };
     Some(NdpiLevel {
         path: path.to_path_buf(),
         dir_index: u32::try_from(dir_index).ok()?,
@@ -2273,112 +2522,35 @@ fn ndpi_level_source(
     })
 }
 
+/// Absolute file offsets of each recorded JPEG MCU restart in a strip.
+///
+/// NDPI stores the low 32 bits of each restart offset in `NDPI_MCU_STARTS_LOW`
+/// and, for strips larger than 4 GB, the high 32 bits in the parallel
+/// `NDPI_MCU_STARTS_HIGH` array. Each absolute offset is
+/// `start_in_file + (low | (high << 32))`. Mirrors
+/// `ndpi_read_unreliable_mcu_starts()` in openslide-vendor-hamamatsu.c.
 fn ndpi_recorded_mcu_starts(dir: &TiffDir, start_in_file: u64) -> Option<Vec<u64>> {
-    let values = dir.uints(NDPI_MCU_STARTS)?;
-    if values.is_empty() {
+    let low = dir.uints(NDPI_MCU_STARTS_LOW)?;
+    if low.is_empty() {
         return None;
     }
-    values
-        .into_iter()
-        .map(|value| start_in_file.checked_add(value))
+    let high = dir.uints(NDPI_MCU_STARTS_HIGH);
+    if let Some(high) = high.as_ref() {
+        if high.len() != low.len() {
+            return None;
+        }
+    }
+    low.into_iter()
+        .enumerate()
+        .map(|(tile, value)| {
+            let high_bits = high
+                .as_ref()
+                .and_then(|h| h.get(tile).copied())
+                .map(|h| h << 32)
+                .unwrap_or(0);
+            start_in_file.checked_add(value | high_bits)
+        })
         .collect()
-}
-
-/// Reconstruct the full 64-bit file offset of an NDPI strip/tile value.
-///
-/// NDPI stores 32-bit offsets and re-adds the high-order bits with the
-/// `fix_offset_ndpi` heuristic, which assumes the data sits just below the
-/// directory. Some writers instead place the level-0 JPEG near the start of a
-/// file larger than 4 GB, where the heuristic (and upstream OpenSlide, which
-/// cannot read these files) reconstructs the wrong offset. For JPEG-compressed
-/// levels we therefore validate candidate offsets against the JPEG SOI marker
-/// and fall back to scanning each 4 GB half of the file. Non-JPEG levels keep
-/// the plain heuristic, matching upstream exactly.
-fn ndpi_resolve_value_offset(
-    path: &Path,
-    file_len: u64,
-    diroff: u64,
-    raw_offset: u64,
-    compression: u16,
-) -> u64 {
-    let heuristic = fix_offset_ndpi(diroff, raw_offset);
-    if !matches!(compression, COMPRESSION_JPEG | COMPRESSION_OLD_JPEG) {
-        return heuristic;
-    }
-    if ndpi_offset_has_jpeg_soi(path, file_len, heuristic) {
-        return heuristic;
-    }
-    let low = raw_offset & u64::from(u32::MAX);
-    let mut high = 0u64;
-    while high < file_len {
-        let candidate = high | low;
-        if candidate != heuristic && ndpi_offset_has_jpeg_soi(path, file_len, candidate) {
-            return candidate;
-        }
-        high += 1u64 << 32;
-    }
-    heuristic
-}
-
-fn ndpi_offset_has_jpeg_soi(path: &Path, file_len: u64, offset: u64) -> bool {
-    ndpi_offset_has_marker(path, file_len, offset, 0xD8)
-}
-
-/// Check for a two-byte `0xFF <second>` JPEG marker at `offset`.
-fn ndpi_offset_has_marker(path: &Path, file_len: u64, offset: u64, second: u8) -> bool {
-    if offset.checked_add(2).is_none_or(|end| end > file_len) {
-        return false;
-    }
-    matches!(
-        crate::util::read_file_range(path, offset, 2).as_deref(),
-        Ok([0xFF, b]) if *b == second
-    )
-}
-
-/// Reconstruct the full byte length of an NDPI JPEG strip.
-///
-/// NDPI writes the strip byte count as a 32-bit value; for strips larger than
-/// 4 GB the high bits are lost, so the recorded count can point far short of the
-/// real end of the JPEG (upstream OpenSlide cannot read these files at all). We
-/// only re-add high bits when the stored length demonstrably fails to cover the
-/// recorded MCU restarts, and we confirm each candidate end against the JPEG EOI
-/// marker, so well-formed strips keep their original length untouched.
-fn ndpi_resolve_strip_byte_count(
-    path: &Path,
-    file_len: u64,
-    start: u64,
-    raw_byte_count: u64,
-    min_end: u64,
-) -> u64 {
-    let low = raw_byte_count & u64::from(u32::MAX);
-    let base_end = start.saturating_add(low);
-    if base_end <= file_len && base_end >= min_end {
-        return low;
-    }
-    let mut high = 1u64 << 32;
-    while let Some(count) = low.checked_add(high) {
-        let Some(end) = start.checked_add(count) else {
-            break;
-        };
-        if end > file_len {
-            break;
-        }
-        if end >= min_end && ndpi_offset_has_marker(path, file_len, end - 2, 0xD9) {
-            return count;
-        }
-        high += 1u64 << 32;
-    }
-    low
-}
-
-fn fix_offset_ndpi(diroff: u64, offset: u64) -> u64 {
-    let mut result = (diroff & !u64::from(u32::MAX)) | (offset & u64::from(u32::MAX));
-    if result >= diroff {
-        if let Some(adjusted) = result.checked_sub(u64::from(u32::MAX) + 1) {
-            result = adjusted.min(result);
-        }
-    }
-    result
 }
 
 fn read_vms_region(
@@ -3493,11 +3665,66 @@ fn read_ndpi_tile(
             let jpeg = merge_jpeg_tables(&data, ndpi.jpeg_tables.as_deref())?;
             decode::decode_channel(ImageFormat::Jpeg, &jpeg, channel)
         }
+        COMPRESSION_JPEGXR_NDPI => {
+            // NDPI JPEG XR levels decode to a single-channel 16-bit gray
+            // codestream even though the TIFF tags claim YCbCr/3 samples (those
+            // tags are boilerplate; no reference reader, including OpenSlide 4.x,
+            // supports this codec). Decode as gray and treat it as grayscale.
+            let raw = decode_ndpi_jpegxr_tile_raw(&data, actual_w, actual_h)?;
+            decode_raw_channel(
+                &raw,
+                actual_w,
+                actual_h,
+                1,
+                &[16],
+                PHOTOMETRIC_BLACK_IS_ZERO,
+                PLANARCONFIG_CONTIG,
+                Endian::Little,
+                channel,
+            )
+        }
         other => Err(OpenSlideError::UnsupportedFormat(format!(
             "Unsupported NDPI TIFF compression {}",
             other
         ))),
     }
+}
+
+/// Decode an NDPI JPEG XR level tile as single-channel 16-bit gray (little-endian).
+fn decode_ndpi_jpegxr_tile_raw(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let image =
+        decode::default_decoder_api().decode_jpegxr_image(decode::jpegxr::JpegXrDecodeRequest {
+            data,
+            options: decode::jpegxr::JpegXrDecodeOptions {
+                width,
+                height,
+                pixel_format: decode::jpegxr::JpegXrPixelFormat::Gray16,
+            },
+            context: "Hamamatsu NDPI JPEG XR tile",
+        })?;
+    Ok(image.data)
+}
+
+/// Decode a JPEG XR macro/associated image (BGR) into RGBA.
+fn decode_ndpi_jpegxr_bgr_to_rgba(data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
+    let image =
+        decode::default_decoder_api().decode_jpegxr_image(decode::jpegxr::JpegXrDecodeRequest {
+            data,
+            options: decode::jpegxr::JpegXrDecodeOptions {
+                width,
+                height,
+                pixel_format: decode::jpegxr::JpegXrPixelFormat::Bgr24,
+            },
+            context: "Hamamatsu NDPI JPEG XR macro",
+        })?;
+    let mut rgba = vec![0u8; image.width as usize * image.height as usize * 4];
+    for (dst, src) in rgba.chunks_exact_mut(4).zip(image.data.chunks_exact(3)) {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = 255;
+    }
+    RgbaImage::from_rgba(image.width, image.height, rgba)
 }
 
 fn read_ndpi_tile_region(
@@ -4986,7 +5213,6 @@ struct TiffFile {
 
 #[derive(Debug)]
 struct TiffDir {
-    offset: u64,
     entries: HashMap<u16, TiffValue>,
 }
 
@@ -4995,10 +5221,6 @@ struct TiffValue {
     field_type: u16,
     data: Vec<u8>,
     endian: Endian,
-    /// Fixed file offset of an out-of-line value, or `None` when the value is
-    /// stored inline. Retained so later NDPI directories can reuse an identical
-    /// offset from the first directory (see `entry_value`).
-    offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5052,12 +5274,9 @@ impl TiffFile {
         // and plain classic-TIFF parsing (openslide-decode-tifflike.c create()).
         let mut ndpi = false;
         if !bigtiff && offset != 0 {
-            if let Ok((mut dir, next)) =
-                parse_tiff_dir(path, file_len, offset, endian, false, true, None)
-            {
+            if let Ok((dir, next)) = parse_tiff_dir(path, file_len, offset, endian, false, true) {
                 if dir.contains(NDPI_FORMAT_FLAG) {
                     ndpi = true;
-                    dir.offset = offset;
                     seen.insert(offset);
                     dirs.push(dir);
                     offset = next;
@@ -5073,11 +5292,7 @@ impl TiffFile {
             if !seen.insert(offset) {
                 return Err(OpenSlideError::Format("TIFF directory loop".into()));
             }
-            let (mut dir, next) = {
-                let first_dir = dirs.first();
-                parse_tiff_dir(path, file_len, offset, endian, bigtiff, ndpi, first_dir)?
-            };
-            dir.offset = offset;
+            let (dir, next) = parse_tiff_dir(path, file_len, offset, endian, bigtiff, ndpi)?;
             dirs.push(dir);
             offset = next;
         }
@@ -5195,7 +5410,6 @@ fn parse_tiff_dir(
     endian: Endian,
     bigtiff: bool,
     ndpi: bool,
-    first_dir: Option<&TiffDir>,
 ) -> Result<(TiffDir, u64)> {
     if bigtiff {
         let count_bytes = read_file_range_exact(path, file_len, offset, 8)?;
@@ -5228,15 +5442,13 @@ fn parse_tiff_dir(
                 endian,
                 field_type,
                 value_count,
-                false,
-                offset,
                 None,
             )?;
             entries.insert(tag, value);
         }
         let next_bytes = read_file_range_exact(path, file_len, next_offset_pos, 8)?;
         let next = read_u64_from_chunk(&next_bytes, endian);
-        Ok((TiffDir { offset: 0, entries }, next))
+        Ok((TiffDir { entries }, next))
     } else {
         let count_bytes = read_file_range_exact(path, file_len, offset, 2)?;
         let count = read_u16_from_chunk(&count_bytes, endian) as usize;
@@ -5256,15 +5468,30 @@ fn parse_tiff_dir(
         ensure_file_range(file_len, next_offset_pos, next_width)?;
         let table = read_file_range_exact(path, file_len, entries_start, table_len)?;
 
+        // NDPI stores the high 32 bits of every value/offset in 4-byte blocks
+        // immediately after the next-directory offset. Preloading these "value
+        // extensions" makes each 64-bit value exact, replacing the old heuristic
+        // (openslide-decode-tifflike.c read_directory()).
+        let value_ext = if ndpi {
+            let ext_pos = next_offset_pos.checked_add(8).ok_or_else(|| {
+                OpenSlideError::Format("NDPI value extension offset overflow".into())
+            })?;
+            let ext_len = count
+                .checked_mul(4)
+                .ok_or_else(|| OpenSlideError::Format("NDPI value extension overflow".into()))?;
+            ensure_file_range(file_len, ext_pos, ext_len)?;
+            read_file_range_exact(path, file_len, ext_pos, ext_len)?
+        } else {
+            Vec::new()
+        };
+
         let mut entries = HashMap::new();
         for i in 0..count {
             let pos = i * 12;
             let tag = read_u16_from_chunk(&table[pos..pos + 2], endian);
             let field_type = read_u16_from_chunk(&table[pos + 2..pos + 4], endian);
             let value_count = read_u32_from_chunk(&table[pos + 4..pos + 8], endian) as u64;
-            let first_dir_offset = first_dir
-                .and_then(|d| d.entries.get(&tag))
-                .and_then(|v| v.offset);
+            let extension = ndpi.then(|| read_u32_from_chunk(&value_ext[i * 4..i * 4 + 4], endian));
             let value = entry_value(
                 path,
                 file_len,
@@ -5273,9 +5500,7 @@ fn parse_tiff_dir(
                 endian,
                 field_type,
                 value_count,
-                ndpi,
-                offset,
-                first_dir_offset,
+                extension,
             )?;
             entries.insert(tag, value);
         }
@@ -5285,11 +5510,17 @@ fn parse_tiff_dir(
         } else {
             read_u32_from_chunk(&next_bytes, endian) as u64
         };
-        Ok((TiffDir { offset: 0, entries }, next))
+        Ok((TiffDir { entries }, next))
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Decode one IFD entry's value.
+///
+/// `extension` is the NDPI 4-byte high-order extension for this entry (present
+/// only in NDPI mode); it supplies the high 32 bits of every offset/value.
+/// ASCII values in NDPI are always stored out of line, and an inline 32-bit
+/// value with a nonzero extension is widened to 64-bit. Mirrors
+/// `read_directory()` in openslide-decode-tifflike.c.
 fn entry_value(
     path: &Path,
     file_len: u64,
@@ -5298,47 +5529,66 @@ fn entry_value(
     endian: Endian,
     field_type: u16,
     count: u64,
-    ndpi: bool,
-    diroff: u64,
-    first_dir_offset: Option<u64>,
+    extension: Option<u32>,
 ) -> Result<TiffValue> {
+    let mut field_type = field_type;
     let type_size = tiff_type_size(field_type).ok_or_else(|| {
         OpenSlideError::Format(format!("Unsupported TIFF field type {field_type}"))
     })?;
-    let byte_count = count
+    let mut byte_count = count
         .checked_mul(type_size as u64)
         .and_then(|v| usize::try_from(v).ok())
         .ok_or_else(|| OpenSlideError::Format("TIFF value size overflow".into()))?;
-    let (data, offset) = if byte_count <= inline_width {
-        (value_field[..byte_count].to_vec(), None)
+
+    let ndpi = extension.is_some();
+    let ext = extension.unwrap_or(0);
+    let is_value = byte_count <= inline_width && !(ndpi && field_type == TIFF_TYPE_ASCII);
+
+    if ndpi && is_value && ext != 0 {
+        // An inline value with a nonzero extension is really 64-bit: widen it.
+        match field_type {
+            4 => field_type = 16, // LONG -> LONG8
+            9 => field_type = 17, // SLONG -> SLONG8
+            _ => {
+                return Err(OpenSlideError::Format(format!(
+                    "Found nonzero NDPI value extension for field type {field_type}"
+                )))
+            }
+        }
+        byte_count = count
+            .checked_mul(8)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| OpenSlideError::Format("TIFF value size overflow".into()))?;
+    }
+
+    let data = if is_value {
+        if ndpi && ext != 0 {
+            // Widened LONG8/SLONG8: value = low 32 bits | (extension << 32).
+            let combined =
+                u64::from(read_u32_from_chunk(value_field, endian)) | (u64::from(ext) << 32);
+            let bytes = match endian {
+                Endian::Little => combined.to_le_bytes(),
+                Endian::Big => combined.to_be_bytes(),
+            };
+            bytes[..byte_count].to_vec()
+        } else {
+            value_field[..byte_count].to_vec()
+        }
     } else {
-        let raw_offset = if inline_width == 8 {
+        // Out-of-line: low 32 bits from the entry, high 32 bits from the NDPI
+        // extension (0 for classic TIFF / BigTIFF reads it as a full 64-bit).
+        let offset = if inline_width == 8 {
             read_u64_from_chunk(value_field, endian)
         } else {
-            read_u32_from_chunk(value_field, endian) as u64
-        };
-        // NDPI value offsets are 32 bits; re-add the implied high-order bits.
-        // If the first directory referenced the same tag at the same offset,
-        // reuse it unchanged (openslide-decode-tifflike.c read_directory()).
-        let offset = if ndpi {
-            match first_dir_offset {
-                Some(fixed) if fixed == raw_offset => raw_offset,
-                _ => fix_offset_ndpi(diroff, raw_offset),
-            }
-        } else {
-            raw_offset
+            u64::from(read_u32_from_chunk(value_field, endian)) | (u64::from(ext) << 32)
         };
         ensure_file_range(file_len, offset, byte_count)?;
-        (
-            read_file_range_exact(path, file_len, offset, byte_count)?,
-            Some(offset),
-        )
+        read_file_range_exact(path, file_len, offset, byte_count)?
     };
     Ok(TiffValue {
         field_type,
         data,
         endian,
-        offset,
     })
 }
 
@@ -5636,12 +5886,6 @@ mod tests {
         };
 
         assert!(format!("{err}").contains("VMS JPEG width not consistent"));
-    }
-
-    #[test]
-    fn fixes_ndpi_offsets_relative_to_directory_offset() {
-        assert_eq!(fix_offset_ndpi(0x1_0000_8000, 0x2000), 0x1_0000_2000);
-        assert_eq!(fix_offset_ndpi(0x1_0000_1000, 0x2000), 0x2000);
     }
 
     #[test]
@@ -6035,14 +6279,12 @@ mod tests {
     fn ndpi_property_map_splits_only_on_crlf_like_upstream() {
         let mut properties = HashMap::new();
         let dir = TiffDir {
-            offset: 0,
             entries: HashMap::from([(
                 NDPI_PROPERTY_MAP,
                 TiffValue {
                     field_type: 2,
                     data: b"CustomOne=alpha\nCustomTwo=beta\0".to_vec(),
                     endian: Endian::Little,
-                    offset: None,
                 },
             )]),
         };
@@ -6054,69 +6296,6 @@ mod tests {
             Some(&"alpha\nCustomTwo=beta".to_string())
         );
         assert!(properties.get("hamamatsu.CustomTwo").is_none());
-    }
-
-    #[test]
-    fn ndpi_marker_detection_matches_soi_and_eoi() {
-        let dir = unique_temp_dir("hamamatsu-ndpi-marker");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("markers.bin");
-        // SOI at 0, EOI at 4, plain bytes at 2.
-        fs::write(&path, [0xff, 0xd8, 0x12, 0x34, 0xff, 0xd9]).unwrap();
-        let len = 6;
-        assert!(ndpi_offset_has_jpeg_soi(&path, len, 0));
-        assert!(ndpi_offset_has_marker(&path, len, 4, 0xd9));
-        assert!(!ndpi_offset_has_jpeg_soi(&path, len, 2));
-        // Out-of-range reads never panic and report "no marker".
-        assert!(!ndpi_offset_has_marker(&path, len, 5, 0xd9));
-        assert!(!ndpi_offset_has_marker(&path, len, u64::MAX, 0xd8));
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn ndpi_value_offset_keeps_heuristic_for_valid_and_non_jpeg() {
-        let dir = unique_temp_dir("hamamatsu-ndpi-value-offset");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("data.bin");
-        // JPEG SOI at offset 8.
-        let mut bytes = vec![0u8; 32];
-        bytes[8] = 0xff;
-        bytes[9] = 0xd8;
-        fs::write(&path, &bytes).unwrap();
-        let len = 32;
-        // Sub-4 GB directory: the heuristic is the identity, and the SOI is
-        // present, so the offset is returned unchanged.
-        assert_eq!(
-            ndpi_resolve_value_offset(&path, len, 0x100, 8, COMPRESSION_JPEG),
-            8
-        );
-        // Non-JPEG levels always keep the plain heuristic without touching the file.
-        assert_eq!(
-            ndpi_resolve_value_offset(&path, len, 0x100, 20, COMPRESSION_NONE),
-            20
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn ndpi_strip_byte_count_trusts_covering_length() {
-        let dir = unique_temp_dir("hamamatsu-ndpi-byte-count");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("strip.bin");
-        fs::write(&path, vec![0u8; 4096]).unwrap();
-        let len = 4096;
-        // Stored length already reaches past the recorded restarts (min_end): keep it.
-        assert_eq!(
-            ndpi_resolve_strip_byte_count(&path, len, 100, 3000, 3000),
-            3000
-        );
-        // Length falls short of min_end but the 4 GB-shifted candidate is beyond
-        // the file, so we fall back to the stored low value rather than inventing one.
-        assert_eq!(
-            ndpi_resolve_strip_byte_count(&path, len, 100, 200, 4000),
-            200
-        );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

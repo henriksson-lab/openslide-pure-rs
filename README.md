@@ -6,6 +6,7 @@ Includes full **Mirax (.mrxs)** support from 3DHISTECH scanners; format reverse 
 trying to [address long-standing problems with this format](https://www.openmicroscopy.org/2016/01/06/format-support.html).
 Fix yet to be contributed upstream (more testing needed)
 
+* 2026-07-13: Support to get raw compressed tile data out. Now tracking openslide 4.0.1
 * 2026-06-07: Audits and performance work
 * 2026-06-03: Audit on real data from https://openslide.cs.cmu.edu/download/openslide-testdata/ ; benchmarking
 * 2026-05-30: Further audits. **This crate is still experimental**
@@ -64,6 +65,7 @@ set size from `/usr/bin/time -v`, and parity means matching `levels`,
 
 | Reader | Real-data status | Parity vs original | Rust read_s / RSS KiB | Original read_s / RSS KiB | Speed vs original | RSS vs original |
 | --- | --- | --- | ---: | ---: | ---: | ---: |
+| ARGOS | OpenSlide testdata `Argos/Argos-1-Stacked.avs` downloaded and SHA-256 verified | Blocked: installed original OpenSlide 3.4.1 predates ARGOS support and opens it as `generic-tiff`; Rust opens it as `argos` with 8 levels and macro/thumbnail images | n/a | n/a | n/a | n/a |
 | Aperio | `/big/henriksson/ome_images/SVS/77917.svs` | Exact | `0.060252 / 13560` | `0.086509 / 33564` | `1.44x` | `0.40x` |
 | Hamamatsu NDPI | `/big/henriksson/ome_images/Hamamatsu-NDPI/openslide/CMU-1/CMU-1.ndpi` | Exact | `0.018366 / 11316` | `0.044650 / 36892` | `2.43x` | `0.31x` |
 | Hamamatsu NDPI | `/big/henriksson/ome_images/Hamamatsu-NDPI/openslide/CMU-2/CMU-2.ndpi` | Exact | `0.017641 / 13616` | `0.047983 / 39020` | `2.72x` | `0.35x` |
@@ -72,6 +74,7 @@ set size from `/usr/bin/time -v`, and parity means matching `levels`,
 | Hamamatsu VMS | `/big/henriksson/ome_images/Hamamatsu-VMS/openslide/CMU-2/CMU-2-40x - 2010-01-12 13.38.58.vms` | Exact | `0.021541 / 10488` | `0.059653 / 39680` | `2.77x` | `0.26x` |
 | Hamamatsu VMS | `/big/henriksson/ome_images/Hamamatsu-VMS/openslide/CMU-3/CMU-3-40x - 2010-01-12 13.57.09.vms` | Exact | `0.020215 / 11128` | `0.053840 / 41600` | `2.66x` | `0.27x` |
 | Hamamatsu VMU/NGR | No local or public real fixture found | No public OpenSlide testdata fixture found | n/a | n/a | n/a | n/a |
+| Huron | OpenSlide testdata `Huron/Huron-1.tif`, `Huron/Huron-1-40x.tif`, and `Huron/Huron-1-Uncompressed.tif` downloaded and SHA-256 verified | Blocked: installed original OpenSlide 3.4.1 predates Huron support and opens them as `generic-tiff`; Rust opens them as `huron` with 3 levels and label/macro/thumbnail images | n/a | n/a | n/a | n/a |
 | Leica | `/big/henriksson/ome_images/Leica-SCN/openslide/Leica-1/Leica-1.scn` | Exact | `0.005764 / 8264` | `0.017001 / 32320` | `2.95x` | `0.26x` |
 | Leica | `/big/henriksson/ome_images/Leica-SCN/openslide/Leica-2/Leica-2.scn` | Exact | `0.029645 / 8576` | `0.047260 / 41920` | `1.59x` | `0.20x` |
 | Trestle | `/big/henriksson/ome_images/Trestle/openslide/CMU-1/CMU-1.tif` | Exact | `0.038104 / 23360` | `0.041948 / 40640` | `1.10x` | `0.57x` |
@@ -94,16 +97,18 @@ the notes, not to every possible vendor layout.
 Downloadable follow-up fixtures from OpenSlide testdata:
 
 ```sh
-scripts/download-openslide-testdata.py --format mirax --format philips --format zeiss --format generic-tiff --extract --allow-distributable
+scripts/download-openslide-testdata.py --format argos --format huron --format mirax --format philips --format zeiss --format generic-tiff --extract --allow-distributable
 ```
 
 | Format / backend | Extensions | Original OpenSlide | This crate | Notes |
 |------------------|------------|--------------------|------------|-------|
+| ARGOS | `.avs` | Supported in newer upstream | Experimental (reference blocked) | Public `Argos-1-Stacked.avs` is present and Rust-readable, but parity is blocked because the installed OpenSlide 3.4.1 reference stack predates ARGOS support and reports `generic-tiff`. |
 | Aperio | `.svs`, `.tif` | Supported | Fixture-verified (SVS subset) | Exact on one private SVS fixture and public `CMU-1-Small-Region.svs`. Covers the audited tiled-TIFF/JPEG paths; broader libtiff layout coverage remains limited. |
 | DICOM | `.dcm` | Supported | Experimental (limited exact data) | Exact on three readable single-level local members only. Full-pyramid WSI, multi-plane, and multi-optical-path parity are not yet proven; unsupported layouts remain expected. |
 | Hamamatsu NDPI | `.ndpi` | Supported | Fixture-verified (CMU-1/2/3 subset) | Exact on private/public `CMU-1.ndpi` and local DNL `CMU-2.ndpi`/`CMU-3.ndpi` fixtures. Complex NDPI layouts remain unsupported. |
 | Hamamatsu VMS | `.vms` | Supported | Fixture-verified (CMU-1/2/3 subset) | Exact on private VMS CMU-1/2/3 and public VMS `CMU-1` fixtures, including map and macro sidecar paths. |
 | Hamamatsu VMU/NGR | `.vmu`, `.ngr` | Supported | Experimental (no real fixture) | Parser and read paths exist, but no local or public real fixture has been added to the audit manifest yet. |
+| Huron | `.tif` | Supported in newer upstream | Experimental (reference blocked) | Public Huron JPEG, 40x JPEG, and uncompressed fixtures are present and Rust-readable, but parity is blocked because the installed OpenSlide 3.4.1 reference stack predates Huron support and reports `generic-tiff`. |
 | Leica | `.scn` | Supported | Fixture-verified (SCN subset) | Exact on the SCN subset covered by private `Leica-1` and multi-area `Leica-2` fixtures. Other Leica fixtures are not reference-openable or remain outside that subset. |
 | MIRAX / 3DHISTECH | `.mrxs` | Supported | Fixture-verified (brightfield and fluorescence public fixtures) | Exact on public brightfield `CMU-1-Saved-1_16` and fluorescence `Mirax2-Fluorescence-2` fixtures, including associated macro/label/thumbnail metadata. |
 | Philips | `.tiff` | Supported | Fixture-verified (Philips-1) | Exact on public `Philips-1.tiff`; tile reads delegate to the generic TIFF reader. |
@@ -227,6 +232,8 @@ scripts/download-openslide-testdata.py --profile coverage --extract --allow-dist
 
 # Fetch only one backend family, for example Aperio or MIRAX.
 scripts/download-openslide-testdata.py --format aperio
+scripts/download-openslide-testdata.py --format argos
+scripts/download-openslide-testdata.py --format huron
 scripts/download-openslide-testdata.py --format mirax --extract --allow-distributable
 ```
 

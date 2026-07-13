@@ -33,6 +33,14 @@ fixtures = []
 notes = "Need fixtures for macro/label/thumbnail names, ICC/profile export, quickhash, and metadata formatting variants before moving beyond fixture-verified."
 
 [[case]]
+reader = "argos"
+area = "public-stacked"
+requirement = "Public ARGOS Z-stack fixture opens as ARGOS and has parity or a documented reference-stack blocker."
+status = "blocked"
+fixtures = ["argos-public-stacked"]
+notes = "Rust opens the completed public ARGOS Z-stack fixture as argos with 8 levels and macro/thumbnail images. Installed OpenSlide 3.4.1 predates ARGOS support and opens the file as generic-tiff with one level."
+
+[[case]]
 reader = "hamamatsu-ndpi"
 area = "cmu-1"
 requirement = "Private and public CMU-1 NDPI fixtures are exact with speed/RSS baselines."
@@ -89,7 +97,7 @@ area = "ndpi-jpegxr"
 requirement = "JPEG-XR-compressed NDPI (TIFF compression 22610 / JPEGXR_NDPI) opens and reads through the jpegxr backend with parity or documented behavior."
 status = "pending"
 fixtures = ["hamamatsu-ndpi-local-jpegxr-1", "hamamatsu-ndpi-local-jpegxr-2"]
-notes = "Local DM0014 pair uses JPEG-XR tiles and a JPEG-XR macro image. Reference OpenSlide 3.4.1 also cannot open them (tag 278; OPENSLIDE_BUGS.md bug 3), so both are reference-blocked. Rust still fails because the jpegxr backend (src/decode/jpegxr.rs) is not wired into the NDPI tile/macro path; wiring it up is the remaining work."
+notes = "Local DM0014 pair uses JPEG-XR tiles and a JPEG-XR macro image. Reference OpenSlide (3.4.1 and 4.x) cannot open them (tag 278; OPENSLIDE_BUGS.md bug 3), so both are reference-blocked. Rust now reads them with --features jpegxr (69888x34944/4 levels and 66304x32256/5 levels) as 16-bit grayscale, decoding the JPEG-XR macro too; pixel correctness is unverifiable since no reference reader exists."
 
 [[case]]
 reader = "hamamatsu-ndpi"
@@ -102,7 +110,7 @@ fixtures = [
   "hamamatsu-ndpi-local-over4gb-3",
   "hamamatsu-ndpi-local-over4gb-4",
 ]
-notes = "Four local baseline-JPEG NDPI files (4.2-5.4 GB), all now readable. SR1274-908A/B (directory chain crosses 4 GB) read with spot-verified exact pixel parity and matching 10-level pyramids after the reader was made faithful to openslide-decode-tifflike.c (64-bit header offset, NDPI 8-byte next-directory offset, fix_offset_ndpi with first-IFD reuse). Dguok/Topors (directories >4 GB, JPEG at file start) are reference-blocked (OPENSLIDE_BUGS.md bug 1) but Rust reads real pixel data via SOI/EOI-validated offset and byte-count reconstruction. Formal harness checksums for the reference-readable pair are pending."
+notes = "Four local baseline-JPEG NDPI files (4.2-5.4 GB), all now readable. The reader was made faithful to openslide-decode-tifflike.c: 64-bit header offset, NDPI 8-byte next-directory offset, and the deterministic NDPI value-extension mechanism (4-byte high halves after each IFD; NDPI_MCU_STARTS_LOW|HIGH) that upstream added in v4.0.0-378. SR1274-908A/B (chain crosses 4 GB) read with spot-verified exact pixel parity and matching 10-level pyramids. Dguok/Topors (directories >4 GB, JPEG at file start) are unreadable by the 3.4.1 runtime and our vendored 4.0.0-377 reference (OPENSLIDE_BUGS.md bug 1) but Rust reads real pixel data. Formal harness checksums for the reference-readable pair are pending."
 
 [[case]]
 reader = "hamamatsu-ndpi"
@@ -115,7 +123,19 @@ fixtures = [
   "hamamatsu-ndpi-local-fluorescence-3",
   "hamamatsu-ndpi-local-fluorescence-set",
 ]
-notes = "Local test3 set: three single-channel fluorescence .ndpi members plus the test3.ndpis descriptor. The member .ndpi files read as RGB slides with spot-verified exact pixel parity and matching 7-level pyramids (formal harness checksums pending). The .ndpis set descriptor is reference-blocked (OPENSLIDE_BUGS.md bug 4); neither reader models the multi-channel set container."
+notes = "Local test3 set: three single-channel fluorescence .ndpi members plus the test3.ndpis descriptor. The member .ndpi files read as RGB slides with spot-verified exact pixel parity and matching 7-level pyramids (formal harness checksums pending). The .ndpis set descriptor is reference-blocked (OPENSLIDE_BUGS.md bug 4), but Rust now opens it as a single 3-channel (DAPI/FITC/TRITC) 7-level slide via a NdpiSetSlide backend."
+
+[[case]]
+reader = "huron"
+area = "public-baseline"
+requirement = "Public Huron JPEG, 40x JPEG, and uncompressed fixtures open as Huron and have parity or a documented reference-stack blocker."
+status = "blocked"
+fixtures = [
+  "huron-public-huron-1",
+  "huron-public-huron-1-40x",
+  "huron-public-huron-1-uncompressed",
+]
+notes = "Rust opens all three completed public Huron fixtures as huron with 3 levels and label/macro/thumbnail images. Installed OpenSlide 3.4.1 predates Huron support and opens them as generic-tiff with one level."
 
 [[case]]
 reader = "leica"

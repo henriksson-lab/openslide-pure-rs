@@ -79,25 +79,25 @@ notes = "DNL/zero-width JPEG fixture is exact after using TIFF dimensions plus r
 fixture = "hamamatsu-ndpi-local-jpegxr-1"
 reader = "hamamatsu-ndpi"
 status = "blocked"
-notes = "JPEG-XR NDPI. Reference OpenSlide 3.4.1 cannot open it (tag 278; OPENSLIDE_BUGS.md bug 3), so parity is not measurable; Rust's jpegxr NDPI path is also unwired."
+notes = "JPEG-XR NDPI. Reference OpenSlide (3.4.1 and 4.x) cannot open it (tag 278; OPENSLIDE_BUGS.md bug 3), so parity is not measurable. Rust now reads it with --features jpegxr as 16-bit grayscale; correctness unverifiable."
 
 [[expectation]]
 fixture = "hamamatsu-ndpi-local-jpegxr-2"
 reader = "hamamatsu-ndpi"
 status = "blocked"
-notes = "JPEG-XR NDPI. Same as hamamatsu-ndpi-local-jpegxr-1: reference-blocked (tag 278) and Rust jpegxr NDPI path unwired."
+notes = "JPEG-XR NDPI. Same as hamamatsu-ndpi-local-jpegxr-1: reference-blocked (tag 278); Rust now reads it with --features jpegxr, correctness unverifiable."
 
 [[expectation]]
 fixture = "hamamatsu-ndpi-local-over4gb-1"
 reader = "hamamatsu-ndpi"
 status = "blocked"
-notes = "4.2 GB baseline-JPEG NDPI. Reference OpenSlide 3.4.1 cannot open it (OPENSLIDE_BUGS.md bug 1), so parity is not measurable. Rust now reads real pixel data via SOI/EOI-validated offset and byte-count reconstruction."
+notes = "4.2 GB baseline-JPEG NDPI. The 3.4.1 runtime and our vendored 4.0.0-377 reference cannot open it (OPENSLIDE_BUGS.md bug 1; fixed upstream in v4.0.0-378). Rust reads real pixel data via the NDPI value-extension mechanism."
 
 [[expectation]]
 fixture = "hamamatsu-ndpi-local-over4gb-2"
 reader = "hamamatsu-ndpi"
 status = "blocked"
-notes = "4.3 GB baseline-JPEG NDPI. Reference-blocked (bug 1); Rust now reads real pixel data after 64-bit header detection and offset/byte-count reconstruction."
+notes = "4.3 GB baseline-JPEG NDPI. Unreadable by the 3.4.1 runtime and vendored 4.0.0-377 reference (bug 1; fixed upstream in v4.0.0-378); Rust reads real pixel data via 64-bit header detection and the NDPI value-extension mechanism."
 
 [[expectation]]
 fixture = "hamamatsu-ndpi-local-over4gb-3"
@@ -133,7 +133,7 @@ notes = "Single-channel fluorescence NDPI (TRITC). Reads as RGB, 7-level pyramid
 fixture = "hamamatsu-ndpi-local-fluorescence-set"
 reader = "hamamatsu-ndpi"
 status = "blocked"
-notes = "The test3.ndpis fluorescence set descriptor. Reference OpenSlide 3.4.1 cannot open it (OPENSLIDE_BUGS.md bug 4); neither reader models the set container."
+notes = "The test3.ndpis fluorescence set descriptor. Reference OpenSlide (3.4.1 and 4.x) cannot open it (OPENSLIDE_BUGS.md bug 4); Rust now opens it as a 3-channel (DAPI/FITC/TRITC) 7-level slide via NdpiSetSlide."
 
 [[expectation]]
 fixture = "hamamatsu-vmu-ngr-missing"
@@ -220,6 +220,12 @@ reference_rgb_checksum = 107346196
 notes = "Exact after fixing benchmark reference coordinate rounding to match Rust's half-away rounding."
 
 [[expectation]]
+fixture = "argos-public-stacked"
+reader = "argos"
+status = "blocked"
+notes = "Public ARGOS Z-stack fixture is present and Rust opens it as argos with 8 levels and macro/thumbnail images. Installed reference OpenSlide 3.4.1 predates ARGOS support and opens it as generic-tiff with one level, so parity cannot be measured against this reference stack."
+
+[[expectation]]
 fixture = "aperio-public-cmu-1-small-region"
 reader = "aperio"
 status = "exact"
@@ -254,6 +260,24 @@ reference_checksum = 95211709
 rust_rgb_checksum = 65966269
 reference_rgb_checksum = 65966269
 notes = "Public VMS fixture has exact sampled checksum parity."
+
+[[expectation]]
+fixture = "huron-public-huron-1"
+reader = "huron"
+status = "blocked"
+notes = "Public Huron JPEG fixture is present and Rust opens it as huron with 3 levels and label/macro/thumbnail images. Installed reference OpenSlide 3.4.1 predates Huron support and opens it as generic-tiff with one level, so parity cannot be measured against this reference stack."
+
+[[expectation]]
+fixture = "huron-public-huron-1-40x"
+reader = "huron"
+status = "blocked"
+notes = "Public Huron 40x JPEG fixture is present and Rust opens it as huron with 3 levels and label/macro/thumbnail images. Installed reference OpenSlide 3.4.1 predates Huron support and opens it as generic-tiff with one level, so parity cannot be measured against this reference stack."
+
+[[expectation]]
+fixture = "huron-public-huron-1-uncompressed"
+reader = "huron"
+status = "blocked"
+notes = "Public Huron uncompressed fixture is present and Rust opens it as huron with 3 levels and label/macro/thumbnail images. Installed reference OpenSlide 3.4.1 predates Huron support and opens it as generic-tiff with one level, so parity cannot be measured against this reference stack."
 
 [[expectation]]
 fixture = "leica-public-fluorescence-1"

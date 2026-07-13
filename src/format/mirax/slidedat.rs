@@ -145,6 +145,22 @@ fn parse_objective_magnification(s: &str) -> Result<i64> {
     parse_int(s).map(i64::from)
 }
 
+/// Blank out MIRAX Slidedat.ini lines that have a value but no key (matching the
+/// `^\s*=` regex upstream applies for the MIRAX key-file flavor, commit f0b330da).
+fn strip_empty_mirax_keys(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for line in content.split_inclusive('\n') {
+        if line.trim_start().starts_with('=') {
+            // drop the keyless value but preserve the line terminator
+            let body = line.trim_end_matches(['\r', '\n']);
+            out.push_str(&line[body.len()..]);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 fn get_value(ini: &Ini, section: &str, key: &str) -> Result<String> {
     ini.get(section, key)
         .ok_or_else(|| OpenSlideError::Format(format!("Missing key [{}].{}", section, key)))
@@ -285,6 +301,10 @@ impl SlideDat {
             .map_err(|e| OpenSlideError::Format(format!("Can't read Slidedat.ini: {}", e)))?;
         let content = String::from_utf8(content)
             .map_err(|e| OpenSlideError::Format(format!("Can't parse Slidedat.ini: {}", e)))?;
+        // Upstream commit f0b330da: some MIRAX Slidedat.ini files contain lines
+        // that have a value but no key (e.g. ` = False`), which the key-file
+        // parser rejects. Blank out such lines before parsing.
+        let content = strip_empty_mirax_keys(&content);
 
         let ini = crate::util::_openslide_key_file_load_from_data(content)
             .map_err(|e| OpenSlideError::Format(format!("Can't parse Slidedat.ini: {}", e)))?;
@@ -302,11 +322,16 @@ impl SlideDat {
             .and_then(|v| parse_int(&v).ok());
         let images_x = get_int(&ini, "GENERAL", "IMAGENUMBER_X")?;
         let images_y = get_int(&ini, "GENERAL", "IMAGENUMBER_Y")?;
-        let objective_magnification = Some(parse_objective_magnification(&get_value(
-            &ini,
-            "GENERAL",
-            "OBJECTIVE_MAGNIFICATION",
-        )?)?);
+        // Upstream openslide-vendor-mirax.c (commit aae38d23): objective-power is
+        // optional. A missing, blank, non-integer, or non-positive value yields
+        // no property, and a trailing 'x' (seen in old files) is stripped first.
+        let objective_magnification = ini
+            .get("GENERAL", "OBJECTIVE_MAGNIFICATION")
+            .and_then(|raw| {
+                let trimmed = raw.strip_suffix('x').unwrap_or(raw.as_str());
+                parse_objective_magnification(trimmed).ok()
+            })
+            .filter(|&v| v > 0);
         let image_divisions = get_int_or_default(&ini, "GENERAL", "CameraImageDivisionsPerSide", 1);
 
         if images_x <= 0 || images_y <= 0 || image_divisions <= 0 {
@@ -757,18 +782,69 @@ COLOR_B=-1\n";
     }
 
     #[test]
-    fn rejects_missing_objective_magnification_like_upstream() {
+    fn allows_missing_or_blank_objective_magnification_like_upstream() {
+        // Upstream commit aae38d23: objective-power is optional. Missing, blank,
+        // and 'x'-suffixed values are all accepted (no property / stripped).
         let dir = std::env::temp_dir().join("openslide_test_slidedat_missing_objective");
         let _ = std::fs::create_dir_all(&dir);
+
         write_test_slidedat(&dir);
         let path = dir.join("Slidedat.ini");
         let content = std::fs::read_to_string(&path).unwrap();
+
+        // Missing key -> no objective-power.
         std::fs::write(&path, content.replace("OBJECTIVE_MAGNIFICATION=40\n", "")).unwrap();
+        assert_eq!(
+            SlideDat::parse(&dir)
+                .unwrap()
+                .general
+                .objective_magnification,
+            None
+        );
 
-        let err = SlideDat::parse(&dir).unwrap_err();
+        // Blank value -> no objective-power.
+        std::fs::write(
+            &path,
+            content.replace("OBJECTIVE_MAGNIFICATION=40", "OBJECTIVE_MAGNIFICATION="),
+        )
+        .unwrap();
+        assert_eq!(
+            SlideDat::parse(&dir)
+                .unwrap()
+                .general
+                .objective_magnification,
+            None
+        );
 
-        assert!(format!("{err}").contains("Missing key [GENERAL].OBJECTIVE_MAGNIFICATION"));
+        // Trailing 'x' -> stripped.
+        std::fs::write(
+            &path,
+            content.replace("OBJECTIVE_MAGNIFICATION=40", "OBJECTIVE_MAGNIFICATION=20x"),
+        )
+        .unwrap();
+        assert_eq!(
+            SlideDat::parse(&dir)
+                .unwrap()
+                .general
+                .objective_magnification,
+            Some(20)
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strips_keyless_mirax_lines_like_upstream() {
+        // Lines with a value but no key (upstream commit f0b330da) are blanked,
+        // preserving other lines and terminators.
+        let input = "[GENERAL]\r\nSLIDE_ID=x\r\n = False\r\n\tFOO=1\r\n  = True\n";
+        let out = strip_empty_mirax_keys(input);
+        assert_eq!(out, "[GENERAL]\r\nSLIDE_ID=x\r\n\r\n\tFOO=1\r\n\n");
+        // A real "= value" line is dropped; keyed lines survive.
+        assert!(!out.contains("False"));
+        assert!(!out.contains("True"));
+        assert!(out.contains("SLIDE_ID=x"));
+        assert!(out.contains("\tFOO=1"));
     }
 
     #[test]

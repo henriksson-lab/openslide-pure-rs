@@ -64,15 +64,15 @@ const TYPE_LONG8: u16 = 16;
 const TYPE_SLONG8: u16 = 17;
 const TYPE_IFD8: u16 = 18;
 
-const TAG_SUBFILETYPE: u16 = 254;
-const TAG_IMAGEWIDTH: u16 = 256;
-const TAG_IMAGELENGTH: u16 = 257;
+pub(crate) const TAG_SUBFILETYPE: u16 = 254;
+pub(crate) const TAG_IMAGEWIDTH: u16 = 256;
+pub(crate) const TAG_IMAGELENGTH: u16 = 257;
 const TAG_BITSPERSAMPLE: u16 = 258;
-const TAG_COMPRESSION: u16 = 259;
+pub(crate) const TAG_COMPRESSION: u16 = 259;
 const TAG_PHOTOMETRIC: u16 = 262;
-const TAG_IMAGEDESCRIPTION: u16 = 270;
+pub(crate) const TAG_IMAGEDESCRIPTION: u16 = 270;
 const TAG_STRIPOFFSETS: u16 = 273;
-const TAG_MAKE: u16 = 271;
+pub(crate) const TAG_MAKE: u16 = 271;
 const TAG_MODEL: u16 = 272;
 const TAG_SAMPLESPERPIXEL: u16 = 277;
 const TAG_ROWSPERSTRIP: u16 = 278;
@@ -90,8 +90,8 @@ const TAG_ARTIST: u16 = 315;
 const TAG_HOSTCOMPUTER: u16 = 316;
 const TAG_COPYRIGHT: u16 = 33432;
 const TAG_DOCUMENTNAME: u16 = 269;
-const TAG_TILEWIDTH: u16 = 322;
-const TAG_TILELENGTH: u16 = 323;
+pub(crate) const TAG_TILEWIDTH: u16 = 322;
+pub(crate) const TAG_TILELENGTH: u16 = 323;
 const TAG_TILEOFFSETS: u16 = 324;
 const TAG_TILEBYTECOUNTS: u16 = 325;
 const TAG_JPEGTABLES: u16 = 347;
@@ -102,8 +102,9 @@ const TAG_JPEG_DC_TABLES: u16 = 520;
 const TAG_JPEG_AC_TABLES: u16 = 521;
 const TAG_ICCPROFILE: u16 = 34675;
 const TAG_YCBCRSUBSAMPLING: u16 = 530;
+const TAG_IMAGEDEPTH: u16 = 32997;
 
-const FILETYPE_REDUCEDIMAGE: u64 = 1;
+pub(crate) const FILETYPE_REDUCEDIMAGE: u64 = 1;
 
 const COMPRESSION_NONE: u16 = 1;
 const COMPRESSION_LZW: u16 = 5;
@@ -187,6 +188,18 @@ pub(crate) struct TiffFile {
     path: PathBuf,
     endian: Endian,
     directories: Vec<TiffDirectory>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TiffDirectorySummary {
+    pub(crate) index: usize,
+    pub(crate) width: Option<u64>,
+    pub(crate) height: Option<u64>,
+    pub(crate) is_tiled: bool,
+    pub(crate) is_stripped: bool,
+    pub(crate) subfile_type: Option<u64>,
+    pub(crate) image_depth: Option<u64>,
+    pub(crate) compression: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,6 +524,29 @@ impl TiffFile {
 
     fn directory(&self, index: usize) -> Option<&TiffDirectory> {
         self.directories.get(index)
+    }
+
+    pub(crate) fn directory_summaries(&self) -> Vec<TiffDirectorySummary> {
+        self.directories
+            .iter()
+            .enumerate()
+            .map(|(index, dir)| TiffDirectorySummary {
+                index,
+                width: dir.uint(self.endian, TAG_IMAGEWIDTH),
+                height: dir.uint(self.endian, TAG_IMAGELENGTH),
+                is_tiled: dir.has(TAG_TILEWIDTH) && dir.has(TAG_TILELENGTH),
+                is_stripped: dir.has(TAG_STRIPOFFSETS) && dir.has(TAG_STRIPBYTECOUNTS),
+                subfile_type: dir.uint(self.endian, TAG_SUBFILETYPE),
+                image_depth: dir.uint(self.endian, TAG_IMAGEDEPTH),
+                compression: dir.uint(self.endian, TAG_COMPRESSION),
+            })
+            .collect()
+    }
+
+    pub(crate) fn directory_ascii_string(&self, index: usize, tag: u16) -> Option<String> {
+        self.directory(index)
+            .and_then(|dir| dir.entry(tag))
+            .and_then(TiffEntry::tiff_ascii_string)
     }
 }
 
@@ -1021,14 +1057,50 @@ fn required_uints(tiff: &TiffFile, dir: &TiffDirectory, tag: u16) -> Result<Vec<
         .ok_or_else(|| OpenSlideError::Format(format!("Missing required TIFF tag {}", tag)))
 }
 
+/// Options for reusing the generic TIFF backend from TIFF-like vendor readers.
+pub(crate) struct GenericTiffSlideConfig {
+    pub(crate) vendor: &'static str,
+    pub(crate) property_dir: usize,
+    pub(crate) lowest_resolution_dir: Option<usize>,
+    pub(crate) icc_dir: Option<usize>,
+    pub(crate) level_dirs: Option<Vec<usize>>,
+    pub(crate) require_reduced_images: bool,
+    pub(crate) omit_tiff_image_description_properties: bool,
+    pub(crate) extra_quickhash_strings: Vec<String>,
+    pub(crate) extra_properties: HashMap<String, String>,
+}
+
+impl GenericTiffSlideConfig {
+    pub(crate) fn new(vendor: &'static str) -> Self {
+        Self {
+            vendor,
+            property_dir: 0,
+            lowest_resolution_dir: None,
+            icc_dir: None,
+            level_dirs: None,
+            require_reduced_images: true,
+            omit_tiff_image_description_properties: false,
+            extra_quickhash_strings: Vec::new(),
+            extra_properties: HashMap::new(),
+        }
+    }
+}
+
+impl Default for GenericTiffSlideConfig {
+    fn default() -> Self {
+        Self::new("generic-tiff")
+    }
+}
+
 /// Generic tiled TIFF backend.
 ///
 /// The parser and level reader are intentionally not coupled to a vendor name,
 /// so TIFF-like vendor modules can reuse the same directory/tag/tile handling.
-struct GenericTiffSlide {
+pub(crate) struct GenericTiffSlide {
     path: PathBuf,
     tiff_file: Arc<crate::util::OpenSlideFile>,
     tiff_file_len: u64,
+    vendor: &'static str,
     levels: Vec<TiffLevel>,
     properties: HashMap<String, String>,
     icc_profile: Option<Vec<u8>>,
@@ -1053,34 +1125,58 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
             "TIFF first directory is not tiled".into(),
         ));
     }
-    let slide = GenericTiffSlide::open(tiff)?;
+    // Match reference openslide-vendor-generic-tiff.c: only *tiled* directories
+    // become levels (`if (!TIFFIsTiled) continue;`). Some pyramids (e.g. Vectra
+    // QPTIFF) append stripped low-resolution directories that reference skips;
+    // including them here over-counted levels versus the reference reader.
+    let slide = GenericTiffSlide::open_with_config(tiff, GenericTiffSlideConfig::default())?;
     Ok(Box::new(slide))
 }
 
 pub(crate) fn open_tiled(path: &Path) -> Result<Box<dyn SlideBackend>> {
     let tiff = TiffFile::open(path)?;
-    let slide = GenericTiffSlide::open_filtered(tiff, 0, |dir| {
-        dir.has(TAG_TILEWIDTH) && dir.has(TAG_TILELENGTH)
-    })?;
+    let slide = GenericTiffSlide::open_with_config(tiff, GenericTiffSlideConfig::default())?;
     Ok(Box::new(slide))
 }
 
 impl GenericTiffSlide {
+    #[cfg(test)]
     fn open(tiff: TiffFile) -> Result<Self> {
-        Self::open_filtered(tiff, 0, |_| true)
+        Self::open_filtered(tiff, GenericTiffSlideConfig::default(), |_, _| true)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn open_path_with_config(
+        path: &Path,
+        config: GenericTiffSlideConfig,
+    ) -> Result<Self> {
+        Self::open_with_config(TiffFile::open(path)?, config)
+    }
+
+    pub(crate) fn open_with_config(tiff: TiffFile, config: GenericTiffSlideConfig) -> Result<Self> {
+        if let Some(level_dirs) = config.level_dirs.clone() {
+            Self::open_filtered(tiff, config, move |_, dir_index| {
+                level_dirs.contains(&dir_index)
+            })
+        } else {
+            Self::open_filtered(tiff, config, |dir, _| {
+                dir.has(TAG_TILEWIDTH) && dir.has(TAG_TILELENGTH)
+            })
+        }
     }
 
     fn open_filtered(
         tiff: TiffFile,
-        property_dir: usize,
-        include_directory: impl Fn(&TiffDirectory) -> bool,
+        mut config: GenericTiffSlideConfig,
+        include_directory: impl Fn(&TiffDirectory, usize) -> bool,
     ) -> Result<Self> {
         let mut levels = Vec::new();
         for dir_index in 0..tiff.directories.len() {
-            if !include_directory(&tiff.directories[dir_index]) {
+            if !include_directory(&tiff.directories[dir_index], dir_index) {
                 continue;
             }
-            let require_reduced_image = !levels.is_empty() && dir_index != 0;
+            let require_reduced_image =
+                config.require_reduced_images && !levels.is_empty() && dir_index != 0;
             if let Some(level) = TiffLevel::from_directory_with_reduced_check(
                 &tiff,
                 dir_index,
@@ -1105,8 +1201,25 @@ impl GenericTiffSlide {
         }
 
         let channel_count = levels[0].channel_count();
-        let properties = build_properties(&tiff, &levels, property_dir)?;
-        let icc_profile = tiff_icc_profile(&tiff, levels[0].dir);
+        let lowest_resolution_dir = config
+            .lowest_resolution_dir
+            .or_else(|| levels.last().map(|level| level.dir));
+        let icc_dir = config.icc_dir.unwrap_or(levels[0].dir);
+        let mut properties = build_properties_with_config(
+            &tiff,
+            &levels,
+            config.vendor,
+            config.property_dir,
+            lowest_resolution_dir,
+            icc_dir,
+            &config.extra_quickhash_strings,
+        )?;
+        if config.omit_tiff_image_description_properties {
+            properties.remove(properties::PROPERTY_COMMENT);
+            properties.remove("tiff.ImageDescription");
+        }
+        properties.extend(config.extra_properties.drain());
+        let icc_profile = tiff_icc_profile(&tiff, icc_dir);
         let path = tiff.path.clone();
         let mut tiff_file = crate::util::_openslide_fopen(&path)?;
         let tiff_file_len =
@@ -1121,6 +1234,7 @@ impl GenericTiffSlide {
             path,
             tiff_file: Arc::new(tiff_file),
             tiff_file_len,
+            vendor: config.vendor,
             levels,
             properties,
             icc_profile,
@@ -1559,7 +1673,7 @@ fn jpeg_color_space(photometric: u16) -> i32 {
 
 impl SlideBackend for GenericTiffSlide {
     fn vendor(&self) -> &'static str {
-        "generic-tiff"
+        self.vendor
     }
 
     fn channel_count(&self) -> u32 {
@@ -1898,11 +2012,15 @@ pub(crate) fn openslide_tifflike_init_properties_and_hash(
     lowest_resolution_level: usize,
     property_dir: usize,
     icc_dir: usize,
+    extra_quickhash_strings: &[String],
 ) -> Result<()> {
     let mut quickhash1 = OpenslideHash::openslide_hash_quickhash1_create();
     hash_tiff_level(&mut quickhash1, tiff, lowest_resolution_level)
         .map_err(|err| OpenSlideError::Format(format!("Cannot hash TIFF tiles: {err}")))?;
     store_and_hash_properties(tiff, property_dir, props, &mut quickhash1);
+    for value in extra_quickhash_strings {
+        quickhash1.openslide_hash_string(Some(value));
+    }
     store_tiff_properties(tiff, property_dir, props);
     if let Some(value) = quickhash1.openslide_hash_get_string() {
         props.insert(properties::PROPERTY_QUICKHASH1.into(), value);
@@ -3722,27 +3840,49 @@ fn unpremultiply_rgba(image: &mut RgbaImage) {
     }
 }
 
+#[cfg(test)]
 fn build_properties(
     tiff: &TiffFile,
     levels: &[TiffLevel],
     property_dir: usize,
 ) -> Result<HashMap<String, String>> {
+    build_properties_with_config(
+        tiff,
+        levels,
+        "generic-tiff",
+        property_dir,
+        levels.last().map(|level| level.dir),
+        levels
+            .first()
+            .map(|level| level.dir)
+            .unwrap_or(property_dir),
+        &[],
+    )
+}
+
+fn build_properties_with_config(
+    tiff: &TiffFile,
+    levels: &[TiffLevel],
+    vendor: &'static str,
+    property_dir: usize,
+    lowest_resolution_dir: Option<usize>,
+    icc_dir: usize,
+    extra_quickhash_strings: &[String],
+) -> Result<HashMap<String, String>> {
     let mut props = HashMap::new();
-    props.insert(
-        properties::PROPERTY_VENDOR.into(),
-        "generic-tiff".to_string(),
-    );
+    props.insert(properties::PROPERTY_VENDOR.into(), vendor.to_string());
 
     let Some(dir) = tiff.directory(property_dir) else {
         return Ok(props);
     };
-    if let Some(level) = levels.last() {
+    if let Some(lowest_resolution_dir) = lowest_resolution_dir {
         openslide_tifflike_init_properties_and_hash(
             &mut props,
             tiff,
-            level.dir,
+            lowest_resolution_dir,
             property_dir,
-            levels[0].dir,
+            icc_dir,
+            extra_quickhash_strings,
         )?;
     }
 
@@ -3806,7 +3946,57 @@ fn build_properties(
         }
     }
 
+    // Bounds properties for sparse generic TIFFs, from level 0 (the largest).
+    // Upstream commit 8fb44607 + _openslide_set_bounds_props_from_grid.
+    if let Some(level) = levels.first() {
+        set_generic_tiff_bounds_props(&mut props, level);
+    }
+
     Ok(props)
+}
+
+/// Emit `openslide.bounds-*` properties when a sparse generic TIFF level's
+/// present tiles cover less than the full level (upstream commit 8fb44607 and
+/// `_openslide_set_bounds_props_from_grid` in openslide-util.c). The bounding box
+/// of present tiles is clamped to the level, since bottom/right tiles may be
+/// partial, and nothing is emitted when the box already spans the whole level.
+fn set_generic_tiff_bounds_props(props: &mut HashMap<String, String>, level: &TiffLevel) {
+    if level.tiles_across == 0 || level.tiles_down == 0 {
+        return;
+    }
+    let tile_w = u64::from(level.tile_width);
+    let tile_h = u64::from(level.tile_height);
+
+    let (mut min_col, mut min_row, mut max_col, mut max_row) = (u64::MAX, u64::MAX, 0u64, 0u64);
+    let mut found = false;
+    for row in 0..level.tiles_down {
+        for col in 0..level.tiles_across {
+            if !is_missing_tile(level, row * level.tiles_across + col) {
+                found = true;
+                min_col = min_col.min(col);
+                max_col = max_col.max(col);
+                min_row = min_row.min(row);
+                max_row = max_row.max(row);
+            }
+        }
+    }
+    if !found {
+        return;
+    }
+
+    let x = min_col * tile_w;
+    let y = min_row * tile_h;
+    // Clamp to the level so a partial bottom/right tile doesn't overrun it.
+    let w = ((max_col + 1 - min_col) * tile_w).min(level.width.saturating_sub(x));
+    let h = ((max_row + 1 - min_row) * tile_h).min(level.height.saturating_sub(y));
+
+    if x == 0 && y == 0 && w == level.width && h == level.height {
+        return;
+    }
+    props.insert(properties::PROPERTY_BOUNDS_X.into(), x.to_string());
+    props.insert(properties::PROPERTY_BOUNDS_Y.into(), y.to_string());
+    props.insert(properties::PROPERTY_BOUNDS_WIDTH.into(), w.to_string());
+    props.insert(properties::PROPERTY_BOUNDS_HEIGHT.into(), h.to_string());
 }
 
 pub(crate) fn format_float(value: f64) -> String {
@@ -5054,6 +5244,119 @@ mod tests {
     }
 
     #[test]
+    fn configured_generic_tiff_slide_uses_vendor_level_filter_and_extra_properties() {
+        let path = temp_path("configured-generic-backend.bin");
+        fs::write(&path, [0u8; 1]).unwrap();
+
+        let mut selected_level = minimal_tiled_level_entries(2, 1);
+        selected_level.insert(TAG_TILEBYTECOUNTS, long_entry(0));
+        let mut ignored_level = minimal_tiled_level_entries(4, 1);
+        ignored_level.insert(TAG_TILEBYTECOUNTS, long_entry(0));
+        let tiff = TiffFile {
+            path: path.clone(),
+            endian: Endian::Little,
+            directories: vec![
+                TiffDirectory {
+                    entries: [(TAG_SOFTWARE, ascii_entry("property-directory"))].into(),
+                },
+                TiffDirectory {
+                    entries: selected_level,
+                },
+                TiffDirectory {
+                    entries: ignored_level,
+                },
+            ],
+        };
+        let mut config = GenericTiffSlideConfig::new("argos");
+        config.property_dir = 0;
+        config.level_dirs = Some(vec![1]);
+        config
+            .extra_properties
+            .insert("argos.Custom".into(), "custom-value".into());
+
+        let slide = GenericTiffSlide::open_with_config(tiff, config).unwrap();
+
+        assert_eq!(slide.vendor(), "argos");
+        assert_eq!(slide.level_count(), 1);
+        assert_eq!(slide.level_dimensions(0), Some((2, 1)));
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_VENDOR),
+            Some(&"argos".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("tiff.Software"),
+            Some(&"property-directory".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("argos.Custom"),
+            Some(&"custom-value".to_string())
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn configured_generic_tiff_slide_accepts_explicit_lowest_resolution_dir() {
+        let path = temp_path("configured-lowest-resolution.bin");
+        fs::write(&path, [11u8, 22u8]).unwrap();
+
+        let mut first_level = minimal_tiled_level_entries(4, 1);
+        first_level.insert(TAG_TILEOFFSETS, long_entry(0));
+        first_level.insert(TAG_TILEBYTECOUNTS, long_entry(1));
+        let mut second_level = minimal_tiled_level_entries(2, 1);
+        second_level.insert(TAG_SUBFILETYPE, long_entry(FILETYPE_REDUCEDIMAGE as u32));
+        second_level.insert(TAG_TILEOFFSETS, long_entry(1));
+        second_level.insert(TAG_TILEBYTECOUNTS, long_entry(1));
+        let tiff = TiffFile {
+            path: path.clone(),
+            endian: Endian::Little,
+            directories: vec![
+                TiffDirectory {
+                    entries: first_level,
+                },
+                TiffDirectory {
+                    entries: second_level,
+                },
+            ],
+        };
+        let mut config = GenericTiffSlideConfig::new("huron");
+        config.lowest_resolution_dir = Some(0);
+
+        let slide = GenericTiffSlide::open_with_config(tiff, config).unwrap();
+        let expected_quickhash = {
+            let mut hash = OpenslideHash::openslide_hash_quickhash1_create();
+            hash.openslide_hash_data(&[11]);
+            hash.openslide_hash_string(Some("tiff.ImageDescription"));
+            hash.openslide_hash_string(None);
+            hash.openslide_hash_string(Some("tiff.Make"));
+            hash.openslide_hash_string(None);
+            hash.openslide_hash_string(Some("tiff.Model"));
+            hash.openslide_hash_string(None);
+            hash.openslide_hash_string(Some("tiff.Software"));
+            hash.openslide_hash_string(None);
+            hash.openslide_hash_string(Some("tiff.DateTime"));
+            hash.openslide_hash_string(None);
+            hash.openslide_hash_string(Some("tiff.Artist"));
+            hash.openslide_hash_string(None);
+            hash.openslide_hash_string(Some("tiff.HostComputer"));
+            hash.openslide_hash_string(None);
+            hash.openslide_hash_string(Some("tiff.Copyright"));
+            hash.openslide_hash_string(None);
+            hash.openslide_hash_string(Some("tiff.DocumentName"));
+            hash.openslide_hash_string(None);
+            hash.openslide_hash_get_string().unwrap()
+        };
+
+        assert_eq!(slide.vendor(), "huron");
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_QUICKHASH1),
+            Some(&expected_quickhash)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn jpeg_table_merge_rejects_old_style_non_interchange_streams() {
         let err = merge_jpeg_tables(&[0xff, 0xda, 0, 0], None).unwrap_err();
         assert!(matches!(err, OpenSlideError::Decode(_)));
@@ -5108,6 +5411,7 @@ mod tests {
             path,
             tiff_file: Arc::new(file),
             tiff_file_len: file_len,
+            vendor: "generic-tiff",
             levels: vec![level],
             properties: HashMap::new(),
             icc_profile: None,

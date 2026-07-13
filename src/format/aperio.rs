@@ -58,7 +58,6 @@ const TIFFTAG_IMAGE_WIDTH: u16 = 256;
 const TIFFTAG_IMAGE_LENGTH: u16 = 257;
 const TIFFTAG_BITS_PER_SAMPLE: u16 = 258;
 const TIFFTAG_COMPRESSION: u16 = 259;
-#[cfg(test)]
 const TIFFTAG_SUBFILE_TYPE: u16 = 254;
 const TIFFTAG_PHOTOMETRIC: u16 = 262;
 const TIFFTAG_IMAGE_DESCRIPTION: u16 = 270;
@@ -109,9 +108,7 @@ const PHOTOMETRIC_RGB: u16 = 2;
 const PHOTOMETRIC_YCBCR: u16 = 6;
 const PLANARCONFIG_SEPARATE: u16 = 2;
 
-#[cfg(test)]
 const APERIO_SUBFILE_LABEL: u64 = 1;
-#[cfg(test)]
 const APERIO_SUBFILE_MACRO: u64 = 9;
 
 #[derive(Debug, Clone, Copy)]
@@ -1780,18 +1777,15 @@ fn associated_name(dir: &TiffDirectory, endian: Endian) -> Option<String> {
     if dir.index == 1 {
         return Some("thumbnail".to_string());
     }
-    let _ = endian;
-    dir.tiff_ascii_string(TIFFTAG_IMAGE_DESCRIPTION)
-        .and_then(|description| associated_name_from_description(&description))
-}
-
-fn associated_name_from_description(description: &str) -> Option<String> {
-    let mut lines = description.split(['\r', '\n']);
-    lines.next()?;
-    lines
-        .next()
-        .and_then(|line| line.split(' ').next())
-        .map(ToOwned::to_owned)
+    // Label and macro images are identified by NewSubfileType rather than by
+    // parsing ImageDescription; some exporters (e.g. Aperio GT 450) omit the
+    // ImageDescription for these images. Mirrors upstream aperio_open()
+    // (openslide-vendor-aperio.c, commit e1a64088).
+    match dir.value_u64(TIFFTAG_SUBFILE_TYPE, endian) {
+        Some(APERIO_SUBFILE_LABEL) => Some("label".to_string()),
+        Some(APERIO_SUBFILE_MACRO) => Some("macro".to_string()),
+        _ => None,
+    }
 }
 
 fn read_properties(description: &str) -> HashMap<String, String> {
@@ -4012,7 +4006,8 @@ mod tests {
     }
 
     #[test]
-    fn associated_name_uses_aperio_directory_description_and_subfile_fallback() {
+    fn associated_name_uses_subfile_type_not_description() {
+        // The thumbnail is always directory 1.
         let thumbnail = TiffDirectory {
             index: 1,
             entries: HashMap::new(),
@@ -4022,21 +4017,7 @@ mod tests {
             Some("thumbnail")
         );
 
-        let mut entries = HashMap::new();
-        entries.insert(
-            TIFFTAG_IMAGE_DESCRIPTION,
-            TiffEntry {
-                field_type: 2,
-                count: 25,
-                data: b"Aperio Image Library\nLabel Image\0".to_vec(),
-            },
-        );
-        let label = TiffDirectory { index: 2, entries };
-        assert_eq!(
-            associated_name(&label, Endian::Little).as_deref(),
-            Some("Label")
-        );
-
+        // Label and macro images are detected by NewSubfileType (1 and 9).
         let label = TiffDirectory {
             index: 3,
             entries: HashMap::from([(
@@ -4048,7 +4029,10 @@ mod tests {
                 },
             )]),
         };
-        assert_eq!(associated_name(&label, Endian::Little), None);
+        assert_eq!(
+            associated_name(&label, Endian::Little).as_deref(),
+            Some("label")
+        );
 
         let macro_dir = TiffDirectory {
             index: 4,
@@ -4061,34 +4045,25 @@ mod tests {
                 },
             )]),
         };
-        assert_eq!(associated_name(&macro_dir, Endian::Little), None);
+        assert_eq!(
+            associated_name(&macro_dir, Endian::Little).as_deref(),
+            Some("macro")
+        );
 
+        // A non-thumbnail directory without a recognized NewSubfileType is not
+        // an associated image, even if it has an ImageDescription (the name is
+        // no longer parsed from the description).
         let mut entries = HashMap::new();
         entries.insert(
             TIFFTAG_IMAGE_DESCRIPTION,
             TiffEntry {
                 field_type: 2,
-                count: 12,
-                data: b"Label Image\0".to_vec(),
+                count: 25,
+                data: b"Aperio Image Library\nLabel Image\0".to_vec(),
             },
         );
         let description_only = TiffDirectory { index: 2, entries };
         assert_eq!(associated_name(&description_only, Endian::Little), None);
-
-        let mut entries = HashMap::new();
-        entries.insert(
-            TIFFTAG_IMAGE_DESCRIPTION,
-            TiffEntry {
-                field_type: 2,
-                count: 26,
-                data: b"Aperio Image Library\n Label Image\0".to_vec(),
-            },
-        );
-        let empty_name = TiffDirectory { index: 5, entries };
-        assert_eq!(
-            associated_name(&empty_name, Endian::Little),
-            Some(String::new())
-        );
     }
 
     #[test]

@@ -100,6 +100,7 @@ const TAG_OPTICAL_PATH_IDENTIFIER: Tag = Tag(0x0048, 0x0106);
 const TAG_OPTICAL_PATH_IDENTIFICATION_SEQUENCE: Tag = Tag(0x0048, 0x0207);
 const TAG_ICC_PROFILE: Tag = Tag(0x0028, 0x2000);
 const TAG_CONTAINER_IDENTIFIER: Tag = Tag(0x0040, 0x0512);
+const TAG_BARCODE_VALUE: Tag = Tag(0x2200, 0x0005);
 const TAG_X_OFFSET_IN_SLIDE_COORDINATE_SYSTEM: Tag = Tag(0x0040, 0x072a);
 const TAG_Y_OFFSET_IN_SLIDE_COORDINATE_SYSTEM: Tag = Tag(0x0040, 0x073a);
 const TAG_Z_OFFSET_IN_SLIDE_COORDINATE_SYSTEM: Tag = Tag(0x0040, 0x074a);
@@ -384,17 +385,30 @@ impl DicomSlide {
         let dataset = parsed.elements;
         let image_type = get_string_all(&dataset, TAG_IMAGE_TYPE)
             .ok_or_else(|| OpenSlideError::Format("Couldn't get ImageType".into()))?;
+        let image_flavor = image_flavor_from_image_type(&image_type)
+            .ok_or_else(|| OpenSlideError::Format("Couldn't get image flavor".into()))?;
         let associated_image_name = associated_image_name_from_image_type(&image_type);
         let series_uid = get_string(&dataset, TAG_SERIES_INSTANCE_UID)
             .ok_or_else(|| OpenSlideError::Format("SeriesInstanceUID not found".into()))?;
-        if !is_pyramid_level_image_type(&image_type) && associated_image_name.is_none() {
-            return Err(OpenSlideError::Format("No pyramid levels found".into()));
-        }
         let same_series_pyramid_files = if discover_series {
             discover_same_series_pyramid_levels(path, Some(series_uid.as_str()))?
         } else {
             Vec::new()
         };
+        if discover_series
+            && (!is_pyramid_level_image_type(&image_type) || associated_image_name.is_some())
+        {
+            if let Some(canonical) = same_series_pyramid_files
+                .iter()
+                .max_by(|a, b| a.width.cmp(&b.width).then_with(|| a.height.cmp(&b.height)))
+            {
+                return DicomSlide::open_with_series(&canonical.path, true);
+            }
+            return Err(OpenSlideError::Format("No pyramid levels found".into()));
+        }
+        if !is_pyramid_level_image_type(&image_type) && associated_image_name.is_none() {
+            return Err(OpenSlideError::Format("No pyramid levels found".into()));
+        }
 
         let bits_allocated = get_required_u16(&dataset, TAG_BITS_ALLOCATED, "BitsAllocated")?;
         let bits_stored = get_required_u16(&dataset, TAG_BITS_STORED, "BitsStored")?;
@@ -444,7 +458,8 @@ impl DicomSlide {
         let supported_photometric = match transfer_syntax.as_str() {
             TS_EXPLICIT_VR_LE => photometric == "RGB",
             TS_JPEG_BASELINE => photometric == "RGB" || photometric == "YBR_FULL_422",
-            TS_JPEG_2000_LOSSLESS | TS_JPEG_2000 => {
+            TS_JPEG_2000_LOSSLESS => photometric == "RGB" || photometric == "YBR_RCT",
+            TS_JPEG_2000 => {
                 photometric == "RGB" || photometric == "YBR_ICT" || photometric == "YBR_RCT"
             }
             _ => false,
@@ -472,16 +487,7 @@ impl DicomSlide {
                 "DICOM contains zero-sized dimensions".into(),
             ));
         }
-        if discover_series && associated_image_name.is_some() {
-            if let Some(canonical) = same_series_pyramid_files
-                .iter()
-                .max_by(|a, b| a.width.cmp(&b.width).then_with(|| a.height.cmp(&b.height)))
-            {
-                return DicomSlide::open_with_series(&canonical.path, true);
-            }
-            return Err(OpenSlideError::Format("No pyramid levels found".into()));
-        }
-        if discover_series && associated_image_name.is_none() {
+        if discover_series && image_flavor == "VOLUME" {
             if let Some(canonical) = same_series_pyramid_files
                 .iter()
                 .filter(|file| file.width > width || file.height > height)
@@ -735,6 +741,9 @@ impl DicomSlide {
         properties.insert(properties::PROPERTY_VENDOR.into(), "dicom".into());
         add_properties_dataset(&mut properties, "dicom", &meta);
         add_properties_dataset(&mut properties, "dicom", &dataset);
+        if let Some(barcode) = get_string(&dataset, TAG_BARCODE_VALUE) {
+            properties.insert(properties::PROPERTY_BARCODE.into(), barcode);
+        }
         if let Some(series_instance_uid) = get_string(&dataset, TAG_SERIES_INSTANCE_UID) {
             properties.insert(
                 properties::PROPERTY_QUICKHASH1.into(),
@@ -2921,7 +2930,16 @@ fn read_dataset_from_reader(
             continue;
         }
         let mut value = vec![0; header.len as usize];
-        file.read_exact_bytes(&mut value)?;
+        file.read_exact_bytes(&mut value).map_err(|err| {
+            OpenSlideError::Format(format!(
+                "Reading DICOM element {} ({:04x},{:04x}) length {} at offset {}: {err}",
+                dicom_keyword(header.tag).unwrap_or("unknown"),
+                header.tag.0,
+                header.tag.1,
+                header.len,
+                header.value_offset
+            ))
+        })?;
         elements.push(DicomElement {
             tag: header.tag,
             vr: header.vr,
@@ -3392,7 +3410,7 @@ fn read_element_header(
 fn uses_32_bit_explicit_vr_length(vr: &[u8; 2]) -> bool {
     matches!(
         vr,
-        b"OB" | b"OD" | b"OF" | b"OL" | b"OW" | b"SQ" | b"UC" | b"UR" | b"UT" | b"UN"
+        b"OB" | b"OD" | b"OF" | b"OL" | b"OV" | b"OW" | b"SQ" | b"UC" | b"UR" | b"UT" | b"UN"
     )
 }
 
@@ -3789,6 +3807,7 @@ fn dicom_keyword(tag: Tag) -> Option<&'static str> {
         TAG_OPTICAL_PATH_IDENTIFICATION_SEQUENCE => "OpticalPathIdentificationSequence",
         TAG_ICC_PROFILE => "ICCProfile",
         TAG_CONTAINER_IDENTIFIER => "ContainerIdentifier",
+        TAG_BARCODE_VALUE => "BarcodeValue",
         TAG_X_OFFSET_IN_SLIDE_COORDINATE_SYSTEM => "XOffsetInSlideCoordinateSystem",
         TAG_Y_OFFSET_IN_SLIDE_COORDINATE_SYSTEM => "YOffsetInSlideCoordinateSystem",
         TAG_Z_OFFSET_IN_SLIDE_COORDINATE_SYSTEM => "ZOffsetInSlideCoordinateSystem",
@@ -3844,38 +3863,19 @@ fn standard_objective_power_value(value: &str) -> Option<String> {
     crate::util::_openslide_parse_double(value).map(format_float)
 }
 
+fn image_flavor_from_image_type(image_type: &str) -> Option<&str> {
+    image_type.split('\\').nth(2)
+}
+
 fn is_pyramid_level_image_type(image_type: &str) -> bool {
-    let parts: Vec<&str> = image_type.split('\\').collect();
-    if parts.len() != 4 {
-        return false;
-    }
-    let Some([origin, primary, volume, derivation]) = parts.get(..4) else {
-        return false;
-    };
-    if *primary != "PRIMARY" || *volume != "VOLUME" {
-        return false;
-    }
-    matches!(
-        (*origin, *derivation),
-        ("ORIGINAL", "NONE") | ("DERIVED", "NONE") | ("DERIVED", "RESAMPLED")
-    )
+    image_flavor_from_image_type(image_type) == Some("VOLUME")
 }
 
 fn associated_image_name_from_image_type(image_type: &str) -> Option<String> {
-    let parts: Vec<&str> = image_type.split('\\').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-    let Some([origin, primary, role, derivation]) = parts.get(..4) else {
-        return None;
-    };
-    if !matches!(*origin, "ORIGINAL" | "DERIVED") || *primary != "PRIMARY" {
-        return None;
-    }
-    match (*role, *derivation) {
-        ("LABEL", "NONE") => Some("label".into()),
-        ("OVERVIEW", "NONE") => Some("macro".into()),
-        ("THUMBNAIL", "RESAMPLED") => Some("thumbnail".into()),
+    match image_flavor_from_image_type(image_type)? {
+        "LABEL" => Some("label".into()),
+        "OVERVIEW" => Some("macro".into()),
+        "THUMBNAIL" => Some("thumbnail".into()),
         _ => None,
     }
 }
@@ -5199,6 +5199,11 @@ mod tests {
         assert_eq!(paths, vec![first, base, last]);
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_vr_ov_uses_32_bit_length() {
+        assert!(uses_32_bit_explicit_vr_length(b"OV"));
     }
 
     #[test]
@@ -6793,6 +6798,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_lossless_jpeg2000_ybr_ict_like_upstream() {
+        let path = test_path("rejects_lossless_jpeg2000_ybr_ict_like_upstream.dcm");
+        let mut data = dicom_preamble(TS_JPEG_2000_LOSSLESS);
+        write_common_wsi_dataset(&mut data, TS_JPEG_2000_LOSSLESS, 1, 1, 1, 1, 1, "YBR_ICT");
+        let jpeg2000 = encoded_jpeg2000_codestream(&[10, 20, 30], 1, 1, 3);
+        write_encapsulated_pixel_data(&mut data, &[&jpeg2000]);
+        fs::write(&path, data).unwrap();
+
+        let err = DicomSlide::open(&path).unwrap_err();
+        assert!(format!("{err}").contains("YBR_ICT"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn exposes_dimension_index_metadata() {
         let path = test_path("exposes_dimension_index_metadata.dcm");
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
@@ -6885,6 +6904,7 @@ mod tests {
             b"US",
             &3u16.to_le_bytes(),
         );
+        write_explicit_element(&mut data, TAG_BARCODE_VALUE, b"LO", b"ABC123");
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
         fs::write(&path, data).unwrap();
 
@@ -6908,6 +6928,14 @@ mod tests {
         assert_eq!(
             slide.properties().get("dicom.InConcatenationTotalNumber"),
             Some(&"3".to_string())
+        );
+        assert_eq!(
+            slide.properties().get("dicom.BarcodeValue"),
+            Some(&"ABC123".to_string())
+        );
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_BARCODE),
+            Some(&"ABC123".to_string())
         );
         let _ = fs::remove_file(path);
     }
@@ -8125,7 +8153,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_only_upstream_associated_image_roles() {
+    fn maps_upstream_associated_image_flavors() {
         assert_eq!(
             associated_image_name_from_image_type("ORIGINAL\\PRIMARY\\LABEL\\NONE"),
             Some("label".to_string())
@@ -8147,7 +8175,7 @@ mod tests {
             Some("thumbnail".to_string())
         );
         assert_eq!(
-            associated_image_name_from_image_type("DERIVED\\PRIMARY\\THUMBNAIL\\RESAMPLED"),
+            associated_image_name_from_image_type("DERIVED\\PRIMARY\\THUMBNAIL\\NONE"),
             Some("thumbnail".to_string())
         );
         assert_eq!(
@@ -8167,10 +8195,6 @@ mod tests {
             None
         );
         assert_eq!(
-            associated_image_name_from_image_type("DERIVED\\PRIMARY\\THUMBNAIL\\NONE"),
-            None
-        );
-        assert_eq!(
             associated_image_name_from_image_type("DERIVED\\PRIMARY\\label-image\\NONE"),
             None
         );
@@ -8186,16 +8210,16 @@ mod tests {
             "original\\primary\\volume\\resampled"
         ));
         assert!(!is_pyramid_level_image_type(
-            "DERIVED\\PRIMARY\\VOLUME \\RESAMPLED"
-        ));
-        assert!(!is_pyramid_level_image_type(
-            "ORIGINAL\\PRIMARY\\VOLUME\\NONE\\MIXED"
-        ));
-        assert!(!is_pyramid_level_image_type(
             "ORIGINAL\\PRIMARY\\volume-image\\RESAMPLED"
         ));
         assert!(!is_pyramid_level_image_type(
             "DERIVED\\PRIMARY\\VOLUME_IMAGE\\RE SAMPLED"
+        ));
+        assert!(is_pyramid_level_image_type(
+            "ORIGINAL\\SECONDARY\\VOLUME\\LOCALIZER"
+        ));
+        assert!(is_pyramid_level_image_type(
+            "ORIGINAL\\PRIMARY\\VOLUME\\NONE\\MIXED"
         ));
         assert!(is_pyramid_level_image_type(
             "DERIVED\\PRIMARY\\VOLUME\\RESAMPLED"
@@ -8260,7 +8284,7 @@ mod tests {
             1,
             1,
             "RGB",
-            b"ORIGINAL\\PRIMARY\\VOLUME\\NONE\\MIXED",
+            b"ORIGINAL\\PRIMARY\\LOCALIZER\\NONE",
         );
         write_explicit_element(&mut data, TAG_PIXEL_DATA, b"OB", &[1, 2, 3]);
         fs::write(&path, data).unwrap();

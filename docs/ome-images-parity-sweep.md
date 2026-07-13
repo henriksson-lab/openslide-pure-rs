@@ -30,41 +30,50 @@ Counting by **slide entry-point** (multi-file formats counted once) gives
 
 ## Results (158 WSI slides)
 
+Buckets after the follow-up fixes (QPTIFF level selection; JPEG-XR NDPI and
+`.ndpis` wired up). Original sweep numbers in parentheses.
+
 | Bucket | Count | Meaning |
 | --- | ---: | --- |
-| **clean** | 20 | both open; metadata + sampled pixels match |
-| **rust-only** | 130 | we open; reference 3.4.1 cannot |
-| **hard** | 3 | reference opens; we diverge (level count) |
-| **neither** | 5 | both fail |
+| **clean** | 23 (was 20) | both open; metadata + sampled pixels match |
+| **rust-only** | 133 (was 130) | we open; reference cannot |
+| **hard** | 0 (was 3) | reference opens; we diverge |
+| **neither** | 2 (was 5) | both fail |
 
-### clean (parity holds) — 20
-SVS ×2, Hamamatsu VMS ×3, Leica SCN ×2, Trestle ×3, Ventana BIF ×2, and
-Hamamatsu NDPI ×8 (CMU-1/2/3 + SR1274-908A/B + the three `test3-*` fluorescence
-members). No parity regressions among reference-readable vendor slides.
+### clean (parity holds) — 23
+SVS ×2, Hamamatsu VMS ×3, Leica SCN ×2, Trestle ×3, Ventana BIF ×2, Hamamatsu
+NDPI ×8 (CMU-1/2/3 + SR1274-908A/B + the three `test3-*` members), and the
+**3 Vectra QPTIFF** (fixed — see below). No parity regressions.
 
-### hard — 3 Vectra QPTIFF level-count divergences (NEW BUG)
-Both readers open these as `generic-tiff`, but we report extra pyramid levels:
+### FIXED — Vectra QPTIFF level-count divergence
+Both readers open these as `generic-tiff`. We over-counted levels because our
+public generic-tiff entry point accepted **stripped** low-res directories as
+pyramid levels, whereas reference `openslide-vendor-generic-tiff.c` accepts only
+**tiled** directories (`if (!TIFFIsTiled) continue;`). QPTIFF appends stripped
+low-res IFDs. Fix: route the public `open` through the same tiled filter
+`open_tiled` uses (`src/format/tiff.rs`).
 
-| File | rust levels | ref levels |
-| --- | ---: | ---: |
-| `PKI_scans/HandEcompressed_Scan1.qptiff` | 5 | 4 |
-| `PKI_scans/HandEuncompressed_Scan1.qptiff` | 5 | 4 |
-| `PKI_scans/LuCa-7color_Scan1.qptiff` | 26 | 21 |
+| File | before | after | ref |
+| --- | ---: | ---: | ---: |
+| `HandEcompressed_Scan1.qptiff` | 5 | **4** | 4 |
+| `HandEuncompressed_Scan1.qptiff` | 5 | **4** | 4 |
+| `LuCa-7color_Scan1.qptiff` | 26 | **21** | 21 |
 
-For `LuCa-7color` we include an extra 780×1080 tier (5 channels) that reference's
-generic-tiff omits. Pixels for the shared levels are otherwise fine. Root cause
-is generic-tiff pyramid/IFD selection, not QPTIFF-specific. **To fix.**
+HandE files now have exact pixel parity; LuCa metadata matches (multi-channel, so
+pixel compare is skipped by the harness).
 
-### rust-only — 130 (reference 3.4.1 cannot open)
-- **128 Zeiss CZI** — OpenSlide 3.4.1 predates CZI support (added in 4.x). We
-  open all of them, but correctness is **unverified** (no 3.4.1 baseline to
-  compare); needs cross-checking against OpenSlide 4.x or Bio-Formats.
-- **2 NDPI** — `Dguok`, `Topors`: >4 GB files upstream cannot open at all; we
-  now read real pixel data (see `OPENSLIDE_BUGS.md` bug 1).
+### rust-only — 133 (reference cannot open)
+- **128 Zeiss CZI** — OpenSlide 3.4.1 predates CZI support. We open all of them,
+  but correctness is **unverified** (no 3.4.1 baseline); cross-check deferred
+  (no OpenSlide 4.x migration yet).
+- **2 NDPI >4 GB** — `Dguok`, `Topors`: the 3.4.1 runtime cannot open; we read
+  real pixel data via the NDPI value-extension mechanism (matching upstream
+  v4.0.0-378, which fixed this; `OPENSLIDE_BUGS.md` bug 1).
+- **2 JPEG-XR NDPI** — `DM0014` ×2: no OpenSlide (3.4.1 *or* 4.x) reads NDPI
+  JPEG-XR; we now decode them as 16-bit grayscale (bug 3, correctness unverifiable).
+- **1 `.ndpis` set** — `test3.ndpis`: we now open it as a 3-channel slide (bug 4).
 
-### neither — 5 (both fail)
-- `Hamamatsu-NDPI/hamamatsu/DM0014 *.ndpi` ×2 — JPEG-XR NDPI (OPENSLIDE_BUGS.md bug 3)
-- `Hamamatsu-NDPI/manuel/test3.ndpis` — `.ndpis` set container (bug 4)
+### neither — 2 (both fail)
 - `Leica-SCN/openslide/Leica-3/Leica-3.scn` — reference-blocked in audit env
 - `Ventana/openslide/Ventana-1.bif` — reference-blocked in audit env
 
@@ -72,16 +81,21 @@ is generic-tiff pyramid/IFD selection, not QPTIFF-specific. **To fix.**
 
 Full paths in `fixtures/reference-unreadable-slides.txt`. Summary:
 
-- **Readable by us, not by reference (130):** 128 CZI + Dguok + Topors.
-- **Readable by neither (5):** the DM0014 JPEG-XR pair, `test3.ndpis`, `Leica-3.scn`,
-  `Ventana-1.bif`.
+- **Readable by us, not by reference (133):** 128 CZI + Dguok + Topors + the
+  DM0014 JPEG-XR pair + `test3.ndpis`.
+- **Readable by neither (2):** `Leica-3.scn`, `Ventana-1.bif` (reference-blocked
+  in the audit environment).
 
-## Follow-up work (not done yet)
+## Follow-up work
 
-1. Fix the QPTIFF/generic-tiff extra-level divergence (3 slides).
-2. Validate the 128 CZI reads against OpenSlide 4.x or Bio-Formats (no 3.4.1 baseline).
-3. Wire JPEG-XR NDPI (DM0014) and the `.ndpis` set container (both reference-blocked).
-4. Promote the 20 clean slides to formal parity fixtures once harness checksums are recorded.
+- [x] Fix the QPTIFF/generic-tiff extra-level divergence (3 slides). — done
+- [x] Wire JPEG-XR NDPI (DM0014) and the `.ndpis` set container. — done
+- [ ] Validate the 128 CZI reads against OpenSlide 4.x or Bio-Formats (no 3.4.1
+  baseline). **Deferred** pending the OpenSlide 4.x migration.
+- [ ] Validate DM0014 JPEG-XR pixel correctness — no reference reader exists
+  (OpenSlide 4.x also lacks NDPI JPEG-XR), so this needs an independent decoder.
+- [ ] Promote the clean reference-readable slides to formal parity fixtures once
+  harness checksums are recorded.
 
 ## Reproduce
 

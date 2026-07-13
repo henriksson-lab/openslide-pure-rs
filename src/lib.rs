@@ -2762,6 +2762,10 @@ mod tests {
         assert_eq!(properties::OPENSLIDE_PROPERTY_NAME_MPP_X, "openslide.mpp-x");
         assert_eq!(properties::OPENSLIDE_PROPERTY_NAME_MPP_Y, "openslide.mpp-y");
         assert_eq!(
+            properties::OPENSLIDE_PROPERTY_NAME_BARCODE,
+            "openslide.barcode"
+        );
+        assert_eq!(
             properties::OPENSLIDE_PROPERTY_NAME_OBJECTIVE_POWER,
             "openslide.objective-power"
         );

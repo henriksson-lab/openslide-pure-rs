@@ -376,6 +376,9 @@ impl ZeissSlide {
             properties.insert(properties::PROPERTY_MPP_Y.into(), format_float(mpp_y));
         }
         duplicate_referenced_objective_power(&mut properties);
+        if let Some(barcode) = parse_first_barcode(&metadata_xml) {
+            properties.insert(properties::PROPERTY_BARCODE.into(), barcode);
+        }
         properties.insert(
             properties::PROPERTY_QUICKHASH1.into(),
             zeiss_quickhash1(&header, &metadata_xml),
@@ -1571,6 +1574,21 @@ fn duplicate_referenced_objective_power(properties: &mut HashMap<String, String>
         &objective_key,
         properties::PROPERTY_OBJECTIVE_POWER,
     );
+}
+
+fn parse_first_barcode(xml: &str) -> Option<String> {
+    let attachment_infos = find_xml_element(xml, "AttachmentInfos")?;
+    let mut rest = attachment_infos.body;
+    while let Some(start) = find_xml_start_tag(rest, "Barcode") {
+        let candidate = &rest[start..];
+        let open_end = candidate.find('>')?;
+        let after_open = &candidate[open_end + 1..];
+        if let Some(content) = parse_simple_xml_text(after_open, "Content") {
+            return Some(content);
+        }
+        rest = after_open;
+    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -3566,6 +3584,16 @@ mod tests {
                   <Distance Id="Y"><Value>5.0e-7</Value></Distance>
                 </Items>
               </Scaling>
+              <AttachmentInfos>
+                <AttachmentInfo>
+                  <Label>
+                    <Barcodes>
+                      <Barcode><Content>ABC123</Content></Barcode>
+                      <Barcode><Content>ignored</Content></Barcode>
+                    </Barcodes>
+                  </Label>
+                </AttachmentInfo>
+              </AttachmentInfos>
             </Metadata>
         "#;
         fs::write(
@@ -3630,6 +3658,10 @@ mod tests {
                 .properties()
                 .get("zeiss.Information.Instrument.Objectives.Objective:1.ObjectiveName"),
             Some(&"Plan-Apochromat 20x".to_string())
+        );
+        assert_eq!(
+            slide.properties().get(properties::PROPERTY_BARCODE),
+            Some(&"ABC123".to_string())
         );
         assert_eq!(
             slide.properties().get("zeiss.Information.Image.Name"),

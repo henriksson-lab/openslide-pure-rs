@@ -1092,6 +1092,15 @@ fn add_openslide_properties(properties: &mut HashMap<String, String>) {
             );
         }
     }
+
+    if let Some(barcode) = properties.get("philips.PIM_DP_UFS_BARCODE").cloned() {
+        if let Ok(decoded) = decode_base64(&barcode) {
+            properties.insert(
+                properties::PROPERTY_BARCODE.into(),
+                String::from_utf8_lossy(&decoded).into_owned(),
+            );
+        }
+    }
 }
 
 fn add_level_properties(
@@ -1189,9 +1198,7 @@ fn read_xml_associated_image(
             continue;
         }
         let Some(b64) = child_attribute_text_exact(image, "PIM_DP_IMAGE_DATA") else {
-            return Err(OpenSlideError::Format(format!(
-                "Can't locate {name} associated image: Couldn't read associated image data"
-            )));
+            return Ok(None);
         };
         let data = decode_base64(&b64).map_err(|err| {
             OpenSlideError::Format(format!("Can't locate {name} associated image: {err}"))
@@ -1837,6 +1844,7 @@ mod tests {
         let root = parse_xml(&philips_xml()).unwrap();
         let mut properties = HashMap::new();
         add_xml_properties(&root, &mut properties);
+        properties.insert("philips.PIM_DP_UFS_BARCODE".into(), "QUJDMTIz".into());
         add_openslide_properties(&mut properties);
 
         assert_eq!(
@@ -1873,6 +1881,10 @@ mod tests {
         assert_eq!(
             properties.get(properties::PROPERTY_MPP_Y),
             Some(&"0.5".to_string())
+        );
+        assert_eq!(
+            properties.get(properties::PROPERTY_BARCODE),
+            Some(&"ABC123".to_string())
         );
     }
 

@@ -70,6 +70,31 @@ are enabled, `check-audit-baselines.py --parity-report` rejects reports whose
 half-away rounding for sampled level-0 coordinates so fractional-downsample
 levels compare the same integer regions as the Rust CLI.
 
+### `check-public-testdata-metadata.py`
+
+Checks Rust metadata for public OpenSlide fixtures whose upstream support is
+newer than the stable reference stack, such as ARGOS and Huron. It defaults to
+`/big/henriksson/openslide_images` and skips missing files unless
+`--require-all` is passed.
+
+```sh
+cargo build --release
+python3 scripts/check-public-testdata-metadata.py --require-all
+OPENSLIDE_PUBLIC_TESTDATA_DIR=.tmp/openslide-testdata \
+  python3 scripts/check-public-testdata-metadata.py
+```
+
+### `smoke-public-testdata.py`
+
+Opens every known direct fixture under the public OpenSlide testdata directory
+and every extracted archive entrypoint under `.tmp/public-openslide-extracted`.
+Only files that current upstream also does not open are allowed to fail.
+
+```sh
+cargo build --release
+python3 scripts/smoke-public-testdata.py
+```
+
 ### `bench-realdata.py`
 
 Benchmarks Rust and reference OpenSlide reads over discovered slides. It records

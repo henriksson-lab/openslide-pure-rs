@@ -288,6 +288,7 @@ pub(crate) fn open(path: &Path) -> Result<Box<dyn SlideBackend>> {
         lowest_resolution_level,
         levels[0].dir_index,
         levels[0].dir_index,
+        &[],
     )?;
 
     add_level_properties(&mut properties, &levels);
@@ -3289,6 +3290,13 @@ fn parse_bif_info(xml: &str, tile_width: u64, tile_height: u64) -> Result<BifInf
 
         let tiles_across = parse_i64_attr(&element.attrs, "NumCols")?;
         let tiles_down = parse_i64_attr(&element.attrs, "NumRows")?;
+        // Upstream openslide-vendor-ventana.c (commit 2be88bd7): reject areas
+        // whose tile counts aren't positive (some files record negative rows).
+        if tiles_across < 1 || tiles_down < 1 {
+            return Err(OpenSlideError::Format(format!(
+                "Area has invalid tile count {tiles_across}x{tiles_down}"
+            )));
+        }
         let tile_count = tiles_across
             .checked_mul(tiles_down)
             .ok_or_else(|| OpenSlideError::Format("Ventana BIF tile count overflow".into()))?;
@@ -3313,8 +3321,8 @@ fn parse_bif_info(xml: &str, tile_width: u64, tile_height: u64) -> Result<BifInf
                 .map(String::as_str)
                 .unwrap_or("");
             match direction {
-                "RIGHT" => {
-                    if tile2 != (tile1.0 + 1, tile1.1) {
+                "RIGHT" | "LEFT" => {
+                    if tile1.1 != tile2.1 || (tile1.0 - tile2.0).abs() != 1 {
                         return Err(OpenSlideError::Format(
                             "Unexpected Ventana BIF horizontal tile join".into(),
                         ));
@@ -3322,8 +3330,8 @@ fn parse_bif_info(xml: &str, tile_width: u64, tile_height: u64) -> Result<BifInf
                     total_offset_x += confidence * -parse_f64_attr(&joint.attrs, "OverlapX")?;
                     total_x_weight += confidence;
                 }
-                "UP" => {
-                    if tile2 != (tile1.0, tile1.1 - 1) {
+                "UP" | "DOWN" => {
+                    if tile1.0 != tile2.0 || (tile1.1 - tile2.1).abs() != 1 {
                         return Err(OpenSlideError::Format(
                             "Unexpected Ventana BIF vertical tile join".into(),
                         ));
@@ -3796,14 +3804,11 @@ impl TiffFile {
             } else {
                 &entry_buf[8..12]
             };
-            let value_size = tiff_type_size(value_type)
-                .and_then(|size| size.checked_mul(count))
-                .ok_or_else(|| {
-                    OpenSlideError::Format(format!(
-                        "Unsupported or oversized TIFF value type {}",
-                        value_type
-                    ))
-                })?;
+            let Some(value_size) =
+                tiff_type_size(value_type).and_then(|size| size.checked_mul(count))
+            else {
+                continue;
+            };
             if value_size > 512 * 1024 * 1024 {
                 return Err(OpenSlideError::Format(format!(
                     "Refusing to allocate {} bytes for TIFF tag {}",
@@ -4466,6 +4471,34 @@ mod tests {
 
         let red = slide.read_region(0, 0, 0, 0, 3, 2).unwrap();
         assert_eq!(red.data, vec![10, 40, 4, 70, 100, 10]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_bif_aoi_tilemap_with_left_overlap() {
+        let path = temp_path("left-overlap.bif");
+        fs::write(&path, make_left_overlapping_bif_tilemap_tiff()).unwrap();
+
+        let slide = OpenSlide::open(&path).unwrap();
+        assert_eq!(slide.level_dimensions(0), Some((3, 2)));
+
+        let red = slide.read_region(0, 0, 0, 0, 3, 2).unwrap();
+        assert_eq!(red.data, vec![10, 40, 4, 70, 100, 10]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_bif_aoi_tilemap_with_down_overlap() {
+        let path = temp_path("down-overlap.bif");
+        fs::write(&path, make_down_overlapping_bif_tilemap_tiff()).unwrap();
+
+        let slide = OpenSlide::open(&path).unwrap();
+        assert_eq!(slide.level_dimensions(0), Some((2, 3)));
+
+        let red = slide.read_region(0, 0, 0, 0, 2, 3).unwrap();
+        assert_eq!(red.data, vec![10, 40, 70, 100, 7, 10]);
 
         let _ = fs::remove_file(path);
     }
@@ -5474,6 +5507,36 @@ mod tests {
             Some(tile_data()),
             4,
             2,
+        );
+        builder.finish()
+    }
+
+    fn make_left_overlapping_bif_tilemap_tiff() -> Vec<u8> {
+        let mut builder = TiffBuilder::new();
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
+        builder.add_dir(
+            b"level=0 mag=20\0",
+            Some(
+                br#"<EncodeInfo><SlideStitchInfo><ImageInfo AOIScanned="1" Width="2" Height="2" NumRows="1" NumCols="2" Pos-X="0" Pos-Y="0"><TileJointInfo Tile1="2" Tile2="1" Direction="LEFT" OverlapX="1" Confidence="1"/></ImageInfo></SlideStitchInfo><AoiOrigin><AOI OriginX="0" OriginY="0"/></AoiOrigin></EncodeInfo>"#,
+            ),
+            Some(tile_data()),
+            4,
+            2,
+        );
+        builder.finish()
+    }
+
+    fn make_down_overlapping_bif_tilemap_tiff() -> Vec<u8> {
+        let mut builder = TiffBuilder::new();
+        builder.add_metadata_dir(br#"<iScan Magnification="20" ScanRes="0.25"/>"#);
+        builder.add_dir(
+            b"level=0 mag=20\0",
+            Some(
+                br#"<EncodeInfo><SlideStitchInfo><ImageInfo AOIScanned="1" Width="2" Height="2" NumRows="2" NumCols="1" Pos-X="0" Pos-Y="0"><TileJointInfo Tile1="2" Tile2="1" Direction="DOWN" OverlapY="1" Confidence="1"/></ImageInfo></SlideStitchInfo><AoiOrigin><AOI OriginX="0" OriginY="0"/></AoiOrigin></EncodeInfo>"#,
+            ),
+            Some(tile_data()),
+            2,
+            4,
         );
         builder.finish()
     }

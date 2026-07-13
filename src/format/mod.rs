@@ -1,6 +1,8 @@
 pub mod aperio;
+pub mod argos;
 pub mod dicom;
 pub mod hamamatsu;
+pub mod huron;
 pub mod leica;
 pub mod mirax;
 pub mod philips;
@@ -126,6 +128,9 @@ pub(crate) fn open_slide(path: &Path) -> Result<Box<dyn SlideBackend>> {
     if dicom::detect(path) {
         return dicom::open(path);
     }
+    if hamamatsu::detect_ndpis(path) {
+        return hamamatsu::open_ndpis(path);
+    }
     if hamamatsu::detect_vms_vmu(path) {
         return hamamatsu::open_vms_vmu(path);
     }
@@ -140,6 +145,12 @@ pub(crate) fn open_slide(path: &Path) -> Result<Box<dyn SlideBackend>> {
     }
     if aperio::detect(path) {
         return aperio::open(path);
+    }
+    if huron::detect(path) {
+        return huron::open(path);
+    }
+    if argos::detect(path) {
+        return argos::open(path);
     }
     if leica::detect(path) {
         return leica::open(path);
@@ -189,6 +200,12 @@ pub(crate) fn detect_vendor(path: &Path) -> Option<&'static str> {
     if aperio::detect(path) {
         return Some("aperio");
     }
+    if huron::detect(path) {
+        return Some("huron");
+    }
+    if argos::detect(path) {
+        return Some("argos");
+    }
     if leica::detect(path) {
         return Some("leica");
     }
@@ -220,6 +237,8 @@ mod tests {
         "sakura",
         "trestle",
         "aperio",
+        "huron",
+        "argos",
         "leica",
         "philips-tiff",
         "ventana",
@@ -235,6 +254,8 @@ mod tests {
         "sakura",
         "trestle",
         "aperio",
+        "huron",
+        "argos",
         "leica",
         "philips-tiff",
         "ventana",
