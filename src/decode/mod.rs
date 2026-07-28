@@ -16,10 +16,10 @@ use crate::error::Result;
 use crate::pixel::{GrayImage, RgbaImage};
 use std::path::Path;
 
-static DEFAULT_JPEG2000_DECODER: jpeg2000::DicomToolkitJpeg2000Decoder =
-    jpeg2000::DicomToolkitJpeg2000Decoder;
+static DEFAULT_JPEG2000_DECODER: jpeg2000::OpenJpegPureRustDecoder =
+    jpeg2000::OpenJpegPureRustDecoder;
 #[cfg(feature = "jpegxr")]
-static DEFAULT_JPEGXR_DECODER: jpegxr::NativeJpegXrDecoder = jpegxr::NativeJpegXrDecoder;
+static DEFAULT_JPEGXR_DECODER: jpegxr::PureRustJpegXrDecoder = jpegxr::PureRustJpegXrDecoder;
 #[cfg(not(feature = "jpegxr"))]
 static DEFAULT_JPEGXR_DECODER: jpegxr::NoJpegXrDecoder = jpegxr::NoJpegXrDecoder;
 
@@ -27,7 +27,7 @@ static DEFAULT_JPEGXR_DECODER: jpegxr::NoJpegXrDecoder = jpegxr::NoJpegXrDecoder
 ///
 /// This keeps unsupported-but-detected codec paths routed through one API
 /// boundary.  Default builds validate JPEG XR requests and report that no
-/// backend is linked; `jpegxr` builds route JPEG XR to the native
+/// backend is linked; `jpegxr` builds route JPEG XR to the pure-Rust
 /// backend. JPEG 2000 uses the pure-Rust decoder backend.
 #[derive(Clone, Copy)]
 pub struct DecoderApi<'a> {

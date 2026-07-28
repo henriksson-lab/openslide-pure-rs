@@ -1,7 +1,5 @@
 use crate::error::{OpenSlideError, Result};
 use crate::pixel::GrayImage;
-#[cfg(feature = "jpegxr")]
-use std::io::Cursor;
 
 /// Pixel layouts that a JPEG XR backend may need to produce for CZI subblocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,28 +105,28 @@ impl JpegXrDecoderBackend for NoJpegXrDecoder {
     }
 }
 
-/// Native JPEG XR backend using the optional `jpegxr` crate.
+/// Pure-Rust JPEG XR backend using the optional `jpegxr-pure-rs` crate.
 #[cfg(feature = "jpegxr")]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct NativeJpegXrDecoder;
+pub struct PureRustJpegXrDecoder;
 
 #[cfg(feature = "jpegxr")]
-impl JpegXrDecoderBackend for NativeJpegXrDecoder {
+impl JpegXrDecoderBackend for PureRustJpegXrDecoder {
     fn name(&self) -> &'static str {
-        "jpegxr"
+        "jpegxr-pure-rs"
     }
 
     fn supports_pixel_format(&self, pixel_format: JpegXrPixelFormat) -> bool {
-        native_supported_pixel_format(pixel_format)
+        pure_supported_pixel_format(pixel_format)
     }
 
     fn decode(&self, request: JpegXrDecodeRequest<'_>) -> Result<JpegXrImage> {
-        decode_with_native_backend(request)
+        decode_with_pure_backend(request)
     }
 }
 
 #[cfg(feature = "jpegxr")]
-static DEFAULT_JPEG_XR_DECODER: NativeJpegXrDecoder = NativeJpegXrDecoder;
+static DEFAULT_JPEG_XR_DECODER: PureRustJpegXrDecoder = PureRustJpegXrDecoder;
 #[cfg(not(feature = "jpegxr"))]
 static DEFAULT_JPEG_XR_DECODER: NoJpegXrDecoder = NoJpegXrDecoder;
 static NO_JPEG_XR_DECODER: NoJpegXrDecoder = NoJpegXrDecoder;
@@ -591,32 +589,14 @@ fn no_backend_error(context: &str) -> OpenSlideError {
 }
 
 #[cfg(feature = "jpegxr")]
-fn decode_with_native_backend(request: JpegXrDecodeRequest<'_>) -> Result<JpegXrImage> {
-    use ::jpegxr::ImageDecode;
-
-    let mut decoder = ImageDecode::with_reader(Cursor::new(request.data))
-        .map_err(|err| native_decode_error(request.context, err))?;
-    let (width, height) = decoder
-        .get_size()
-        .map_err(|err| native_decode_error(request.context, err))?;
-    if width < 0 || height < 0 {
-        return Err(OpenSlideError::Decode(format!(
-            "{} JPEG XR decoder returned negative dimensions {width}x{height}",
-            request.context
-        )));
-    }
-    let width = u32::try_from(width).map_err(|err| {
-        OpenSlideError::Decode(format!(
-            "{} JPEG XR width does not fit u32: {err}",
-            request.context
-        ))
-    })?;
-    let height = u32::try_from(height).map_err(|err| {
-        OpenSlideError::Decode(format!(
-            "{} JPEG XR height does not fit u32: {err}",
-            request.context
-        ))
-    })?;
+fn decode_with_pure_backend(request: JpegXrDecodeRequest<'_>) -> Result<JpegXrImage> {
+    let mut decoder = jpegxr_pure_rs::Decoder::from_slice(request.data)
+        .map_err(|err| pure_decode_error(request.context, err))?;
+    let image = decoder
+        .decode()
+        .map_err(|err| pure_decode_error(request.context, err))?;
+    let width = image.width();
+    let height = image.height();
     if width != request.options.width || height != request.options.height {
         return Err(OpenSlideError::Decode(format!(
             "{} JPEG XR decoder returned dimensions {}x{}, expected {}x{}",
@@ -624,29 +604,9 @@ fn decode_with_native_backend(request: JpegXrDecodeRequest<'_>) -> Result<JpegXr
         )));
     }
 
-    let native_format = decoder
-        .get_pixel_format()
-        .map_err(|err| native_decode_error(request.context, err))?;
-    ensure_native_format_supported(request, native_format)?;
-
-    let stride = native_stride(width, native_format).ok_or_else(|| {
-        OpenSlideError::Decode(format!(
-            "{} JPEG XR native decoded image size overflows usize",
-            request.context
-        ))
-    })?;
-    let len = stride.checked_mul(height as usize).ok_or_else(|| {
-        OpenSlideError::Decode(format!(
-            "{} JPEG XR native decoded image size overflows usize",
-            request.context
-        ))
-    })?;
-    let mut native_data = vec![0; len];
-    decoder
-        .copy_all(&mut native_data, stride)
-        .map_err(|err| native_decode_error(request.context, err))?;
-
-    let data = normalize_native_data(native_data, width, height, native_format, request)?;
+    let pure_format = image.pixel_format();
+    ensure_pure_format_supported(request, pure_format)?;
+    let data = normalize_pure_data(image, request)?;
     Ok(JpegXrImage {
         width,
         height,
@@ -656,7 +616,7 @@ fn decode_with_native_backend(request: JpegXrDecodeRequest<'_>) -> Result<JpegXr
 }
 
 #[cfg(feature = "jpegxr")]
-fn native_supported_pixel_format(pixel_format: JpegXrPixelFormat) -> bool {
+fn pure_supported_pixel_format(pixel_format: JpegXrPixelFormat) -> bool {
     matches!(
         pixel_format,
         JpegXrPixelFormat::Gray8
@@ -671,101 +631,112 @@ fn native_supported_pixel_format(pixel_format: JpegXrPixelFormat) -> bool {
 }
 
 #[cfg(feature = "jpegxr")]
-fn native_decode_error(context: &str, err: ::jpegxr::JXRError) -> OpenSlideError {
-    match err {
-        ::jpegxr::JXRError::UnsupportedFormat => OpenSlideError::UnsupportedFormat(format!(
-            "{context} JPEG XR native decoder does not support this codestream"
-        )),
-        other => OpenSlideError::Decode(format!("{context} JPEG XR native decode failed: {other}")),
-    }
+fn pure_decode_error(context: &str, err: jpegxr_pure_rs::Error) -> OpenSlideError {
+    OpenSlideError::Decode(format!("{context} JPEG XR pure-Rust decode failed: {err}"))
 }
 
 #[cfg(feature = "jpegxr")]
-fn ensure_native_format_supported(
+fn ensure_pure_format_supported(
     request: JpegXrDecodeRequest<'_>,
-    native_format: ::jpegxr::PixelFormat,
+    pure_format: jpegxr_pure_rs::PixelFormat,
 ) -> Result<()> {
-    if native_format_matches_request(native_format, request.options.pixel_format) {
+    if pure_format_matches_request(pure_format, request.options.pixel_format) {
         return Ok(());
     }
     Err(OpenSlideError::UnsupportedFormat(format!(
-        "{} JPEG XR native decoder returned {:?}, which cannot be normalized to {:?}",
-        request.context, native_format, request.options.pixel_format
+        "{} JPEG XR pure-Rust decoder returned {:?}, which cannot be normalized to {:?}",
+        request.context, pure_format, request.options.pixel_format
     )))
 }
 
 #[cfg(feature = "jpegxr")]
-fn native_format_matches_request(
-    native_format: ::jpegxr::PixelFormat,
+fn pure_format_matches_request(
+    pure_format: jpegxr_pure_rs::PixelFormat,
     requested: JpegXrPixelFormat,
 ) -> bool {
-    use ::jpegxr::PixelFormat;
+    use jpegxr_pure_rs::{BitDepth, ChannelOrder, ColorFormat, SampleFormat};
+
     match requested {
-        JpegXrPixelFormat::Gray8 => native_format == PixelFormat::PixelFormat8bppGray,
-        JpegXrPixelFormat::Gray16 => matches!(
-            native_format,
-            PixelFormat::PixelFormat16bppGray | PixelFormat::PixelFormat16bppGrayFixedPoint
-        ),
-        JpegXrPixelFormat::GrayFloat => native_format == PixelFormat::PixelFormat32bppGrayFloat,
-        JpegXrPixelFormat::Gray32 => native_format == PixelFormat::PixelFormat32bppGrayFixedPoint,
-        JpegXrPixelFormat::Bgr24 => matches!(
-            native_format,
-            PixelFormat::PixelFormat24bppBGR | PixelFormat::PixelFormat24bppRGB
-        ),
-        JpegXrPixelFormat::Bgr48 => matches!(
-            native_format,
-            PixelFormat::PixelFormat48bppRGB | PixelFormat::PixelFormat48bppRGBFixedPoint
-        ),
-        JpegXrPixelFormat::BgrFloat => native_format == PixelFormat::PixelFormat96bppRGBFloat,
-        JpegXrPixelFormat::Bgra32 => matches!(
-            native_format,
-            PixelFormat::PixelFormat32bppBGR
-                | PixelFormat::PixelFormat32bppBGRA
-                | PixelFormat::PixelFormat32bppRGBA
-                | PixelFormat::PixelFormat32bppPBGRA
-                | PixelFormat::PixelFormat32bppPRGBA
-        ),
+        JpegXrPixelFormat::Gray8 => {
+            pure_format.color_format() == ColorFormat::Luma
+                && pure_format.bit_depth() == BitDepth::Eight
+        }
+        JpegXrPixelFormat::Gray16 => {
+            pure_format.color_format() == ColorFormat::Luma
+                && matches!(
+                    pure_format.bit_depth(),
+                    BitDepth::Sixteen | BitDepth::SignedSixteen
+                )
+        }
+        JpegXrPixelFormat::GrayFloat => {
+            pure_format.color_format() == ColorFormat::Luma
+                && pure_format.bit_depth() == BitDepth::Float
+        }
+        JpegXrPixelFormat::Gray32 => {
+            pure_format.color_format() == ColorFormat::Luma
+                && matches!(
+                    pure_format.sample_format(),
+                    SampleFormat::FixedPoint | SampleFormat::UnsignedInteger
+                )
+                && matches!(
+                    pure_format.bit_depth(),
+                    BitDepth::ThirtyTwo | BitDepth::SignedThirtyTwo
+                )
+        }
+        JpegXrPixelFormat::Bgr24 => {
+            pure_format.color_format() == ColorFormat::Rgb
+                && pure_format.bit_depth() == BitDepth::Eight
+                && !pure_format.has_alpha()
+                && matches!(
+                    pure_format.channel_order(),
+                    ChannelOrder::Bgr | ChannelOrder::Rgb
+                )
+        }
+        JpegXrPixelFormat::Bgr48 => {
+            pure_format.color_format() == ColorFormat::Rgb
+                && matches!(
+                    pure_format.bit_depth(),
+                    BitDepth::Sixteen | BitDepth::SignedSixteen
+                )
+                && !pure_format.has_alpha()
+                && matches!(
+                    pure_format.channel_order(),
+                    ChannelOrder::Bgr | ChannelOrder::Rgb
+                )
+        }
+        JpegXrPixelFormat::BgrFloat => {
+            pure_format.color_format() == ColorFormat::Rgb
+                && pure_format.bit_depth() == BitDepth::Float
+                && !pure_format.has_alpha()
+                && matches!(
+                    pure_format.channel_order(),
+                    ChannelOrder::Bgr | ChannelOrder::Rgb
+                )
+        }
+        JpegXrPixelFormat::Bgra32 => {
+            pure_format.color_format() == ColorFormat::Rgb
+                && pure_format.bit_depth() == BitDepth::Eight
+                && matches!(
+                    pure_format.channel_order(),
+                    ChannelOrder::Bgr | ChannelOrder::Rgb
+                )
+        }
         JpegXrPixelFormat::GrayDouble => false,
     }
 }
 
 #[cfg(feature = "jpegxr")]
-fn native_stride(width: u32, native_format: ::jpegxr::PixelFormat) -> Option<usize> {
-    let bytes_per_pixel = native_bytes_per_pixel(native_format)?;
-    (width as usize).checked_mul(bytes_per_pixel)
-}
-
-#[cfg(feature = "jpegxr")]
-fn native_bytes_per_pixel(native_format: ::jpegxr::PixelFormat) -> Option<usize> {
-    use ::jpegxr::PixelFormat;
-    match native_format {
-        PixelFormat::PixelFormat8bppGray => Some(1),
-        PixelFormat::PixelFormat16bppGray | PixelFormat::PixelFormat16bppGrayFixedPoint => Some(2),
-        PixelFormat::PixelFormat32bppGrayFloat | PixelFormat::PixelFormat32bppGrayFixedPoint => {
-            Some(4)
-        }
-        PixelFormat::PixelFormat24bppBGR | PixelFormat::PixelFormat24bppRGB => Some(3),
-        PixelFormat::PixelFormat32bppBGR => Some(4),
-        PixelFormat::PixelFormat48bppRGB | PixelFormat::PixelFormat48bppRGBFixedPoint => Some(6),
-        PixelFormat::PixelFormat96bppRGBFloat => Some(12),
-        PixelFormat::PixelFormat32bppBGRA
-        | PixelFormat::PixelFormat32bppRGBA
-        | PixelFormat::PixelFormat32bppPBGRA
-        | PixelFormat::PixelFormat32bppPRGBA => Some(4),
-        _ => None,
-    }
-}
-
-#[cfg(feature = "jpegxr")]
-fn normalize_native_data(
-    mut native_data: Vec<u8>,
-    width: u32,
-    height: u32,
-    native_format: ::jpegxr::PixelFormat,
+fn normalize_pure_data(
+    image: jpegxr_pure_rs::DecodedImage,
     request: JpegXrDecodeRequest<'_>,
 ) -> Result<Vec<u8>> {
-    use ::jpegxr::PixelFormat;
+    use jpegxr_pure_rs::ChannelOrder;
 
+    let width = image.width();
+    let height = image.height();
+    let pure_format = image.pixel_format();
+    let stride = image.stride();
+    let bytes_per_pixel = pure_format.bytes_per_pixel();
     let expected =
         expected_decoded_len(width, height, request.options.pixel_format).ok_or_else(|| {
             OpenSlideError::Decode(format!(
@@ -773,64 +744,73 @@ fn normalize_native_data(
                 request.context
             ))
         })?;
-    if native_data.len() != expected {
+    let row_len = (width as usize)
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| {
+            OpenSlideError::Decode(format!(
+                "{} JPEG XR decoded row size overflows usize",
+                request.context
+            ))
+        })?;
+    if row_len > stride {
         return Err(OpenSlideError::Decode(format!(
-            "{} JPEG XR native decoder returned {} bytes, expected {expected}",
+            "{} JPEG XR pure-Rust decoder returned stride {stride}, expected at least {row_len}",
+            request.context
+        )));
+    }
+    let mut data = Vec::with_capacity(expected);
+    for row in image.pixels().chunks_exact(stride).take(height as usize) {
+        data.extend_from_slice(&row[..row_len]);
+    }
+    if data.len() != expected {
+        return Err(OpenSlideError::Decode(format!(
+            "{} JPEG XR pure-Rust decoder returned {} compact bytes, expected {expected}",
             request.context,
-            native_data.len()
+            data.len()
         )));
     }
 
-    match (request.options.pixel_format, native_format) {
-        (_, PixelFormat::PixelFormat8bppGray)
-        | (_, PixelFormat::PixelFormat16bppGray)
-        | (_, PixelFormat::PixelFormat16bppGrayFixedPoint)
-        | (_, PixelFormat::PixelFormat32bppGrayFloat)
-        | (_, PixelFormat::PixelFormat32bppGrayFixedPoint)
-        | (_, PixelFormat::PixelFormat24bppBGR)
-        | (_, PixelFormat::PixelFormat32bppBGRA) => Ok(native_data),
-        (JpegXrPixelFormat::Bgra32, PixelFormat::PixelFormat32bppBGR) => {
-            for pixel in native_data.chunks_exact_mut(4) {
-                pixel[3] = 0xff;
+    match request.options.pixel_format {
+        JpegXrPixelFormat::Gray8
+        | JpegXrPixelFormat::Gray16
+        | JpegXrPixelFormat::GrayFloat
+        | JpegXrPixelFormat::Gray32 => Ok(data),
+        JpegXrPixelFormat::Bgr24 | JpegXrPixelFormat::Bgr48 | JpegXrPixelFormat::BgrFloat
+            if pure_format.channel_order() == ChannelOrder::Bgr =>
+        {
+            Ok(data)
+        }
+        JpegXrPixelFormat::Bgr24 | JpegXrPixelFormat::Bgr48 | JpegXrPixelFormat::BgrFloat
+            if pure_format.channel_order() == ChannelOrder::Rgb =>
+        {
+            swap_rgb_channels(&mut data, bytes_per_pixel);
+            Ok(data)
+        }
+        JpegXrPixelFormat::Bgra32 if pure_format.channel_order() == ChannelOrder::Bgr => {
+            if !pure_format.has_alpha() {
+                for pixel in data.chunks_exact_mut(4) {
+                    pixel[3] = 0xff;
+                }
+            } else if pure_format.premultiplied_alpha() {
+                unpremultiply_bgra(&mut data);
             }
-            Ok(native_data)
+            Ok(data)
         }
-        (JpegXrPixelFormat::Bgra32, PixelFormat::PixelFormat32bppPBGRA) => {
-            unpremultiply_bgra(&mut native_data);
-            Ok(native_data)
-        }
-        (JpegXrPixelFormat::Bgr24, PixelFormat::PixelFormat24bppRGB) => {
-            swap_rgb_channels(&mut native_data, 3);
-            Ok(native_data)
-        }
-        (JpegXrPixelFormat::Bgr48, PixelFormat::PixelFormat48bppRGB) => {
-            swap_rgb_channels(&mut native_data, 6);
-            Ok(native_data)
-        }
-        (JpegXrPixelFormat::Bgr48, PixelFormat::PixelFormat48bppRGBFixedPoint) => {
-            swap_rgb_channels(&mut native_data, 6);
-            Ok(native_data)
-        }
-        (JpegXrPixelFormat::BgrFloat, PixelFormat::PixelFormat96bppRGBFloat) => {
-            swap_rgb_channels(&mut native_data, 12);
-            Ok(native_data)
-        }
-        (JpegXrPixelFormat::Bgra32, PixelFormat::PixelFormat32bppRGBA) => {
-            for pixel in native_data.chunks_exact_mut(4) {
+        JpegXrPixelFormat::Bgra32 if pure_format.channel_order() == ChannelOrder::Rgb => {
+            for pixel in data.chunks_exact_mut(4) {
                 pixel.swap(0, 2);
+                if !pure_format.has_alpha() {
+                    pixel[3] = 0xff;
+                }
             }
-            Ok(native_data)
-        }
-        (JpegXrPixelFormat::Bgra32, PixelFormat::PixelFormat32bppPRGBA) => {
-            for pixel in native_data.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
+            if pure_format.has_alpha() && pure_format.premultiplied_alpha() {
+                unpremultiply_bgra(&mut data);
             }
-            unpremultiply_bgra(&mut native_data);
-            Ok(native_data)
+            Ok(data)
         }
         _ => Err(OpenSlideError::UnsupportedFormat(format!(
-            "{} JPEG XR native decoder returned {:?}, which cannot be normalized to {:?}",
-            request.context, native_format, request.options.pixel_format
+            "{} JPEG XR pure-Rust decoder returned {:?}, which cannot be normalized to {:?}",
+            request.context, pure_format, request.options.pixel_format
         ))),
     }
 }
@@ -993,9 +973,9 @@ mod tests {
 
     #[cfg(feature = "jpegxr")]
     #[test]
-    fn default_config_uses_native_backend_when_feature_enabled() {
+    fn default_config_uses_pure_backend_when_feature_enabled() {
         let config = JpegXrDecoderConfig::default();
-        assert_eq!(config.backend_name(), "jpegxr");
+        assert_eq!(config.backend_name(), "jpegxr-pure-rs");
         assert!(config
             .backend
             .supports_pixel_format(JpegXrPixelFormat::Gray8));
@@ -1023,8 +1003,8 @@ mod tests {
 
     #[cfg(feature = "jpegxr")]
     #[test]
-    fn native_backend_advertises_translated_czi_pixel_layouts() {
-        let backend = NativeJpegXrDecoder;
+    fn pure_backend_advertises_translated_czi_pixel_layouts() {
+        let backend = PureRustJpegXrDecoder;
 
         for pixel_format in [
             JpegXrPixelFormat::Gray8,
@@ -1038,230 +1018,15 @@ mod tests {
         ] {
             assert!(
                 backend.supports_pixel_format(pixel_format),
-                "{pixel_format:?} should be advertised by the native JPEG XR backend"
+                "{pixel_format:?} should be advertised by the pure-Rust JPEG XR backend"
             );
         }
 
         let pixel_format = JpegXrPixelFormat::GrayDouble;
         assert!(
             !backend.supports_pixel_format(pixel_format),
-            "{pixel_format:?} should stay disabled until the native backend exposes it"
+            "{pixel_format:?} should stay disabled until the pure-Rust backend exposes it"
         );
-    }
-
-    #[cfg(feature = "jpegxr")]
-    #[test]
-    fn native_accepts_bgr24_layouts() {
-        assert!(native_format_matches_request(
-            ::jpegxr::PixelFormat::PixelFormat24bppBGR,
-            JpegXrPixelFormat::Bgr24
-        ));
-        assert!(native_format_matches_request(
-            ::jpegxr::PixelFormat::PixelFormat24bppRGB,
-            JpegXrPixelFormat::Bgr24
-        ));
-
-        let data = normalize_native_data(
-            vec![1, 2, 3, 4, 5, 6],
-            2,
-            1,
-            ::jpegxr::PixelFormat::PixelFormat24bppRGB,
-            JpegXrDecodeRequest {
-                data: &[1, 2, 3],
-                options: JpegXrDecodeOptions {
-                    width: 2,
-                    height: 1,
-                    pixel_format: JpegXrPixelFormat::Bgr24,
-                },
-                context: "CZI subblock",
-            },
-        )
-        .unwrap();
-
-        assert_eq!(data, vec![3, 2, 1, 6, 5, 4]);
-    }
-
-    #[cfg(feature = "jpegxr")]
-    #[test]
-    fn native_accepts_gray32_fixed_point_layout() {
-        let data = normalize_native_data(
-            vec![0x00, 0x00, 0x00, 0x7f],
-            1,
-            1,
-            ::jpegxr::PixelFormat::PixelFormat32bppGrayFixedPoint,
-            JpegXrDecodeRequest {
-                data: &[1, 2, 3],
-                options: JpegXrDecodeOptions {
-                    width: 1,
-                    height: 1,
-                    pixel_format: JpegXrPixelFormat::Gray32,
-                },
-                context: "CZI subblock",
-            },
-        )
-        .unwrap();
-
-        assert_eq!(data, vec![0x00, 0x00, 0x00, 0x7f]);
-        let gray = extract_gray_channel(
-            &JpegXrImage {
-                width: 1,
-                height: 1,
-                pixel_format: JpegXrPixelFormat::Gray32,
-                data,
-            },
-            0,
-        );
-        assert_eq!(gray.data, vec![0x7f]);
-    }
-
-    #[cfg(feature = "jpegxr")]
-    #[test]
-    fn native_accepts_fixed_point_gray16_layout() {
-        assert!(native_format_matches_request(
-            ::jpegxr::PixelFormat::PixelFormat16bppGrayFixedPoint,
-            JpegXrPixelFormat::Gray16
-        ));
-
-        let data = normalize_native_data(
-            vec![0x34, 0x12],
-            1,
-            1,
-            ::jpegxr::PixelFormat::PixelFormat16bppGrayFixedPoint,
-            JpegXrDecodeRequest {
-                data: &[1, 2, 3],
-                options: JpegXrDecodeOptions {
-                    width: 1,
-                    height: 1,
-                    pixel_format: JpegXrPixelFormat::Gray16,
-                },
-                context: "CZI subblock",
-            },
-        )
-        .unwrap();
-
-        assert_eq!(data, vec![0x34, 0x12]);
-        let gray = extract_gray_channel(
-            &JpegXrImage {
-                width: 1,
-                height: 1,
-                pixel_format: JpegXrPixelFormat::Gray16,
-                data,
-            },
-            0,
-        );
-        assert_eq!(gray.data, vec![0x12]);
-    }
-
-    #[cfg(feature = "jpegxr")]
-    #[test]
-    fn native_accepts_fixed_point_rgb48_layout() {
-        assert!(native_format_matches_request(
-            ::jpegxr::PixelFormat::PixelFormat48bppRGBFixedPoint,
-            JpegXrPixelFormat::Bgr48
-        ));
-
-        let data = normalize_native_data(
-            vec![1, 2, 3, 4, 5, 6],
-            1,
-            1,
-            ::jpegxr::PixelFormat::PixelFormat48bppRGBFixedPoint,
-            JpegXrDecodeRequest {
-                data: &[1, 2, 3],
-                options: JpegXrDecodeOptions {
-                    width: 1,
-                    height: 1,
-                    pixel_format: JpegXrPixelFormat::Bgr48,
-                },
-                context: "CZI subblock",
-            },
-        )
-        .unwrap();
-
-        assert_eq!(data, vec![5, 6, 3, 4, 1, 2]);
-        let gray = extract_gray_channel(
-            &JpegXrImage {
-                width: 1,
-                height: 1,
-                pixel_format: JpegXrPixelFormat::Bgr48,
-                data,
-            },
-            0,
-        );
-        assert_eq!(gray.data, vec![2]);
-    }
-
-    #[cfg(feature = "jpegxr")]
-    #[test]
-    fn native_normalizes_premultiplied_bgra_to_straight_bgra() {
-        let data = normalize_native_data(
-            vec![5, 10, 20, 128, 0, 0, 0, 0],
-            2,
-            1,
-            ::jpegxr::PixelFormat::PixelFormat32bppPBGRA,
-            JpegXrDecodeRequest {
-                data: &[1, 2, 3],
-                options: JpegXrDecodeOptions {
-                    width: 2,
-                    height: 1,
-                    pixel_format: JpegXrPixelFormat::Bgra32,
-                },
-                context: "CZI subblock",
-            },
-        )
-        .unwrap();
-
-        assert_eq!(data, vec![10, 20, 40, 128, 0, 0, 0, 0]);
-    }
-
-    #[cfg(feature = "jpegxr")]
-    #[test]
-    fn native_normalizes_32bpp_bgr_to_opaque_bgra() {
-        assert!(native_format_matches_request(
-            ::jpegxr::PixelFormat::PixelFormat32bppBGR,
-            JpegXrPixelFormat::Bgra32
-        ));
-
-        let data = normalize_native_data(
-            vec![5, 10, 20, 0, 7, 11, 13, 99],
-            2,
-            1,
-            ::jpegxr::PixelFormat::PixelFormat32bppBGR,
-            JpegXrDecodeRequest {
-                data: &[1, 2, 3],
-                options: JpegXrDecodeOptions {
-                    width: 2,
-                    height: 1,
-                    pixel_format: JpegXrPixelFormat::Bgra32,
-                },
-                context: "CZI subblock",
-            },
-        )
-        .unwrap();
-
-        assert_eq!(data, vec![5, 10, 20, 0xff, 7, 11, 13, 0xff]);
-    }
-
-    #[cfg(feature = "jpegxr")]
-    #[test]
-    fn native_normalizes_premultiplied_rgba_to_straight_bgra() {
-        let data = normalize_native_data(
-            vec![20, 10, 5, 128],
-            1,
-            1,
-            ::jpegxr::PixelFormat::PixelFormat32bppPRGBA,
-            JpegXrDecodeRequest {
-                data: &[1, 2, 3],
-                options: JpegXrDecodeOptions {
-                    width: 1,
-                    height: 1,
-                    pixel_format: JpegXrPixelFormat::Bgra32,
-                },
-                context: "CZI subblock",
-            },
-        )
-        .unwrap();
-
-        assert_eq!(data, vec![10, 20, 40, 128]);
     }
 
     #[test]

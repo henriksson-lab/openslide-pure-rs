@@ -1414,7 +1414,7 @@ def validate_stable_runner_report(path: Path, bench_doc: dict[str, Any]) -> list
 def validate_workflow_contracts() -> list[str]:
     errors: list[str] = []
     contracts = {
-        ".github/workflows/ci.yml": [
+        ".github/workflows/audit-ci.yml": [
             "scripts/maturity-audit.sh",
             "cargo clippy --all-targets -- -D warnings",
             "cargo test",
@@ -1423,10 +1423,7 @@ def validate_workflow_contracts() -> list[str]:
             "cargo install --path",
         ],
         ".github/workflows/parity-smoke.yml": [
-            "README.md",
-            "MATURITY_PLAN.md",
-            "TOAUDIT.md",
-            "docs/**",
+            "workflow_dispatch",
             "--profile smoke",
             "parity-check.py",
             "--no-pixels",
@@ -1749,7 +1746,7 @@ def validate_package_contract(cargo_path: Path, readme_path: Path, build_path: P
     if "UnsupportedFormat" not in Path("src/error.rs").read_text() or "UnsupportedFormat" not in memory_policy:
         errors.append("memory/error policy must document UnsupportedFormat error behavior")
 
-    if "cargo package --no-verify" not in Path(".github/workflows/ci.yml").read_text():
+    if "cargo package --no-verify" not in Path(".github/workflows/audit-ci.yml").read_text():
         errors.append("CI workflow does not run cargo package --no-verify")
     return errors
 

@@ -55,44 +55,38 @@ Source for the original OpenSlide format list:
 
 ## Real-data parity and benchmark snapshot
 
-The table below compares this crate with the installed original OpenSlide stack
-used during the audit: `openslide-python 1.4.3 with libopenslide 3.4.1`.
-The command was
-`scripts/bench-realdata.py --cpu-list 0-3 --region-size 128 --regions-per-level 1`; read time
-excludes open time, RSS is maximum resident
-set size from `/usr/bin/time -v`, and parity means matching `levels`,
-`regions`, `pixels`, full checksum, and `rgb_checksum`.
+Original benchmark baseline: this translation tracks the vendored OpenSlide
+source tree at `v4.0.0-530-g7bebe7ee` (`7bebe7ee2b51`), while
+the installed comparison stack used by the benchmark runner is
+`openslide-python 1.4.3` with `libopenslide 3.4.1`.
 
-| Reader | Real-data status | Parity vs original | Rust read_s / RSS KiB | Original read_s / RSS KiB | Speed vs original | RSS vs original |
-| --- | --- | --- | ---: | ---: | ---: | ---: |
-| ARGOS | OpenSlide testdata `Argos/Argos-1-Stacked.avs` downloaded and SHA-256 verified | Blocked: installed original OpenSlide 3.4.1 predates ARGOS support and opens it as `generic-tiff`; Rust opens it as `argos` with 8 levels and macro/thumbnail images | n/a | n/a | n/a | n/a |
-| Aperio | `/big/henriksson/ome_images/SVS/77917.svs` | Exact | `0.060252 / 13560` | `0.086509 / 33564` | `1.44x` | `0.40x` |
-| Hamamatsu NDPI | `/big/henriksson/ome_images/Hamamatsu-NDPI/openslide/CMU-1/CMU-1.ndpi` | Exact | `0.018366 / 11316` | `0.044650 / 36892` | `2.43x` | `0.31x` |
-| Hamamatsu NDPI | `/big/henriksson/ome_images/Hamamatsu-NDPI/openslide/CMU-2/CMU-2.ndpi` | Exact | `0.017641 / 13616` | `0.047983 / 39020` | `2.72x` | `0.35x` |
-| Hamamatsu NDPI | `/big/henriksson/ome_images/Hamamatsu-NDPI/openslide/CMU-3/CMU-3.ndpi` | Exact | `0.017522 / 16100` | `0.049154 / 41172` | `2.81x` | `0.39x` |
-| Hamamatsu VMS | `/big/henriksson/ome_images/Hamamatsu-VMS/openslide/CMU-1/CMU-1-40x - 2010-01-12 13.24.05.vms` | Exact | `0.028689 / 10168` | `0.054574 / 38080` | `1.90x` | `0.27x` |
-| Hamamatsu VMS | `/big/henriksson/ome_images/Hamamatsu-VMS/openslide/CMU-2/CMU-2-40x - 2010-01-12 13.38.58.vms` | Exact | `0.021541 / 10488` | `0.059653 / 39680` | `2.77x` | `0.26x` |
-| Hamamatsu VMS | `/big/henriksson/ome_images/Hamamatsu-VMS/openslide/CMU-3/CMU-3-40x - 2010-01-12 13.57.09.vms` | Exact | `0.020215 / 11128` | `0.053840 / 41600` | `2.66x` | `0.27x` |
-| Hamamatsu VMU/NGR | No local or public real fixture found | No public OpenSlide testdata fixture found | n/a | n/a | n/a | n/a |
-| Huron | OpenSlide testdata `Huron/Huron-1.tif`, `Huron/Huron-1-40x.tif`, and `Huron/Huron-1-Uncompressed.tif` downloaded and SHA-256 verified | Blocked: installed original OpenSlide 3.4.1 predates Huron support and opens them as `generic-tiff`; Rust opens them as `huron` with 3 levels and label/macro/thumbnail images | n/a | n/a | n/a | n/a |
-| Leica | `/big/henriksson/ome_images/Leica-SCN/openslide/Leica-1/Leica-1.scn` | Exact | `0.005764 / 8264` | `0.017001 / 32320` | `2.95x` | `0.26x` |
-| Leica | `/big/henriksson/ome_images/Leica-SCN/openslide/Leica-2/Leica-2.scn` | Exact | `0.029645 / 8576` | `0.047260 / 41920` | `1.59x` | `0.20x` |
-| Trestle | `/big/henriksson/ome_images/Trestle/openslide/CMU-1/CMU-1.tif` | Exact | `0.038104 / 23360` | `0.041948 / 40640` | `1.10x` | `0.57x` |
-| Ventana | `/big/henriksson/ome_images/Ventana/openslide/OS-1.bif` | Exact | `0.179328 / 56836` | `0.188814 / 89392` | `1.05x` | `0.64x` |
-| Ventana | `/big/henriksson/ome_images/Ventana/openslide/OS-2.bif` | Exact | `0.201066 / 67028` | `0.231555 / 82968` | `1.15x` | `0.81x` |
-| DICOM | 3 reference-readable single-level members under `/big/henriksson/ome_images/DICOM` | Exact on readable members | `0.000358-0.000471 / 6720-7040` | `0.006836-0.008807 / 32320-34560` | `18-19x` | `0.19-0.21x` |
-| Zeiss CZI | 128 CZI files checked under `/big/henriksson/ome_images/Zeiss-CZI`; OpenSlide testdata `Zeiss-5-JXR`, `Zeiss-5-SlidePreview-JXR`, `Zeiss-5-SlidePreview-Zstd0`, and `Zeiss-5-SlidePreview-Zstd1-HiLo` downloaded | Blocked locally: original OpenSlide could not open `/big` CZI files or the public JXR/Zstd CZI fixtures; Rust reads the public Zstd0/Zstd1 preview fixtures and the JXR slide-preview fixture with `--features jpegxr`; full-slide Bgr24 JXR is wired through the optional native backend but still has a recorded native jxrlib crash probe on `Zeiss-5-JXR.czi` | n/a | n/a | n/a | n/a |
-| Generic TIFF | OpenSlide testdata `Generic-TIFF/CMU-1.tiff`; `/big/henriksson/ome_images/TIFF/libtiff/zackthecat.tif` now opens in Rust but installed reference OpenSlide cannot open it | Exact on public CMU-1; Rust-only old-JPEG smoke on zackthecat | `0.021107 / 10880` | `0.045140 / 33892` | `2.14x` | `0.32x` |
-| MIRAX / 3DHISTECH | OpenSlide testdata `Mirax/CMU-1-Saved-1_16.zip`; `Mirax/Mirax2-Fluorescence-2.zip`; no `.mrxs` fixture under `/big/henriksson/ome_images` | Exact on public brightfield and fluorescence fixtures | `0.006637 / 20424`; `0.001197 / 11576` | `0.023115 / 32960`; `0.028447 / 31332` | `3.48x`; `23.77x` | `0.62x`; `0.37x` |
-| Philips | OpenSlide testdata `Philips-TIFF/Philips-1.tiff`; no obvious Philips/PTIF fixture under `/big/henriksson/ome_images` | Exact | `0.027797 / 14400` | `0.047869 / 38720` | `1.72x` | `0.37x` |
-| Sakura | No `.svslide` fixture under `/big/henriksson/ome_images`; no Sakura entry in OpenSlide `index.json` | No public OpenSlide testdata fixture found | n/a | n/a | n/a | n/a |
+Latest captured run: 2026-07-14, Rust commit `a5d05ce`, public OpenSlide
+testdata from `.tmp/public-openslide-extracted` sourced from
+`https://openslide.cs.cmu.edu/download/openslide-testdata/`. Command:
+`python3 scripts/bench-realdata.py --data-dir .tmp/public-openslide-extracted --jobs 1 --runner-profile overnight-2026-07-14 --cpu-list 0-3 --region-size 128 --regions-per-level 1 --repeats 1 --json /tmp/pres_rustification_openslide_bench.json`.
+Aggregate speedup over the 13 exact comparable rows is **9.34x** (original read seconds / Rust read seconds; higher is better). Average RSS ratio is **0.59x** (Rust RSS / original RSS; lower is better). The TSV in the presentation repository keeps all 19 discovered rows, including 3 RGB-checksum mismatch rows and 3 reference-unopenable VSI skips.
 
-Full notes, rejected trial measurements, and fixture caveats are tracked in
-`TOAUDIT.md`.
-
-README reader labels use the policy in `docs/status-policy.md`. A
-`Fixture-verified` label applies only to the covered fixture subset named in
-the notes, not to every possible vendor layout.
+| Slide | Status | Rust read_s / RSS KiB | Original read_s / RSS KiB | Speed vs original | RSS vs original | Notes |
+|---|---|---:|---:|---:|---:|---|
+| `CMU-1.mrxs` | Exact | `0.007957 / 29356` | `0.031743 / 40960` | 3.99x | 0.72x | levels/regions/pixels/rgb_checksum matched |
+| `CMU-1-Exported.mrxs` | Exact | `0.001478 / 18336` | `0.021680 / 42560` | 14.67x | 0.43x | levels/regions/pixels/rgb_checksum matched |
+| `CMU-1-Saved-1_16.mrxs` | Exact | `0.038918 / 20872` | `0.022476 / 32960` | 0.58x | 0.63x | levels/regions/pixels/rgb_checksum matched |
+| `CMU-1-Saved-1_2.mrxs` | Exact | `0.011697 / 23340` | `0.028994 / 35048` | 2.48x | 0.67x | levels/regions/pixels/rgb_checksum matched |
+| `CMU-2.mrxs` | Exact | `0.149258 / 38052` | `0.052805 / 53440` | 0.35x | 0.71x | levels/regions/pixels/rgb_checksum matched |
+| `CMU-3.mrxs` | Exact | `0.004170 / 30360` | `0.029206 / 42240` | 7.00x | 0.72x | levels/regions/pixels/rgb_checksum matched |
+| `Mirax2-Fluorescence-1.mrxs` | Exact | `0.000437 / 15224` | `0.027715 / 31040` | 63.42x | 0.49x | levels/regions/pixels/rgb_checksum matched |
+| `Mirax2-Fluorescence-2.mrxs` | Exact | `0.001278 / 11548` | `0.028013 / 31340` | 21.92x | 0.37x | levels/regions/pixels/rgb_checksum matched |
+| `Mirax2.2-1.mrxs` | Mismatch | `0.369891 / 40288` | `0.076783 / 70080` | 0.21x | 0.57x | rgb_checksum: rust=77224116 reference=77224111 |
+| `Mirax2.2-2.mrxs` | Mismatch | `0.405068 / 59860` | `0.077343 / 69440` | 0.19x | 0.86x | rgb_checksum: rust=91336882 reference=91302470 |
+| `Mirax2.2-3.mrxs` | Mismatch | `0.425792 / 59972` | `0.079395 / 75200` | 0.19x | 0.80x | rgb_checksum: rust=105917479 reference=105913458 |
+| `Mirax2.2-4-BMP.mrxs` | Exact | `0.030186 / 19340` | `0.033171 / 32756` | 1.10x | 0.59x | levels/regions/pixels/rgb_checksum matched |
+| `Mirax2.2-4-PNG.mrxs` | Exact | `0.006673 / 19020` | `0.031803 / 32464` | 4.77x | 0.59x | levels/regions/pixels/rgb_checksum matched |
+| `OS-1.vsi` | Reference skipped | n/a | n/a | n/a | n/a | reference OpenSlide could not open |
+| `OS-2.vsi` | Reference skipped | n/a | n/a | n/a | n/a | reference OpenSlide could not open |
+| `OS-3.vsi` | Reference skipped | n/a | n/a | n/a | n/a | reference OpenSlide could not open |
+| `CMU-1.tif` | Exact | `0.121657 / 23680` | `0.050034 / 40320` | 0.41x | 0.59x | levels/regions/pixels/rgb_checksum matched |
+| `CMU-2.tif` | Exact | `0.117729 / 23360` | `0.042206 / 41280` | 0.36x | 0.57x | levels/regions/pixels/rgb_checksum matched |
+| `CMU-3.tif` | Exact | `0.126093 / 22720` | `0.045419 / 40960` | 0.36x | 0.55x | levels/regions/pixels/rgb_checksum matched |
 
 Downloadable follow-up fixtures from OpenSlide testdata:
 
@@ -267,6 +261,11 @@ and OpenJPEG development files. On Debian/Ubuntu:
 ```sh
 sudo apt-get install build-essential pkg-config libjpeg-dev libcairo2-dev libopenjp2-7-dev
 ```
+
+`zune-core` and `zune-jpeg` are vendored under `vendor/` from the upstream
+0.5.x crates with the OpenSlide JPEG decode-control patch applied locally. This
+keeps normal JPEG decode pure Rust without depending on the temporary fork while
+the upstream API review is pending.
 
 ## Quick start
 

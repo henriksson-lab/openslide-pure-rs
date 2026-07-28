@@ -6,88 +6,10 @@ use std::path::Path;
 use crate::error::{OpenSlideError, Result};
 use crate::pixel::{GrayImage, RgbaImage};
 use zune_jpeg::zune_core::colorspace::ColorSpace;
-use zune_jpeg::zune_core::options::DecoderOptions;
-use zune_jpeg::JpegDecoder;
+use zune_jpeg::zune_core::options::{DecoderOptions, InputColorspaceOverride, JpegScale};
+use zune_jpeg::{assemble_split_jpeg, DecodeRegion, JpegDecoder, JpegDimensions, RegionDecodeMode};
 
 extern "C" {
-    fn osr_jpeg_crop_channel(
-        data: *const c_uchar,
-        len: usize,
-        channel: c_uint,
-        x: c_uint,
-        y: c_uint,
-        w: c_uint,
-        h: c_uint,
-        out: *mut c_uchar,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-    fn osr_jpeg_decode_rgb(
-        data: *const c_uchar,
-        len: usize,
-        expected_w: c_uint,
-        expected_h: c_uint,
-        out: *mut c_uchar,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-    fn osr_jpeg_dimensions(
-        data: *const c_uchar,
-        len: usize,
-        width: *mut c_uint,
-        height: *mut c_uint,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-    fn osr_jpeg_decode_tiff_ycbcr_rgb(
-        data: *const c_uchar,
-        len: usize,
-        expected_w: c_uint,
-        expected_h: c_uint,
-        out: *mut c_uchar,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-    fn osr_jpeg_file_range_rgb(
-        path: *const c_char,
-        header_start: u64,
-        sof_position: u64,
-        header_stop: u64,
-        data_start: u64,
-        data_stop: u64,
-        tile_w: c_uint,
-        tile_h: c_uint,
-        scale_denom: c_uint,
-        expected_w: c_uint,
-        expected_h: c_uint,
-        out: *mut c_uchar,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-    fn osr_jpeg_memory_range_rgb(
-        buffer: *mut c_uchar,
-        len: usize,
-        sof_offset: u64,
-        tile_w: c_uint,
-        tile_h: c_uint,
-        scale_denom: c_uint,
-        expected_w: c_uint,
-        expected_h: c_uint,
-        out: *mut c_uchar,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-    fn osr_jpeg_crop_rgb(
-        data: *const c_uchar,
-        len: usize,
-        x: c_uint,
-        y: c_uint,
-        w: c_uint,
-        h: c_uint,
-        out: *mut c_uchar,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
     fn osr_jpeg_crop_bgra_rgb(
         data: *const c_uchar,
         len: usize,
@@ -110,29 +32,6 @@ extern "C" {
         w: c_uint,
         h: c_uint,
         jpeg_color_space: c_int,
-        out: *mut c_uchar,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-    fn osr_jpeg_file_crop_channel(
-        path: *const c_char,
-        offset: u64,
-        channel: c_uint,
-        x: c_uint,
-        y: c_uint,
-        w: c_uint,
-        h: c_uint,
-        out: *mut c_uchar,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-    fn osr_jpeg_file_crop_rgb(
-        path: *const c_char,
-        offset: u64,
-        x: c_uint,
-        y: c_uint,
-        w: c_uint,
-        h: c_uint,
         out: *mut c_uchar,
         err: *mut c_char,
         err_len: usize,
@@ -191,27 +90,15 @@ pub fn decode_jpeg_rgba(data: &[u8]) -> Result<RgbaImage> {
 
 /// Read JPEG dimensions from headers without decoding pixel data.
 pub fn decode_jpeg_dimensions(data: &[u8]) -> Result<(u32, u32)> {
-    let mut width = 0u32;
-    let mut height = 0u32;
-    let mut err = vec![0i8; 512];
-    let ok = unsafe {
-        osr_jpeg_dimensions(
-            data.as_ptr(),
-            data.len(),
-            &mut width,
-            &mut height,
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
-    if ok != 0 {
-        Ok((width, height))
-    } else {
-        Err(OpenSlideError::Decode(format!(
-            "JPEG dimensions decode failed: {}",
-            jpeg_crop_error_message(&err)
-        )))
-    }
+    let reader = BufReader::new(Cursor::new(data));
+    let mut decoder = JpegDecoder::new(reader);
+    decoder
+        .decode_headers()
+        .map_err(|e| OpenSlideError::Decode(format!("JPEG dimensions decode failed: {e}")))?;
+    let (width, height) = decoder
+        .dimensions()
+        .ok_or_else(|| OpenSlideError::Decode("No JPEG image dimensions".into()))?;
+    Ok((width as u32, height as u32))
 }
 
 /// Decode JPEG data, returning raw RGB bytes and dimensions.
@@ -233,63 +120,41 @@ pub fn decode_jpeg_rgb(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
 }
 
 pub fn decode_jpeg_rgb_libjpeg(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-    decode_jpeg_rgb_libjpeg_with(data, false)
+    decode_jpeg_rgb_with_options(
+        data,
+        DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::RGB),
+        "JPEG RGB decode failed",
+    )
 }
 
 pub fn decode_jpeg_tiff_ycbcr_rgb_libjpeg(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-    decode_jpeg_rgb_libjpeg_with(data, true)
+    let options = DecoderOptions::new_fast()
+        .jpeg_set_input_colorspace_override(InputColorspaceOverride::Force(ColorSpace::YCbCr))
+        .jpeg_set_out_colorspace(ColorSpace::BGRA);
+    let (bgra, width, height) =
+        decode_jpeg_rgb_with_options(data, options, "TIFF YCbCr JPEG RGB decode failed")?;
+    Ok((bgra_to_rgb(&bgra), width, height))
 }
 
-fn decode_jpeg_rgb_libjpeg_with(data: &[u8], tiff_ycbcr: bool) -> Result<(Vec<u8>, u32, u32)> {
-    let header_reader = BufReader::new(Cursor::new(data));
-    let mut header_decoder = JpegDecoder::new(header_reader);
-    header_decoder
-        .decode_headers()
-        .map_err(|e| OpenSlideError::Decode(format!("JPEG header read failed: {e}")))?;
-    let info = header_decoder
-        .info()
+fn decode_jpeg_rgb_with_options(
+    data: &[u8],
+    options: DecoderOptions,
+    context: &str,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let reader = BufReader::new(Cursor::new(data));
+    let mut decoder = JpegDecoder::new_with_options(reader, options);
+    let pixels = decoder
+        .decode()
+        .map_err(|e| OpenSlideError::Decode(format!("{context}: {e}")))?;
+    let (width, height) = decoder
+        .dimensions()
+        .or_else(|| {
+            decoder
+                .info()
+                .map(|info| (info.width as usize, info.height as usize))
+        })
         .ok_or_else(|| OpenSlideError::Decode("No JPEG image info".into()))?;
-    let width = info.width as u32;
-    let height = info.height as u32;
-    let mut rgb = vec![0; width as usize * height as usize * 3];
-    let mut err = vec![0i8; 512];
-    let ok = unsafe {
-        if tiff_ycbcr {
-            osr_jpeg_decode_tiff_ycbcr_rgb(
-                data.as_ptr(),
-                data.len(),
-                width,
-                height,
-                rgb.as_mut_ptr(),
-                err.as_mut_ptr(),
-                err.len(),
-            )
-        } else {
-            osr_jpeg_decode_rgb(
-                data.as_ptr(),
-                data.len(),
-                width,
-                height,
-                rgb.as_mut_ptr(),
-                err.as_mut_ptr(),
-                err.len(),
-            )
-        }
-    };
-    if ok != 0 {
-        Ok((rgb, width, height))
-    } else {
-        let label = if tiff_ycbcr {
-            "TIFF YCbCr JPEG RGB decode failed"
-        } else {
-            "JPEG RGB decode failed"
-        };
-        Err(OpenSlideError::Decode(format!(
-            "{}: {}",
-            label,
-            jpeg_crop_error_message(&err)
-        )))
-    }
+    Ok((pixels, width as u32, height as u32))
 }
 
 pub fn decode_jpeg_rgb_region(
@@ -299,33 +164,130 @@ pub fn decode_jpeg_rgb_region(
     w: u32,
     h: u32,
 ) -> Result<(Vec<u8>, u32, u32)> {
-    let mut rgb = vec![0; w as usize * h as usize * 3];
     if w == 0 || h == 0 {
-        return Ok((rgb, w, h));
+        return Ok((Vec::new(), w, h));
     }
+    let rgb = decode_jpeg_region_with_options(
+        data,
+        x,
+        y,
+        w,
+        h,
+        DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::RGB),
+        "JPEG RGB crop decode failed",
+    )?;
+    Ok((rgb, w, h))
+}
 
-    let mut err = vec![0i8; 512];
-    let ok = unsafe {
-        osr_jpeg_crop_rgb(
-            data.as_ptr(),
-            data.len(),
-            x,
-            y,
-            w,
-            h,
-            rgb.as_mut_ptr(),
-            err.as_mut_ptr(),
-            err.len(),
-        )
+fn decode_jpeg_region_with_options(
+    data: &[u8],
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    options: DecoderOptions,
+    context: &str,
+) -> Result<Vec<u8>> {
+    let reader = BufReader::new(Cursor::new(data));
+    let mut decoder = JpegDecoder::new_with_options(reader, options);
+    let region = DecodeRegion {
+        x: x as usize,
+        y: y as usize,
+        width: w as usize,
+        height: h as usize,
     };
-    if ok != 0 {
-        Ok((rgb, w, h))
-    } else {
-        Err(OpenSlideError::Decode(format!(
-            "JPEG RGB crop decode failed: {}",
-            jpeg_crop_error_message(&err)
-        )))
+    decoder
+        .decode_region(region, RegionDecodeMode::BestEffort)
+        .map_err(|e| OpenSlideError::Decode(format!("{context}: {e}")))
+}
+
+fn decode_split_jpeg_rgb(
+    header: &[u8],
+    data: &[u8],
+    sof_offset: u64,
+    tile_w: u32,
+    tile_h: u32,
+    scale_denom: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let width = u16::try_from(tile_w)
+        .map_err(|_| OpenSlideError::Decode("JPEG range width does not fit u16".into()))?;
+    let height = u16::try_from(tile_h)
+        .map_err(|_| OpenSlideError::Decode("JPEG range height does not fit u16".into()))?;
+    let sof_offset = usize::try_from(sof_offset)
+        .map_err(|_| OpenSlideError::Decode("JPEG SOF offset does not fit usize".into()))?;
+
+    let mut assembled =
+        Vec::with_capacity(header.len().saturating_add(data.len()).saturating_add(2));
+    assemble_split_jpeg(
+        header,
+        data,
+        sof_offset,
+        JpegDimensions { width, height },
+        &mut assembled,
+    )
+    .map_err(|e| OpenSlideError::Decode(format!("JPEG range assembly failed: {e}")))?;
+
+    let scale = jpeg_scale_from_denom(scale_denom)?;
+    let options = DecoderOptions::new_fast()
+        .jpeg_set_out_colorspace(ColorSpace::RGB)
+        .jpeg_set_scale(scale);
+    let reader = BufReader::new(Cursor::new(&assembled));
+    let mut decoder = JpegDecoder::new_with_options(reader, options);
+    let rgb = decoder
+        .decode()
+        .map_err(|e| OpenSlideError::Decode(format!("JPEG range RGB decode failed: {e}")))?;
+    let denom = scale.denominator() as u32;
+    let out_w = tile_w.div_ceil(denom).max(1);
+    let out_h = tile_h.div_ceil(denom).max(1);
+    Ok((rgb, out_w, out_h))
+}
+
+fn jpeg_scale_from_denom(scale_denom: u32) -> Result<JpegScale> {
+    match scale_denom.max(1) {
+        1 => Ok(JpegScale::Full),
+        2 => Ok(JpegScale::Half),
+        4 => Ok(JpegScale::Quarter),
+        8 => Ok(JpegScale::Eighth),
+        other => Err(OpenSlideError::InvalidArgument(format!(
+            "unsupported JPEG scale denominator {other}"
+        ))),
     }
+}
+
+fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(bgra.len() / 4 * 3);
+    for pixel in bgra.chunks_exact(4) {
+        rgb.push(pixel[2]);
+        rgb.push(pixel[1]);
+        rgb.push(pixel[0]);
+    }
+    rgb
+}
+
+fn rgb_region_to_gray(rgb: Vec<u8>, width: u32, height: u32, channel: u32) -> GrayImage {
+    let mut data = Vec::with_capacity(width as usize * height as usize);
+    for pixel in rgb.chunks_exact(3) {
+        data.push(pixel[channel as usize]);
+    }
+    GrayImage {
+        width,
+        height,
+        data,
+    }
+}
+
+fn read_file_to_end_from_offset(path: &Path, offset: u64) -> Result<Vec<u8>> {
+    let mut file = crate::util::_openslide_fopen(path)?;
+    let file_len = u64::try_from(crate::util::_openslide_fsize(&mut file)?).map_err(|_| {
+        crate::error::OpenSlideError::Format(format!("Negative file size for {}", path.display()))
+    })?;
+    let len = file_len.checked_sub(offset).ok_or_else(|| {
+        crate::error::OpenSlideError::Format(format!(
+            "Decode offset extends outside file: offset={}, file_len={}",
+            offset, file_len
+        ))
+    })?;
+    crate::util::read_file_range(path, offset, len)
 }
 
 pub fn decode_jpeg_bgra_rgb_region(
@@ -432,39 +394,21 @@ pub fn decode_jpeg_file_range_rgb(
     tile_h: u32,
     scale_denom: u32,
 ) -> Result<(Vec<u8>, u32, u32)> {
-    let out_w = (tile_w / scale_denom.max(1)).max(1);
-    let out_h = (tile_h / scale_denom.max(1)).max(1);
-    let mut rgb = vec![0; out_w as usize * out_h as usize * 3];
-    let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
-        OpenSlideError::InvalidArgument("JPEG path contains an interior NUL byte".into())
-    })?;
-    let mut err = vec![0i8; 512];
-    let ok = unsafe {
-        osr_jpeg_file_range_rgb(
-            path.as_ptr(),
-            header_start,
-            sof_position,
-            header_stop,
-            data_start,
-            data_stop,
-            tile_w,
-            tile_h,
-            scale_denom.max(1),
-            out_w,
-            out_h,
-            rgb.as_mut_ptr(),
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
-    if ok != 0 {
-        Ok((rgb, out_w, out_h))
-    } else {
-        Err(OpenSlideError::Decode(format!(
-            "JPEG range RGB decode failed: {}",
-            jpeg_crop_error_message(&err)
-        )))
+    if header_start > header_stop || header_stop > data_start || data_start > data_stop {
+        return Err(OpenSlideError::Decode("invalid JPEG range offsets".into()));
     }
+    let header = crate::util::read_file_range(path, header_start, header_stop - header_start)?;
+    let data = crate::util::read_file_range(path, data_start, data_stop - data_start)?;
+    decode_split_jpeg_rgb(
+        &header,
+        &data,
+        sof_position
+            .checked_sub(header_start)
+            .ok_or_else(|| OpenSlideError::Decode("JPEG SOF is outside header range".into()))?,
+        tile_w,
+        tile_h,
+        scale_denom,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -480,69 +424,30 @@ pub(crate) fn decode_jpeg_open_file_range_rgb(
     tile_h: u32,
     scale_denom: u32,
 ) -> Result<(Vec<u8>, u32, u32)> {
-    let out_w = (tile_w / scale_denom.max(1)).max(1);
-    let out_h = (tile_h / scale_denom.max(1)).max(1);
     if header_start > header_stop || header_stop > data_start || data_start > data_stop {
         return Err(OpenSlideError::Decode("invalid JPEG range offsets".into()));
     }
     let header_len = header_stop - header_start;
     let data_len = data_stop - data_start;
-    let total_len = header_len
-        .checked_add(data_len)
-        .ok_or_else(|| OpenSlideError::Decode("JPEG range is too large".into()))?;
-    let total_len_usize = usize::try_from(total_len)
-        .map_err(|_| OpenSlideError::Decode("JPEG range is too large".into()))?;
     let header_len_usize = usize::try_from(header_len)
         .map_err(|_| OpenSlideError::Decode("JPEG range is too large".into()))?;
+    let data_len_usize = usize::try_from(data_len)
+        .map_err(|_| OpenSlideError::Decode("JPEG range is too large".into()))?;
 
-    let mut buffer = vec![0; total_len_usize];
-    crate::util::read_file_range_into_from_open_file(
-        file,
-        file_len,
-        header_start,
-        &mut buffer[..header_len_usize],
-    )?;
-    crate::util::read_file_range_into_from_open_file(
-        file,
-        file_len,
-        data_start,
-        &mut buffer[header_len_usize..],
-    )?;
+    let mut header = vec![0; header_len_usize];
+    let mut data = vec![0; data_len_usize];
+    crate::util::read_file_range_into_from_open_file(file, file_len, header_start, &mut header)?;
+    crate::util::read_file_range_into_from_open_file(file, file_len, data_start, &mut data)?;
 
     let sof_offset = sof_position
         .checked_sub(header_start)
         .ok_or_else(|| OpenSlideError::Decode("JPEG SOF is outside header range".into()))?;
-    if sof_offset >= header_len || header_len_usize > buffer.len() {
+    if sof_offset >= header_len {
         return Err(OpenSlideError::Decode(
             "JPEG SOF is outside header range".into(),
         ));
     }
-
-    let mut rgb = vec![0; out_w as usize * out_h as usize * 3];
-    let mut err = vec![0i8; 512];
-    let ok = unsafe {
-        osr_jpeg_memory_range_rgb(
-            buffer.as_mut_ptr(),
-            buffer.len(),
-            sof_offset,
-            tile_w,
-            tile_h,
-            scale_denom.max(1),
-            out_w,
-            out_h,
-            rgb.as_mut_ptr(),
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
-    if ok != 0 {
-        Ok((rgb, out_w, out_h))
-    } else {
-        Err(OpenSlideError::Decode(format!(
-            "JPEG range RGB decode failed: {}",
-            jpeg_crop_error_message(&err)
-        )))
-    }
+    decode_split_jpeg_rgb(&header, &data, sof_offset, tile_w, tile_h, scale_denom)
 }
 
 /// Decode JPEG data and extract a single RGB channel as a grayscale image.
@@ -586,46 +491,19 @@ pub fn decode_jpeg_channel_region(
             channel
         )));
     }
-    let mut out = GrayImage::new(w, h);
     if w == 0 || h == 0 {
-        return Ok(out);
+        return Ok(GrayImage::new(w, h));
     }
-
-    let mut err = vec![0i8; 512];
-    let ok = unsafe {
-        osr_jpeg_crop_channel(
-            data.as_ptr(),
-            data.len(),
-            channel,
-            x,
-            y,
-            w,
-            h,
-            out.data.as_mut_ptr(),
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
-    if ok != 0 {
-        return Ok(out);
-    }
-
-    let nul = err.iter().position(|&byte| byte == 0).unwrap_or(err.len());
-    let message = String::from_utf8_lossy(
-        &err[..nul]
-            .iter()
-            .map(|&byte| byte as u8)
-            .collect::<Vec<_>>(),
-    )
-    .into_owned();
-    Err(OpenSlideError::Decode(format!(
-        "JPEG crop decode failed: {}",
-        if message.is_empty() {
-            "unknown libjpeg error"
-        } else {
-            &message
-        }
-    )))
+    let rgb = decode_jpeg_region_with_options(
+        data,
+        x,
+        y,
+        w,
+        h,
+        DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::RGB),
+        "JPEG crop decode failed",
+    )?;
+    Ok(rgb_region_to_gray(rgb, w, h, channel))
 }
 
 pub fn decode_jpeg_channel_region_from_file(
@@ -643,37 +521,11 @@ pub fn decode_jpeg_channel_region_from_file(
             channel
         )));
     }
-    let mut out = GrayImage::new(w, h);
     if w == 0 || h == 0 {
-        return Ok(out);
+        return Ok(GrayImage::new(w, h));
     }
-
-    let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
-        OpenSlideError::InvalidArgument("JPEG path contains an interior NUL byte".into())
-    })?;
-    let mut err = vec![0i8; 512];
-    let ok = unsafe {
-        osr_jpeg_file_crop_channel(
-            path.as_ptr(),
-            offset,
-            channel,
-            x,
-            y,
-            w,
-            h,
-            out.data.as_mut_ptr(),
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
-    if ok != 0 {
-        return Ok(out);
-    }
-
-    Err(OpenSlideError::Decode(format!(
-        "JPEG file crop decode failed: {}",
-        jpeg_crop_error_message(&err)
-    )))
+    let data = read_file_to_end_from_offset(path, offset)?;
+    decode_jpeg_channel_region(&data, channel, x, y, w, h)
 }
 
 pub fn decode_jpeg_rgb_region_from_file(
@@ -684,36 +536,11 @@ pub fn decode_jpeg_rgb_region_from_file(
     w: u32,
     h: u32,
 ) -> Result<(Vec<u8>, u32, u32)> {
-    let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
-        OpenSlideError::InvalidArgument("JPEG path contains an interior NUL byte".into())
-    })?;
-    let mut rgb = vec![0; w as usize * h as usize * 3];
     if w == 0 || h == 0 {
-        return Ok((rgb, w, h));
+        return Ok((Vec::new(), w, h));
     }
-
-    let mut err = vec![0i8; 512];
-    let ok = unsafe {
-        osr_jpeg_file_crop_rgb(
-            path.as_ptr(),
-            offset,
-            x,
-            y,
-            w,
-            h,
-            rgb.as_mut_ptr(),
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
-    if ok != 0 {
-        Ok((rgb, w, h))
-    } else {
-        Err(OpenSlideError::Decode(format!(
-            "JPEG file RGB crop decode failed: {}",
-            jpeg_crop_error_message(&err)
-        )))
-    }
+    let data = read_file_to_end_from_offset(path, offset)?;
+    decode_jpeg_rgb_region(&data, x, y, w, h)
 }
 
 pub fn decode_jpeg_sampled_rgb_region_from_file(
@@ -993,8 +820,9 @@ mod tests {
         let cropped = lossless_crop_jpeg(&jpeg, 16, 0, 16, 16).unwrap();
         assert_eq!(decode_jpeg_dimensions(&cropped).unwrap(), (16, 16));
 
-        let (expected, expected_w, expected_h) =
-            decode_jpeg_rgb_region(&jpeg, 16, 0, 16, 16).unwrap();
+        let (full, full_w, _) = decode_jpeg_rgb_libjpeg(&jpeg).unwrap();
+        let expected = crop_rgb(&full, full_w, 16, 0, 16, 16);
+        let (expected_w, expected_h) = (16, 16);
         let (actual, actual_w, actual_h) = decode_jpeg_rgb_libjpeg(&cropped).unwrap();
         assert_eq!((actual_w, actual_h), (expected_w, expected_h));
         assert_eq!(actual, expected);
@@ -1005,6 +833,17 @@ mod tests {
         let (jpeg, _) = generated_multimcu_jpeg();
         let err = lossless_crop_jpeg(&jpeg, 1, 0, 16, 16).unwrap_err();
         assert!(format!("{err}").contains("MCU-aligned"));
+    }
+
+    fn crop_rgb(rgb: &[u8], width: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
+        let mut out = vec![0; w as usize * h as usize * 3];
+        for row in 0..h {
+            let src = ((y + row) as usize * width as usize + x as usize) * 3;
+            let dst = row as usize * w as usize * 3;
+            let len = w as usize * 3;
+            out[dst..dst + len].copy_from_slice(&rgb[src..src + len]);
+        }
+        out
     }
 
     fn jpeg_range_positions(data: &[u8]) -> (u64, u64) {
