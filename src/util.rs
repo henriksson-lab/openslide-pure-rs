@@ -1032,7 +1032,13 @@ mod tests {
         fs::create_dir(&dir_path).unwrap();
 
         let file_name = OsString::from_vec(b"slide-\xff.dcm".to_vec());
-        fs::write(dir_path.join(&file_name), b"d").unwrap();
+        if let Err(err) = fs::write(dir_path.join(&file_name), b"d") {
+            fs::remove_dir(dir_path).unwrap();
+            if matches!(err.raw_os_error(), Some(84 | 92)) {
+                return;
+            }
+            panic!("failed to create non-UTF8 filename: {err}");
+        }
 
         let mut dir = _openslide_dir_open(&dir_path).unwrap();
         let mut names = HashSet::new();

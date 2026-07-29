@@ -6085,6 +6085,9 @@ mod tests {
         fs::write(&level0, ngr_image(4, 2, 2, &[1, 2, 3])).unwrap();
         fs::write(&level1, ngr_image(2, 1, 1, &[4, 5, 6])).unwrap();
         fs::write(&label, [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+        if dir.join("LEVEL0.L0").exists() || dir.join("LABEL.JPG").exists() {
+            return;
+        }
         fs::write(
             &vmu,
             "[Uncompressed Virtual Microscope Specimen]\nImageFile=LEVEL0.L0\nMapFile=level1.l1\nBitsPerPixel=36\nPixelOrder=RGB\nLabelImage=LABEL.JPG\n",

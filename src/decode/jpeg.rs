@@ -1,5 +1,5 @@
 use std::io::{BufReader, Cursor, Seek, SeekFrom};
-#[cfg(feature = "native-jpeg")]
+#[cfg(all(test, feature = "native-jpeg"))]
 use std::os::raw::{c_char, c_int, c_uchar, c_uint, c_ulong};
 use std::path::Path;
 
@@ -12,8 +12,9 @@ use zune_jpeg::{
     DecodeRegion, JpegDecoder, JpegDimensions, RegionDecodeMode,
 };
 
-#[cfg(feature = "native-jpeg")]
+#[cfg(all(test, feature = "native-jpeg"))]
 extern "C" {
+    #[cfg(test)]
     fn osr_jpeg_lossless_crop(
         data: *const c_uchar,
         len: usize,
@@ -37,6 +38,7 @@ extern "C" {
         err: *mut c_char,
         err_len: usize,
     ) -> c_int;
+    #[cfg(test)]
     fn osr_jpeg_free_buffer(buffer: *mut c_uchar);
 }
 
@@ -672,6 +674,7 @@ pub(crate) fn lossless_crop_jpeg(data: &[u8], x: u32, y: u32, w: u32, h: u32) ->
 
 /// Produce a standalone JPEG crop using libjpeg's coefficient-domain
 /// transcoding path for optional oracle tests.
+#[cfg(test)]
 #[cfg(feature = "native-jpeg")]
 fn lossless_crop_jpeg_native(data: &[u8], x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
     let mut out = std::ptr::null_mut();
@@ -751,6 +754,7 @@ fn encode_test_jpeg_rgb(rgb: &[u8], width: u32, height: u32, quality: u32) -> Re
     Ok(bytes)
 }
 
+#[cfg(test)]
 #[cfg(feature = "native-jpeg")]
 fn jpeg_crop_error_message(err: &[i8]) -> String {
     let nul = err.iter().position(|&byte| byte == 0).unwrap_or(err.len());

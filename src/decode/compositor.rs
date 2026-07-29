@@ -762,7 +762,7 @@ mod tests {
             1, 2, 3, 4, 5, 6, 7, 8, 9, //
             10, 11, 12, 13, 14, 15, 16, 17, 18,
         ];
-        let mut dst = vec![0; 2 * 1 * 4];
+        let mut dst = vec![0; 8];
         let mut op = blit(&src, 3, 2);
         op.src_x = 1.0;
         op.src_y = 1.0;
@@ -777,7 +777,7 @@ mod tests {
     #[test]
     fn channel_mapping_and_valid_area_control_alpha() {
         let src = [1, 2, 3, 4, 5, 6];
-        let mut dst = vec![9; 2 * 1 * 4];
+        let mut dst = vec![9; 8];
         let mut op = blit(&src, 2, 1);
         op.valid_width = 1;
         op.channels = [Some(2), Some(1), Some(0), None];
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn clipped_destination_preserves_pixels_outside_clip() {
         let src = [10, 20, 30, 40, 50, 60];
-        let mut dst = vec![7; 3 * 1 * 4];
+        let mut dst = vec![7; 12];
         let mut op = blit(&src, 2, 1);
         op.dst_x = 1.0;
 
@@ -802,7 +802,7 @@ mod tests {
     #[test]
     fn batch_matches_repeated_clipped_blits() {
         let src = [1, 2, 3, 4, 5, 6];
-        let mut repeated = vec![0; 4 * 1 * 4];
+        let mut repeated = vec![0; 16];
         let mut first = blit(&src, 2, 1);
         first.dst_x = 0.0;
         blit_rgb_to_rgba_clipped_dst(&mut repeated, 4, 1, first).unwrap();
@@ -810,7 +810,7 @@ mod tests {
         second.dst_x = 2.0;
         blit_rgb_to_rgba_clipped_dst(&mut repeated, 4, 1, second).unwrap();
 
-        let mut batched = vec![0; 4 * 1 * 4];
+        let mut batched = vec![0; 16];
         blit_rgb_to_rgba_many_same_src(
             &mut batched,
             4,
