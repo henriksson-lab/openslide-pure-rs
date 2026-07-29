@@ -760,7 +760,7 @@ impl SlideBackend for AperioSlide {
 
             let mut file = crate::util::_openslide_fopen(&self.path)?;
             for ((col, row, _, _, _), (dst_x, dst_y, tile)) in
-                tile_jobs.into_iter().zip(decoded_tiles.into_iter())
+                tile_jobs.into_iter().zip(decoded_tiles)
             {
                 if let Some(tile) = tile {
                     cairo_blit_rgb_rgba(&tile, channels, &mut output, dst_x, dst_y)?;

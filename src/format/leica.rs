@@ -1503,7 +1503,9 @@ fn finish_image(image: &mut Image) -> Result<()> {
         }
         dimension.nm_per_pixel = image.nm_across as f64 / dimension.width as f64;
     }
-    image.dimensions.sort_by(|a, b| b.width.cmp(&a.width));
+    image
+        .dimensions
+        .sort_by_key(|dimension| std::cmp::Reverse(dimension.width));
     Ok(())
 }
 

@@ -234,8 +234,7 @@ fn get_nonhier_val_offset(
         return Ok((-1, None));
     }
 
-    let mut offset = base_offset;
-    for i in 0..name_count {
+    for (offset, i) in (base_offset..).zip(0..name_count) {
         let key = format!("NONHIER_{}_VAL_{}", name_index, i);
         let value = get_value(ini, "HIERARCHICAL", &key)?;
 
@@ -244,7 +243,6 @@ fn get_nonhier_val_offset(
             let section = ini.get("HIERARCHICAL", &section_key);
             return Ok((offset, section));
         }
-        offset += 1;
     }
     Ok((-1, None))
 }

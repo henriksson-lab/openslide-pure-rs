@@ -2804,10 +2804,7 @@ fn read_dataset_from_reader(
     let mut pixel_data_bytes = None;
     let mut frame_metadata = Vec::new();
     let mut standard_optical_metadata = StandardOpticalMetadata::default();
-    loop {
-        let Some(header) = read_element_header(file, explicit_vr, endian)? else {
-            break;
-        };
+    while let Some(header) = read_element_header(file, explicit_vr, endian)? {
         if header.tag == TAG_PIXEL_DATA {
             pixel_data = Some(PixelDataLocation {
                 offset: header.value_offset,
