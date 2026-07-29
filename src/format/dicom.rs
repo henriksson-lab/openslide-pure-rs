@@ -5178,7 +5178,7 @@ mod tests {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static TEST_SERIES_UID_COUNTER: AtomicU64 = AtomicU64::new(1);
+    static TEST_UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn dicom_sibling_paths_use_translated_dir_helpers_and_sort_by_name() {
@@ -5664,7 +5664,7 @@ mod tests {
     fn discovers_same_series_associated_dicom_images() {
         let path = test_path("discovers_same_series_associated_dicom_images_volume.dcm");
         let label_path = test_path("discovers_same_series_associated_dicom_images_label.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.543.{}", std::process::id());
+        let series_uid = test_series_uid(543);
 
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
@@ -5729,7 +5729,7 @@ mod tests {
         let path = test_path("ignores_duplicate_same_series_associated_volume.dcm");
         let label_a_path = test_path("ignores_duplicate_same_series_associated_label_a.dcm");
         let label_b_path = test_path("ignores_duplicate_same_series_associated_label_b.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.574.{}", std::process::id());
+        let series_uid = test_series_uid(574);
         let sop_uid = format!("{series_uid}.label");
 
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
@@ -5760,7 +5760,7 @@ mod tests {
     fn rejects_same_series_associated_dicom_without_total_matrix_dimensions_like_upstream() {
         let path = test_path("rejects_associated_without_total_matrix_volume.dcm");
         let label_path = test_path("rejects_associated_without_total_matrix_label.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.584.{}", std::process::id());
+        let series_uid = test_series_uid(584);
 
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
@@ -5849,7 +5849,7 @@ mod tests {
     fn opening_same_series_associated_dicom_uses_pyramid_level_like_upstream() {
         let path = test_path("opens_associated_entry_via_same_series_volume.dcm");
         let label_path = test_path("opens_associated_entry_via_same_series_label.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.576.{}", std::process::id());
+        let series_uid = test_series_uid(576);
 
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
@@ -5886,7 +5886,7 @@ mod tests {
         let path = test_path("rejects_duplicate_same_series_associated_volume.dcm");
         let label_a_path = test_path("rejects_duplicate_same_series_associated_label_a.dcm");
         let label_b_path = test_path("rejects_duplicate_same_series_associated_label_b.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.575.{}", std::process::id());
+        let series_uid = test_series_uid(575);
 
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 1, 1, 1, 1, 1, "RGB");
@@ -5924,7 +5924,7 @@ mod tests {
     fn discovers_same_series_pyramid_dicom_levels() {
         let path = test_path("discovers_same_series_pyramid_dicom_levels_base.dcm");
         let level1_path = test_path("discovers_same_series_pyramid_dicom_levels_low.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.546.{}", std::process::id());
+        let series_uid = test_series_uid(546);
 
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 1, 2, 1, 1, "RGB");
@@ -5982,7 +5982,7 @@ mod tests {
         let path = test_path("ignores_duplicate_same_series_pyramid_level_base.dcm");
         let level1_a_path = test_path("ignores_duplicate_same_series_pyramid_level_low_a.dcm");
         let level1_b_path = test_path("ignores_duplicate_same_series_pyramid_level_low_b.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.586.{}", std::process::id());
+        let series_uid = test_series_uid(586);
         let sop_uid = format!("{series_uid}.low");
 
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
@@ -6037,7 +6037,7 @@ mod tests {
         let path = test_path("rejects_duplicate_same_series_pyramid_level_base.dcm");
         let level1_a_path = test_path("rejects_duplicate_same_series_pyramid_level_low_a.dcm");
         let level1_b_path = test_path("rejects_duplicate_same_series_pyramid_level_low_b.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.587.{}", std::process::id());
+        let series_uid = test_series_uid(587);
 
         let mut data = dicom_preamble(TS_EXPLICIT_VR_LE);
         write_common_wsi_dataset(&mut data, TS_EXPLICIT_VR_LE, 2, 1, 2, 1, 1, "RGB");
@@ -6408,7 +6408,7 @@ mod tests {
     fn reads_native_multi_file_concatenation() {
         let path = test_path("reads_native_multi_file_concatenation_part1.dcm");
         let part2_path = test_path("reads_native_multi_file_concatenation_part2.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.547.{}", std::process::id());
+        let series_uid = test_series_uid(547);
         let concatenation_uid = format!("1.2.826.0.1.3680043.10.548.{}", std::process::id());
 
         for (file_path, in_number, pixel) in [(&path, 1u16, [1, 2, 3]), (&part2_path, 2, [4, 5, 6])]
@@ -6490,7 +6490,7 @@ mod tests {
     fn uses_concatenation_frame_offset_number_for_native_frames() {
         let path = test_path("uses_concatenation_frame_offset_number_part1.dcm");
         let part2_path = test_path("uses_concatenation_frame_offset_number_part2.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.551.{}", std::process::id());
+        let series_uid = test_series_uid(551);
         let concatenation_uid = format!("1.2.826.0.1.3680043.10.552.{}", std::process::id());
 
         for (file_path, in_number, frame_offset, pixel) in [
@@ -6550,7 +6550,7 @@ mod tests {
     fn merges_concatenation_per_frame_positions() {
         let path = test_path("merges_concatenation_per_frame_positions_part1.dcm");
         let part2_path = test_path("merges_concatenation_per_frame_positions_part2.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.548.{}", std::process::id());
+        let series_uid = test_series_uid(548);
         let concatenation_uid = format!("1.2.826.0.1.3680043.10.549.{}", std::process::id());
 
         for (file_path, in_number, position, pixel) in [
@@ -6607,7 +6607,7 @@ mod tests {
 
         let path = test_path("rejects_deflated_multi_file_concatenation_part1.dcm");
         let part2_path = test_path("rejects_deflated_multi_file_concatenation_part2.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.549.{}", std::process::id());
+        let series_uid = test_series_uid(549);
         let concatenation_uid = format!("1.2.826.0.1.3680043.10.550.{}", std::process::id());
 
         for (file_path, in_number, pixel) in
@@ -6660,7 +6660,7 @@ mod tests {
     fn assembles_encapsulated_multi_file_concatenation_frame_table() {
         let path = test_path("assembles_encapsulated_multi_file_concatenation_part1.dcm");
         let part2_path = test_path("assembles_encapsulated_multi_file_concatenation_part2.dcm");
-        let series_uid = format!("1.2.826.0.1.3680043.10.549.{}", std::process::id());
+        let series_uid = test_series_uid(549);
         let concatenation_uid = format!("1.2.826.0.1.3680043.10.550.{}", std::process::id());
 
         for (file_path, in_number, payload) in [
@@ -8750,7 +8750,21 @@ mod tests {
     }
 
     fn test_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("openslide_rs_{name}_{}", std::process::id()))
+        let unique = TEST_UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "openslide_rs_{name}_{}_{}",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    fn test_series_uid(case_id: u32) -> String {
+        let unique = TEST_UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "1.2.826.0.1.3680043.10.{case_id}.{}.{}",
+            std::process::id(),
+            unique
+        )
     }
 
     fn dicom_preamble(transfer_syntax: &str) -> Vec<u8> {
@@ -9009,11 +9023,7 @@ mod tests {
             pixel_representation,
             planar_configuration,
         );
-        let uid = format!(
-            "1.2.826.0.1.3680043.10.1.{}.{}",
-            std::process::id(),
-            TEST_SERIES_UID_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
+        let uid = test_series_uid(1);
         write_explicit_element(data, TAG_SERIES_INSTANCE_UID, b"UI", uid.as_bytes());
     }
 

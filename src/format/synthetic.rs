@@ -1510,13 +1510,10 @@ const SYNTHETIC_ITEMS: &[SyntheticItem] = &[
 mod tests {
     use super::*;
     use crate::OpenSlide;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn synthetic_requires_empty_path_and_debug_flag() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::debug::openslide_debug_env_lock();
         let old = std::env::var("OPENSLIDE_DEBUG").ok();
         std::env::remove_var("OPENSLIDE_DEBUG");
         assert!(!detect(Path::new("")));
@@ -1528,7 +1525,7 @@ mod tests {
 
     #[test]
     fn opens_synthetic_debug_slide() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::debug::openslide_debug_env_lock();
         let old = std::env::var("OPENSLIDE_DEBUG").ok();
         std::env::set_var("OPENSLIDE_DEBUG", "synthetic");
         let slide = OpenSlide::open("").unwrap();

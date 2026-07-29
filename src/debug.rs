@@ -131,14 +131,16 @@ pub(crate) fn _openslide_performance_warn_once_with(
 }
 
 #[cfg(test)]
+pub(crate) fn openslide_debug_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
 
     const UPSTREAM_OPENSLIDE_DEBUG_OPTIONS: &[(&str, OpenSlideDebugFlag, &str)] = &[
         (
@@ -198,7 +200,7 @@ mod tests {
 
     #[test]
     fn performance_warn_once_matches_openslide_debug_gate_and_atomic_guard() {
-        let _guard = env_lock();
+        let _guard = openslide_debug_env_lock();
         let old = std::env::var(OPENSLIDE_DEBUG_ENV_VAR).ok();
         std::env::set_var(OPENSLIDE_DEBUG_ENV_VAR, "performance");
         let warned = AtomicI32::new(0);
@@ -230,7 +232,7 @@ mod tests {
 
     #[test]
     fn performance_warn_once_suppressed_without_performance_debug_flag() {
-        let _guard = env_lock();
+        let _guard = openslide_debug_env_lock();
         let old = std::env::var(OPENSLIDE_DEBUG_ENV_VAR).ok();
         std::env::set_var(OPENSLIDE_DEBUG_ENV_VAR, "decoding");
         let warned = AtomicI32::new(0);

@@ -125,12 +125,6 @@ impl Default for TileCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex as StdMutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap()
-    }
 
     fn make_tile(w: u32, h: u32) -> CachedTile {
         CachedTile {
@@ -210,7 +204,7 @@ mod tests {
 
     #[test]
     fn overlarge_cache_entry_warns_once_like_openslide() {
-        let _guard = env_lock();
+        let _guard = crate::debug::openslide_debug_env_lock();
         let old = std::env::var(crate::debug::OPENSLIDE_DEBUG_ENV_VAR).ok();
         std::env::set_var(crate::debug::OPENSLIDE_DEBUG_ENV_VAR, "performance");
         let cache = TileCache::with_capacity(2);
