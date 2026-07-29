@@ -151,13 +151,13 @@
     {
       "fixture": "ventana-local-os-1",
       "reader": "ventana",
-      "status": "exact",
-      "rust_read_s": 0.179328,
-      "rust_rss_kib": 56836,
-      "reference_read_s": 0.188814,
-      "reference_rss_kib": 89392,
-      "speed_vs_reference": 1.05,
-      "rss_vs_reference": 0.64
+      "status": "known-drift",
+      "rust_read_s": 0.338834,
+      "rust_rss_kib": 54632,
+      "reference_read_s": 0.381548,
+      "reference_rss_kib": 89400,
+      "speed_vs_reference": 1.13,
+      "rss_vs_reference": 0.61
     },
     {
       "fixture": "ventana-local-os-2",
@@ -202,46 +202,46 @@
     {
       "fixture": "generic-tiff-public-cmu-1",
       "reader": "generic-tiff",
-      "status": "exact",
-      "rust_read_s": 0.021107,
-      "rust_rss_kib": 10880,
-      "reference_read_s": 0.04514,
-      "reference_rss_kib": 33892,
-      "speed_vs_reference": 2.14,
-      "rss_vs_reference": 0.32
+      "status": "known-drift",
+      "rust_read_s": 0.027844,
+      "rust_rss_kib": 8320,
+      "reference_read_s": 0.107404,
+      "reference_rss_kib": 34236,
+      "speed_vs_reference": 3.86,
+      "rss_vs_reference": 0.24
     },
     {
       "fixture": "aperio-public-cmu-1-small-region",
       "reader": "aperio",
-      "status": "exact",
-      "rust_read_s": 0.003545,
-      "rust_rss_kib": 7680,
-      "reference_read_s": 0.004874,
-      "reference_rss_kib": 30928,
-      "speed_vs_reference": 1.37,
-      "rss_vs_reference": 0.25
+      "status": "known-drift",
+      "rust_read_s": 0.002486,
+      "rust_rss_kib": 5760,
+      "reference_read_s": 0.011369,
+      "reference_rss_kib": 30960,
+      "speed_vs_reference": 4.57,
+      "rss_vs_reference": 0.19
     },
     {
       "fixture": "mirax-public-cmu-1-saved-1-16",
       "reader": "mirax",
-      "status": "exact",
-      "rust_read_s": 0.006637,
-      "rust_rss_kib": 20424,
-      "reference_read_s": 0.023115,
-      "reference_rss_kib": 32960,
-      "speed_vs_reference": 3.48,
-      "rss_vs_reference": 0.62
+      "status": "known-drift",
+      "rust_read_s": 0.00979,
+      "rust_rss_kib": 18984,
+      "reference_read_s": 0.055555,
+      "reference_rss_kib": 33280,
+      "speed_vs_reference": 5.67,
+      "rss_vs_reference": 0.57
     },
     {
       "fixture": "mirax-public-fluorescence-2",
       "reader": "mirax",
-      "status": "exact",
-      "rust_read_s": 0.001197,
-      "rust_rss_kib": 11576,
-      "reference_read_s": 0.028447,
-      "reference_rss_kib": 31332,
-      "speed_vs_reference": 23.77,
-      "rss_vs_reference": 0.37
+      "status": "known-drift",
+      "rust_read_s": 0.002011,
+      "rust_rss_kib": 10748,
+      "reference_read_s": 0.070875,
+      "reference_rss_kib": 31344,
+      "speed_vs_reference": 35.24,
+      "rss_vs_reference": 0.34
     },
     {
       "fixture": "philips-public-philips-1",
@@ -257,13 +257,13 @@
     {
       "fixture": "trestle-public-cmu-1",
       "reader": "trestle",
-      "status": "exact",
-      "rust_read_s": 0.03407,
-      "rust_rss_kib": 23680,
-      "reference_read_s": 0.042403,
-      "reference_rss_kib": 40320,
-      "speed_vs_reference": 1.24,
-      "rss_vs_reference": 0.59
+      "status": "known-drift",
+      "rust_read_s": 0.054048,
+      "rust_rss_kib": 21760,
+      "reference_read_s": 0.095293,
+      "reference_rss_kib": 40640,
+      "speed_vs_reference": 1.76,
+      "rss_vs_reference": 0.54
     },
     {
       "fixture": "zeiss-public-jxr-and-zstd",

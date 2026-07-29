@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::os::raw::{c_char, c_int, c_uint};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,6 +8,7 @@ use flate2::read::{DeflateDecoder, ZlibDecoder};
 
 use crate::cache::{CachedTile, TileCache};
 use crate::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
+use crate::decode::compositor::{RgbBatchBlit, RgbBlit};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff, SlideBackend};
@@ -17,55 +17,6 @@ use crate::properties;
 use crate::util::_openslide_format_double as format_float;
 use crate::util::unescape_xml_entities as xml_unescape;
 use crate::util::{read_file_range, read_file_range_from_open_file};
-
-extern "C" {
-    fn osr_cairo_blit_rgb_to_rgba_clipped_dst(
-        src_rgb: *const u8,
-        src_width: c_uint,
-        src_height: c_uint,
-        valid_width: c_uint,
-        valid_height: c_uint,
-        src_x: f64,
-        src_y: f64,
-        src_w: c_uint,
-        src_h: c_uint,
-        channel_r: c_int,
-        channel_g: c_int,
-        channel_b: c_int,
-        channel_a: c_int,
-        dst_rgba: *mut u8,
-        dst_width: c_uint,
-        dst_height: c_uint,
-        dst_x: f64,
-        dst_y: f64,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-
-    fn osr_cairo_blit_rgb_to_rgba_many_same_src(
-        src_rgb: *const u8,
-        src_width: c_uint,
-        src_height: c_uint,
-        valid_width: c_uint,
-        valid_height: c_uint,
-        src_xs: *const f64,
-        src_ys: *const f64,
-        src_w: c_uint,
-        src_h: c_uint,
-        channel_r: c_int,
-        channel_g: c_int,
-        channel_b: c_int,
-        channel_a: c_int,
-        dst_rgba: *mut u8,
-        dst_width: c_uint,
-        dst_height: c_uint,
-        dst_xs: *const f64,
-        dst_ys: *const f64,
-        count: usize,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-}
 
 const TIFF_MAGIC_CLASSIC: u16 = 42;
 const TIFF_MAGIC_BIG: u16 = 43;
@@ -2474,40 +2425,26 @@ fn cairo_blit_decoded_tile_rgba_channels(
     dst_x: f64,
     dst_y: f64,
 ) -> Result<()> {
-    let channel_arg =
-        |channel: Option<u32>| -> c_int { channel.map(|ch| ch.min(2) as c_int).unwrap_or(-1) };
-    let mut err = [0i8; 256];
-    let ok = unsafe {
-        osr_cairo_blit_rgb_to_rgba_clipped_dst(
-            src.rgb.as_ptr(),
-            src.width,
-            src.height,
+    decode::compositor::blit_rgb_to_rgba_clipped_dst(
+        &mut dst.data,
+        dst.width,
+        dst.height,
+        RgbBlit {
+            src_rgb: &src.rgb,
+            src_width: src.width,
+            src_height: src.height,
             valid_width,
             valid_height,
             src_x,
             src_y,
             src_w,
             src_h,
-            channel_arg(channels[0]),
-            channel_arg(channels[1]),
-            channel_arg(channels[2]),
-            channel_arg(channels[3]),
-            dst.data.as_mut_ptr(),
-            dst.width,
-            dst.height,
+            channels,
             dst_x,
             dst_y,
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
-    if ok == 0 {
-        return Err(OpenSlideError::Decode(format!(
-            "Ventana Cairo tile blit failed: {}",
-            c_error_message(&err)
-        )));
-    }
-    Ok(())
+        },
+    )
+    .map_err(|err| OpenSlideError::Decode(format!("Ventana tile blit failed: {err}")))
 }
 
 fn predecode_bif_tiles_for_ops(
@@ -2626,54 +2563,27 @@ fn try_cairo_blit_single_tile_batch(
     let src_ys = ops.iter().map(|op| op.src_y).collect::<Vec<_>>();
     let dst_xs = ops.iter().map(|op| op.dst_x).collect::<Vec<_>>();
     let dst_ys = ops.iter().map(|op| op.dst_y).collect::<Vec<_>>();
-    let channel_arg =
-        |channel: Option<u32>| -> c_int { channel.map(|ch| ch.min(2) as c_int).unwrap_or(-1) };
-    let mut err = [0i8; 256];
-    let ok = unsafe {
-        osr_cairo_blit_rgb_to_rgba_many_same_src(
-            tile.rgb.as_ptr(),
-            tile.width,
-            tile.height,
-            level.valid_tile_width(ops[0].tile_col),
-            level.valid_tile_height(ops[0].tile_row),
-            src_xs.as_ptr(),
-            src_ys.as_ptr(),
+    decode::compositor::blit_rgb_to_rgba_many_same_src(
+        &mut dst.data,
+        dst.width,
+        dst.height,
+        RgbBatchBlit {
+            src_rgb: &tile.rgb,
+            src_width: tile.width,
+            src_height: tile.height,
+            valid_width: level.valid_tile_width(ops[0].tile_col),
+            valid_height: level.valid_tile_height(ops[0].tile_row),
+            src_xs: &src_xs,
+            src_ys: &src_ys,
             src_w,
             src_h,
-            channel_arg(channels[0]),
-            channel_arg(channels[1]),
-            channel_arg(channels[2]),
-            channel_arg(channels[3]),
-            dst.data.as_mut_ptr(),
-            dst.width,
-            dst.height,
-            dst_xs.as_ptr(),
-            dst_ys.as_ptr(),
-            ops.len(),
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
-    if ok == 0 {
-        return Err(OpenSlideError::Decode(format!(
-            "Ventana Cairo batch tile blit failed: {}",
-            c_error_message(&err)
-        )));
-    }
+            channels,
+            dst_xs: &dst_xs,
+            dst_ys: &dst_ys,
+        },
+    )
+    .map_err(|err| OpenSlideError::Decode(format!("Ventana batch tile blit failed: {err}")))?;
     Ok(true)
-}
-
-fn c_error_message(err: &[i8]) -> String {
-    let bytes: Vec<u8> = err
-        .iter()
-        .take_while(|&&byte| byte != 0)
-        .map(|&byte| byte as u8)
-        .collect();
-    if bytes.is_empty() {
-        "unknown Cairo error".into()
-    } else {
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
 }
 
 fn unpremultiply_rgba(image: &mut RgbaImage) {

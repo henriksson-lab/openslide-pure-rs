@@ -174,6 +174,19 @@ pub(crate) trait BitStream {
     where
         T: ZByteReaderTrait;
 
+    fn decode_mcu_block_raw<T>(
+        &mut self, _reader: &mut ZReader<T>, _dc_table: &mut Self::DCEntropyTable,
+        _ac_table: &mut Self::ACEntropyTable, _block: &mut [i16; 64], _dc_prediction: &mut i32,
+        _last_dc_diff: &mut i32,
+    ) -> Result<u16, DecodeErrors>
+    where
+        T: ZByteReaderTrait,
+    {
+        Err(DecodeErrors::FormatStatic(
+            "Raw coefficient decode is not supported for this bitstream",
+        ))
+    }
+
     fn discard_mcu_block<T>(
         &mut self, reader: &mut ZReader<T>, dc_table: &mut Self::DCEntropyTable,
         ac_table: &mut Self::ACEntropyTable, last_dc_diff: &mut i32,
@@ -766,6 +779,71 @@ impl BitStream for BitStreamHuffman {
         }
 
         return Ok(64);
+    }
+
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    #[inline(never)]
+    fn decode_mcu_block_raw<T>(
+        &mut self, reader: &mut ZReader<T>, dc_table: &mut HuffmanTable,
+        ac_table: &mut HuffmanTable, block: &mut [i16; 64], dc_prediction: &mut i32,
+        _last_dc_diff: &mut i32,
+    ) -> Result<u16, DecodeErrors>
+    where
+        T: ZByteReaderTrait,
+    {
+        let ac_lookup = ac_table.ac_lookup.as_ref().unwrap();
+
+        let (mut symbol, mut r, mut fast_ac);
+        let mut pos: usize = 1;
+        if self.bits_left < 1 && self.marker.is_some() {
+            return Err(DecodeErrors::Format(
+                "No more bytes left in stream before marker".to_string(),
+            ));
+        }
+        self.decode_dc(reader, dc_table, dc_prediction)?;
+        block[0] = *dc_prediction as i16;
+
+        while pos < 64 {
+            self.refill(reader)?;
+            symbol = self.peek_bits::<HUFF_LOOKAHEAD>();
+            fast_ac = ac_lookup[symbol as usize];
+            symbol = ac_table.lookup[symbol as usize];
+
+            if fast_ac != 0 {
+                pos += ((fast_ac >> 4) & 15) as usize;
+                let t_pos = UN_ZIGZAG[min(pos, 63)] & 63;
+
+                block[t_pos] = fast_ac >> 8;
+                self.drop_bits((fast_ac & 15) as u8);
+                pos += 1;
+            } else {
+                decode_huff!(self, symbol, ac_table);
+
+                r = symbol >> 4;
+                symbol &= 15;
+
+                if symbol != 0 {
+                    pos += r as usize;
+                    r = self.get_bits(symbol as u8);
+                    symbol = huff_extend(r, symbol);
+                    let t_pos = UN_ZIGZAG[pos & 63] & 63;
+
+                    block[t_pos] = symbol as i16;
+
+                    pos += 1;
+                } else if r != 15 {
+                    return Ok(pos as u16);
+                } else {
+                    pos += 16;
+                }
+            }
+        }
+
+        Ok(64)
     }
 
     /// Advance the bitstream over a block but ignore the data contained.

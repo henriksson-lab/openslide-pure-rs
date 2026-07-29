@@ -6,6 +6,7 @@ Includes full **Mirax (.mrxs)** support from 3DHISTECH scanners; format reverse 
 trying to [address long-standing problems with this format](https://www.openmicroscopy.org/2016/01/06/format-support.html).
 Fix yet to be contributed upstream (more testing needed)
 
+* 2026-07-29: Pure rust; vendoring modified zune-jpeg until upstream accepts patches
 * 2026-07-13: Support to get raw compressed tile data out. Now tracking openslide 4.0.1
 * 2026-06-07: Audits and performance work
 * 2026-06-03: Audit on real data from https://openslide.cs.cmu.edu/download/openslide-testdata/ ; benchmarking
@@ -59,34 +60,51 @@ Original benchmark baseline: this translation tracks the vendored OpenSlide
 source tree at `v4.0.0-530-g7bebe7ee` (`7bebe7ee2b51`), while
 the installed comparison stack used by the benchmark runner is
 `openslide-python 1.4.3` with `libopenslide 3.4.1`.
+Reference stack: openslide-python 1.4.3 with libopenslide 3.4.1.
+Checked-in benchmark baselines use command
+`scripts/bench-realdata.py --cpu-list 0-3 --region-size 128 --regions-per-level 1`.
+RSS is maximum resident set size from `/usr/bin/time -v`.
 
-Latest captured run: 2026-07-14, Rust commit `a5d05ce`, public OpenSlide
-testdata from `.tmp/public-openslide-extracted` sourced from
-`https://openslide.cs.cmu.edu/download/openslide-testdata/`. Command:
-`python3 scripts/bench-realdata.py --data-dir .tmp/public-openslide-extracted --jobs 1 --runner-profile overnight-2026-07-14 --cpu-list 0-3 --region-size 128 --regions-per-level 1 --repeats 1 --json /tmp/pres_rustification_openslide_bench.json`.
-Aggregate speedup over the 13 exact comparable rows is **9.34x** (original read seconds / Rust read seconds; higher is better). Average RSS ratio is **0.59x** (Rust RSS / original RSS; lower is better). The TSV in the presentation repository keeps all 19 discovered rows, including 3 RGB-checksum mismatch rows and 3 reference-unopenable VSI skips.
+| Reader | Status | Fixture set | Rust read_s / RSS KiB | Original read_s / RSS KiB | Speed vs original | RSS vs original | Notes |
+|---|---|---|---:|---:|---:|---:|---|
+| Aperio | Fixture-verified (SVS subset) | aperio | `0.060252 / 13560; 0.002486 / 5760` | `0.086509 / 33564; 0.011369 / 30960` | 1.44x; 4.57x | 0.40x; 0.19x | |
+| ARGOS | Experimental (reference blocked) | argos | n/a | n/a | n/a | n/a | |
+| DICOM | Experimental (limited exact data) | dicom | `0.000358-0.000471 / 6720-7040` | `0.006836-0.008807 / 32320-34560` | 18-19x | 0.19-0.21x | |
+| Hamamatsu NDPI | Fixture-verified (CMU-1/2/3 subset) | hamamatsu-ndpi | `0.018366 / 11316; 0.017641 / 13616; 0.017522 / 16100; 0.018459 / 11344` | `0.044650 / 36892; 0.047983 / 39020; 0.049154 / 41172; 0.042145 / 36920` | 2.43x; 2.72x; 2.81x; 2.28x | 0.31x; 0.35x; 0.39x; 0.31x | |
+| Hamamatsu VMS | Fixture-verified (CMU-1/2/3 subset) | hamamatsu-vms | `0.028689 / 10168; 0.021541 / 10488; 0.020215 / 11128; 0.026865 / 10164` | `0.054574 / 38080; 0.059653 / 39680; 0.053840 / 41600; 0.053557 / 38080` | 1.90x; 2.77x; 2.66x; 1.99x | 0.27x; 0.26x; 0.27x; 0.27x | |
+| Hamamatsu VMU/NGR | Experimental (no real fixture) | hamamatsu-vmu-ngr | n/a | n/a | n/a | n/a | |
+| Huron | Experimental (reference blocked) | huron | n/a | n/a | n/a | n/a | |
+| Leica | Fixture-verified (SCN subset) | leica | `0.005764 / 8264; 0.029645 / 8576` | `0.017001 / 32320; 0.047260 / 41920` | 2.95x; 1.59x | 0.26x; 0.20x | |
+| MIRAX / 3DHISTECH | Experimental (bounded drift) | mirax | `0.009790 / 18984; 0.002011 / 10748` | `0.055555 / 33280; 0.070875 / 31344` | 5.67x; 35.24x | 0.57x; 0.34x | |
+| Philips | Fixture-verified (Philips-1) | philips | `0.027797 / 14400` | `0.047869 / 38720` | 1.72x | 0.37x | |
+| Sakura | Experimental (no fixture) | sakura | n/a | n/a | n/a | n/a | |
+| Trestle | Fixture-verified (CMU-1) | trestle | `0.038104 / 23360; 0.054048 / 21760` | `0.041948 / 40640; 0.095293 / 40640` | 1.10x; 1.76x | 0.57x; 0.54x | |
+| Ventana | Fixture-verified (BIF AOI subset) | ventana | `0.338834 / 54632; 0.201066 / 67028` | `0.381548 / 89400; 0.231555 / 82968` | 1.13x; 1.15x | 0.61x; 0.81x | |
+| Zeiss CZI | Experimental (reference blocked) | zeiss | n/a | n/a | n/a | n/a | |
+| Generic TIFF | Experimental (bounded drift) | generic-tiff | `0.027844 / 8320` | `0.107404 / 34236` | 3.86x | 0.24x | |
 
-| Slide | Status | Rust read_s / RSS KiB | Original read_s / RSS KiB | Speed vs original | RSS vs original | Notes |
-|---|---|---:|---:|---:|---:|---|
-| `CMU-1.mrxs` | Exact | `0.007957 / 29356` | `0.031743 / 40960` | 3.99x | 0.72x | levels/regions/pixels/rgb_checksum matched |
-| `CMU-1-Exported.mrxs` | Exact | `0.001478 / 18336` | `0.021680 / 42560` | 14.67x | 0.43x | levels/regions/pixels/rgb_checksum matched |
-| `CMU-1-Saved-1_16.mrxs` | Exact | `0.038918 / 20872` | `0.022476 / 32960` | 0.58x | 0.63x | levels/regions/pixels/rgb_checksum matched |
-| `CMU-1-Saved-1_2.mrxs` | Exact | `0.011697 / 23340` | `0.028994 / 35048` | 2.48x | 0.67x | levels/regions/pixels/rgb_checksum matched |
-| `CMU-2.mrxs` | Exact | `0.149258 / 38052` | `0.052805 / 53440` | 0.35x | 0.71x | levels/regions/pixels/rgb_checksum matched |
-| `CMU-3.mrxs` | Exact | `0.004170 / 30360` | `0.029206 / 42240` | 7.00x | 0.72x | levels/regions/pixels/rgb_checksum matched |
-| `Mirax2-Fluorescence-1.mrxs` | Exact | `0.000437 / 15224` | `0.027715 / 31040` | 63.42x | 0.49x | levels/regions/pixels/rgb_checksum matched |
-| `Mirax2-Fluorescence-2.mrxs` | Exact | `0.001278 / 11548` | `0.028013 / 31340` | 21.92x | 0.37x | levels/regions/pixels/rgb_checksum matched |
-| `Mirax2.2-1.mrxs` | Mismatch | `0.369891 / 40288` | `0.076783 / 70080` | 0.21x | 0.57x | rgb_checksum: rust=77224116 reference=77224111 |
-| `Mirax2.2-2.mrxs` | Mismatch | `0.405068 / 59860` | `0.077343 / 69440` | 0.19x | 0.86x | rgb_checksum: rust=91336882 reference=91302470 |
-| `Mirax2.2-3.mrxs` | Mismatch | `0.425792 / 59972` | `0.079395 / 75200` | 0.19x | 0.80x | rgb_checksum: rust=105917479 reference=105913458 |
-| `Mirax2.2-4-BMP.mrxs` | Exact | `0.030186 / 19340` | `0.033171 / 32756` | 1.10x | 0.59x | levels/regions/pixels/rgb_checksum matched |
-| `Mirax2.2-4-PNG.mrxs` | Exact | `0.006673 / 19020` | `0.031803 / 32464` | 4.77x | 0.59x | levels/regions/pixels/rgb_checksum matched |
-| `OS-1.vsi` | Reference skipped | n/a | n/a | n/a | n/a | reference OpenSlide could not open |
-| `OS-2.vsi` | Reference skipped | n/a | n/a | n/a | n/a | reference OpenSlide could not open |
-| `OS-3.vsi` | Reference skipped | n/a | n/a | n/a | n/a | reference OpenSlide could not open |
-| `CMU-1.tif` | Exact | `0.121657 / 23680` | `0.050034 / 40320` | 0.41x | 0.59x | levels/regions/pixels/rgb_checksum matched |
-| `CMU-2.tif` | Exact | `0.117729 / 23360` | `0.042206 / 41280` | 0.36x | 0.57x | levels/regions/pixels/rgb_checksum matched |
-| `CMU-3.tif` | Exact | `0.126093 / 22720` | `0.045419 / 40960` | 0.36x | 0.55x | levels/regions/pixels/rgb_checksum matched |
+Latest affected-format run: 2026-07-28, dirty working tree after the no-C
+JPEG/JPEG2000/compositor changes. This is an ad-hoc local refresh, not the
+strict stable-runner baseline in `fixtures/bench-baseline.json`. Command:
+`scripts/bench-realdata.py --data-dir /tmp/openslide-readme-bench --rust-bench /tmp/openslide-rs-target/release/examples/bench_real --jobs 1 --runner-profile readme-current-2026-07-28 --cpu-list 0-3 --region-size 128 --regions-per-level 1 --repeats 1 --json /tmp/openslide-readme-bench-current.json`.
+All rows opened in both implementations and matched level/region/pixel counts,
+but the sampled RGB checksums differ after the Rust codec/compositor switch, so
+these rows are benchmark evidence, not exact parity evidence.
+Follow-up tolerance parity with `scripts/parity-check.py --region-size 128
+--regions-per-level 1 --pixel-tol 2.0` passed for all affected rows. Worst
+opaque-pixel mean absolute channel error was below 1.0 in each case; the
+remaining checksum drift is consistent with pure-Rust JPEG/JPEG2000 rounding
+and low-alpha edge compositing differences from libjpeg/OpenJPEG/Cairo.
+
+| Slide | Affected path | Status | Rust read_s / RSS KiB | Original read_s / RSS KiB | Speed vs original | RSS vs original | Notes |
+|---|---|---|---:|---:|---:|---:|---|
+| `CMU-1-Small-Region.svs` | Aperio JPEG + Rust compositor | Mismatch | `0.002486 / 5760` | `0.011369 / 30960` | 4.57x | 0.19x | rgb_checksum: rust=4973315 reference=4973117 |
+| `JP2K-33003-1.svs` | Aperio JPEG 2000 via `openjpeg2-pure-rs` | Mismatch | `0.044944 / 8640` | `0.060446 / 32552` | 1.34x | 0.27x | rgb_checksum: rust=33469391 reference=33508684 |
+| `CMU-1.tiff` | Generic TIFF JPEG + Rust compositor | Mismatch | `0.027844 / 8320` | `0.107404 / 34236` | 3.86x | 0.24x | rgb_checksum: rust=107315276 reference=107346196 |
+| `CMU-1-Saved-1_16.mrxs` | MIRAX JPEG crop/composite | Mismatch | `0.009790 / 18984` | `0.055555 / 33280` | 5.67x | 0.57x | rgb_checksum: rust=3998181 reference=4005168 |
+| `Mirax2-Fluorescence-2.mrxs` | MIRAX JPEG crop/composite | Mismatch | `0.002011 / 10748` | `0.070875 / 31344` | 35.24x | 0.34x | rgb_checksum: rust=163897 reference=164350 |
+| `CMU-1.tif` | Trestle JPEG + Rust compositor | Mismatch | `0.054048 / 21760` | `0.095293 / 40640` | 1.76x | 0.54x | rgb_checksum: rust=76829858 reference=76871296 |
+| `OS-1.bif` | Ventana TIFF/JPEG + Rust compositor | Mismatch | `0.338834 / 54632` | `0.381548 / 89400` | 1.13x | 0.61x | rgb_checksum: rust=89700212 reference=90030435 |
 
 Downloadable follow-up fixtures from OpenSlide testdata:
 
@@ -97,21 +115,21 @@ scripts/download-openslide-testdata.py --format argos --format huron --format mi
 | Format / backend | Extensions | Original OpenSlide | This crate | Notes |
 |------------------|------------|--------------------|------------|-------|
 | ARGOS | `.avs` | Supported in newer upstream | Experimental (reference blocked) | Public `Argos-1-Stacked.avs` is present and Rust-readable, but parity is blocked because the installed OpenSlide 3.4.1 reference stack predates ARGOS support and reports `generic-tiff`. |
-| Aperio | `.svs`, `.tif` | Supported | Fixture-verified (SVS subset) | Exact on one private SVS fixture and public `CMU-1-Small-Region.svs`. Covers the audited tiled-TIFF/JPEG paths; broader libtiff layout coverage remains limited. |
+| Aperio | `.svs`, `.tif` | Supported | Fixture-verified (SVS subset) | Exact on one private SVS fixture; public `CMU-1-Small-Region.svs` now has bounded codec drift with the pure-Rust JPEG path. Covers the audited tiled-TIFF/JPEG paths; broader libtiff layout coverage remains limited. |
 | DICOM | `.dcm` | Supported | Experimental (limited exact data) | Exact on three readable single-level local members only. Full-pyramid WSI, multi-plane, and multi-optical-path parity are not yet proven; unsupported layouts remain expected. |
 | Hamamatsu NDPI | `.ndpi` | Supported | Fixture-verified (CMU-1/2/3 subset) | Exact on private/public `CMU-1.ndpi` and local DNL `CMU-2.ndpi`/`CMU-3.ndpi` fixtures. Complex NDPI layouts remain unsupported. |
 | Hamamatsu VMS | `.vms` | Supported | Fixture-verified (CMU-1/2/3 subset) | Exact on private VMS CMU-1/2/3 and public VMS `CMU-1` fixtures, including map and macro sidecar paths. |
 | Hamamatsu VMU/NGR | `.vmu`, `.ngr` | Supported | Experimental (no real fixture) | Parser and read paths exist, but no local or public real fixture has been added to the audit manifest yet. |
 | Huron | `.tif` | Supported in newer upstream | Experimental (reference blocked) | Public Huron JPEG, 40x JPEG, and uncompressed fixtures are present and Rust-readable, but parity is blocked because the installed OpenSlide 3.4.1 reference stack predates Huron support and reports `generic-tiff`. |
 | Leica | `.scn` | Supported | Fixture-verified (SCN subset) | Exact on the SCN subset covered by private `Leica-1` and multi-area `Leica-2` fixtures. Other Leica fixtures are not reference-openable or remain outside that subset. |
-| MIRAX / 3DHISTECH | `.mrxs` | Supported | Fixture-verified (brightfield and fluorescence public fixtures) | Exact on public brightfield `CMU-1-Saved-1_16` and fluorescence `Mirax2-Fluorescence-2` fixtures, including associated macro/label/thumbnail metadata. |
+| MIRAX / 3DHISTECH | `.mrxs` | Supported | Experimental (bounded drift) | Public brightfield `CMU-1-Saved-1_16` and fluorescence `Mirax2-Fluorescence-2` fixtures have bounded codec/compositor drift after the pure-Rust JPEG/compositor switch; associated macro/label/thumbnail metadata remains covered. |
 | Philips | `.tiff` | Supported | Fixture-verified (Philips-1) | Exact on public `Philips-1.tiff`; tile reads delegate to the generic TIFF reader. |
 | Sakura | `.svslide` | Supported | Experimental (no fixture) | Sakura SQLite detection and tile lookup are implemented, but no local or public fixture has been found. |
 | Synthetic | empty path with `OPENSLIDE_DEBUG=synthetic` | Supported | Debug backend (embedded corpus copied) | Mirrors upstream's debug-gated synthetic backend; this is test infrastructure, not a real fixture-backed reader. |
-| Trestle | `.tif` | Supported | Fixture-verified (CMU-1) | Exact on private and public `CMU-1.tif` fixtures, including tiled reads and JPEG `.Full` macro sidecars. Broader libtiff layout coverage remains limited. |
-| Ventana | `.bif`, `.tif` | Supported | Fixture-verified (BIF AOI subset) | Exact on private `OS-1.bif` and subpixel-AOI `OS-2.bif` fixtures. Public/local `Ventana-1.bif` fixtures are not reference-openable with the installed OpenSlide stack. |
+| Trestle | `.tif` | Supported | Fixture-verified (CMU-1) | Private `CMU-1.tif` remains exact real-data parity evidence; public `CMU-1.tif` has bounded codec/compositor drift after the pure-Rust JPEG/compositor switch. Broader libtiff layout coverage remains limited. |
+| Ventana | `.bif`, `.tif` | Supported | Fixture-verified (BIF AOI subset) | Subpixel-AOI `OS-2.bif` remains exact real-data parity evidence; `OS-1.bif` has bounded codec/compositor drift after the pure-Rust JPEG/compositor switch. Public/local `Ventana-1.bif` fixtures are not reference-openable with the installed OpenSlide stack. |
 | Zeiss | `.czi` | Supported | Experimental (reference blocked) | Rust opens audited public preview/JXR-adjacent fixtures, but reference OpenSlide could not open comparable local/public CZI fixtures. JPEG XR requires `--features jpegxr` and still needs fixture-backed parity. |
-| Generic tiled TIFF | `.tif` | Supported | Fixture-verified (CMU-1.tiff) | Public `CMU-1.tiff` has exact sampled checksum parity. This backend covers audited tiled TIFF paths; broader libtiff codec/layout coverage remains limited. |
+| Generic tiled TIFF | `.tif` | Supported | Experimental (bounded drift) | Public `CMU-1.tiff` has bounded codec drift with the pure-Rust JPEG path. This backend covers audited tiled TIFF paths; broader libtiff codec/layout coverage remains limited. |
 
 The JPEG, PNG, and BMP decoders in this crate are tile/associated-image
 decoders. Container support is listed separately above; reader maturity labels
@@ -237,9 +255,9 @@ samples. Downloaded files are ignored by Git via `.tmp/`.
 
 ## Features
 
-- **Rust format parsers with native helpers** -- format logic is Rust, while
-  selected codec/compositor paths currently build small C shims and link
-  system `libjpeg`, Cairo, and OpenJPEG
+- **Rust format parsers and decoders** -- default builds avoid native codec and
+  compositor libraries; optional oracle features can enable native helpers for
+  regression comparison
 - **Multi-channel fluorescence** -- reads individual filter channels (DAPI, FITC, TRITC, CY5, etc.) from packed JPEG tiles and separate filter level tile sets
 - **Per-channel access** -- `read_region(channel, ...)` returns a single grayscale channel
 - **RGBA compositing** -- `read_region_rgba(...)` maps any channels to R/G/B/A
@@ -254,18 +272,25 @@ samples. Downloaded files are ignored by Git via `.tmp/`.
 
 ## Native build dependencies
 
-This crate currently builds helper shims from `src/decode/*.c` in `build.rs`.
-A build environment needs a C compiler, `ar`, `pkg-config`, `libjpeg`, Cairo,
-and OpenJPEG development files. On Debian/Ubuntu:
+Default builds do not require a C compiler or native codec/compositor
+development files.
 
-```sh
-sudo apt-get install build-essential pkg-config libjpeg-dev libcairo2-dev libopenjp2-7-dev
-```
+Historical audit wording described this as "Rust format parsers with native helpers";
+after the no-C refactor, native helpers are default-off oracle/test paths only.
+
+The default JPEG decode paths use the vendored pure-Rust `zune-jpeg` backend,
+including region decode, TIFF `JPEGTables` assembly, and sampled file-region
+decode. MCU-aligned coefficient-domain lossless crop/transcode also uses the
+vendored pure-Rust zune-jpeg backend. The optional default-off `native-jpeg`
+feature links system `libjpeg` only for regression oracle tests. The optional
+default-off `native-cairo-oracle` feature links Cairo for compositor regression
+tests.
 
 `zune-core` and `zune-jpeg` are vendored under `vendor/` from the upstream
-0.5.x crates with the OpenSlide JPEG decode-control patch applied locally. This
-keeps normal JPEG decode pure Rust without depending on the temporary fork while
-the upstream API review is pending.
+0.5.x crates with the OpenSlide JPEG decode-control and coefficient-transcode
+patches applied locally. This keeps normal JPEG decode and derived compressed
+JPEG extraction pure Rust without depending on the temporary fork while the
+upstream API review is pending.
 
 ## Quick start
 

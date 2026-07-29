@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::Read;
-use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -12,37 +11,13 @@ use crate::compressed::{
     CompressedLevelInfo, CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace,
     JpegSubsampling, LossyCodec,
 };
+use crate::decode::compositor::RgbBlit;
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::SlideBackend;
 use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
 use crate::util::{read_file_range, read_file_range_from_open_file};
-
-extern "C" {
-    fn osr_cairo_blit_rgb_to_rgba(
-        src_rgb: *const u8,
-        src_w: u32,
-        src_h: u32,
-        visible_w: u32,
-        visible_h: u32,
-        src_x: f64,
-        src_y: f64,
-        src_region_w: u32,
-        src_region_h: u32,
-        r_channel: c_int,
-        g_channel: c_int,
-        b_channel: c_int,
-        a_channel: c_int,
-        dst_rgba: *mut u8,
-        dst_w: u32,
-        dst_h: u32,
-        dst_x: f64,
-        dst_y: f64,
-        err: *mut i8,
-        err_len: usize,
-    ) -> c_int;
-}
 
 const TIFF_MAGIC_CLASSIC: u16 = 42;
 const TIFF_MAGIC_BIG: u16 = 43;
@@ -3786,41 +3761,26 @@ fn cairo_blit_rgb_rgba(
     dst_x: f64,
     dst_y: f64,
 ) -> Result<()> {
-    let channel = |idx: usize| -> c_int { channels[idx].map_or(-1, |channel| channel as c_int) };
-    let mut err = vec![0i8; 256];
-    let ok = unsafe {
-        osr_cairo_blit_rgb_to_rgba(
-            src.rgb.as_ptr(),
-            src.width,
-            src.height,
-            visible_w.min(src.width),
-            visible_h.min(src.height),
-            0.0,
-            0.0,
-            visible_w.min(src.width),
-            visible_h.min(src.height),
-            channel(0),
-            channel(1),
-            channel(2),
-            channel(3),
-            dst.data.as_mut_ptr(),
-            dst.width,
-            dst.height,
+    decode::compositor::blit_rgb_to_rgba(
+        &mut dst.data,
+        dst.width,
+        dst.height,
+        RgbBlit {
+            src_rgb: &src.rgb,
+            src_width: src.width,
+            src_height: src.height,
+            valid_width: visible_w.min(src.width),
+            valid_height: visible_h.min(src.height),
+            src_x: 0.0,
+            src_y: 0.0,
+            src_w: visible_w.min(src.width),
+            src_h: visible_h.min(src.height),
+            channels,
             dst_x,
             dst_y,
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
-    if ok == 0 {
-        let nul = err.iter().position(|&ch| ch == 0).unwrap_or(err.len());
-        let bytes: Vec<u8> = err[..nul].iter().map(|&ch| ch as u8).collect();
-        return Err(OpenSlideError::Decode(format!(
-            "TIFF Cairo tile blit failed: {}",
-            String::from_utf8_lossy(&bytes)
-        )));
-    }
-    Ok(())
+        },
+    )
+    .map_err(|err| OpenSlideError::Decode(format!("TIFF tile blit failed: {err}")))
 }
 
 fn tiff_level_needs_cairo_composition(level: &TiffLevel) -> bool {

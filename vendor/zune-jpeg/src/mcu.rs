@@ -301,6 +301,229 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         Ok(())
     }
 
+    pub(crate) fn decode_scaled_baseline_region_into<B: BitStream>(
+        &mut self, region: DecodeRegion, out: &mut [u8],
+    ) -> Result<(), DecodeErrors> {
+        setup_component_params(self)?;
+
+        let scale = self.options.jpeg_get_scale();
+        if scale == JpegScale::Full {
+            return Err(DecodeErrors::FormatStatic(
+                "Scaled baseline region path requires a reduced JPEG scale",
+            ));
+        }
+        if self.restart_interval != 0 || usize::from(self.num_scans) != self.components.len() {
+            return Err(DecodeErrors::FormatStatic(
+                "Scaled baseline region path only supports single-scan images without restarts",
+            ));
+        }
+        if !matches!(self.input_colorspace, ColorSpace::Luma | ColorSpace::YCbCr) {
+            return Err(DecodeErrors::FormatStatic(
+                "Scaled baseline region path only supports Luma and YCbCr input",
+            ));
+        }
+        if self.input_colorspace.num_components() != self.components.len() {
+            return Err(DecodeErrors::FormatStatic(
+                "Scaled baseline region path requires the input colorspace component count to match the JPEG",
+            ));
+        }
+
+        self.check_tables::<B>()?;
+
+        let denominator = scale.denominator();
+        let block_output = 8 / denominator;
+        let scaled_width = usize::from(self.info.width).div_ceil(denominator);
+        let scaled_height = usize::from(self.info.height).div_ceil(denominator);
+        let out_components = self.options.jpeg_get_out_colorspace().num_components();
+        let expected_size = region
+            .width
+            .checked_mul(region.height)
+            .and_then(|v| v.checked_mul(out_components))
+            .ok_or(DecodeErrors::FormatStatic(
+                "Scaled baseline region output size overflows usize",
+            ))?;
+        if out.len() < expected_size {
+            return Err(DecodeErrors::TooSmallOutput(expected_size, out.len()));
+        }
+        if region.x + region.width > scaled_width || region.y + region.height > scaled_height {
+            return Err(DecodeErrors::FormatStatic(
+                "Scaled baseline region is outside image bounds",
+            ));
+        }
+
+        let mcu_x = self.mcu_x;
+        let mcu_y = self.mcu_y;
+        let y_stride = mcu_x * self.h_max * block_output;
+        let stripe_rows = self.v_max * block_output;
+        let stripe_rgb_len = scaled_width
+            .checked_mul(stripe_rows)
+            .and_then(|v| v.checked_mul(out_components))
+            .ok_or(DecodeErrors::FormatStatic(
+                "Scaled baseline region stripe size overflows usize",
+            ))?;
+        let mut stripe_rgb = vec![0; stripe_rgb_len];
+
+        let plane_shapes: Vec<(usize, usize)> = self
+            .components
+            .iter()
+            .map(|component| {
+                (
+                    mcu_x * component.horizontal_sample * block_output,
+                    component.vertical_sample * block_output,
+                )
+            })
+            .collect();
+        let mut planes: Vec<Vec<i16>> = plane_shapes
+            .iter()
+            .map(|(stride, rows)| vec![0; stride * rows])
+            .collect();
+        let mut expanded: [Vec<i16>; MAX_COMPONENTS] = core::array::from_fn(|_| Vec::new());
+        let mut stream = B::new();
+        let mut tmp = [0_i32; DCT_BLOCK];
+        let mut idct_out = [0_i16; DCT_BLOCK];
+        let idct = choose_scaled_idct_func(scale, &self.options);
+        let z_order = self.z_order;
+        let z_scans = &z_order[..usize::from(self.num_scans)];
+        let region_y_end = region.y + region.height;
+        let mut decoded_all_mcu_rows = false;
+
+        for mcu_row in 0..mcu_y {
+            for plane in &mut planes {
+                plane.fill(0);
+            }
+
+            for mcu_col in 0..mcu_x {
+                for &component_index in z_scans {
+                    let (horizontal_sample, vertical_sample) = {
+                        let component = &self.components[component_index];
+                        (component.horizontal_sample, component.vertical_sample)
+                    };
+
+                    for v_samp in 0..vertical_sample {
+                        for h_samp in 0..horizontal_sample {
+                            tmp.fill(0);
+                            idct_out.fill(0);
+
+                            {
+                                let component = &mut self.components[component_index];
+                                let (dc_table, ac_table) = B::get_dc_ac_tables(
+                                    &mut self.entropy_tables,
+                                    component.dc_huff_table % MAX_COMPONENTS,
+                                    component.ac_huff_table % MAX_COMPONENTS,
+                                )?;
+                                stream.decode_mcu_block(
+                                    &mut self.stream,
+                                    dc_table,
+                                    ac_table,
+                                    &component.quantization_table,
+                                    &mut tmp,
+                                    &mut component.dc_pred,
+                                    &mut component.dc_diff,
+                                )?;
+                            }
+
+                            idct(&mut tmp, &mut idct_out, 8);
+
+                            let plane_stride = plane_shapes[component_index].0;
+                            let out_x = (mcu_col * horizontal_sample + h_samp) * block_output;
+                            let out_y = (v_samp) * block_output;
+                            let plane = &mut planes[component_index];
+
+                            for y in 0..block_output {
+                                let dst_row = out_y + y;
+                                let dst = dst_row * plane_stride + out_x;
+                                plane[dst..dst + block_output]
+                                    .copy_from_slice(&idct_out[y * 8..y * 8 + block_output]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let stripe_start_y = mcu_row * stripe_rows;
+            let visible_rows = min(stripe_rows, scaled_height.saturating_sub(stripe_start_y));
+            if stripe_start_y < region_y_end && stripe_start_y + visible_rows > region.y {
+                expanded[0].clear();
+                expanded[0].extend_from_slice(&planes[0]);
+
+                if self.input_colorspace == ColorSpace::YCbCr {
+                    for component_index in 1..self.components.len().min(3) {
+                        expanded[component_index].clear();
+                        expanded[component_index].resize(y_stride * stripe_rows, 0);
+                        let component = &self.components[component_index];
+                        let src_stride = plane_shapes[component_index].0;
+                        let src_rows = plane_shapes[component_index].1;
+                        let h_scale = self.h_max / component.horizontal_sample;
+                        let v_scale = self.v_max / component.vertical_sample;
+
+                        for y in 0..stripe_rows {
+                            let src_y = (y / v_scale).min(src_rows.saturating_sub(1));
+                            for x in 0..y_stride {
+                                let src_x = (x / h_scale).min(src_stride.saturating_sub(1));
+                                expanded[component_index][y * y_stride + x] =
+                                    planes[component_index][src_y * src_stride + src_x];
+                            }
+                        }
+                    }
+                }
+
+                let mut channels: [&[i16]; MAX_COMPONENTS] = [&[]; MAX_COMPONENTS];
+                for (index, channel) in channels.iter_mut().enumerate() {
+                    *channel = &expanded[index];
+                }
+                color_convert(
+                    &channels,
+                    self.color_convert_16,
+                    self.input_colorspace,
+                    self.options.jpeg_get_out_colorspace(),
+                    &mut stripe_rgb,
+                    scaled_width,
+                    y_stride,
+                )?;
+
+                let copy_y0 = region.y.max(stripe_start_y);
+                let copy_y1 = region_y_end.min(stripe_start_y + visible_rows);
+                let full_stride = scaled_width * out_components;
+                let region_stride = region.width * out_components;
+                let src_x = region.x * out_components;
+                for image_y in copy_y0..copy_y1 {
+                    let stripe_y = image_y - stripe_start_y;
+                    let dst_y = image_y - region.y;
+                    let src = stripe_y * full_stride + src_x;
+                    let dst = dst_y * region_stride;
+                    out[dst..dst + region_stride]
+                        .copy_from_slice(&stripe_rgb[src..src + region_stride]);
+                }
+            }
+
+            if mcu_row + 1 == mcu_y {
+                decoded_all_mcu_rows = true;
+            }
+            if stripe_start_y + visible_rows >= region_y_end {
+                break;
+            }
+        }
+
+        if decoded_all_mcu_rows {
+            match self.check_stream_marker_after_mcu_width(&mut stream)? {
+                McuContinuation::Ok | McuContinuation::Terminate => {}
+                McuContinuation::DnlFound => {
+                    return Err(DecodeErrors::FormatStatic(
+                        "DNL is not supported in scaled baseline region fast path",
+                    ))
+                }
+                McuContinuation::AnotherSos | McuContinuation::InterScanMarker(_) => {
+                    return Err(DecodeErrors::FormatStatic(
+                        "Multiple scans are not supported in scaled baseline region fast path",
+                    ))
+                }
+            }
+        }
+
+        self.pixels_decoded = expected_size;
+        Ok(())
+    }
+
     /// Inner implementation of [`Self::decode_mcu_ycbcr_baseline`].
     ///
     /// `progressive_mcus` is owned by the decoder across calls so its
@@ -1176,7 +1399,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         self.check_stream_marker_after_mcu_width(stream)
     }
 
-    fn check_stream_marker_after_mcu_width<B: BitStream>(
+    pub(crate) fn check_stream_marker_after_mcu_width<B: BitStream>(
         &mut self, stream: &mut B,
     ) -> Result<McuContinuation, DecodeErrors> {
         // After all interleaved components, that's an MCU
@@ -1590,7 +1813,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     }
 }
 
-enum McuContinuation {
+pub(crate) enum McuContinuation {
     Ok,
     AnotherSos,
     /// Found an inter-scan marker (DHT/DQT/DRI/COM/APP) that needs handling.

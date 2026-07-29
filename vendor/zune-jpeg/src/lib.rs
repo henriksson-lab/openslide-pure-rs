@@ -241,7 +241,11 @@ pub use zune_core;
 pub use crate::cancel::{CancelCheck, NeverCancel};
 pub use crate::components::SampleRatios;
 pub use crate::decoder::{
-    assemble_split_jpeg, DecodeRegion, ImageInfo, JpegDecoder, JpegDimensions, RegionDecodeMode,
+    assemble_jpeg_with_tables, assemble_split_jpeg, encode_lossless_crop_coefficients,
+    DecodeRegion, ImageInfo, JpegDecoder, JpegDimensions, JpegFrameComponent, JpegHuffmanTable,
+    JpegHuffmanTableClass,
+    JpegQuantizationTable, JpegScanComponent, JpegTranscodeMetadata, LosslessCropCoefficients,
+    LosslessCropComponent, LosslessCropComponentCoefficients, LosslessCropInfo, RegionDecodeMode,
 };
 pub use crate::marker::Marker;
 mod bitstream;

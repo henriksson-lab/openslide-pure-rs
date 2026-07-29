@@ -1,4 +1,5 @@
 pub mod bmp;
+pub mod compositor;
 pub mod jpeg;
 pub mod jpeg2000;
 pub mod jpegxr;

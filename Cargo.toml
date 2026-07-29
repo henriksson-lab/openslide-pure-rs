@@ -17,7 +17,8 @@ include = [
     "/fixtures/*.toml",
     "/MATURITY_PLAN.md",
     "/src/**/*.rs",
-    "/src/decode/*.c",
+    "/src/decode/cairo_blit.c",
+    "/src/decode/jpeg_crop.c",
     "/scripts/*.py",
     "/scripts/*.sh",
     "/scripts/README.md",
@@ -48,3 +49,5 @@ jpegxr_pure_rs = { package = "jpegxr-pure-rs", version = "0.1.0", optional = tru
 default = []
 jpegxr = ["dep:jpegxr_pure_rs"]
 jpegxr-backend = ["jpegxr"]
+native-jpeg = []
+native-cairo-oracle = []

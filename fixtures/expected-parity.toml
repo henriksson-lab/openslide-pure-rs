@@ -180,12 +180,12 @@ notes = "Exact on audited local data."
 [[expectation]]
 fixture = "ventana-local-os-1"
 reader = "ventana"
-status = "exact"
-rust_checksum = 131801249
+status = "known-drift"
+rust_checksum = 131465358
 reference_checksum = 131801249
-rust_rgb_checksum = 90030435
+rust_rgb_checksum = 89700212
 reference_rgb_checksum = 90030435
-notes = "Exact on audited local data."
+notes = "Pure-Rust JPEG/compositor path has bounded opaque-pixel drift from the OpenSlide/libjpeg/Cairo reference; parity-check worst mean_abs=0.9324, max_abs=8 at region size 128."
 
 [[expectation]]
 fixture = "ventana-local-os-2"
@@ -212,12 +212,12 @@ notes = "Exact on three reference-readable single-level members only; not a matu
 [[expectation]]
 fixture = "generic-tiff-public-cmu-1"
 reader = "generic-tiff"
-status = "exact"
-rust_checksum = 144947476
+status = "known-drift"
+rust_checksum = 144916556
 reference_checksum = 144947476
-rust_rgb_checksum = 107346196
+rust_rgb_checksum = 107315276
 reference_rgb_checksum = 107346196
-notes = "Exact after fixing benchmark reference coordinate rounding to match Rust's half-away rounding."
+notes = "Pure-Rust JPEG path has bounded codec rounding drift from the OpenSlide/libjpeg reference; parity-check worst mean_abs=0.2095, max_abs=9 at region size 128."
 
 [[expectation]]
 fixture = "argos-public-stacked"
@@ -228,12 +228,12 @@ notes = "Public ARGOS Z-stack fixture is present and Rust opens it as argos with
 [[expectation]]
 fixture = "aperio-public-cmu-1-small-region"
 reader = "aperio"
-status = "exact"
-rust_checksum = 9151037
+status = "known-drift"
+rust_checksum = 9151235
 reference_checksum = 9151037
-rust_rgb_checksum = 4973117
+rust_rgb_checksum = 4973315
 reference_rgb_checksum = 4973117
-notes = "Exact after forcing RGB-tagged TIFF JPEG tiles through libjpeg with JCS_RGB instead of default YCbCr conversion."
+notes = "Pure-Rust zune-jpeg RGB output preserves the intended RGB path but differs from libjpeg by bounded rounding noise; parity-check worst mean_abs=0.0096, max_abs=1 at region size 128."
 
 [[expectation]]
 fixture = "dicom-public-leica-4"
@@ -288,22 +288,22 @@ notes = "Installed reference OpenSlide 3.4.1 could not open this public Leica fl
 [[expectation]]
 fixture = "mirax-public-cmu-1-saved-1-16"
 reader = "mirax"
-status = "exact"
-rust_checksum = 5588307
+status = "known-drift"
+rust_checksum = 5580887
 reference_checksum = 5588307
-rust_rgb_checksum = 4005168
+rust_rgb_checksum = 3998181
 reference_rgb_checksum = 4005168
-notes = "Brightfield MRXS public fixture is exact after decoding Mirax JPEG tiles through libjpeg before Cairo tilemap composition."
+notes = "Pure-Rust JPEG crop/compositor output has bounded opaque-pixel drift from libjpeg/Cairo; low-alpha edges amplify raw RGB checksum differences. parity-check worst mean_abs=0.6855, max_abs=8 at region size 128."
 
 [[expectation]]
 fixture = "mirax-public-fluorescence-2"
 reader = "mirax"
-status = "exact"
-rust_checksum = 250093
+status = "known-drift"
+rust_checksum = 249585
 reference_checksum = 250093
-rust_rgb_checksum = 164350
+rust_rgb_checksum = 163897
 reference_rgb_checksum = 164350
-notes = "Public fluorescence MRXS fixture is exact after same-filter Cairo RGBA tilemap composition."
+notes = "Pure-Rust JPEG/compositor output has bounded opaque-pixel drift from libjpeg/Cairo; low-alpha edges amplify raw RGB checksum differences. parity-check worst mean_abs=0.6535, max_abs=3 at region size 128."
 
 [[expectation]]
 fixture = "philips-public-philips-1"
@@ -318,12 +318,12 @@ notes = "Public Philips fixture is an immediate candidate for a blocking CI pari
 [[expectation]]
 fixture = "trestle-public-cmu-1"
 reader = "trestle"
-status = "exact"
-rust_checksum = 106116736
+status = "known-drift"
+rust_checksum = 106074659
 reference_checksum = 106116736
-rust_rgb_checksum = 76871296
+rust_rgb_checksum = 76829858
 reference_rgb_checksum = 76871296
-notes = "Public Trestle fixture has exact sampled checksum parity."
+notes = "Pure-Rust JPEG/compositor path has bounded opaque-pixel drift from the OpenSlide/libjpeg/Cairo reference; parity-check worst mean_abs=0.3054, max_abs=4 at region size 128."
 
 [[expectation]]
 fixture = "ventana-public-ventana-1"

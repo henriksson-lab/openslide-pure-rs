@@ -3,7 +3,6 @@ use std::ffi::OsString;
 #[cfg(test)]
 use std::fs;
 use std::io::Read;
-use std::os::raw::{c_char, c_int, c_uint};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -17,6 +16,7 @@ use crate::compressed::{
     CompressedLevelInfo, CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace,
     LossyCodec,
 };
+use crate::decode::compositor::RgbBlit;
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff::OpenslideHash, SlideBackend};
@@ -24,31 +24,6 @@ use crate::pixel::{GrayImage, RgbaImage};
 use crate::properties;
 use crate::util::_openslide_format_double as format_float;
 use crate::util::{read_file_range, read_file_range_from_open_file};
-
-extern "C" {
-    fn osr_cairo_blit_rgb_to_rgba_clipped_dst(
-        src_rgb: *const u8,
-        src_width: c_uint,
-        src_height: c_uint,
-        valid_width: c_uint,
-        valid_height: c_uint,
-        src_x: f64,
-        src_y: f64,
-        src_w: c_uint,
-        src_h: c_uint,
-        channel_r: c_int,
-        channel_g: c_int,
-        channel_b: c_int,
-        channel_a: c_int,
-        dst_rgba: *mut u8,
-        dst_width: c_uint,
-        dst_height: c_uint,
-        dst_x: f64,
-        dst_y: f64,
-        err: *mut c_char,
-        err_len: usize,
-    ) -> c_int;
-}
 
 const TRESTLE_SOFTWARE: &str = "MedScan";
 
@@ -3176,41 +3151,26 @@ fn cairo_blit_rgb_rgba(
     dst_x: f64,
     dst_y: f64,
 ) -> Result<()> {
-    let channel = |idx: usize| -> c_int { channels[idx].map_or(-1, |channel| channel as c_int) };
-    let mut err = vec![0i8; 256];
-    let ok = unsafe {
-        osr_cairo_blit_rgb_to_rgba_clipped_dst(
-            src.rgb.as_ptr(),
-            src.width,
-            src.height,
-            visible_w.min(src.width),
-            visible_h.min(src.height),
-            0.0,
-            0.0,
-            visible_w.min(src.width),
-            visible_h.min(src.height),
-            channel(0),
-            channel(1),
-            channel(2),
-            channel(3),
-            dst.data.as_mut_ptr(),
-            dst.width,
-            dst.height,
+    decode::compositor::blit_rgb_to_rgba_clipped_dst(
+        &mut dst.data,
+        dst.width,
+        dst.height,
+        RgbBlit {
+            src_rgb: &src.rgb,
+            src_width: src.width,
+            src_height: src.height,
+            valid_width: visible_w.min(src.width),
+            valid_height: visible_h.min(src.height),
+            src_x: 0.0,
+            src_y: 0.0,
+            src_w: visible_w.min(src.width),
+            src_h: visible_h.min(src.height),
+            channels,
             dst_x,
             dst_y,
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
-    if ok == 0 {
-        let nul = err.iter().position(|&ch| ch == 0).unwrap_or(err.len());
-        let bytes: Vec<u8> = err[..nul].iter().map(|&ch| ch as u8).collect();
-        return Err(OpenSlideError::Decode(format!(
-            "Trestle Cairo tile blit failed: {}",
-            String::from_utf8_lossy(&bytes)
-        )));
-    }
-    Ok(())
+        },
+    )
+    .map_err(|err| OpenSlideError::Decode(format!("Trestle tile blit failed: {err}")))
 }
 
 fn trestle_level_needs_cairo_composition(level: &TrestleLevel) -> bool {

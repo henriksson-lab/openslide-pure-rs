@@ -43,8 +43,10 @@ pub struct HuffmanTable {
     ///
     /// \# number of symbols with codes of length `k` bits
     // bits[0] is unused
+    pub(crate) code_counts: [u8; 17],
     /// Symbols in order of increasing code length
     pub(crate) values: [u8; 256],
+    pub(crate) values_len: usize,
 }
 
 impl HuffmanTable {
@@ -56,11 +58,13 @@ impl HuffmanTable {
             maxcode: [0; 18],
             offset: [0; 18],
             lookup: [too_long_code; 1 << HUFF_LOOKAHEAD],
+            code_counts: *codes,
             values,
+            values_len: 0,
             ac_lookup: None,
         };
 
-        p.make_derived_table(is_dc, is_progressive, codes)?;
+        p.values_len = p.make_derived_table(is_dc, is_progressive, codes)?;
 
         Ok(p)
     }
@@ -88,7 +92,7 @@ impl HuffmanTable {
     )]
     fn make_derived_table(
         &mut self, is_dc: bool, _is_progressive: bool, bits: &[u8; 17],
-    ) -> Result<(), DecodeErrors> {
+    ) -> Result<usize, DecodeErrors> {
         // build a list of code size
         let mut huff_size = [0; 257];
         // Huffman code lengths
@@ -249,6 +253,10 @@ impl HuffmanTable {
             }
         }
 
-        Ok(())
+        Ok(num_symbols)
+    }
+
+    pub(crate) fn definition(&self) -> ([u8; 17], &[u8]) {
+        (self.code_counts, &self.values[..self.values_len])
     }
 }

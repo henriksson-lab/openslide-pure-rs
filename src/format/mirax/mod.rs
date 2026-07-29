@@ -31,7 +31,6 @@ pub mod tile;
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,6 +39,7 @@ use crate::compressed::{
     mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
     CompressedLevelInfo, CompressedTile, CompressedTileMode, JpegColorSpace, LossyCodec,
 };
+use crate::decode::compositor::RgbBlit;
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::tiff::OpenslideHash;
@@ -52,31 +52,6 @@ use crate::util::_openslide_format_double as format_float;
 use self::index::{HierEntry, IndexFile};
 use self::slidedat::SlideDat;
 use self::tile::{compute_base_dimensions, compute_zoom_level_params, Image, MiraxLevel, Tile};
-
-extern "C" {
-    fn osr_cairo_blit_rgb_to_rgba_clipped_dst(
-        src_rgb: *const u8,
-        src_width: u32,
-        src_height: u32,
-        valid_width: u32,
-        valid_height: u32,
-        src_x: f64,
-        src_y: f64,
-        src_w: u32,
-        src_h: u32,
-        channel_r: c_int,
-        channel_g: c_int,
-        channel_b: c_int,
-        channel_a: c_int,
-        dst_rgba: *mut u8,
-        dst_width: u32,
-        dst_height: u32,
-        dst_x: f64,
-        dst_y: f64,
-        err: *mut i8,
-        err_len: usize,
-    ) -> c_int;
-}
 
 /// Check whether a path looks like a Mirax .mrxs slide.
 pub fn detect(path: &Path) -> bool {
@@ -1156,7 +1131,8 @@ fn mirax_compressed_tile_mode(
         if mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
             return Ok(CompressedTileMode::OriginalBytes);
         }
-    } else if mode_allowed(preferred_modes, CompressedTileMode::DerivedLosslessJpeg) {
+    }
+    if mode_allowed(preferred_modes, CompressedTileMode::DerivedLosslessJpeg) {
         return Ok(CompressedTileMode::DerivedLosslessJpeg);
     }
     Err(OpenSlideError::UnsupportedFormat(
@@ -1638,41 +1614,26 @@ fn cairo_blit_rgb_rgba(
     dst_x: f64,
     dst_y: f64,
 ) -> Result<()> {
-    let channel = |idx: usize| -> c_int { channels[idx].map_or(-1, |channel| channel as c_int) };
-    let mut err = vec![0i8; 256];
-    let ok = unsafe {
-        osr_cairo_blit_rgb_to_rgba_clipped_dst(
-            src.rgb.as_ptr(),
-            src.width,
-            src.height,
-            src.width,
-            src.height,
+    decode::compositor::blit_rgb_to_rgba_clipped_dst(
+        &mut dst.data,
+        dst.width,
+        dst.height,
+        RgbBlit {
+            src_rgb: &src.rgb,
+            src_width: src.width,
+            src_height: src.height,
+            valid_width: src.width,
+            valid_height: src.height,
             src_x,
             src_y,
-            src_w.ceil() as u32,
-            src_h.ceil() as u32,
-            channel(0),
-            channel(1),
-            channel(2),
-            channel(3),
-            dst.data.as_mut_ptr(),
-            dst.width,
-            dst.height,
+            src_w: src_w.ceil() as u32,
+            src_h: src_h.ceil() as u32,
+            channels,
             dst_x,
             dst_y,
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
-    if ok == 0 {
-        let nul = err.iter().position(|&ch| ch == 0).unwrap_or(err.len());
-        let bytes: Vec<u8> = err[..nul].iter().map(|&ch| ch as u8).collect();
-        return Err(OpenSlideError::Decode(format!(
-            "Mirax Cairo tile blit failed: {}",
-            String::from_utf8_lossy(&bytes)
-        )));
-    }
-    Ok(())
+        },
+    )
+    .map_err(|err| OpenSlideError::Decode(format!("Mirax tile blit failed: {err}")))
 }
 
 fn unpremultiply_rgba(image: &mut RgbaImage) {
@@ -1977,7 +1938,7 @@ mod tests {
     }
 
     #[test]
-    fn compressed_extraction_derives_mirax_jpeg_subregion_tiles() {
+    fn compressed_extraction_returns_mirax_jpeg_subregion_as_derived_lossless_jpeg() {
         use std::fs;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2056,10 +2017,13 @@ mod tests {
         );
         assert_eq!(tile.width, 1);
         assert_eq!(tile.height, 1);
-        let crate::compressed::CompressedBytes::Owned(jpeg) = tile.bytes else {
-            panic!("expected derived MIRAX JPEG to be owned bytes");
+        let crate::compressed::CompressedBytes::Owned(bytes) = tile.bytes else {
+            panic!("expected MIRAX subregion tile to return owned derived JPEG bytes");
         };
-        assert_eq!(decode::jpeg::decode_jpeg_dimensions(&jpeg).unwrap(), (1, 1));
+        assert_eq!(
+            crate::decode::jpeg::decode_jpeg_dimensions(&bytes).unwrap(),
+            (1, 1)
+        );
 
         fs::remove_file(path).unwrap();
     }

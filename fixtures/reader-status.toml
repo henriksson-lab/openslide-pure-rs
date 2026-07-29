@@ -4,8 +4,8 @@ schema_version = 1
 id = "aperio"
 name = "Aperio"
 status = "Fixture-verified (SVS subset)"
-evidence = ["aperio-local-77917", "aperio-public-cmu-1-small-region"]
-blockers = []
+evidence = ["aperio-local-77917"]
+blockers = ["aperio-public-cmu-1-small-region"]
 
 [[reader]]
 id = "argos"
@@ -84,9 +84,9 @@ blockers = ["leica-local-leica-3", "leica-public-fluorescence-1"]
 [[reader]]
 id = "mirax"
 name = "MIRAX / 3DHISTECH"
-status = "Fixture-verified (brightfield and fluorescence public fixtures)"
-evidence = ["mirax-public-cmu-1-saved-1-16", "mirax-public-fluorescence-2"]
-blockers = []
+status = "Experimental (bounded drift)"
+evidence = []
+blockers = ["mirax-public-cmu-1-saved-1-16", "mirax-public-fluorescence-2"]
 
 [[reader]]
 id = "philips"
@@ -106,15 +106,15 @@ blockers = ["sakura-missing"]
 id = "trestle"
 name = "Trestle"
 status = "Fixture-verified (CMU-1)"
-evidence = ["trestle-local-cmu-1", "trestle-public-cmu-1"]
-blockers = []
+evidence = ["trestle-local-cmu-1"]
+blockers = ["trestle-public-cmu-1"]
 
 [[reader]]
 id = "ventana"
 name = "Ventana"
 status = "Fixture-verified (BIF AOI subset)"
-evidence = ["ventana-local-os-1", "ventana-local-os-2"]
-blockers = ["ventana-local-ventana-1", "ventana-public-ventana-1"]
+evidence = ["ventana-local-os-2"]
+blockers = ["ventana-local-os-1", "ventana-local-ventana-1", "ventana-public-ventana-1"]
 
 [[reader]]
 id = "zeiss"
@@ -128,6 +128,6 @@ blockers = ["zeiss-public-jxr-and-zstd"]
 id = "generic-tiff"
 name = "Generic tiled TIFF"
 snapshot_name = "Generic TIFF"
-status = "Fixture-verified (CMU-1.tiff)"
-evidence = ["generic-tiff-public-cmu-1"]
-blockers = ["generic-tiff-local-zackthecat"]
+status = "Experimental (bounded drift)"
+evidence = []
+blockers = ["generic-tiff-public-cmu-1", "generic-tiff-local-zackthecat"]

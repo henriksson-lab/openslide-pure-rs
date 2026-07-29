@@ -1,0 +1,36 @@
+name: Audit CI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libjpeg-dev libcairo2-dev libopenjp2-7-dev
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - name: Maturity audit
+        run: scripts/maturity-audit.sh
+      - name: Check
+        run: cargo check --all-targets
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Build benchmark examples
+        run: cargo build --release --examples
+      - name: Package completeness
+        run: cargo package --no-verify
+      - name: Package install smoke
+        run: |
+          crate="$(find target/package -maxdepth 1 -type f -name 'openslide-pure-rs-*.crate' | sort -V | tail -n 1)"
+          mkdir -p .tmp/package-source
+          tar -xzf "$crate" -C .tmp/package-source
+          package_dir="$(find .tmp/package-source -maxdepth 1 -type d -name 'openslide-pure-rs-*' | sort -V | tail -n 1)"
+          cargo install --path "$package_dir" --root .tmp/package-install --debug --locked --offline
+          test -x .tmp/package-install/bin/openslide-pure-rs

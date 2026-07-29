@@ -1,0 +1,38 @@
+name: Stable Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      report_dir:
+        description: "Directory for bench-stable.json"
+        required: false
+        default: ".tmp/openslide-testdata"
+        type: string
+
+jobs:
+  stable-benchmark:
+    runs-on: [self-hosted, openslide-audit-stable-v1]
+    env:
+      OPENSLIDE_AUDIT_RUNNER_PROFILE: openslide-audit-stable-v1
+      OPENSLIDE_AUDIT_JOBS: "1"
+      OPENSLIDE_AUDIT_CPU_LIST: "0-3"
+      OPENSLIDE_AUDIT_REPORT_DIR: ${{ inputs.report_dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify stable runner contract
+        run: |
+          mkdir -p "${OPENSLIDE_AUDIT_REPORT_DIR}"
+          python3 scripts/check-stable-runner.py \
+            --json "${OPENSLIDE_AUDIT_REPORT_DIR}/stable-runner-preflight.json"
+          python3 scripts/check-audit-baselines.py \
+            --stable-runner-report "${OPENSLIDE_AUDIT_REPORT_DIR}/stable-runner-preflight.json"
+      - name: Run strict stable benchmark
+        run: scripts/run-stable-benchmark.sh
+      - name: Upload stable benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-benchmark
+          path: |
+            ${{ inputs.report_dir }}/bench-stable.json
+            ${{ inputs.report_dir }}/stable-runner-preflight.json

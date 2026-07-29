@@ -1,0 +1,37 @@
+name: Parity Smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native and reference dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libjpeg-dev libcairo2-dev libopenjp2-7-dev libopenslide0
+          python3 -m pip install --upgrade pip
+          python3 -m pip install numpy pillow openslide-python
+      - name: Download smoke fixtures
+        run: python3 scripts/download-openslide-testdata.py --profile smoke --extract --allow-distributable
+      - name: Build release binary
+        run: cargo build --release
+      - name: Metadata parity smoke
+        run: python3 scripts/parity-check.py --jobs 2 --no-pixels --exclude-mirax --json .tmp/openslide-testdata/parity-smoke.json
+      - name: Missing fixture candidate report
+        run: python3 scripts/find-fixture-candidates.py --missing-from-reader-status fixtures/reader-status.toml --json .tmp/openslide-testdata/fixture-candidates.json
+      - name: Check parity smoke against audit baselines
+        run: |
+          python3 scripts/check-audit-baselines.py \
+            --parity-report .tmp/openslide-testdata/parity-smoke.json \
+            --fixture-candidates-report .tmp/openslide-testdata/fixture-candidates.json \
+            --fail-on-fixture-candidates
+      - name: Upload parity report
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-smoke
+          path: |
+            .tmp/openslide-testdata/parity-smoke.json
+            .tmp/openslide-testdata/fixture-candidates.json

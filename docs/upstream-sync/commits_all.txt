@@ -1,0 +1,108 @@
+95124ddf 2026-06-27 pre-commit: update versions
+b5d4e5a1 2026-06-27 test/driver: ignore redundant casts on pyfuse3 3.5.0
+c899b262 2026-06-27 workflows: bump the deps group with 2 updates
+6541e10c 2026-06-11 test/extended: run opacity assertions in chunks
+062b3d13 2026-06-27 scripts/vcpkg-prune: paginate list fetches
+d408c4f0 2026-06-27 workflows: run vcpkg-prune with unbuffered stdout
+8407db05 2026-06-26 workflows: convert vcpkg-cache from pull_request_target to workflow_run
+df20da5c 2026-06-26 workflows: reduce initial delay waiting for vcpkg cache
+d1e411f0 2026-06-26 scripts: fix execute bit
+f6189b11 2026-06-26 workflows: prune old vcpkg package versions once a month
+eeb783b1 2026-06-26 workflows: rebuild vcpkg cache once upon PR
+ac4ac7cb 2026-06-26 workflows: skip vcpkg-cache workflow in forks
+14f1ab88 2026-06-25 meson: update xdelta3 wrap
+fe6d2cc4 2026-06-25 meson: drop uthash wrap
+5d45f487 2026-06-11 meson: clarify description for doc option
+fa94cb1e 2026-06-18 util: don't use a regex when ignoring empty MIRAX Slidedat.ini keys
+1f8879c4 2026-06-15 CHANGELOG: add CVE number to libtiff 4.7.1 fix
+cf7ebbf3 2026-06-11 workflows: switch Ubuntu 26.04 to GitHub runner image
+59a6de1a 2026-06-08 README: drop .tif file extension for Aperio
+65777538 2026-06-08 tools: fix `slidetool test deps` on Windows
+16122332 2026-06-08 meson: expand description of -Dtest
+2d0f5cca 2026-06-08 doc: drop references/referenced-by lines in function descriptions
+db89782c 2026-06-08 maintainer/release: automatically sync release table and docs
+2accdbf6 2026-06-06 Update for release
+d9a315f8 2026-06-07 workflows: switch release job back to ubuntu-latest
+12d052ec 2026-05-23 tools: avoid left shift into sign bit when unpremultiplying for PNG
+2d69e16a 2026-06-06 tests: update frozen archive
+2be88bd7 2026-05-21 ventana: fail if area has invalid tile count
+2f04c7f6 2026-06-06 ventana: avoid explicit free of GStrv
+48f4e277 2026-06-06 Doxyfile: update for Doxygen 1.16.1
+01de5142 2026-06-06 meson: show explanatory message if cjpeg/djpeg/xdelta3 aren't found
+bf5c1c35 2026-06-05 dicom: switch to dcm_filehandle_find_frame_number()
+75abbb29 2026-06-06 tests: update frozen archive
+23107ee2 2026-05-30 Add ARGOS AVS support
+7730342a 2026-06-05 test/extended: check for opaque pixels at boundaries
+110a7b04 2026-05-26 Add openslide.barcode property
+59f532e3 2026-06-02 dicom: draw filename and frame number when tile debugging is enabled
+38d6a6bb 2026-06-03 meson: ignore subprojects/.wraplock
+99cf32aa 2026-06-05 tests: update frozen archive
+0d1b32fd 2026-06-04 dicom: forbid YBR_ICT with lossless JP2K transfer syntax
+265d332e 2026-06-04 dicom: fix JPEG 2000 colorspaces
+3a0a877c 2026-06-04 aperio: fix terminology for 33005 compression
+5448c65b 2026-06-03 dicom: preload missing tiles in sparse levels
+94f67194 2026-06-05 dicom: log unknown image flavors to `search` debug flag
+2b0b62b7 2026-06-05 dicom: ignore ImageType except for image flavor
+6ddda055 2026-06-03 pre-commit: update versions
+2285b457 2026-06-04 dicom: add concatenation support (#648)
+90031989 2026-06-01 dicom: add read cache
+450b4aa3 2026-06-01 dicom: seek lazily
+c25c920a 2026-06-01 hamamatsu: avoid unnecessary seeks reading VMU header
+80151e0a 2026-06-01 util: do not JIT the regex
+ba466e5f 2026-06-01 test/cases: drop support for libdicom < 1.2 errors
+8fb44607 2026-05-30 generic-tiff: conditionally add bounds properties
+7176bad1 2026-05-30 grid: have simple grid track sparse tiles
+8b428ba1 2026-05-31 tests: update frozen archive
+f0b330da 2026-05-25 util: ignore empty MIRAX Slidedat.ini keys
+72804181 2026-05-24 util: drop obsolete comment
+aae38d23 2026-05-24 mirax: allow objective magnification to be missing, blank, or end in `x`
+5340400a 2026-05-30 dicom: copy objective power and MPP from vendor properties; unswap MPP
+90524cb1 2026-05-31 Add helper function to duplicate and scale double property
+8669a585 2026-05-30 huron: assert if we don't add any levels
+0eca86a0 2026-05-29 hamamatsu: assume NDPI ASCII values are always stored out-of-line
+0ac30b87 2026-05-29 test: add 2026 NDPI scan
+57587357 2026-05-29 misc/imhex/hamamatsu-ndpi: add some additional tags
+8ecdf310 2026-05-29 test/cases: skip Huron tests on older libtiff without log callbacks
+1691880e 2026-05-28 Add Huron driver
+7b0032c3 2026-05-27 test/cases: add some additional required-missing properties
+07cc289a 2026-05-27 test/cases: consistently use ~ for null values
+e4909383 2026-05-27 test: distinguish between missing and empty properties
+f7dbb1df 2026-05-27 test/try_open: switch to `-n NULL` for requiring a NULL vendor
+9e11cde8 2026-05-27 test/cases: drop unused error message check
+d473a8b3 2026-05-28 Update copyright string dates for 2026
+765de7c4 2026-05-27 tests: update frozen archive
+6d9c3024 2026-05-25 aperio: allow thumbnails to omit ImageDescription
+e1a64088 2026-05-25 aperio: detect label and macro images via subfile type
+bb5db2c7 2026-05-25 test/cases: check for associated images in all primary tests
+ec8d09a2 2026-05-27 hamamatsu: use JPEG dimensions for non-tiled NDPI levels
+ba332811 2026-05-25 hamamatsu: compare JPEG and TIFF dimensions for non-tiled NDPI levels
+e9f738aa 2026-05-26 hamamatsu: don't reread JPEG header on every tile access
+fdec300f 2026-05-25 hamamatsu: store offsets of SOF and SOS within JPEG header
+a1d06e96 2026-05-25 hamamatsu: validate strip count instead of rows per strip
+bdaeee21 2026-05-21 Use g_new() to allocate arrays with elements larger than 1
+648b0199 2026-05-25 hamamatsu: fix comment leak after validate_jpeg_header() failure
+96e71765 2026-05-24 test: add performance debug flag to primary Hamamatsu tests
+c25a03f3 2026-05-24 hamamatsu: break out reading of NDPI MCU starts; improve error reporting
+095e880d 2026-05-25 tifflike: break long lines in debug dump
+25e7929f 2026-05-22 test/mosaic: expand matrix to six columns
+62ecd96d 2026-05-24 tests: update frozen archive
+8d069a11 2024-05-29 test/cases: add tests for NDPI file with 4+ GiB bottom level
+659eaa4c 2026-05-24 test/cases: fix cases broken by NDPI value extension support
+4e67b192 2026-05-24 misc/tiff-delete-tag: port to Python 3
+b944869d 2026-05-24 tifflike: perform NDPI value extension only on specific field types
+638b662b 2024-05-28 tifflike: minor cleanups
+0d22814e 2024-05-28 tifflike: read NDPI value extensions all at once
+d3bec136 2026-05-24 hamamatsu: check NDPI_MCU_STARTS_HIGH value count and successful read
+80240e61 2024-05-28 hamamatsu: consolidate unreliable MCU start cases
+ef7b565d 2024-05-28 hamamatsu: shorten names of MCU starts constants/variables
+3181ac95 2024-05-15 hamamatsu: add support for NDPI images > 4 GB
+b86e0b6e 2026-05-22 test/driver: use HeadBucket to get S3 bucket region
+bd79638d 2026-05-02 pre-commit: bump the deps group with 2 updates
+c3583b5e 2026-04-30 meson: update libdicom to 1.2.1
+57ca85e2 2026-04-24 workflows: add Ubuntu 26.04
+292da01b 2026-04-15 pre-commit: switch to prek
+45101f55 2026-04-15 pre-commit: switch to Ruff
+2b32ac6e 2026-04-15 test/driver: chain exceptions
+4b288005 2026-04-15 test/driver: switch triple single quotes to triple double quotes
+0d65bd81 2026-04-15 pre-commit: update to Meson 1.11
+2c5c4baf 2026-04-02 pre-commit: bump https://github.com/pre-commit/mirrors-mypy

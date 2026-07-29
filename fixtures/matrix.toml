@@ -6,15 +6,15 @@ area = "svs-baseline"
 requirement = "Representative SVS fixture has metadata, pixel, speed, and RSS parity."
 status = "covered"
 fixtures = ["aperio-local-77917"]
-notes = "Representative local SVS fixture is exact; public small-region SVS is tracked as a separate exact public JPEG/RGB case."
+notes = "Representative local SVS fixture is exact; public small-region SVS is tracked as a separate bounded-drift public JPEG/RGB case."
 
 [[case]]
 reader = "aperio"
 area = "public-jpeg-rgb"
 requirement = "Public RGB-tagged JPEG SVS variants have exact or documented parity."
-status = "covered"
+status = "known-drift"
 fixtures = ["aperio-public-cmu-1-small-region"]
-notes = "Public small-region SVS now has exact sampled checksum parity after forcing TIFF JPEG tiles to honor the RGB photometric colorspace."
+notes = "Public small-region SVS uses the pure-Rust zune-jpeg RGB path and has bounded codec rounding drift from libjpeg."
 
 [[case]]
 reader = "aperio"
@@ -180,16 +180,17 @@ notes = "Current fluorescence and Leica-3 witnesses are reference blocked; need 
 reader = "mirax"
 area = "fluorescence-public"
 requirement = "Public fluorescence MRXS fixture has exact aggregate and per-level parity."
-status = "covered"
+status = "known-drift"
 fixtures = ["mirax-public-fluorescence-2"]
+notes = "Pure-Rust JPEG/compositor output has bounded opaque-pixel drift from libjpeg/Cairo; low-alpha edges make raw RGB checksums differ."
 
 [[case]]
 reader = "mirax"
 area = "brightfield-public"
 requirement = "Public brightfield MRXS fixture has exact aggregate and per-level parity."
-status = "covered"
+status = "known-drift"
 fixtures = ["mirax-public-cmu-1-saved-1-16"]
-notes = "Exact after decoding JPEG tiles with libjpeg before Cairo tilemap composition."
+notes = "Pure-Rust JPEG/compositor output has bounded opaque-pixel drift from libjpeg/Cairo; low-alpha edges make raw RGB checksums differ."
 
 [[case]]
 reader = "mirax"
@@ -197,7 +198,7 @@ area = "broader-mrxs-breadth"
 requirement = "Additional MRXS channel maps, grid placements, missing-channel cases, and associated-image behavior are fixture-backed."
 status = "pending"
 fixtures = []
-notes = "Public brightfield and fluorescence fixtures are exact; broader MRXS layouts need additional fixtures before conditional maturity."
+notes = "Public brightfield and fluorescence fixtures have bounded drift; broader MRXS layouts need additional fixtures before conditional maturity."
 
 [[case]]
 reader = "philips"
@@ -219,7 +220,16 @@ reader = "trestle"
 area = "cmu-1"
 requirement = "Private and public CMU-1 Trestle fixtures are exact."
 status = "covered"
-fixtures = ["trestle-local-cmu-1", "trestle-public-cmu-1"]
+fixtures = ["trestle-local-cmu-1"]
+notes = "Private CMU-1 remains the exact promotion fixture; public CMU-1 is tracked separately as bounded drift after the pure-Rust JPEG/compositor switch."
+
+[[case]]
+reader = "trestle"
+area = "public-cmu-1-drift"
+requirement = "Public CMU-1 Trestle fixture has documented parity drift."
+status = "known-drift"
+fixtures = ["trestle-public-cmu-1"]
+notes = "Pure-Rust JPEG/compositor path has bounded opaque-pixel drift from the OpenSlide/libjpeg/Cairo reference."
 
 [[case]]
 reader = "trestle"
@@ -234,7 +244,16 @@ reader = "ventana"
 area = "bif-aoi-baseline"
 requirement = "Representative BIF AOI fixtures, including subpixel AOI origins, have exact parity."
 status = "covered"
-fixtures = ["ventana-local-os-1", "ventana-local-os-2"]
+fixtures = ["ventana-local-os-2"]
+notes = "OS-2 remains exact subpixel-AOI evidence; OS-1 is tracked separately as bounded drift after the pure-Rust JPEG/compositor switch."
+
+[[case]]
+reader = "ventana"
+area = "bif-aoi-drift"
+requirement = "Representative OS-1 BIF AOI fixture has documented parity drift."
+status = "known-drift"
+fixtures = ["ventana-local-os-1"]
+notes = "Pure-Rust JPEG/compositor path has bounded opaque-pixel drift from the OpenSlide/libjpeg/Cairo reference."
 
 [[case]]
 reader = "ventana"
@@ -360,8 +379,9 @@ notes = "No Sakura .svslide fixture was found locally or in the OpenSlide public
 reader = "generic-tiff"
 area = "public-baseline"
 requirement = "Public Generic TIFF CMU-1 fixture is exact."
-status = "covered"
+status = "known-drift"
 fixtures = ["generic-tiff-public-cmu-1"]
+notes = "Pure-Rust JPEG path has bounded codec rounding drift from the OpenSlide/libjpeg reference."
 
 [[case]]
 reader = "generic-tiff"

@@ -22,9 +22,7 @@ use zune_core::options::{DecoderOptions, InputColorspaceOverride, JpegScale};
 
 use crate::cancel::{CancelCheck, Debounced, CANCEL_POLL_INTERVAL_MCUS};
 
-#[cfg(feature = "arith")]
-use crate::bitstream::BitStream;
-use crate::bitstream::{BitStreamHuffman, BitstreamStateSnapshot};
+use crate::bitstream::{BitStream, BitStreamHuffman, BitstreamStateSnapshot};
 #[cfg(feature = "arith")]
 use crate::bitstream_arith::{ArithACTables, ArithDCTables, BitStreamArithmetic};
 use crate::color_convert::choose_ycbcr_to_rgb_convert_func;
@@ -39,7 +37,8 @@ use crate::headers::{
 use crate::huffman::HuffmanTable;
 use crate::idct::{choose_idct_1x1_func, choose_idct_4x4_func, choose_idct_func};
 use crate::marker::Marker;
-use crate::misc::SOFMarkers;
+use crate::mcu::McuContinuation;
+use crate::misc::{setup_component_params, SOFMarkers, UN_ZIGZAG};
 use crate::upsampler::{
     choose_horizontal_samp_function, choose_hv_samp_function, choose_v_samp_function,
     generic_sampler, upsample_no_op,
@@ -58,6 +57,103 @@ pub struct DecodeRegion {
     pub y: usize,
     pub width: usize,
     pub height: usize,
+}
+
+/// Per-component block layout for a coefficient-domain lossless crop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LosslessCropComponent {
+    pub component_index: usize,
+    pub src_col_blocks: usize,
+    pub src_row_blocks: usize,
+    pub dst_width_blocks: usize,
+    pub dst_height_blocks: usize,
+}
+
+/// Validated geometry for a coefficient-domain lossless crop/transcode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LosslessCropInfo {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+    pub mcu_width: usize,
+    pub mcu_height: usize,
+    pub components: Vec<LosslessCropComponent>,
+}
+
+/// Quantized DCT coefficients for one component of a lossless crop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LosslessCropComponentCoefficients {
+    pub component_index: usize,
+    pub width_blocks: usize,
+    pub height_blocks: usize,
+    pub blocks: Vec<[i16; 64]>,
+}
+
+/// Quantized DCT coefficients and marker metadata for a lossless crop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LosslessCropCoefficients {
+    pub info: LosslessCropInfo,
+    pub metadata: JpegTranscodeMetadata,
+    pub quantization_tables: Vec<JpegQuantizationTable>,
+    pub huffman_tables: Vec<JpegHuffmanTable>,
+    pub components: Vec<LosslessCropComponentCoefficients>,
+}
+
+/// JPEG Huffman table class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JpegHuffmanTableClass {
+    Dc,
+    Ac,
+}
+
+/// Parsed JPEG Huffman table definition in DHT marker order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JpegHuffmanTable {
+    pub class: JpegHuffmanTableClass,
+    pub index: usize,
+    pub code_counts: [u8; 16],
+    pub values: Vec<u8>,
+}
+
+/// Parsed JPEG quantization table definition in DQT marker order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JpegQuantizationTable {
+    pub index: usize,
+    pub precision: u8,
+    pub values: Vec<u16>,
+}
+
+/// Component parameters from the SOF marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JpegFrameComponent {
+    pub id: u8,
+    pub horizontal_sample: usize,
+    pub vertical_sample: usize,
+    pub quantization_table: u8,
+}
+
+/// Component/table mapping from the active SOS marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JpegScanComponent {
+    pub id: u8,
+    pub dc_huffman_table: usize,
+    pub ac_huffman_table: usize,
+}
+
+/// Parsed JPEG frame and scan metadata needed to emit SOF/SOS markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JpegTranscodeMetadata {
+    pub width: u16,
+    pub height: u16,
+    pub precision: u8,
+    pub sof_marker: u16,
+    pub components: Vec<JpegFrameComponent>,
+    pub scan_components: Vec<JpegScanComponent>,
+    pub spectral_start: u8,
+    pub spectral_end: u8,
+    pub successive_high: u8,
+    pub successive_low: u8,
 }
 
 /// Region decode strategy.
@@ -127,6 +223,553 @@ pub fn assemble_split_jpeg(
     out.extend_from_slice(data);
     if !out.ends_with(&[0xff, 0xd9]) {
         out.extend_from_slice(&[0xff, 0xd9]);
+    }
+
+    Ok(())
+}
+
+/// Assemble a JPEG stream from TIFF-style separate JPEG tables and tile data.
+///
+/// TIFF's `JPEGTables` tag commonly stores a tables-only JPEG stream containing
+/// SOI, DQT/DHT/DAC marker segments, and EOI. Tile or strip data then stores the
+/// image headers and entropy data without repeating those tables. This helper
+/// extracts table-definition marker segments from `tables` and inserts them
+/// after the tile stream's SOI marker so a normal JPEG decoder can consume the
+/// result.
+///
+/// If the tile data also contains table definitions, those later definitions
+/// remain in the stream and can override the inserted tables.
+///
+/// # Errors
+/// Returns an error if either input is not a JPEG stream, a marker segment is
+/// truncated, or the table stream contains image data.
+pub fn assemble_jpeg_with_tables(
+    tables: &[u8], data: &[u8], out: &mut Vec<u8>,
+) -> Result<(), DecodeErrors> {
+    if !starts_with_soi(tables) {
+        return Err(DecodeErrors::IllegalMagicBytes(first_u16_be(tables)));
+    }
+    if !starts_with_soi(data) {
+        return Err(DecodeErrors::IllegalMagicBytes(first_u16_be(data)));
+    }
+
+    let mut table_segments = Vec::new();
+    collect_jpeg_table_segments(tables, &mut table_segments)?;
+    if table_segments.is_empty() {
+        return Err(DecodeErrors::FormatStatic(
+            "TIFF JPEG tables contain no DQT, DHT, or DAC segments",
+        ));
+    }
+
+    out.clear();
+    out.reserve(data.len().saturating_add(table_segments.len()));
+    out.extend_from_slice(&data[..2]);
+    out.extend_from_slice(&table_segments);
+    out.extend_from_slice(&data[2..]);
+    Ok(())
+}
+
+/// Encode extracted crop coefficients into a standalone JPEG stream.
+///
+/// This is the write half of a coefficient-domain lossless crop/transcode path.
+/// It currently supports baseline Huffman, a single interleaved scan, and no
+/// restart marker rewriting.
+pub fn encode_lossless_crop_coefficients(
+    coefficients: &LosslessCropCoefficients, out: &mut Vec<u8>,
+) -> Result<(), DecodeErrors> {
+    if coefficients.info.width == 0 || coefficients.info.height == 0 {
+        return Err(DecodeErrors::FormatStatic(
+            "JPEG lossless crop output dimensions must be non-zero",
+        ));
+    }
+    let width = u16::try_from(coefficients.info.width).map_err(|_| {
+        DecodeErrors::FormatStatic("JPEG lossless crop width does not fit baseline JPEG")
+    })?;
+    let height = u16::try_from(coefficients.info.height).map_err(|_| {
+        DecodeErrors::FormatStatic("JPEG lossless crop height does not fit baseline JPEG")
+    })?;
+    if coefficients.metadata.sof_marker != 0xffc0 {
+        return Err(DecodeErrors::FormatStatic(
+            "JPEG lossless crop writer currently supports baseline DCT only",
+        ));
+    }
+    if coefficients.metadata.spectral_start != 0
+        || coefficients.metadata.spectral_end != 63
+        || coefficients.metadata.successive_high != 0
+        || coefficients.metadata.successive_low != 0
+    {
+        return Err(DecodeErrors::FormatStatic(
+            "JPEG lossless crop writer only supports baseline scan parameters",
+        ));
+    }
+
+    out.clear();
+    out.extend_from_slice(&[0xff, 0xd8]);
+    write_dqt_segments(&coefficients.quantization_tables, out)?;
+    write_sof_segment(&coefficients.metadata, width, height, out)?;
+    write_dht_segments(&coefficients.huffman_tables, out)?;
+    write_sos_segment(&coefficients.metadata, out)?;
+    write_entropy_scan(coefficients, out)?;
+    out.extend_from_slice(&[0xff, 0xd9]);
+    Ok(())
+}
+
+fn write_dqt_segments(
+    tables: &[JpegQuantizationTable], out: &mut Vec<u8>,
+) -> Result<(), DecodeErrors> {
+    for table in tables {
+        if table.index > 3 || table.precision > 1 || table.values.len() != 64 {
+            return Err(DecodeErrors::FormatStatic(
+                "Invalid JPEG quantization table for lossless crop writer",
+            ));
+        }
+        let value_bytes = if table.precision == 0 { 64 } else { 128 };
+        let len = u16::try_from(2 + 1 + value_bytes).map_err(|_| {
+            DecodeErrors::FormatStatic("JPEG quantization table marker length overflow")
+        })?;
+        out.extend_from_slice(&[0xff, 0xdb]);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.push((table.precision << 4) | table.index as u8);
+        if table.precision == 0 {
+            for &value in &table.values {
+                if value > 255 {
+                    return Err(DecodeErrors::FormatStatic(
+                        "8-bit JPEG quantization table contains a 16-bit value",
+                    ));
+                }
+                out.push(value as u8);
+            }
+        } else {
+            for &value in &table.values {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_sof_segment(
+    metadata: &JpegTranscodeMetadata, width: u16, height: u16, out: &mut Vec<u8>,
+) -> Result<(), DecodeErrors> {
+    if metadata.components.is_empty() || metadata.components.len() > MAX_COMPONENTS {
+        return Err(DecodeErrors::FormatStatic(
+            "Invalid JPEG component count for lossless crop writer",
+        ));
+    }
+    let len = u16::try_from(8 + 3 * metadata.components.len())
+        .map_err(|_| DecodeErrors::FormatStatic("JPEG SOF marker length overflow"))?;
+    out.extend_from_slice(&metadata.sof_marker.to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.push(metadata.precision);
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&width.to_be_bytes());
+    out.push(metadata.components.len() as u8);
+    for component in &metadata.components {
+        if component.horizontal_sample > 15
+            || component.vertical_sample > 15
+            || component.quantization_table > 3
+        {
+            return Err(DecodeErrors::FormatStatic(
+                "Invalid JPEG SOF component for lossless crop writer",
+            ));
+        }
+        out.push(component.id);
+        out.push(((component.horizontal_sample as u8) << 4) | component.vertical_sample as u8);
+        out.push(component.quantization_table);
+    }
+    Ok(())
+}
+
+fn write_dht_segments(
+    tables: &[JpegHuffmanTable], out: &mut Vec<u8>,
+) -> Result<(), DecodeErrors> {
+    for table in tables {
+        if table.index > 3 {
+            return Err(DecodeErrors::FormatStatic(
+                "Invalid JPEG Huffman table index for lossless crop writer",
+            ));
+        }
+        let values_len = table.values.len();
+        if values_len != table.code_counts.iter().map(|&count| count as usize).sum::<usize>() {
+            return Err(DecodeErrors::FormatStatic(
+                "JPEG Huffman table symbol count does not match code counts",
+            ));
+        }
+        let len = u16::try_from(2 + 1 + 16 + values_len)
+            .map_err(|_| DecodeErrors::FormatStatic("JPEG DHT marker length overflow"))?;
+        out.extend_from_slice(&[0xff, 0xc4]);
+        out.extend_from_slice(&len.to_be_bytes());
+        let class = match table.class {
+            JpegHuffmanTableClass::Dc => 0,
+            JpegHuffmanTableClass::Ac => 1,
+        };
+        out.push((class << 4) | table.index as u8);
+        out.extend_from_slice(&table.code_counts);
+        out.extend_from_slice(&table.values);
+    }
+    Ok(())
+}
+
+fn write_sos_segment(
+    metadata: &JpegTranscodeMetadata, out: &mut Vec<u8>,
+) -> Result<(), DecodeErrors> {
+    if metadata.scan_components.is_empty() || metadata.scan_components.len() > MAX_COMPONENTS {
+        return Err(DecodeErrors::FormatStatic(
+            "Invalid JPEG scan component count for lossless crop writer",
+        ));
+    }
+    let len = u16::try_from(6 + 2 * metadata.scan_components.len())
+        .map_err(|_| DecodeErrors::FormatStatic("JPEG SOS marker length overflow"))?;
+    out.extend_from_slice(&[0xff, 0xda]);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.push(metadata.scan_components.len() as u8);
+    for component in &metadata.scan_components {
+        if component.dc_huffman_table > 3 || component.ac_huffman_table > 3 {
+            return Err(DecodeErrors::FormatStatic(
+                "Invalid JPEG SOS Huffman table index for lossless crop writer",
+            ));
+        }
+        out.push(component.id);
+        out.push(((component.dc_huffman_table as u8) << 4) | component.ac_huffman_table as u8);
+    }
+    out.push(metadata.spectral_start);
+    out.push(metadata.spectral_end);
+    out.push((metadata.successive_high << 4) | metadata.successive_low);
+    Ok(())
+}
+
+fn write_entropy_scan(
+    coefficients: &LosslessCropCoefficients, out: &mut Vec<u8>,
+) -> Result<(), DecodeErrors> {
+    let huffman_tables = EncodeHuffmanTables::new(&coefficients.huffman_tables)?;
+    let h_max = coefficients
+        .metadata
+        .components
+        .iter()
+        .map(|component| component.horizontal_sample)
+        .max()
+        .unwrap_or(1);
+    let v_max = coefficients
+        .metadata
+        .components
+        .iter()
+        .map(|component| component.vertical_sample)
+        .max()
+        .unwrap_or(1);
+    let mcu_width = h_max * 8;
+    let mcu_height = v_max * 8;
+    let mcu_x = coefficients.info.width.div_ceil(mcu_width);
+    let mcu_y = coefficients.info.height.div_ceil(mcu_height);
+    let mut dc_predictions = [0_i16; MAX_COMPONENTS];
+    let mut writer = EntropyBitWriter::new(out);
+
+    for mcu_row in 0..mcu_y {
+        for mcu_col in 0..mcu_x {
+            for scan_component in &coefficients.metadata.scan_components {
+                let frame_index = coefficients
+                    .metadata
+                    .components
+                    .iter()
+                    .position(|component| component.id == scan_component.id)
+                    .ok_or(DecodeErrors::FormatStatic(
+                        "JPEG SOS references a component missing from SOF",
+                    ))?;
+                let frame_component = coefficients.metadata.components[frame_index];
+                let component = coefficients
+                    .components
+                    .iter()
+                    .find(|component| component.component_index == frame_index)
+                    .ok_or(DecodeErrors::FormatStatic(
+                        "JPEG lossless crop coefficient component is missing",
+                    ))?;
+                for v_samp in 0..frame_component.vertical_sample {
+                    for h_samp in 0..frame_component.horizontal_sample {
+                        let block_x = mcu_col * frame_component.horizontal_sample + h_samp;
+                        let block_y = mcu_row * frame_component.vertical_sample + v_samp;
+                        let block = if block_x < component.width_blocks
+                            && block_y < component.height_blocks
+                        {
+                            component.blocks[block_y * component.width_blocks + block_x]
+                        } else {
+                            [0; 64]
+                        };
+                        encode_block(
+                            &mut writer,
+                            &block,
+                            &mut dc_predictions[frame_index],
+                            huffman_tables.dc(scan_component.dc_huffman_table)?,
+                            huffman_tables.ac(scan_component.ac_huffman_table)?,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    writer.finish()
+}
+
+#[derive(Clone, Copy)]
+struct EncodeHuffmanCode {
+    code: u16,
+    len: u8,
+}
+
+struct EncodeHuffmanTable {
+    codes: [Option<EncodeHuffmanCode>; 256],
+}
+
+struct EncodeHuffmanTables {
+    dc: [Option<EncodeHuffmanTable>; MAX_COMPONENTS],
+    ac: [Option<EncodeHuffmanTable>; MAX_COMPONENTS],
+}
+
+impl EncodeHuffmanTables {
+    fn new(tables: &[JpegHuffmanTable]) -> Result<Self, DecodeErrors> {
+        let mut out = Self {
+            dc: core::array::from_fn(|_| None),
+            ac: core::array::from_fn(|_| None),
+        };
+        for table in tables {
+            let encoded = EncodeHuffmanTable::new(table)?;
+            match table.class {
+                JpegHuffmanTableClass::Dc => out.dc[table.index] = Some(encoded),
+                JpegHuffmanTableClass::Ac => out.ac[table.index] = Some(encoded),
+            }
+        }
+        Ok(out)
+    }
+
+    fn dc(&self, index: usize) -> Result<&EncodeHuffmanTable, DecodeErrors> {
+        self.dc
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(DecodeErrors::FormatStatic(
+                "JPEG lossless crop writer is missing a DC Huffman table",
+            ))
+    }
+
+    fn ac(&self, index: usize) -> Result<&EncodeHuffmanTable, DecodeErrors> {
+        self.ac
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(DecodeErrors::FormatStatic(
+                "JPEG lossless crop writer is missing an AC Huffman table",
+            ))
+    }
+}
+
+impl EncodeHuffmanTable {
+    fn new(table: &JpegHuffmanTable) -> Result<Self, DecodeErrors> {
+        if table.index >= MAX_COMPONENTS {
+            return Err(DecodeErrors::FormatStatic(
+                "JPEG Huffman table index is outside supported range",
+            ));
+        }
+        let mut codes = [None; 256];
+        let mut code = 0_u16;
+        let mut value_index = 0_usize;
+        for (len_index, &count) in table.code_counts.iter().enumerate() {
+            let len = (len_index + 1) as u8;
+            for _ in 0..count {
+                let value = *table.values.get(value_index).ok_or(DecodeErrors::FormatStatic(
+                    "JPEG Huffman table code count exceeds symbol data",
+                ))?;
+                codes[value as usize] = Some(EncodeHuffmanCode { code, len });
+                code = code.wrapping_add(1);
+                value_index += 1;
+            }
+            code <<= 1;
+        }
+        if value_index != table.values.len() {
+            return Err(DecodeErrors::FormatStatic(
+                "JPEG Huffman table has unused symbol data",
+            ));
+        }
+        Ok(Self { codes })
+    }
+
+    fn code(&self, symbol: u8) -> Result<EncodeHuffmanCode, DecodeErrors> {
+        self.codes[symbol as usize].ok_or(DecodeErrors::FormatStatic(
+            "JPEG lossless crop writer is missing a Huffman symbol",
+        ))
+    }
+}
+
+struct EntropyBitWriter<'a> {
+    out: &'a mut Vec<u8>,
+    buffer: u32,
+    bits: u8,
+}
+
+impl<'a> EntropyBitWriter<'a> {
+    fn new(out: &'a mut Vec<u8>) -> Self {
+        Self {
+            out,
+            buffer: 0,
+            bits: 0,
+        }
+    }
+
+    fn write_bits(&mut self, bits: u16, len: u8) {
+        if len == 0 {
+            return;
+        }
+        self.buffer = (self.buffer << len) | u32::from(bits & ((1_u16 << len) - 1));
+        self.bits += len;
+        while self.bits >= 8 {
+            let shift = self.bits - 8;
+            let byte = ((self.buffer >> shift) & 0xff) as u8;
+            self.out.push(byte);
+            if byte == 0xff {
+                self.out.push(0);
+            }
+            self.bits -= 8;
+            self.buffer &= (1_u32 << shift).wrapping_sub(1);
+        }
+    }
+
+    fn write_huffman(
+        &mut self, table: &EncodeHuffmanTable, symbol: u8,
+    ) -> Result<(), DecodeErrors> {
+        let code = table.code(symbol)?;
+        self.write_bits(code.code, code.len);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), DecodeErrors> {
+        if self.bits > 0 {
+            let pad = (1_u16 << (8 - self.bits)) - 1;
+            self.write_bits(pad, 8 - self.bits);
+        }
+        Ok(())
+    }
+}
+
+fn encode_block(
+    writer: &mut EntropyBitWriter<'_>, block: &[i16; 64], dc_prediction: &mut i16,
+    dc_table: &EncodeHuffmanTable, ac_table: &EncodeHuffmanTable,
+) -> Result<(), DecodeErrors> {
+    let dc_diff = block[0].wrapping_sub(*dc_prediction);
+    *dc_prediction = block[0];
+    let (category, bits) = coefficient_bits(dc_diff);
+    writer.write_huffman(dc_table, category)?;
+    writer.write_bits(bits, category);
+
+    let mut zero_run = 0_u8;
+    for zigzag_index in 1..64 {
+        let value = block[UN_ZIGZAG[zigzag_index]];
+        if value == 0 {
+            zero_run += 1;
+            continue;
+        }
+        while zero_run >= 16 {
+            writer.write_huffman(ac_table, 0xf0)?;
+            zero_run -= 16;
+        }
+        let (size, bits) = coefficient_bits(value);
+        writer.write_huffman(ac_table, (zero_run << 4) | size)?;
+        writer.write_bits(bits, size);
+        zero_run = 0;
+    }
+    if zero_run > 0 {
+        writer.write_huffman(ac_table, 0)?;
+    }
+    Ok(())
+}
+
+fn coefficient_bits(value: i16) -> (u8, u16) {
+    if value == 0 {
+        return (0, 0);
+    }
+    let abs = value.unsigned_abs();
+    let category = 16 - abs.leading_zeros() as u8;
+    let bits = if value > 0 {
+        abs
+    } else {
+        abs ^ ((1_u16 << category) - 1)
+    };
+    (category, bits)
+}
+
+fn starts_with_soi(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == 0xff && data[1] == 0xd8
+}
+
+fn first_u16_be(data: &[u8]) -> u16 {
+    if data.len() >= 2 {
+        u16::from_be_bytes([data[0], data[1]])
+    } else {
+        0
+    }
+}
+
+fn collect_jpeg_table_segments(tables: &[u8], out: &mut Vec<u8>) -> Result<(), DecodeErrors> {
+    let mut pos = 2;
+    while pos < tables.len() {
+        if tables[pos] != 0xff {
+            return Err(DecodeErrors::FormatStatic(
+                "TIFF JPEG tables contain non-marker data",
+            ));
+        }
+        while pos < tables.len() && tables[pos] == 0xff {
+            pos += 1;
+        }
+        if pos >= tables.len() {
+            return Err(DecodeErrors::FormatStatic(
+                "TIFF JPEG tables end inside marker padding",
+            ));
+        }
+
+        let marker = tables[pos];
+        pos += 1;
+        if marker == 0 {
+            return Err(DecodeErrors::FormatStatic(
+                "TIFF JPEG tables contain entropy-coded data",
+            ));
+        }
+        if marker == 0xd9 {
+            return Ok(());
+        }
+        if marker == 0xd8 {
+            continue;
+        }
+        if marker == 0xda {
+            return Err(DecodeErrors::FormatStatic(
+                "TIFF JPEG tables must not contain scan data",
+            ));
+        }
+        if (0xd0..=0xd7).contains(&marker) || marker == 0x01 {
+            continue;
+        }
+
+        let segment_start = pos
+            .checked_sub(2)
+            .ok_or(DecodeErrors::FormatStatic("Marker position underflow"))?;
+        if pos + 2 > tables.len() {
+            return Err(DecodeErrors::FormatStatic(
+                "TIFF JPEG table marker length is truncated",
+            ));
+        }
+        let segment_len = u16::from_be_bytes([tables[pos], tables[pos + 1]]) as usize;
+        if segment_len < 2 {
+            return Err(DecodeErrors::FormatStatic(
+                "TIFF JPEG table marker length is invalid",
+            ));
+        }
+        let segment_end = pos
+            .checked_add(segment_len)
+            .ok_or(DecodeErrors::FormatStatic(
+                "TIFF JPEG table marker length overflows usize",
+            ))?;
+        if segment_end > tables.len() {
+            return Err(DecodeErrors::FormatStatic(
+                "TIFF JPEG table marker is truncated",
+            ));
+        }
+        if matches!(marker, 0xdb | 0xc4 | 0xcc) {
+            out.extend_from_slice(&tables[segment_start..segment_end]);
+        }
+        pos = segment_end;
     }
 
     Ok(())
@@ -957,6 +1600,18 @@ where
     fn decode_scaled_region_into(
         &mut self, region: DecodeRegion, out: &mut [u8],
     ) -> Result<(), DecodeErrors> {
+        if !self.is_progressive
+            && !self.is_arithmetic
+            && !self.expects_dnl
+            && !self.scan_decode_attempted
+            && self.restart_interval == 0
+            && usize::from(self.num_scans) == self.components.len()
+            && matches!(self.input_colorspace, ColorSpace::Luma | ColorSpace::YCbCr)
+            && self.input_colorspace.num_components() == self.components.len()
+        {
+            return self.decode_scaled_baseline_region_into::<BitStreamHuffman>(region, out);
+        }
+
         let scaled_size = self.output_buffer_size().ok_or(DecodeErrors::FormatStatic(
             "Scaled output buffer size is unavailable after header decode",
         ))?;
@@ -1012,6 +1667,358 @@ where
         }
 
         Ok(())
+    }
+
+    /// Validate an MCU-aligned coefficient-domain lossless crop.
+    ///
+    /// This is the geometry contract used by libjpeg's coefficient crop path:
+    /// the crop origin must be aligned to the source MCU grid, and any crop
+    /// edge that is not also the image edge must end on the same MCU grid. The
+    /// returned component block coordinates are the source/destination block
+    /// ranges that a pure-Rust coefficient transcode should copy.
+    ///
+    /// # Errors
+    /// Returns an error if headers are invalid, the crop rectangle is empty or
+    /// out of bounds, or the current JPEG uses features outside the initial
+    /// baseline Huffman coefficient-transcode scope.
+    pub fn validate_lossless_crop(
+        &mut self, x: usize, y: usize, width: usize, height: usize,
+    ) -> Result<LosslessCropInfo, DecodeErrors> {
+        self.decode_headers()?;
+        setup_component_params(self)?;
+
+        if width == 0 || height == 0 {
+            return Err(DecodeErrors::FormatStatic(
+                "JPEG lossless crop rectangle is empty",
+            ));
+        }
+        if x.checked_add(width).is_none_or(|right| right > usize::from(self.info.width))
+            || y.checked_add(height).is_none_or(|bottom| bottom > usize::from(self.info.height))
+        {
+            return Err(DecodeErrors::FormatStatic(
+                "JPEG lossless crop rectangle is outside image bounds",
+            ));
+        }
+        if self.is_progressive || self.is_arithmetic {
+            return Err(DecodeErrors::FormatStatic(
+                "JPEG lossless crop currently supports baseline Huffman images only",
+            ));
+        }
+        if self.restart_interval != 0 {
+            return Err(DecodeErrors::FormatStatic(
+                "JPEG lossless crop currently does not rewrite restart markers",
+            ));
+        }
+        if usize::from(self.num_scans) != self.components.len() {
+            return Err(DecodeErrors::FormatStatic(
+                "JPEG lossless crop currently requires a single interleaved scan",
+            ));
+        }
+        if self.h_max == 0 || self.v_max == 0 {
+            return Err(DecodeErrors::FormatStatic(
+                "JPEG lossless crop has invalid sampling factors",
+            ));
+        }
+
+        let mcu_width = self.h_max.checked_mul(8).ok_or(DecodeErrors::FormatStatic(
+            "JPEG lossless crop MCU width overflows usize",
+        ))?;
+        let mcu_height = self.v_max.checked_mul(8).ok_or(DecodeErrors::FormatStatic(
+            "JPEG lossless crop MCU height overflows usize",
+        ))?;
+        if x % mcu_width != 0 || y % mcu_height != 0 {
+            return Err(DecodeErrors::FormatStatic(
+                "JPEG lossless crop origin is not MCU-aligned",
+            ));
+        }
+        let right = x + width;
+        let bottom = y + height;
+        if (right < usize::from(self.info.width) && width % mcu_width != 0)
+            || (bottom < usize::from(self.info.height) && height % mcu_height != 0)
+        {
+            return Err(DecodeErrors::FormatStatic(
+                "JPEG lossless crop size is not MCU-compatible",
+            ));
+        }
+
+        let components = self
+            .components
+            .iter()
+            .enumerate()
+            .map(|(component_index, component)| {
+                let src_col_blocks = (x / mcu_width) * component.horizontal_sample;
+                let src_row_blocks = (y / mcu_height) * component.vertical_sample;
+                let dst_width_blocks =
+                    (width * component.horizontal_sample).div_ceil(self.h_max * 8);
+                let dst_height_blocks =
+                    (height * component.vertical_sample).div_ceil(self.v_max * 8);
+                LosslessCropComponent {
+                    component_index,
+                    src_col_blocks,
+                    src_row_blocks,
+                    dst_width_blocks,
+                    dst_height_blocks,
+                }
+            })
+            .collect();
+
+        Ok(LosslessCropInfo {
+            x,
+            y,
+            width,
+            height,
+            mcu_width,
+            mcu_height,
+            components,
+        })
+    }
+
+    /// Decode quantized DCT coefficients for an MCU-aligned lossless crop.
+    ///
+    /// This does not dequantize, run IDCT, or color-convert. It is intended as
+    /// the read half of a pure-Rust coefficient-domain crop/transcode path.
+    ///
+    /// # Errors
+    /// Returns an error if [`validate_lossless_crop`](Self::validate_lossless_crop)
+    /// rejects the rectangle or if the entropy stream cannot be decoded.
+    pub fn decode_lossless_crop_coefficients(
+        &mut self, x: usize, y: usize, width: usize, height: usize,
+    ) -> Result<LosslessCropCoefficients, DecodeErrors> {
+        let info = self.validate_lossless_crop(x, y, width, height)?;
+        self.check_tables::<BitStreamHuffman>()?;
+
+        let metadata = self.transcode_metadata().ok_or(DecodeErrors::FormatStatic(
+            "JPEG transcode metadata is unavailable after header decode",
+        ))?;
+        let quantization_tables = self
+            .quantization_tables()
+            .ok_or(DecodeErrors::FormatStatic(
+                "JPEG quantization tables are unavailable after header decode",
+            ))?;
+        let huffman_tables = self.huffman_tables().ok_or(DecodeErrors::FormatStatic(
+            "JPEG Huffman tables are unavailable after header decode",
+        ))?;
+
+        let mut components = info
+            .components
+            .iter()
+            .map(|component| LosslessCropComponentCoefficients {
+                component_index: component.component_index,
+                width_blocks: component.dst_width_blocks,
+                height_blocks: component.dst_height_blocks,
+                blocks: Vec::with_capacity(component.dst_width_blocks * component.dst_height_blocks),
+            })
+            .collect::<Vec<_>>();
+
+        let crop_mcu_x = x / info.mcu_width;
+        let crop_mcu_y = y / info.mcu_height;
+        let crop_mcu_width = width.div_ceil(info.mcu_width);
+        let crop_mcu_height = height.div_ceil(info.mcu_height);
+        let mut stream = BitStreamHuffman::new();
+        let mut block = [0_i16; 64];
+        let z_order = self.z_order;
+        let z_scans = &z_order[..usize::from(self.num_scans)];
+
+        for mcu_row in 0..self.mcu_y {
+            for mcu_col in 0..self.mcu_x {
+                let keep_mcu = mcu_col >= crop_mcu_x
+                    && mcu_col < crop_mcu_x + crop_mcu_width
+                    && mcu_row >= crop_mcu_y
+                    && mcu_row < crop_mcu_y + crop_mcu_height;
+                for &component_index in z_scans {
+                    let (horizontal_sample, vertical_sample) = {
+                        let component = &self.components[component_index];
+                        (component.horizontal_sample, component.vertical_sample)
+                    };
+                    for v_samp in 0..vertical_sample {
+                        for h_samp in 0..horizontal_sample {
+                            block.fill(0);
+                            {
+                                let component = &mut self.components[component_index];
+                                let (dc_table, ac_table) = BitStreamHuffman::get_dc_ac_tables(
+                                    &mut self.entropy_tables,
+                                    component.dc_huff_table % MAX_COMPONENTS,
+                                    component.ac_huff_table % MAX_COMPONENTS,
+                                )?;
+                                stream.decode_mcu_block_raw(
+                                    &mut self.stream,
+                                    dc_table,
+                                    ac_table,
+                                    &mut block,
+                                    &mut component.dc_pred,
+                                    &mut component.dc_diff,
+                                )?;
+                            }
+                            if keep_mcu {
+                                let dst = components
+                                    .iter_mut()
+                                    .find(|component| {
+                                        component.component_index == component_index
+                                    })
+                                    .ok_or(DecodeErrors::FormatStatic(
+                                        "JPEG lossless crop component metadata is inconsistent",
+                                    ))?;
+                                let local_block_x =
+                                    (mcu_col - crop_mcu_x) * horizontal_sample + h_samp;
+                                let local_block_y =
+                                    (mcu_row - crop_mcu_y) * vertical_sample + v_samp;
+                                if local_block_x < dst.width_blocks
+                                    && local_block_y < dst.height_blocks
+                                {
+                                    dst.blocks.push(block);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        match self.check_stream_marker_after_mcu_width(&mut stream)? {
+            McuContinuation::Ok | McuContinuation::Terminate => {}
+            McuContinuation::DnlFound => {
+                return Err(DecodeErrors::FormatStatic(
+                    "DNL is not supported in lossless crop coefficient decode",
+                ))
+            }
+            McuContinuation::AnotherSos | McuContinuation::InterScanMarker(_) => {
+                return Err(DecodeErrors::FormatStatic(
+                    "Multiple scans are not supported in lossless crop coefficient decode",
+                ))
+            }
+        }
+
+        for component in &components {
+            let expected = component.width_blocks * component.height_blocks;
+            if component.blocks.len() != expected {
+                return Err(DecodeErrors::FormatStatic(
+                    "JPEG lossless crop decoded an unexpected number of coefficient blocks",
+                ));
+            }
+        }
+
+        Ok(LosslessCropCoefficients {
+            info,
+            metadata,
+            quantization_tables,
+            huffman_tables,
+            components,
+        })
+    }
+
+    /// Return the parsed Huffman table definitions needed to re-emit DHT
+    /// markers.
+    ///
+    /// The table definitions are available after [`decode_headers`](Self::decode_headers).
+    /// They preserve the code-length histogram and symbols from the input DHT
+    /// markers, which is the state a coefficient-domain transcode writer needs
+    /// to encode copied coefficients without inventing new tables.
+    #[must_use]
+    pub fn huffman_tables(&self) -> Option<Vec<JpegHuffmanTable>> {
+        if !self.headers_decoded {
+            return None;
+        }
+
+        let mut tables = Vec::new();
+        for (index, table) in self.entropy_tables.dc_huffman.iter().enumerate() {
+            if let Some(table) = table {
+                let (code_counts, values) = table.definition();
+                let mut compact_counts = [0; 16];
+                compact_counts.copy_from_slice(&code_counts[1..17]);
+                tables.push(JpegHuffmanTable {
+                    class: JpegHuffmanTableClass::Dc,
+                    index,
+                    code_counts: compact_counts,
+                    values: values.to_vec(),
+                });
+            }
+        }
+        for (index, table) in self.entropy_tables.ac_huffman.iter().enumerate() {
+            if let Some(table) = table {
+                let (code_counts, values) = table.definition();
+                let mut compact_counts = [0; 16];
+                compact_counts.copy_from_slice(&code_counts[1..17]);
+                tables.push(JpegHuffmanTable {
+                    class: JpegHuffmanTableClass::Ac,
+                    index,
+                    code_counts: compact_counts,
+                    values: values.to_vec(),
+                });
+            }
+        }
+        Some(tables)
+    }
+
+    /// Return parsed quantization table definitions needed to re-emit DQT
+    /// markers.
+    ///
+    /// Values are returned in JPEG marker zigzag order. `precision` is 0 for
+    /// 8-bit table values and 1 for 16-bit table values.
+    #[must_use]
+    pub fn quantization_tables(&self) -> Option<Vec<JpegQuantizationTable>> {
+        if !self.headers_decoded {
+            return None;
+        }
+
+        let mut tables = Vec::new();
+        for (index, table) in self.qt_tables.iter().enumerate() {
+            let Some(table) = table else {
+                continue;
+            };
+            let precision = u8::from(table.iter().any(|&value| value > 255));
+            let mut values = vec![0; 64];
+            for zigzag_index in 0..64 {
+                values[zigzag_index] = u16::try_from(table[UN_ZIGZAG[zigzag_index]])
+                    .expect("quantization table values are non-negative and fit in u16");
+            }
+            tables.push(JpegQuantizationTable {
+                index,
+                precision,
+                values,
+            });
+        }
+        Some(tables)
+    }
+
+    /// Return frame and active scan metadata needed for coefficient-domain
+    /// transcode output.
+    #[must_use]
+    pub fn transcode_metadata(&self) -> Option<JpegTranscodeMetadata> {
+        if !self.headers_decoded {
+            return None;
+        }
+
+        Some(JpegTranscodeMetadata {
+            width: self.info.width,
+            height: self.info.height,
+            precision: self.info.pixel_density,
+            sof_marker: self.info.sof.to_marker(),
+            components: self
+                .components
+                .iter()
+                .map(|component| JpegFrameComponent {
+                    id: component.id,
+                    horizontal_sample: component.horizontal_sample,
+                    vertical_sample: component.vertical_sample,
+                    quantization_table: component.quantization_table_number,
+                })
+                .collect(),
+            scan_components: self.z_order[..usize::from(self.num_scans)]
+                .iter()
+                .map(|&component_index| {
+                    let component = &self.components[component_index];
+                    JpegScanComponent {
+                        id: component.id,
+                        dc_huffman_table: component.dc_huff_table,
+                        ac_huffman_table: component.ac_huff_table,
+                    }
+                })
+                .collect(),
+            spectral_start: self.spec_start,
+            spectral_end: self.spec_end,
+            successive_high: self.succ_high,
+            successive_low: self.succ_low,
+        })
     }
 
     fn validate_region(&self, region: DecodeRegion) -> Result<(), DecodeErrors> {

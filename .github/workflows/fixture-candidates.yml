@@ -1,0 +1,29 @@
+name: Fixture Candidates
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 0"
+
+jobs:
+  fixture-candidates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find missing fixture candidates
+        run: |
+          mkdir -p .tmp/openslide-testdata
+          python3 scripts/find-fixture-candidates.py \
+            --missing-from-reader-status fixtures/reader-status.toml \
+            --fetch-index \
+            --json .tmp/openslide-testdata/fixture-candidates-live.json
+      - name: Check fixture candidate report
+        run: |
+          python3 scripts/check-audit-baselines.py \
+            --fixture-candidates-report .tmp/openslide-testdata/fixture-candidates-live.json \
+            --fail-on-fixture-candidates
+      - name: Upload fixture candidate report
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixture-candidates
+          path: .tmp/openslide-testdata/fixture-candidates-live.json

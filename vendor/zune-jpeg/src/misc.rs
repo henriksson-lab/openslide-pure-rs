@@ -152,6 +152,19 @@ impl SOFMarkers {
             _ => None,
         }
     }
+
+    /// Return the JPEG marker value for this start-of-frame kind.
+    pub fn to_marker(self) -> u16 {
+        match self {
+            Self::BaselineDct => START_OF_FRAME_BASE,
+            Self::ExtendedSequentialHuffman => START_OF_FRAME_EXT_SEQ,
+            Self::ProgressiveDctHuffman => START_OF_FRAME_PROG_DCT,
+            Self::LosslessHuffman => START_OF_FRAME_LOS_SEQ,
+            Self::ExtendedSequentialDctArithmetic => START_OF_FRAME_EXT_AR,
+            Self::ProgressiveDctArithmetic => START_OF_FRAME_PROG_DCT_AR,
+            Self::LosslessArithmetic => START_OF_FRAME_LOS_SEQ_AR,
+        }
+    }
 }
 
 impl fmt::Debug for SOFMarkers {

@@ -1,0 +1,69 @@
+name: Parity Nightly
+
+on:
+  workflow_dispatch:
+    inputs:
+      enforce_bench:
+        description: "Fail if benchmark rows exceed saved read-time/RSS thresholds"
+        required: false
+        default: false
+        type: boolean
+      runner_profile:
+        description: "Benchmark runner profile written into reports; strict enforcement requires openslide-audit-stable-v1"
+        required: false
+        default: "github-ubuntu-latest-audit"
+        type: string
+  schedule:
+    - cron: "17 3 * * 1"
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native and reference dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libjpeg-dev libcairo2-dev libopenjp2-7-dev libopenslide0
+          python3 -m pip install --upgrade pip
+          python3 -m pip install numpy pillow openslide-python
+      - name: Download public coverage fixtures
+        run: python3 scripts/download-openslide-testdata.py --profile nonmirax-coverage --extract --allow-distributable
+      - name: Download MIRAX diagnostic fixtures
+        run: python3 scripts/download-openslide-testdata.py --profile mrxs --extract --allow-distributable
+      - name: Build release binary and benchmarks
+        run: cargo build --release --examples
+      - name: Parity coverage report
+        run: python3 scripts/parity-check.py --jobs 2 --json .tmp/openslide-testdata/parity-nightly.json
+      - name: Benchmark coverage report
+        env:
+          RUNNER_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_profile || 'github-ubuntu-latest-audit' }}
+        run: python3 scripts/bench-realdata.py --jobs 2 --runner-profile "$RUNNER_PROFILE" --cpu-list 0-3 --region-size 128 --regions-per-level 1 --json .tmp/openslide-testdata/bench-nightly.json
+      - name: MIRAX per-level diagnostic report
+        run: |
+          python3 scripts/bench-realdata-levels.py \
+            --allow-mismatch \
+            --json .tmp/openslide-testdata/levels-mirax.json \
+            .tmp/openslide-testdata/extracted/Mirax/CMU-1-Saved-1_16/CMU-1-Saved-1_16.mrxs \
+            .tmp/openslide-testdata/extracted/Mirax/Mirax2-Fluorescence-2/Mirax2-Fluorescence-2.mrxs
+      - name: Check reports against audit baselines
+        env:
+          ENFORCE_BENCH: ${{ github.event_name == 'workflow_dispatch' && inputs.enforce_bench == true }}
+        run: |
+          extra_args=""
+          if [ "$ENFORCE_BENCH" = "true" ]; then
+            extra_args="--enforce-bench"
+          fi
+          python3 scripts/check-audit-baselines.py \
+            --parity-report .tmp/openslide-testdata/parity-nightly.json \
+            --bench-report .tmp/openslide-testdata/bench-nightly.json \
+            --level-report .tmp/openslide-testdata/levels-mirax.json \
+            $extra_args
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-nightly
+          path: |
+            .tmp/openslide-testdata/parity-nightly.json
+            .tmp/openslide-testdata/bench-nightly.json
+            .tmp/openslide-testdata/levels-mirax.json
