@@ -517,11 +517,11 @@ fn decode_openjp2_rgb(
     } else {
         let mut decoded = decode_openjp2_packed(request, openjp2_interleaved_output(3)?)?;
         if request.options.component_color_space == Jpeg2000ComponentColorSpace::YCbCr {
-            openjp2::openjp2::api::convert::ycbcr_to_rgb8_in_place(
+            openjp2::convert::ycbcr_to_rgb8_in_place(
                 &mut decoded.pixels,
                 decoded.width,
                 decoded.height,
-                openjp2::openjp2::api::convert::YCbCrTransform::Bt601OpenSlideRounding,
+                openjp2::convert::YCbCrTransform::Bt601OpenSlideRounding,
             );
         }
         decoded.pixels
@@ -558,19 +558,19 @@ fn decode_openjp2_rgba(
         3 if request.options.component_color_space == Jpeg2000ComponentColorSpace::Rgb => {
             let decoded = decode_openjp2_packed(
                 request,
-                openjp2::openjp2::api::OutputFormat::Rgba8 {
-                    alpha: openjp2::openjp2::api::AlphaMode::Opaque,
+                openjp2::OutputFormat::Rgba8 {
+                    alpha: openjp2::AlphaMode::Opaque,
                 },
             )?;
             decoded.pixels
         }
         3 => {
             let mut decoded = decode_openjp2_packed(request, openjp2_interleaved_output(3)?)?;
-            openjp2::openjp2::api::convert::ycbcr_to_rgb8_in_place(
+            openjp2::convert::ycbcr_to_rgb8_in_place(
                 &mut decoded.pixels,
                 decoded.width,
                 decoded.height,
-                openjp2::openjp2::api::convert::YCbCrTransform::Bt601OpenSlideRounding,
+                openjp2::convert::YCbCrTransform::Bt601OpenSlideRounding,
             );
             rgb_to_rgba(decoded.pixels)
         }
@@ -601,11 +601,11 @@ fn decode_openjp2_gray(
         && components >= 3
     {
         let mut decoded = decode_openjp2_packed(request, openjp2_interleaved_output(3)?)?;
-        openjp2::openjp2::api::convert::ycbcr_to_rgb8_in_place(
+        openjp2::convert::ycbcr_to_rgb8_in_place(
             &mut decoded.pixels,
             decoded.width,
             decoded.height,
-            openjp2::openjp2::api::convert::YCbCrTransform::Bt601OpenSlideRounding,
+            openjp2::convert::YCbCrTransform::Bt601OpenSlideRounding,
         );
         decoded
             .pixels
@@ -627,25 +627,25 @@ fn decode_openjp2_gray(
 
 fn decode_openjp2_packed(
     request: &Jpeg2000DecodeRequest<'_>,
-    output: openjp2::openjp2::api::OutputFormat,
-) -> Result<openjp2::openjp2::api::DecodedImage> {
-    let expected = openjp2::openjp2::api::ExpectedImage {
+    output: openjp2::OutputFormat,
+) -> Result<openjp2::DecodedImage> {
+    let expected = openjp2::ExpectedImage {
         width: Some(request.options.expected_width),
         height: Some(request.options.expected_height),
         components: Some(request.options.expected_components),
     };
-    let options = openjp2::openjp2::api::DecodeOptions {
+    let options = openjp2::DecodeOptions {
         format: if request.info.is_jp2_container {
-            openjp2::openjp2::api::Format::Jp2
+            openjp2::Format::Jp2
         } else {
-            openjp2::openjp2::api::Format::J2k
+            openjp2::Format::J2k
         },
         threads: 0,
         output,
-        upsampling: openjp2::openjp2::api::Upsampling::Nearest,
+        upsampling: openjp2::Upsampling::Nearest,
         expected: Some(expected),
     };
-    openjp2::openjp2::api::Decoder::decode_to_u8(request.data, options).map_err(|err| {
+    openjp2::Decoder::decode_to_u8(request.data, options).map_err(|err| {
         OpenSlideError::Decode(format!(
             "{} JPEG 2000 decode failed with {}: {err}",
             request.options.context,
@@ -654,15 +654,15 @@ fn decode_openjp2_packed(
     })
 }
 
-fn openjp2_gray_output(channel: usize) -> openjp2::openjp2::api::OutputFormat {
-    openjp2::openjp2::api::OutputFormat::Gray8 { channel }
+fn openjp2_gray_output(channel: usize) -> openjp2::OutputFormat {
+    openjp2::OutputFormat::Gray8 { channel }
 }
 
-fn openjp2_interleaved_output(channels: usize) -> Result<openjp2::openjp2::api::OutputFormat> {
+fn openjp2_interleaved_output(channels: usize) -> Result<openjp2::OutputFormat> {
     let channels = std::num::NonZeroUsize::new(channels).ok_or_else(|| {
         OpenSlideError::Decode("JPEG 2000 interleaved output channel count is zero".into())
     })?;
-    Ok(openjp2::openjp2::api::OutputFormat::Interleaved8 { channels })
+    Ok(openjp2::OutputFormat::Interleaved8 { channels })
 }
 
 fn rgb_to_rgba(rgb: Vec<u8>) -> Vec<u8> {
@@ -2049,49 +2049,23 @@ mod tests {
         height: u32,
         components: u32,
     ) -> Vec<u8> {
-        use openjp2::openjp2::image as openjp2_image;
-        use openjp2::openjp2::openjpeg::{opj_color_space, opj_cparameters, opj_image_comptparm};
-
-        let parms: Vec<opj_image_comptparm> = (0..components)
-            .map(|_| opj_image_comptparm {
-                dx: 1,
-                dy: 1,
-                w: width,
-                h: height,
-                x0: 0,
-                y0: 0,
-                prec: 8,
-                bpp: 8,
-                sgnd: 0,
-            })
-            .collect();
-        let color_space = if components >= 3 {
-            opj_color_space::Srgb
-        } else {
-            opj_color_space::Gray
+        let image = openjp2::Image::from_interleaved_u8(
+            width,
+            height,
+            if components >= 3 {
+                openjp2::ColorSpace::Srgb
+            } else {
+                openjp2::ColorSpace::Greyscale
+            },
+            components as usize,
+            pixels,
+        )
+        .unwrap();
+        let options = openjp2::EncodeOptions {
+            num_resolutions: Some(1),
+            ..openjp2::EncodeOptions::default()
         };
-        let mut image = openjp2_image::opj_image_create(&parms, color_space).unwrap();
-        image.x0 = 0;
-        image.y0 = 0;
-        image.x1 = width;
-        image.y1 = height;
-        for c in 0..components as usize {
-            image.comps_storage[c].data_storage = pixels
-                .chunks_exact(components as usize)
-                .map(|pixel| i32::from(pixel[c]))
-                .collect();
-        }
-
-        let mut params = opj_cparameters::default();
-        openjp2::openjp2::openjpeg::opj_set_default_encoder_parameters(&mut params);
-        params.tcp_numlayers = 1;
-        params.tcp_rates[0] = 0.0;
-        params.cp_disto_alloc = true;
-        params.irreversible = false;
-        params.numresolution = 1;
-        openjp2::openjp2::api::Encoder::new_j2k()
-            .encode(&mut params, &mut image)
-            .unwrap()
+        openjp2::Encoder::encode(&image, &options).unwrap()
     }
 
     fn synthetic_codestream(width: u32, height: u32, components: u16, bits: u8) -> Vec<u8> {
