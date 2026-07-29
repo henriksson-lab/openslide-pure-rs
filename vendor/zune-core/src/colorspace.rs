@@ -85,7 +85,7 @@ impl ColorSpace {
     ///
     /// That is for an array of color components say `[0,1,2,3]` if the image has an alpha channel
     /// and is in RGBA format, this will return `Some(3)`, indicating alpha is found in the third index
-    /// but if the image is in `ARGB` format, it will return `Some(0)` indicating alpha is found in  
+    /// but if the image is in `ARGB` format, it will return `Some(0)` indicating alpha is found in
     /// index 0
     ///
     /// If an image doesn't have an alpha channel returns `None`
@@ -185,7 +185,7 @@ pub struct ColorPrimaries {
 ///
 /// Further reading
 ///  - [IBM Rendering Intent](https://www.ibm.com/docs/en/i/7.5?topic=management-rendering-intents)
-///  - [ColorGate Blog](https://blog.colorgate.com/en/rendering-intent-explained)   
+///  - [ColorGate Blog](https://blog.colorgate.com/en/rendering-intent-explained)
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum RenderingIntent {
     AbsoluteColorimetric,

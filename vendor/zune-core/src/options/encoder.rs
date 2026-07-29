@@ -87,7 +87,7 @@ impl EncoderOptions {
     ///  Create  new encode options
     ///
     /// # Arguments
-    ///  
+    ///
     /// * `width`: Image width
     /// * `height`: Image height
     /// * `colorspace`:  Image colorspaces

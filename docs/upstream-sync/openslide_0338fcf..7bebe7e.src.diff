@@ -21,7 +21,7 @@ index c02aa0e7..2d16549c 100644
 @@ -24,13 +24,30 @@
  #include "openslide-private.h"
  #include "openslide-decode-dicom.h"
- 
+
 +#define CACHE_BLOCKS 2
 +#define CACHE_BLOCK_SIZE 8192
 +#define CACHE_BLOCK_MIN_RELOAD 1024
@@ -48,7 +48,7 @@ index c02aa0e7..2d16549c 100644
 +  int32_t cache_len[CACHE_BLOCKS];
 +  int cache_mru_block;
  };
- 
+
  void _openslide_dicom_propagate_error(GError **err, DcmError *dcm_error) {
 @@ -64,15 +81,9 @@ static bool ensure_file(struct _openslide_dicom_io *dio, GError **err) {
    if (dio->file) {
@@ -67,12 +67,12 @@ index c02aa0e7..2d16549c 100644
 +  dio->file = _openslide_fopen(dio->filename, err);
 +  return dio->file != NULL;
  }
- 
+
  static DcmIO *vfs_open(DcmError **dcm_error, void *client) {
 @@ -97,37 +108,101 @@ static void vfs_close(DcmIO *io) {
    dicom_io_free((struct _openslide_dicom_io *) io);
  }
- 
+
 +// try to fill from cache, at least partially
 +// the cache exists to reduce seeks, which incur syscall overhead and flush
 +// libc's I/O buffer
@@ -163,7 +163,7 @@ index c02aa0e7..2d16549c 100644
 +  dio->phys_offset = dio->virt_offset;
    return count;
  }
- 
+
 -static int64_t vfs_seek(DcmError **dcm_error, DcmIO *io,
 +static int64_t vfs_seek(DcmError **dcm_error G_GNUC_UNUSED, DcmIO *io,
                          int64_t offset, int whence) {
@@ -183,7 +183,7 @@ index c02aa0e7..2d16549c 100644
 +    _openslide_compute_seek(dio->virt_offset, dio->size, offset, whence);
 +  return dio->virt_offset;
  }
- 
+
  static const DcmIOMethods dicom_open_methods = {
 @@ -162,5 +237,6 @@ DcmFilehandle *_openslide_dicom_open(const char *filename,
  void _openslide_dicom_io_suspend(struct _openslide_dicom_io *dio) {
@@ -210,9 +210,9 @@ index f056e9b0..7807eaca 100644
 --- a/src/openslide-decode-jp2k.h
 +++ b/src/openslide-decode-jp2k.h
 @@ -26,7 +26,9 @@
- 
+
  /* JPEG 2000 support */
- 
+
 +// the colorspace that comes out of OpenJPEG
  enum _openslide_jp2k_colorspace {
 +  // includes MCT
@@ -225,7 +225,7 @@ index 32648bef..118a291b 100644
 +++ b/src/openslide-decode-png.c
 @@ -72,7 +72,7 @@ static struct png_ctx *png_ctx_new(uint32_t *dest,
    g_auto(png_ctx) ctx = g_new0(struct png_ctx, 1);
- 
+
    // allocate row pointers
 -  ctx->rows = g_malloc(h * sizeof(*ctx->rows));
 +  ctx->rows = g_new(png_byte *, h);
@@ -239,7 +239,7 @@ index 9364639b..85c9ea3f 100644
 @@ -352,36 +352,34 @@ bool _openslide_tiff_read_tile_data(struct _openslide_tiff_level *tiffl,
    return true;
  }
- 
+
 -// sets out-argument to indicate whether the tile data is zero bytes long
 -// returns false on error
 -bool _openslide_tiff_check_missing_tile(struct _openslide_tiff_level *tiffl,
@@ -255,7 +255,7 @@ index 9364639b..85c9ea3f 100644
    if (!_openslide_tiff_set_dir(tiff, tiffl->dir, err)) {
      return false;
    }
- 
+
 -  // get tile number
 -  ttile_t tile_no = TIFFComputeTile(tiff,
 -                                    tile_col * tiffl->tile_w,
@@ -273,7 +273,7 @@ index 9364639b..85c9ea3f 100644
      return false;
    }
 -  tsize_t tile_size = sizes[tile_no];
- 
+
 -  // return result
 -  *is_missing = tile_size == 0;
 +  // walk
@@ -290,7 +290,7 @@ index 9364639b..85c9ea3f 100644
 +  }
    return true;
  }
- 
+
 diff --git a/src/openslide-decode-tiff.h b/src/openslide-decode-tiff.h
 index 4d99385b..8acea8e2 100644
 --- a/src/openslide-decode-tiff.h
@@ -298,7 +298,7 @@ index 4d99385b..8acea8e2 100644
 @@ -55,11 +55,10 @@ bool _openslide_tiff_level_init(TIFF *tiff,
                                  struct _openslide_tiff_level *tiffl,
                                  GError **err);
- 
+
 -bool _openslide_tiff_check_missing_tile(struct _openslide_tiff_level *tiffl,
 -                                        TIFF *tiff,
 -                                        int64_t tile_col, int64_t tile_row,
@@ -308,7 +308,7 @@ index 4d99385b..8acea8e2 100644
 +                                                  TIFF *tiff,
 +                                                  struct _openslide_grid *grid,
 +                                                  GError **err);
- 
+
  bool _openslide_tiff_read_tile(struct _openslide_tiff_level *tiffl,
                                 TIFF *tiff,
 diff --git a/src/openslide-decode-tifflike.c b/src/openslide-decode-tifflike.c
@@ -318,7 +318,7 @@ index cb3f794e..f1bf059e 100644
 @@ -166,18 +166,6 @@ static uint32_t get_value_size(uint16_t type, uint64_t *count) {
    }
  }
- 
+
 -// Re-add implied high-order bits to a 32-bit offset.
 -// Heuristic: maximize high-order bits while keeping the offset below diroff.
 -static uint64_t fix_offset_ndpi(uint64_t diroff, uint64_t offset) {
@@ -335,7 +335,7 @@ index cb3f794e..f1bf059e 100644
      OUT = g_try_new(TYPE, COUNT);					\
      if (!OUT) {								\
 @@ -389,7 +377,6 @@ OPENSLIDE_DEFINE_G_DESTROY_NOTIFY_WRAPPER(tiff_item_destroy)
- 
+
  static struct tiff_directory *read_directory(struct _openslide_file *f,
                                               uint64_t *diroff,
 -                                             struct tiff_directory *first_dir,
@@ -345,7 +345,7 @@ index cb3f794e..f1bf059e 100644
 @@ -441,6 +428,29 @@ static struct tiff_directory *read_directory(struct _openslide_file *f,
                                     OPENSLIDE_G_DESTROY_NOTIFY_WRAPPER(tiff_item_destroy));
    d->offset = off;
- 
+
 +  // preload NDPI value extensions
 +  g_autofree uint8_t *ndpi_value_ext = NULL;
 +  if (ndpi) {
@@ -374,7 +374,7 @@ index cb3f794e..f1bf059e 100644
      uint16_t tag = read_uint(f, 2, big_endian, &ok);
 @@ -478,14 +488,48 @@ static struct tiff_directory *read_directory(struct _openslide_file *f,
      }
- 
+
      // read in the value/offset
 -    uint8_t value[bigtiff ? 8 : 4];
 -    if (!_openslide_fread_exact(f, value, sizeof(value), err)) {
@@ -417,7 +417,7 @@ index cb3f794e..f1bf059e 100644
 +        }
 +      }
 +    }
- 
+
      // does value/offset contain the value?
 -    if (value_len <= sizeof(value)) {
 +    if (is_value) {
@@ -425,7 +425,7 @@ index cb3f794e..f1bf059e 100644
        fix_byte_order(value, value_size, count, big_endian);
        if (!set_item_values(item, value, err)) {
 @@ -494,7 +538,7 @@ static struct tiff_directory *read_directory(struct _openslide_file *f,
- 
+
      } else {
        // no; store offset
 -      if (bigtiff) {
@@ -452,13 +452,13 @@ index cb3f794e..f1bf059e 100644
 -      }
      }
    }
- 
+
 @@ -600,7 +631,6 @@ struct _openslide_tifflike *_openslide_tifflike_create(const char *filename,
    // initialize directory reading
    g_autoptr(GHashTable) loop_detector =
      g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
 -  struct tiff_directory *first_dir = NULL;
- 
+
    // NDPI needs special quirks, since it is classic TIFF pretending to be
    // BigTIFF.  Enable NDPI mode if this is classic TIFF but the offset to
 @@ -609,7 +639,6 @@ struct _openslide_tifflike *_openslide_tifflike_create(const char *filename,
@@ -486,14 +486,14 @@ index cb3f794e..f1bf059e 100644
                                                bigtiff, tl->ndpi, big_endian,
                                                err);
 @@ -655,9 +682,6 @@ struct _openslide_tifflike *_openslide_tifflike_create(const char *filename,
- 
+
      // store result
      g_ptr_array_add(tl->directories, d);
 -    if (!first_dir) {
 -      first_dir = d;
 -    }
    }
- 
+
    // ensure there are directories
 @@ -713,6 +737,9 @@ static void print_tag(struct _openslide_tifflike *tl,
    case TIFF_UNDEFINED: {
@@ -548,7 +548,7 @@ index cb3f794e..f1bf059e 100644
 @@ -941,16 +980,6 @@ bool _openslide_tifflike_is_tiled(struct _openslide_tifflike *tl,
           _openslide_tifflike_get_value_count(tl, dir, TIFFTAG_TILELENGTH);
  }
- 
+
 -uint64_t _openslide_tifflike_uint_fix_offset_ndpi(struct _openslide_tifflike *tl,
 -                                                  int64_t dir, uint64_t offset) {
 -  g_assert(dir >= 0 && dir < tl->directories->len);
@@ -569,7 +569,7 @@ index cb928c4d..bb8a516e 100644
 @@ -72,11 +72,6 @@ const uint64_t *_openslide_tifflike_get_uints(struct _openslide_tifflike *tl,
                                                int64_t dir, int32_t tag,
                                                GError **err);
- 
+
 -// if the file was detected as NDPI, heuristically add high-order bits to
 -// the specified offset
 -uint64_t _openslide_tifflike_uint_fix_offset_ndpi(struct _openslide_tifflike *tl,
@@ -598,7 +598,7 @@ index 9fd5a24c..8ad5d5af 100644
 @@ -30,6 +30,9 @@
  #define COLOR_TILE 0.6, 0,   0,   0.3
  #define COLOR_BIN  0,   0,   0.6, 0.15
- 
+
 +#define BITMAP_ELEMENT_SHIFT 6  // uint64_t
 +#define BITMAP_BIT_MASK ((1 << BITMAP_ELEMENT_SHIFT) - 1)
 +
@@ -606,17 +606,17 @@ index 9fd5a24c..8ad5d5af 100644
    double x;
    double y;
 @@ -85,6 +88,7 @@ struct simple_grid {
- 
+
    int64_t tiles_across;
    int64_t tiles_down;
 +  uint64_t *tiles_missing;
    _openslide_grid_simple_read_fn read_tile;
  };
- 
+
 @@ -294,12 +298,63 @@ static void label_tile(cairo_t *cr,
- 
- 
- 
+
+
+
 +static bool simple_tile_missing(struct simple_grid *grid,
 +                                int64_t tile_col, int64_t tile_row) {
 +  uint64_t tile_index = tile_row * grid->tiles_across + tile_col;
@@ -628,7 +628,7 @@ index 9fd5a24c..8ad5d5af 100644
  static void simple_get_bounds(struct _openslide_grid *_grid,
                                struct bounds *bounds) {
    struct simple_grid *grid = (struct simple_grid *) _grid;
- 
+
 -  bounds->w = grid->tiles_across * grid->base.tile_advance_x;
 -  bounds->h = grid->tiles_down * grid->base.tile_advance_y;
 +  if (grid->tiles_missing) {
@@ -677,12 +677,12 @@ index 9fd5a24c..8ad5d5af 100644
 +    bounds->h = grid->tiles_down * grid->base.tile_advance_y;
 +  }
  }
- 
+
  static bool simple_read_tile(struct _openslide_grid *_grid,
 @@ -311,6 +366,9 @@ static bool simple_read_tile(struct _openslide_grid *_grid,
                               GError **err) {
    struct simple_grid *grid = (struct simple_grid *) _grid;
- 
+
 +  if (simple_tile_missing(grid, tile_col, tile_row)) {
 +    return true;
 +  }
@@ -692,15 +692,15 @@ index 9fd5a24c..8ad5d5af 100644
 @@ -368,6 +426,7 @@ static bool simple_paint_region(struct _openslide_grid *_grid,
  static void simple_destroy(struct _openslide_grid *_grid) {
    struct simple_grid *grid = (struct simple_grid *) _grid;
- 
+
 +  g_free(grid->tiles_missing);
    g_free(grid);
  }
- 
+
 @@ -394,6 +453,25 @@ struct _openslide_grid *_openslide_grid_create_simple(openslide_t *osr,
    return (struct _openslide_grid *) grid;
  }
- 
+
 +void _openslide_grid_simple_set_missing(struct _openslide_grid *_grid,
 +                                        int64_t tile_col, int64_t tile_row) {
 +  struct simple_grid *grid = (struct simple_grid *) _grid;
@@ -720,8 +720,8 @@ index 9fd5a24c..8ad5d5af 100644
 +    1ULL << (tile_index & BITMAP_BIT_MASK);
 +}
 +
- 
- 
+
+
  static guint tilemap_tile_hash_func(gconstpointer key) {
 diff --git a/src/openslide-private.h b/src/openslide-private.h
 index bcf62e74..cbc14cd6 100644
@@ -729,7 +729,7 @@ index bcf62e74..cbc14cd6 100644
 +++ b/src/openslide-private.h
 @@ -137,10 +137,12 @@ struct _openslide_format {
  };
- 
+
  extern const struct _openslide_format _openslide_format_aperio;
 +extern const struct _openslide_format _openslide_format_argos;
  extern const struct _openslide_format _openslide_format_dicom;
@@ -742,7 +742,7 @@ index bcf62e74..cbc14cd6 100644
  extern const struct _openslide_format _openslide_format_philips_tiff;
 @@ -151,8 +153,13 @@ extern const struct _openslide_format _openslide_format_ventana;
  extern const struct _openslide_format _openslide_format_zeiss;
- 
+
  /* g_key_file_new() + g_key_file_load_from_file() wrapper */
 +enum _openslide_key_file_flavor {
 +  OPENSLIDE_KEY_FILE_GENERIC,
@@ -752,13 +752,13 @@ index bcf62e74..cbc14cd6 100644
 -                                   GKeyFileFlags flags, GError **err);
 +                                   enum _openslide_key_file_flavor flavor,
 +                                   GError **err);
- 
+
  void *_openslide_inflate_buffer(const void *src, int64_t src_len,
                                  int64_t dst_len,
 @@ -180,11 +187,19 @@ double _openslide_parse_double(const char *value);
  /* Serialize double to string */
  char *_openslide_format_double(double d);
- 
+
 +/* Decode Base64 to string */
 +char *_openslide_decode_base64_str(const char *base64);
 +
@@ -772,13 +772,13 @@ index bcf62e74..cbc14cd6 100644
 +void _openslide_duplicate_double_prop_scaled(openslide_t *osr,
 +                                             const char *src, double scale,
 +                                             const char *dest);
- 
+
  // background color helper
  void _openslide_set_background_color_prop(openslide_t *osr,
 @@ -261,6 +276,9 @@ struct _openslide_grid *_openslide_grid_create_simple(openslide_t *osr,
                                                        int32_t tile_h,
                                                        _openslide_grid_simple_read_fn read_tile);
- 
+
 +void _openslide_grid_simple_set_missing(struct _openslide_grid *grid,
 +                                        int64_t tile_col, int64_t tile_row);
 +
@@ -786,13 +786,13 @@ index bcf62e74..cbc14cd6 100644
                                                         double tile_advance_x,
                                                         double tile_advance_y,
 @@ -305,6 +323,7 @@ void _openslide_grid_destroy(struct _openslide_grid *grid);
- 
+
  /* Bounds properties helper */
  void _openslide_set_bounds_props_from_grid(openslide_t *osr,
 +                                           struct _openslide_level *level,
                                             struct _openslide_grid *grid);
- 
- 
+
+
 diff --git a/src/openslide-util.c b/src/openslide-util.c
 index 2f07c5bd..55fe623c 100644
 --- a/src/openslide-util.c
@@ -808,7 +808,7 @@ index 2f07c5bd..55fe623c 100644
   *  OpenSlide is free software: you can redistribute it and/or modify
 @@ -61,15 +61,12 @@ static const struct debug_option {
  static uint32_t debug_flags;
- 
+
  GKeyFile *_openslide_read_key_file(const char *filename, int32_t max_size,
 -                                   GKeyFileFlags flags, GError **err) {
 +                                   enum _openslide_key_file_flavor flavor,
@@ -823,13 +823,13 @@ index 2f07c5bd..55fe623c 100644
 -   * does not expect to find. */
 +   * because that allows us to skip a UTF-8 BOM which the g_key_file parser
 +   * does not expect to find, and to do some extra preprocessing. */
- 
+
    /* Hamamatsu attempts to load the slide file as a key file.  We impose
       a maximum file size to avoid loading an entire slide into RAM. */
 @@ -109,11 +106,35 @@ GKeyFile *_openslide_read_key_file(const char *filename, int32_t max_size,
      offset = 3;
    }
- 
+
 +  // remove empty keys reported to occur in MIRAX Slidedat.ini
 +  if (flavor == OPENSLIDE_KEY_FILE_MIRAX) {
 +    char *end = buf + size;
@@ -866,7 +866,7 @@ index 2f07c5bd..55fe623c 100644
 @@ -257,6 +278,27 @@ char *_openslide_format_double(double d) {
    return g_strdup(buf);
  }
- 
+
 +char *_openslide_decode_base64_str(const char *base64) {
 +  gsize len;
 +  char *decoded = (char *) g_base64_decode(base64, &len);
@@ -904,7 +904,7 @@ index 2f07c5bd..55fe623c 100644
 +                                             const char *src, double scale,
 +                                             const char *dest) {
    g_return_if_fail(g_hash_table_lookup(osr->properties, dest) == NULL);
- 
+
    char *value = g_hash_table_lookup(osr->properties, src);
 @@ -281,7 +331,7 @@ void _openslide_duplicate_double_prop(openslide_t *osr, const char *src,
      double result = _openslide_parse_double(value);
@@ -917,13 +917,13 @@ index 2f07c5bd..55fe623c 100644
  }
 @@ -297,12 +347,20 @@ void _openslide_set_background_color_prop(openslide_t *osr,
  }
- 
+
  void _openslide_set_bounds_props_from_grid(openslide_t *osr,
 +                                           struct _openslide_level *level,
                                             struct _openslide_grid *grid) {
    g_return_if_fail(g_hash_table_lookup(osr->properties,
                                         OPENSLIDE_PROPERTY_NAME_BOUNDS_X) == NULL);
- 
+
    double x, y, w, h;
    _openslide_grid_get_bounds(grid, &x, &y, &w, &h);
 +  // simple grid doesn't know about padding in bottom/right tiles
@@ -933,7 +933,7 @@ index 2f07c5bd..55fe623c 100644
 +  if (x == 0 && y == 0 && w == level->w && h == level->h) {
 +    return;
 +  }
- 
+
    g_hash_table_insert(osr->properties,
                        g_strdup(OPENSLIDE_PROPERTY_NAME_BOUNDS_X),
 diff --git a/src/openslide-vendor-aperio.c b/src/openslide-vendor-aperio.c
@@ -942,11 +942,11 @@ index ad055af4..8c5b35aa 100644
 +++ b/src/openslide-vendor-aperio.c
 @@ -41,7 +41,7 @@
  static const char APERIO_DESCRIPTION[] = "Aperio";
- 
+
  #define APERIO_COMPRESSION_JP2K_YCBCR 33003
 -#define APERIO_COMPRESSION_JP2K_RGB   33005
 +#define APERIO_COMPRESSION_JP2K_MCT   33005
- 
+
  struct aperio_ops_data {
    struct _openslide_tiffcache *tc;
 @@ -141,7 +141,7 @@ static bool decode_tile(struct level *l,
@@ -970,7 +970,7 @@ index ad055af4..8c5b35aa 100644
 @@ -345,50 +345,6 @@ static bool add_properties(openslide_t *osr, TIFF *tiff, GError **err) {
    return true;
  }
- 
+
 -// add the image from the current TIFF directory
 -// returns false and sets GError if fatal error
 -// true does not necessarily imply an image was added
@@ -1030,7 +1030,7 @@ index ad055af4..8c5b35aa 100644
 @@ -536,22 +492,34 @@ static bool aperio_open(openslide_t *osr,
        if (dir == 1) {
          name = "thumbnail";
- 
+
 -        g_autoptr(GHashTable) thumbnail_props = read_properties(ct.tiff, err);
 -        if (!thumbnail_props) {
 -          g_prefix_error(err, "Reading thumbnail properties: ");
@@ -1507,7 +1507,7 @@ index da06cd12..4f7fa36f 100644
 +  FORMAT_JPEG2000_LOSSLESS,
    FORMAT_RGB,
  };
- 
+
 @@ -61,9 +62,10 @@ struct dicom_file {
    const DcmDataSet *file_meta;
    const DcmDataSet *metadata;
@@ -1518,12 +1518,12 @@ index da06cd12..4f7fa36f 100644
    J_COLOR_SPACE jpeg_colorspace;
 -  enum _openslide_jp2k_colorspace jp2k_colorspace;
  };
- 
+
  // g_auto wrapper struct with reference for runtime I/O
 @@ -71,15 +73,22 @@ struct dicom_file_io {
    struct dicom_file *file;
  };
- 
+
 +// g_auto wrapper struct for fio array
 +struct dicom_file_io_set {
 +  struct dicom_file_io *fios;
@@ -1533,24 +1533,24 @@ index da06cd12..4f7fa36f 100644
  struct dicom_level {
    struct _openslide_level base;
    struct _openslide_grid *grid;
- 
+
 -  double pixel_spacing_x;
 -  double pixel_spacing_y;
 -  double objective_lens_power;
 +  int64_t tiles_across;
 +  int64_t tiles_down;
- 
+
 -  struct dicom_file *file;
 +  struct dicom_file **files;
 +  uint16_t file_count;
 +  uint16_t *tile_files;
  };
- 
+
  struct associated {
 @@ -93,67 +102,17 @@ struct syntax_format {
    enum image_format format;
  };
- 
+
 -// a set of allowed image types for a class of image
 -struct allowed_types {
 -  const char *const *const *types;
@@ -1624,7 +1624,7 @@ index da06cd12..4f7fa36f 100644
 +  FLAVOR_THUMBNAIL,
 +  NULL,
  };
- 
+
  /* The DICOM UIDs and fields we check.
 @@ -161,22 +120,21 @@ static const struct allowed_types ASSOCIATED_TYPES = {
  static const char BitsAllocated[] = "BitsAllocated";
@@ -1656,7 +1656,7 @@ index da06cd12..4f7fa36f 100644
 @@ -192,18 +150,23 @@ static struct syntax_format supported_syntax_formats[] = {
    // jpeg baseline, we don't handle lossless or 12 bit
    { "1.2.840.10008.1.2.4.50", FORMAT_JPEG },
- 
+
 -  // lossless and lossy jp2k
 -  // we separate RGB and YCbCr with other tags
 -  { "1.2.840.10008.1.2.4.90", FORMAT_JPEG2000 },
@@ -1664,7 +1664,7 @@ index da06cd12..4f7fa36f 100644
 +  { "1.2.840.10008.1.2.4.90", FORMAT_JPEG2000_LOSSLESS },
    { "1.2.840.10008.1.2.4.91", FORMAT_JPEG2000 },
  };
- 
+
 +OPENSLIDE_DEFINE_G_DESTROY_NOTIFY_WRAPPER(g_ptr_array_unref)
 +
  static void dicom_file_destroy(struct dicom_file *f) {
@@ -1677,13 +1677,13 @@ index da06cd12..4f7fa36f 100644
    g_free(f);
  }
 +OPENSLIDE_DEFINE_G_DESTROY_NOTIFY_WRAPPER(dicom_file_destroy)
- 
+
  typedef struct dicom_file dicom_file;
  G_DEFINE_AUTOPTR_CLEANUP_FUNC(dicom_file, dicom_file_destroy)
 @@ -232,6 +195,26 @@ static void dicom_file_io_put(struct dicom_file_io *fio) {
  typedef struct dicom_file_io dicom_file_io;
  G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(dicom_file_io, dicom_file_io_put)
- 
+
 +static struct dicom_file_io_set dicom_file_io_set_make(uint16_t len) {
 +  struct dicom_file_io_set fioset = {
 +    .fios = g_new0(struct dicom_file_io, len),
@@ -1710,7 +1710,7 @@ index da06cd12..4f7fa36f 100644
 @@ -269,22 +252,6 @@ static bool get_tag_binary(const DcmDataSet *dataset,
    return true;
  }
- 
+
 -static bool get_tag_decimal_str(const DcmDataSet *dataset,
 -                                const char *keyword,
 -                                int index,
@@ -1733,7 +1733,7 @@ index da06cd12..4f7fa36f 100644
 @@ -306,25 +273,6 @@ static bool get_tag_seq_item(const DcmDataSet *dataset,
    return *result != NULL;
  }
- 
+
 -static char **get_tag_strv(const DcmDataSet *dataset,
 -                           const char *keyword,
 -                           int length) {
@@ -1759,13 +1759,13 @@ index da06cd12..4f7fa36f 100644
 @@ -392,17 +340,16 @@ static struct dicom_file *dicom_file_new(const char *filename,
      }
    }
- 
+
 -  // done with I/O for now
 -  _openslide_dicom_io_suspend(f->dio);
 -
    return g_steal_pointer(&f);
  }
- 
+
  static void level_destroy(struct dicom_level *l) {
    _openslide_grid_destroy(l->grid);
 -  if (l->file) {
@@ -1780,7 +1780,7 @@ index da06cd12..4f7fa36f 100644
  OPENSLIDE_DEFINE_G_DESTROY_NOTIFY_WRAPPER(level_destroy)
 @@ -439,13 +386,7 @@ static bool decode_frame(struct dicom_file *file,
    g_mutex_unlock(&file->lock);
- 
+
    if (!frame) {
 -    if (dcm_error_get_code(dcm_error) == DCM_ERROR_CODE_MISSING_FRAME) {
 -      dcm_error_clear(&dcm_error);
@@ -1792,7 +1792,7 @@ index da06cd12..4f7fa36f 100644
 +    _openslide_dicom_propagate_error(err, dcm_error);
      return false;
    }
- 
+
 @@ -466,10 +407,11 @@ static bool decode_frame(struct dicom_file *file,
                                                      file->jpeg_colorspace,
                                                      dest, w, h, err);
@@ -1816,7 +1816,7 @@ index da06cd12..4f7fa36f 100644
                        GError **err) {
    struct dicom_level *l = (struct dicom_level *) level;
 +  struct dicom_file_io *fios = arg;
- 
+
    // cache
    g_autoptr(_openslide_cache_entry) cache_entry = NULL;
    uint32_t *tiledata = _openslide_cache_get(osr->cache,
@@ -1854,12 +1854,12 @@ index da06cd12..4f7fa36f 100644
 +                      l->base.tile_w, l->base.tile_h, err)) {
 +      return false;
      }
- 
+
      // clip, if necessary
 @@ -536,6 +483,31 @@ static bool read_tile(openslide_t *osr,
    cairo_set_source_surface(cr, surface, 0, 0);
    cairo_paint(cr);
- 
+
 +  // draw debug info
 +  if (_openslide_debug(OPENSLIDE_DEBUG_TILES)) {
 +    uint32_t frame_number;
@@ -1887,11 +1887,11 @@ index da06cd12..4f7fa36f 100644
 +
    return true;
  }
- 
+
 @@ -547,8 +519,8 @@ static bool paint_region(openslide_t *osr G_GNUC_UNUSED,
                           GError **err) {
    struct dicom_level *l = (struct dicom_level *) level;
- 
+
 -  g_auto(dicom_file_io) fio G_GNUC_UNUSED = dicom_file_io_get(l->file);
 -  return _openslide_grid_paint_region(l->grid, cr, NULL,
 +  g_auto(dicom_file_io_set) fioset = dicom_file_io_set_make(l->file_count);
@@ -1911,7 +1911,7 @@ index da06cd12..4f7fa36f 100644
 @@ -610,30 +582,6 @@ static bool dicom_detect(const char *filename, struct _openslide_tifflike *tl,
    return f != NULL;
  }
- 
+
 -// replace with g_strv_equal() once we have glib 2.60
 -static bool strv_equal(const char *const *a, const char *const *b) {
 -  while (1) {
@@ -1941,7 +1941,7 @@ index da06cd12..4f7fa36f 100644
                                       GError **err) {
 @@ -664,9 +612,7 @@ static bool associated_read_icc_profile(struct _openslide_associated_image *img,
  }
- 
+
  static void _associated_destroy(struct associated *a) {
 -  if (a->file) {
 -    dicom_file_destroy(a->file);
@@ -1949,11 +1949,11 @@ index da06cd12..4f7fa36f 100644
 +  dicom_file_destroy(a->file);
    g_free(a);
  }
- 
+
 @@ -684,46 +630,30 @@ static const struct _openslide_associated_image_ops dicom_associated_ops = {
    .destroy = associated_destroy,
  };
- 
+
 -// error if two files have different SOP instance UIDs
 -// if we discover two files with the same purpose (e.g. two label images)
 -// and their UIDs are the same, it's a simple file duplication and we can
@@ -1987,7 +1987,7 @@ index da06cd12..4f7fa36f 100644
    }
 -  return true;
  }
- 
+
  // unconditionally takes ownership of dicom_file
  static bool add_associated(openslide_t *osr,
                             struct dicom_file *f,
@@ -1997,7 +1997,7 @@ index da06cd12..4f7fa36f 100644
    g_autoptr(associated) a = g_new0(struct associated, 1);
    a->base.ops = &dicom_associated_ops;
    a->file = f;
- 
+
 +  // do checks
 +  if (f->concatenation_id) {
 +    g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
@@ -2009,7 +2009,7 @@ index da06cd12..4f7fa36f 100644
    if (!get_tag_int(f->metadata, TotalPixelMatrixColumns, &a->base.w) ||
        !get_tag_int(f->metadata, TotalPixelMatrixRows, &a->base.h)) {
 @@ -737,14 +667,14 @@ static bool add_associated(openslide_t *osr,
- 
+
    // associated image name
    char *name;
 -  if (g_str_equal(image_type[2], LABEL_TYPE)) {
@@ -2026,7 +2026,7 @@ index da06cd12..4f7fa36f 100644
 +    // ASSOCIATED_FLAVORS contains something unexpected
      g_assert_not_reached();
    }
- 
+
 @@ -754,9 +684,20 @@ static bool add_associated(openslide_t *osr,
    struct associated *previous =
      g_hash_table_lookup(osr->associated_images, name);
@@ -2042,7 +2042,7 @@ index da06cd12..4f7fa36f 100644
 +      return false;
 +    }
    }
- 
+
 +  // done with I/O
 +  _openslide_dicom_io_suspend(f->dio);
 +
@@ -2052,7 +2052,7 @@ index da06cd12..4f7fa36f 100644
 @@ -764,97 +705,168 @@ static bool add_associated(openslide_t *osr,
    return true;
  }
- 
+
 -static struct dicom_level *find_level_by_dimensions(GPtrArray *level_array,
 -                                                    int64_t w, int64_t h) {
 +static bool find_level_by_dimensions(GPtrArray *level_array,
@@ -2073,7 +2073,7 @@ index da06cd12..4f7fa36f 100644
 -  return NULL;
 +  return false;
  }
- 
+
  // unconditionally takes ownership of dicom_file
 -static bool add_level(openslide_t *osr,
 -                      GPtrArray *level_array,
@@ -2087,7 +2087,7 @@ index da06cd12..4f7fa36f 100644
 +                           struct dicom_file *file,
 +                           GError **err) {
 +  g_autoptr(dicom_file) f = file;
- 
+
 -  // dimensions
 -  if (!get_tag_int(f->metadata, TotalPixelMatrixColumns, &l->base.w) ||
 -      !get_tag_int(f->metadata, TotalPixelMatrixRows, &l->base.h) ||
@@ -2105,7 +2105,7 @@ index da06cd12..4f7fa36f 100644
                  "Couldn't read level dimensions");
      return false;
    }
- 
+
 -  // read PixelSpacing to expose as the mpp settings, if present
 -  DcmDataSet *shared_functional_group;
 -  DcmDataSet *pixel_measures;
@@ -2146,7 +2146,7 @@ index da06cd12..4f7fa36f 100644
 +        return true;
 +      }
 +    }
- 
+
 -  // objective power
 -  DcmDataSet *optical_path;
 -  if (get_tag_seq_item(f->metadata, OpticalPathSequence, 0, &optical_path)) {
@@ -2222,7 +2222,7 @@ index da06cd12..4f7fa36f 100644
 +    g_ptr_array_add(level_array, l);
 +    g_ptr_array_add(level_files_array, files);
    }
- 
+
 -  // add
 -  g_ptr_array_add(level_array, g_steal_pointer(&l));
 +  // put it in the correct spot in the array.  having a defined ordering
@@ -2241,7 +2241,7 @@ index da06cd12..4f7fa36f 100644
 +  files->pdata[file_num] = g_steal_pointer(&f);
    return true;
  }
- 
+
  // unconditionally takes ownership of dicom_file
  static bool maybe_add_file(openslide_t *osr,
                             GPtrArray *level_array,
@@ -2250,7 +2250,7 @@ index da06cd12..4f7fa36f 100644
                             GError **err) {
    g_autoptr(dicom_file) f = file;
    g_assert(f->metadata);
- 
+
 -  // check ImageType
 -  g_auto(GStrv) image_type = get_tag_strv(f->metadata, ImageType, 4);
 -  if (!image_type) {
@@ -2276,7 +2276,7 @@ index da06cd12..4f7fa36f 100644
 +    }
      return true;
    }
- 
+
 @@ -895,13 +907,15 @@ static bool maybe_add_file(openslide_t *osr,
    found = false;
    switch (f->format) {
@@ -2303,7 +2303,7 @@ index da06cd12..4f7fa36f 100644
 @@ -923,11 +937,21 @@ static bool maybe_add_file(openslide_t *osr,
      return false;
    }
- 
+
 +  // populate IDs
 +  if (!get_tag_str(f->metadata, SOPInstanceUID, 0, &f->instance_id)) {
 +    g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
@@ -2323,10 +2323,10 @@ index da06cd12..4f7fa36f 100644
 +    return add_associated(osr, g_steal_pointer(&f), image_flavor, err);
    }
  }
- 
+
 @@ -1042,25 +1066,28 @@ static bool add_properties_element(const DcmElement *element,
  }
- 
+
  static void add_properties(openslide_t *osr, struct dicom_level *level0) {
 -  // pixel spacing is in mm, so convert to microns
 -  if (level0->pixel_spacing_x && level0->pixel_spacing_y) {
@@ -2368,12 +2368,12 @@ index da06cd12..4f7fa36f 100644
 +                                "dicom.BarcodeValue",
 +                                OPENSLIDE_PROPERTY_NAME_BARCODE);
  }
- 
+
  static gint compare_level_width(const void *a, const void *b) {
 @@ -1070,6 +1097,102 @@ static gint compare_level_width(const void *a, const void *b) {
    return bb->base.w - aa->base.w;
  }
- 
+
 +static bool finalize_level(struct dicom_level *l, GPtrArray *files,
 +                           GError **err) {
 +  // check for each file
@@ -2480,13 +2480,13 @@ index da06cd12..4f7fa36f 100644
 +  g_autoptr(GPtrArray) level_files_array =
 +    g_ptr_array_new_full(10,
 +                         OPENSLIDE_G_DESTROY_NOTIFY_WRAPPER(g_ptr_array_unref));
- 
+
    // open the passed-in file and get the slide-id
    g_autoptr(dicom_file) start = dicom_file_new(filename, true, err);
 @@ -1094,7 +1220,8 @@ static bool dicom_open(openslide_t *osr,
    }
    g_autofree char *slide_id = g_strdup(start->slide_id);
- 
+
 -  if (!maybe_add_file(osr, level_array, g_steal_pointer(&start), err)) {
 +  if (!maybe_add_file(osr, level_array, level_files_array,
 +                      g_steal_pointer(&start), err)) {
@@ -2496,7 +2496,7 @@ index da06cd12..4f7fa36f 100644
 @@ -1128,7 +1255,8 @@ static bool dicom_open(openslide_t *osr,
        continue;
      }
- 
+
 -    if (!maybe_add_file(osr, level_array, g_steal_pointer(&f), err)) {
 +    if (!maybe_add_file(osr, level_array, level_files_array,
 +                        g_steal_pointer(&f), err)) {
@@ -2506,7 +2506,7 @@ index da06cd12..4f7fa36f 100644
 @@ -1144,13 +1272,22 @@ static bool dicom_open(openslide_t *osr,
      return false;
    }
- 
+
 +  // finalize levels
 +  for (uint32_t i = 0; i < level_array->len; i++) {
 +    if (!finalize_level(level_array->pdata[i], level_files_array->pdata[i],
@@ -2517,14 +2517,14 @@ index da06cd12..4f7fa36f 100644
 +
    // sort levels by width
    g_ptr_array_sort(level_array, compare_level_width);
- 
+
 +  // add properties
    struct dicom_level *level0 = level_array->pdata[0];
    add_properties(osr, level0);
- 
+
 -  (void) get_icc_profile(level0->file, &osr->icc_profile_size);
 +  (void) get_icc_profile(level0->files[0], &osr->icc_profile_size);
- 
+
    // compute quickhash
    _openslide_hash_string(quickhash1, slide_id);
 @@ -1162,7 +1299,6 @@ static bool dicom_open(openslide_t *osr,
@@ -2534,7 +2534,7 @@ index da06cd12..4f7fa36f 100644
 -
    return true;
  }
- 
+
 diff --git a/src/openslide-vendor-generic-tiff.c b/src/openslide-vendor-generic-tiff.c
 index b2bcd2a7..04e350c5 100644
 --- a/src/openslide-vendor-generic-tiff.c
@@ -2570,7 +2570,7 @@ index b2bcd2a7..04e350c5 100644
      if (!TIFFIsTiled(ct.tiff)) {
        continue;
      }
- 
+
      // confirm it is either the first image, or reduced-resolution
 -    if (TIFFCurrentDirectory(ct.tiff) != 0) {
 +    if (dir != 0) {
@@ -2596,12 +2596,12 @@ index b2bcd2a7..04e350c5 100644
 +                                                      err)) {
 +      return false;
 +    }
- 
+
      // add to array
      g_ptr_array_add(level_array, g_steal_pointer(&l));
 @@ -272,6 +266,7 @@ static bool generic_tiff_open(openslide_t *osr,
    g_ptr_array_sort(level_array, width_compare);
- 
+
    // set hash and properties
 +  struct level *bottom_level = level_array->pdata[0];
    struct level *top_level = level_array->pdata[level_array->len - 1];
@@ -2613,7 +2613,7 @@ index b2bcd2a7..04e350c5 100644
    _openslide_tifflike_set_resolution_props(osr, tl, 0);
 +  _openslide_set_bounds_props_from_grid(osr, &bottom_level->base,
 +                                        bottom_level->grid);
- 
+
    // get icc profile size, if present
    struct level *base_level = level_array->pdata[0];
 diff --git a/src/openslide-vendor-hamamatsu.c b/src/openslide-vendor-hamamatsu.c
@@ -2633,19 +2633,19 @@ index 065d1ae7..1b3ac1d6 100644
 @@ -108,8 +109,9 @@ struct jpeg {
    int64_t *mcu_starts;
    int64_t *unreliable_mcu_starts;
- 
+
 -  int64_t sof_position;
 -  int64_t header_stop_position;
 +  uint8_t *header_data;
 +  int64_t header_sof_offset;
 +  int64_t header_length;
  };
- 
+
  struct jpeg_level {
 @@ -162,47 +164,36 @@ struct ngr_level {
    int32_t column_width;
  };
- 
+
 -enum OpenSlideHamamatsuError {
 -  // JPEG does not contain restart markers
 -  OPENSLIDE_HAMAMATSU_ERROR_NO_RESTART_MARKERS,
@@ -2693,7 +2693,7 @@ index 065d1ae7..1b3ac1d6 100644
  	       start_position, stop_position);
      return false;
    }
- 
+
    // compute size of buffer and allocate
 -  int header_length = header_stop_position - header_start_position;
    int data_length = 0;
@@ -2701,7 +2701,7 @@ index 065d1ae7..1b3ac1d6 100644
      data_length = stop_position - start_position;
 @@ -214,17 +205,7 @@ static bool jpeg_random_access_src(j_decompress_ptr cinfo,
                                                JPOOL_IMAGE, buffer_size);
- 
+
    // read in the 2 parts
 -  //  g_debug("reading header from %"PRId64, header_start_position);
 -  if (!_openslide_fseek(infile, header_start_position, SEEK_SET, err)) {
@@ -2719,7 +2719,7 @@ index 065d1ae7..1b3ac1d6 100644
      //  g_debug("reading from %"PRId64, start_position);
      if (!_openslide_fseek(infile, start_position, SEEK_SET, err)) {
 @@ -249,7 +230,7 @@ static bool jpeg_random_access_src(j_decompress_ptr cinfo,
- 
+
    // check for overlarge or 0 X/Y in SOF (some NDPI JPEGs have this)
    // change them to a value libjpeg will accept
 -  int64_t size_offset = sof_position - header_start_position + 5;
@@ -2738,7 +2738,7 @@ index 065d1ae7..1b3ac1d6 100644
 @@ -312,9 +294,9 @@ static void jpeg_setup_free(struct jpeg_setup *setup) {
  typedef struct jpeg_setup jpeg_setup;
  G_DEFINE_AUTOPTR_CLEANUP_FUNC(jpeg_setup, jpeg_setup_free)
- 
+
 -static bool find_bitstream_start(struct _openslide_file *f,
 -                                 int64_t *sof_position,
 -                                 int64_t *header_stop_position,
@@ -2751,7 +2751,7 @@ index 065d1ae7..1b3ac1d6 100644
 @@ -322,21 +304,28 @@ static bool find_bitstream_start(struct _openslide_file *f,
    int64_t pos;
    bool have_sof = false;
- 
+
 +  g_autoptr(GByteArray) data = g_byte_array_new();
 +  int64_t header_start_position = _openslide_ftell(f, err);
 +  if (header_start_position == -1) {
@@ -2788,7 +2788,7 @@ index 065d1ae7..1b3ac1d6 100644
 +      *header_sof_offset = pos - header_start_position;
        have_sof = true;
      }
- 
+
 @@ -357,26 +346,29 @@ static bool find_bitstream_start(struct _openslide_file *f,
      if (!_openslide_fread_exact(f, buf, sizeof(buf), err)) {
        g_prefix_error(err, "Couldn't read JPEG marker length at %"PRId64": ",
@@ -2805,7 +2805,7 @@ index 065d1ae7..1b3ac1d6 100644
 +      return NULL;
 +    }
 +    len -= sizeof(len);
- 
+
 -    // seek
 -    if (!_openslide_fseek(f, pos + sizeof(buf) + len, SEEK_SET, err)) {
 -      g_prefix_error(err, "Couldn't seek to next marker: ");
@@ -2816,7 +2816,7 @@ index 065d1ae7..1b3ac1d6 100644
 +      g_prefix_error(err, "Couldn't read JPEG marker data at %"PRId64": ", pos);
 +      return NULL;
      }
- 
+
      // check for SOS
      if (marker_byte == 0xDA) {
        // found it; done
@@ -2837,12 +2837,12 @@ index 065d1ae7..1b3ac1d6 100644
 -    return false;
 +    return NULL;
    }
- 
+
 -  return true;
 +  *header_length = data->len;
 +  return g_byte_array_free(g_steal_pointer(&data), false);
  }
- 
+
  static bool find_next_ff_marker(struct _openslide_file *f,
 @@ -468,7 +461,7 @@ static bool _compute_mcu_start(struct jpeg *jpeg,
  			       GError **err) {
@@ -2851,11 +2851,11 @@ index 065d1ae7..1b3ac1d6 100644
 -    jpeg->mcu_starts[0] = jpeg->header_stop_position;
 +    jpeg->mcu_starts[0] = jpeg->start_in_file + jpeg->header_length;
    }
- 
+
    // walk backwards to find the first non -1 offset
 @@ -621,9 +614,9 @@ static bool read_from_jpeg(openslide_t *osr,
      _openslide_jpeg_decompress_init(dc, &env);
- 
+
      if (!jpeg_random_access_src(cinfo, f,
 -                                jpeg->start_in_file,
 -                                jpeg->sof_position,
@@ -2868,7 +2868,7 @@ index 065d1ae7..1b3ac1d6 100644
                                  err)) {
 @@ -683,7 +676,7 @@ static bool read_jpeg_tile(openslide_t *osr,
                                              &cache_entry);
- 
+
    if (!tiledata) {
 -    g_autofree uint32_t *buf = g_malloc(tw * th * 4);
 +    g_autofree uint32_t *buf = g_new(uint32_t, tw * th);
@@ -2876,7 +2876,7 @@ index 065d1ae7..1b3ac1d6 100644
                          jp, tileno,
                          l->scale_denom,
 @@ -816,7 +809,8 @@ static bool hamamatsu_vms_vmu_detect(const char *filename,
- 
+
    // try to parse key file
    g_autoptr(GKeyFile) key_file =
 -    _openslide_read_key_file(filename, KEY_FILE_MAX_SIZE, G_KEY_FILE_NONE, err);
@@ -2899,11 +2899,11 @@ index 065d1ae7..1b3ac1d6 100644
 +                                 int64_t *header_length,
                                   char **comment, GError **err) {
    jmp_buf env;
- 
+
 @@ -993,13 +989,14 @@ static bool validate_jpeg_header(struct _openslide_file *f,
      *comment = NULL;
    }
- 
+
 -  // find limits of JPEG header
 +  // find limits of JPEG header and buffer it
    int64_t header_start = _openslide_ftell(f, err);
@@ -2916,7 +2916,7 @@ index 065d1ae7..1b3ac1d6 100644
 +  if (!*header_data) {
      return false;
    }
- 
+
 @@ -1010,8 +1007,8 @@ static bool validate_jpeg_header(struct _openslide_file *f,
    if (setjmp(env) == 0) {
      _openslide_jpeg_decompress_init(dc, &env);
@@ -2927,7 +2927,7 @@ index 065d1ae7..1b3ac1d6 100644
 +                                *header_length, -1, -1, err)) {
        return false;
      }
- 
+
 @@ -1030,12 +1027,6 @@ static bool validate_jpeg_header(struct _openslide_file *f,
                    "JPEG color components != 3");
        return false;
@@ -2938,13 +2938,13 @@ index 065d1ae7..1b3ac1d6 100644
 -                  "No restart markers");
 -      return false;
 -    }
- 
+
      jpeg_start_decompress(cinfo);
- 
+
 @@ -1056,6 +1047,21 @@ static bool validate_jpeg_header(struct _openslide_file *f,
        *h = cinfo->output_height;
      }
- 
+
 +    if (cinfo->restart_interval == 0) {
 +      if (!require_restart_markers && use_jpeg_dimensions) {
 +        // nothing else to check
@@ -2965,7 +2965,7 @@ index 065d1ae7..1b3ac1d6 100644
      if (cinfo->comps_in_scan > 1) {
 @@ -1400,17 +1406,18 @@ static bool hamamatsu_vms_part2(openslide_t *osr,
      }
- 
+
      // comment?
 -    char *comment = NULL;
 +    g_autofree char *comment = NULL;
@@ -2973,7 +2973,7 @@ index 065d1ae7..1b3ac1d6 100644
      if (i == 0) {
        comment_ptr = &comment;
      }
- 
+
 -    if (!validate_jpeg_header(f, true,
 +    if (!validate_jpeg_header(f, true, true,
                                &jp->width, &jp->height,
@@ -2993,10 +2993,10 @@ index 065d1ae7..1b3ac1d6 100644
 -			  comment);
 +			  g_steal_pointer(&comment));
      }
- 
+
      jp->end_in_file = _openslide_fsize(f, err);
 @@ -1542,7 +1549,6 @@ static bool ngr_read_tile(openslide_t *osr,
- 
+
    int64_t tw = l->column_width;
    int64_t th = MIN(NGR_TILE_HEIGHT, l->base.h - tile_y * NGR_TILE_HEIGHT);
 -  int tilesize = tw * th * 4;
@@ -3005,7 +3005,7 @@ index 065d1ae7..1b3ac1d6 100644
    uint32_t *tiledata = _openslide_cache_get(osr->cache, level, tile_x, tile_y,
 @@ -1573,7 +1579,7 @@ static bool ngr_read_tile(openslide_t *osr,
      }
- 
+
      // got the data, now convert to 8-bit xRGB
 -    tiledata = g_malloc(tilesize);
 +    tiledata = g_new(uint32_t, tw * th);
@@ -3020,10 +3020,10 @@ index 065d1ae7..1b3ac1d6 100644
 +                         tw * th * 4,
                           &cache_entry);
    }
- 
+
 @@ -1665,18 +1671,12 @@ static bool hamamatsu_vmu_part2(openslide_t *osr,
      }
- 
+
      // read w, h, column width, headersize
 -    if (!_openslide_fseek(f, 4, SEEK_SET, err)) {
 -      g_prefix_error(err, "Couldn't seek to NGR header: ");
@@ -3041,7 +3041,7 @@ index 065d1ae7..1b3ac1d6 100644
 -    }
 +    _openslide_fread_exact(f, unused, 8, NULL);
      l->start_in_file = read_le_int32_from_file(f);
- 
+
      // validate
 @@ -1726,7 +1726,7 @@ static bool hamamatsu_vms_vmu_open(openslide_t *osr, const char *filename,
    // first, see if it's a VMS/VMU file
@@ -3055,7 +3055,7 @@ index 065d1ae7..1b3ac1d6 100644
 @@ -2095,6 +2095,56 @@ static void ndpi_set_props(openslide_t *osr,
    }
  }
- 
+
 +static int64_t *ndpi_read_unreliable_mcu_starts(struct _openslide_tifflike *tl,
 +                                                int64_t dir,
 +                                                int64_t start_in_file,
@@ -3131,13 +3131,13 @@ index 065d1ae7..1b3ac1d6 100644
 +                  strip_count, height);
 +      return false;
 +    }
- 
+
      double lens =
        _openslide_tifflike_get_float(tl, dir, NDPI_SOURCELENS, &tmp_err);
 @@ -2131,14 +2187,6 @@ static bool hamamatsu_ndpi_open(openslide_t *osr, const char *filename,
        return false;
      }
- 
+
 -    // check results
 -    if (height != rows_per_strip) {
 -      g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
@@ -3148,11 +3148,11 @@ index 065d1ae7..1b3ac1d6 100644
 -
      if (lens > 0) {
        // is a pyramid level
- 
+
 @@ -2153,18 +2201,6 @@ static bool hamamatsu_ndpi_open(openslide_t *osr, const char *filename,
          continue;
        }
- 
+
 -      // is smallest level?
 -      if (width < min_width) {
 -        min_width = width;
@@ -3235,7 +3235,7 @@ index 065d1ae7..1b3ac1d6 100644
 +                    "Unexpected directory layout");
          return false;
        }
- 
+
 @@ -2218,8 +2268,9 @@ static bool hamamatsu_ndpi_open(openslide_t *osr, const char *filename,
        jp->tile_width = jp_tw;
        jp->tile_height = jp_th;
@@ -3249,7 +3249,7 @@ index 065d1ae7..1b3ac1d6 100644
        // init all to -1
        for (int32_t i = 0; i < jp->tile_count; i++) {
 @@ -2228,30 +2279,16 @@ static bool hamamatsu_ndpi_open(openslide_t *osr, const char *filename,
- 
+
        // read MCU starts, if this directory is tiled
        if (jp->tile_count > 1) {
 -        int64_t mcu_start_count =
@@ -3644,12 +3644,12 @@ index fd774bd4..0e02ebff 100644
 @@ -554,8 +550,9 @@ static bool create_levels_from_collection(openslide_t *osr,
                                            GError **err) {
    *quickhash_dir = -1;
- 
+
 -  // set barcode property
 +  // set barcode properties
    set_prop(osr, "leica.barcode", collection->barcode);
 +  set_prop(osr, OPENSLIDE_PROPERTY_NAME_BARCODE, collection->barcode);
- 
+
    // determine quickhash mode
    bool legacy_quickhash = should_use_legacy_quickhash(collection);
 diff --git a/src/openslide-vendor-mirax.c b/src/openslide-vendor-mirax.c
@@ -3659,14 +3659,14 @@ index 7e37d9e3..00326b69 100644
 @@ -220,7 +220,7 @@ static uint32_t *read_image(openslide_t *osr,
    struct mirax_ops_data *data = osr->data;
    bool result = false;
- 
+
 -  g_autofree uint32_t *dest = g_malloc(w * h * 4);
 +  g_autofree uint32_t *dest = g_new(uint32_t, w * h);
- 
+
    g_autoptr(_openslide_file) f =
      _openslide_fopen(data->datafile_paths[image->fileno], err);
 @@ -1386,7 +1386,7 @@ static bool mirax_open(openslide_t *osr, const char *filename,
- 
+
    g_autoptr(GKeyFile) slidedat =
      _openslide_read_key_file(slidedat_path, SLIDEDAT_MAX_SIZE,
 -                             G_KEY_FILE_NONE, err);
@@ -3696,11 +3696,11 @@ index 7e37d9e3..00326b69 100644
 +    _openslide_parse_int64(objective_magnification_str,
 +                           &objective_magnification);
 +  }
- 
+
    GError *tmp_err = NULL;
    int image_divisions =
 @@ -1807,15 +1819,17 @@ static bool mirax_open(openslide_t *osr, const char *filename,
- 
+
    // set properties
    struct level *l0 = level_array->pdata[0];
 -  _openslide_set_bounds_props_from_grid(osr, l0->grid);
@@ -3759,7 +3759,7 @@ index 2a249022..b5c01c36 100644
 +                        _openslide_decode_base64_str(barcode));
 +  }
  }
- 
+
  static bool fix_level_dimensions(struct level **levels,
 @@ -621,6 +617,11 @@ static bool philips_tiff_open(openslide_t *osr,
                                                tiffl->tile_w,
@@ -3770,7 +3770,7 @@ index 2a249022..b5c01c36 100644
 +                                                        err)) {
 +        return false;
 +      }
- 
+
        // verify that levels are sorted by size
        if (prev_l &&
 diff --git a/src/openslide-vendor-sakura.c b/src/openslide-vendor-sakura.c
@@ -3783,7 +3783,7 @@ index 232629aa..3b3695a8 100644
    if (!tiledata) {
 -    g_autofree uint32_t *buf = g_malloc(tile_size * tile_size * 4);
 +    g_autofree uint32_t *buf = g_new(uint32_t, tile_size * tile_size);
- 
+
      // read tile
      if (!read_image(buf, tile_col, tile_row, l->base.downsample,
 diff --git a/src/openslide-vendor-trestle.c b/src/openslide-vendor-trestle.c
@@ -3822,7 +3822,7 @@ index 80f5b221..0fdf8f78 100644
 +                  area->tiles_across, area->tiles_down);
 +      return NULL;
 +    }
- 
+
      // get position
      // it seems these are always whole numbers, but they are sometimes
 @@ -652,8 +658,9 @@ static bool parse_level_info(const char *desc,
@@ -3836,7 +3836,7 @@ index 80f5b221..0fdf8f78 100644
 +                          g_steal_pointer(&kv[1]));
      }
    }
- 
+
 diff --git a/src/openslide-vendor-zeiss.c b/src/openslide-vendor-zeiss.c
 index ec6acdf8..011edc51 100644
 --- a/src/openslide-vendor-zeiss.c
@@ -3853,7 +3853,7 @@ index ec6acdf8..011edc51 100644
 @@ -1018,28 +1018,15 @@ static bool parse_xml_set_prop(openslide_t *osr, struct czi *czi,
    czi->h = h;
    czi->nscene = nscene;
- 
+
 -  // in meter/pixel
 -  const char *meters =
 -    g_hash_table_lookup(osr->properties, "zeiss.Scaling.Items.X.Value");
@@ -3885,13 +3885,13 @@ index ec6acdf8..011edc51 100644
 +                                          "zeiss.Scaling.Items.Y.Value",
 +                                          1000000.0,
 +                                          OPENSLIDE_PROPERTY_NAME_MPP_Y);
- 
+
    char *objective_id = g_hash_table_lookup(osr->properties,
                                             "zeiss.Information.Image.ObjectiveSettings.ObjectiveRef.Id");
 @@ -1051,6 +1038,15 @@ static bool parse_xml_set_prop(openslide_t *osr, struct czi *czi,
                                       OPENSLIDE_PROPERTY_NAME_OBJECTIVE_POWER);
    }
- 
+
 +  // schema allows for more than one barcode; just take the first one
 +  char *barcode =
 +    _openslide_xml_xpath_get_string(ctx, "(/ImageDocument/Metadata/AttachmentInfos/AttachmentInfo/Label/Barcodes/Barcode/Content)[1]/text()");
@@ -3903,20 +3903,20 @@ index ec6acdf8..011edc51 100644
 +
    return true;
  }
- 
+
 diff --git a/src/openslide.c b/src/openslide.c
 index 5cdd4188..9f6d0085 100644
 --- a/src/openslide.c
 +++ b/src/openslide.c
 @@ -35,7 +35,7 @@
- 
+
  #include "openslide-error.h"
- 
+
 -const char _openslide_release_info[] = "OpenSlide " SUFFIXED_VERSION ", copyright (C) 2007-2025 Carnegie Mellon University and others.\nLicensed under the GNU Lesser General Public License, version 2.1.";
 +const char _openslide_release_info[] = "OpenSlide " SUFFIXED_VERSION ", copyright (C) 2007-2026 Carnegie Mellon University and others.\nLicensed under the GNU Lesser General Public License, version 2.1.";
- 
+
  static const char * const EMPTY_STRING_ARRAY[] = { NULL };
- 
+
 @@ -49,6 +49,8 @@ static const struct _openslide_format *formats[] = {
    &_openslide_format_sakura,
    &_openslide_format_trestle,
@@ -3933,7 +3933,7 @@ index 4671e0fb..3ed581e2 100644
 @@ -300,6 +300,13 @@ const char *openslide_get_error(openslide_t *osr);
   */
  #define OPENSLIDE_PROPERTY_NAME_BACKGROUND_COLOR "openslide.background-color"
- 
+
 +/**
 + * The name of the property containing a slide's barcode, if any.
 + *

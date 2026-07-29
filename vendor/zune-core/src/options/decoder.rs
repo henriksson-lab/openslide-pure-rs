@@ -364,7 +364,7 @@ impl DecoderOptions {
     /// Set the number of threads used to decode images
     ///
     /// This can be used e.g to implement threads used in
-    /// heic tile decoding  
+    /// heic tile decoding
     pub fn set_num_threads(mut self, num_threads: u8) -> Self {
         self.num_threads = num_threads.min(1);
         self

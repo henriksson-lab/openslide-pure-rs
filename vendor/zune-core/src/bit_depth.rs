@@ -149,7 +149,7 @@ impl BitDepth {
     }
     /// Get the number of bytes needed to store a specific bit depth
     ///
-    ///  
+    ///
     /// # Example
     /// For images less than or equal to 8 bits(1 byte), we can use a [`u8`] to store
     /// the pixels, and a size_of [`u8`] is 1

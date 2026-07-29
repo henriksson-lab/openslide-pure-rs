@@ -225,7 +225,7 @@ impl<T: ZByteReaderTrait> ZReader<T> {
     ///
     /// # Returns.
     /// - The next byte on the stream.
-    ///  
+    ///
     #[inline(always)]
     pub fn read_u8(&mut self) -> u8 {
         self.inner.read_byte_no_error()
@@ -235,7 +235,7 @@ impl<T: ZByteReaderTrait> ZReader<T> {
     ///
     /// # Returns
     /// - `Ok(u8)`: The next byte
-    /// - Error if the byte read could not be satisfied   
+    /// - Error if the byte read could not be satisfied
     #[inline(always)]
     pub fn read_u8_err(&mut self) -> Result<u8, ZByteIoError> {
         let mut buf = [0];

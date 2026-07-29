@@ -35,7 +35,7 @@ impl<T: ZByteWriterTrait> ZWriter<T> {
     /// - `Ok(usize)` - Number of bytes written
     ///   This number may be less than `buf.len()` if the length of the buffer is greater
     ///   than the internal bytestream length
-    ///  
+    ///
     /// If you want to be sure that all bytes were written, see [`write_all`](Self::write_all)
     ///
     #[inline]
@@ -130,7 +130,7 @@ impl<T: ZByteWriterTrait> ZWriter<T> {
     /// one can use this to reserve additional space to encode
     ///
     /// # Example
-    ///  
+    ///
     /// ```
     /// use zune_core::bytestream::ZWriter;
     /// let space_needed = 10; // Assume the image will fit into 10 bytes

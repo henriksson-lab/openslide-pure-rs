@@ -13,7 +13,7 @@ Fix yet to be contributed upstream (more testing needed)
 * 2026-05-30: Further audits. **This crate is still experimental**
 * 2026-05-28: Blind-translated a large number of non-MRXS formats. **These need real data to be tested**; please provide files if you find bugs and I will make them work!
 
-## This is an LLM-mediated faithful (hopefully) translation, not the original code! 
+## This is an LLM-mediated faithful (hopefully) translation, not the original code!
 
 Most users should probably first see if the existing original code works for them, unless they have reason otherwise. The original source
 may have newer features and it has had more love in terms of fixing bugs. In fact, we aim to replicate bugs if they are present, for the
