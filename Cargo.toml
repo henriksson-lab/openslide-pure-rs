@@ -1,6 +1,6 @@
 [package]
 name = "openslide-pure-rs"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 description = "Whole slide image reader with Rust format parsers and optional native codec/compositor helpers"
 license = "LGPL-2.1-only"
