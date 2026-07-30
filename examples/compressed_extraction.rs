@@ -1,5 +1,5 @@
 use openslide_pure_rs::compressed::{
-    CompressedBytes, CompressedExtractionSupport, CompressedTileMode,
+    CompressedBytes, CompressedExtractionSupport, CompressedPlaneBytes, CompressedTileMode,
 };
 use openslide_pure_rs::OpenSlide;
 
@@ -70,6 +70,40 @@ fn main() -> openslide_pure_rs::Result<()> {
                     range.offset,
                     range.length
                 );
+            }
+        }
+        CompressedBytes::Planes { planes } => {
+            println!("tile has {} compressed planes:", planes.len());
+            for plane in planes {
+                match &plane.bytes {
+                    CompressedPlaneBytes::Owned(bytes) => {
+                        println!("  {:?}: {} bytes in memory", plane.channel, bytes.len());
+                    }
+                    CompressedPlaneBytes::FileRange {
+                        path,
+                        offset,
+                        length,
+                    } => {
+                        println!(
+                            "  {:?}: {} @ {}+{}",
+                            plane.channel,
+                            path.display(),
+                            offset,
+                            length
+                        );
+                    }
+                    CompressedPlaneBytes::FileRanges { ranges } => {
+                        println!("  {:?}: {} source fragments", plane.channel, ranges.len());
+                        for range in ranges {
+                            println!(
+                                "    {} @ {}+{}",
+                                range.path.display(),
+                                range.offset,
+                                range.length
+                            );
+                        }
+                    }
+                }
             }
         }
     }
