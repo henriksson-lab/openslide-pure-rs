@@ -2,7 +2,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
+use crate::compressed::{
+    mode_allowed, ColorChannel, CompressedBytes, CompressedExtractionConstraint,
+    CompressedExtractionSupport, CompressedLevelInfo, CompressedPlane, CompressedPlaneBytes,
+    CompressedTile, CompressedTileMode, JpegColorSpace, JpegPlaneInfo, LossyCodec,
+};
 use crate::decode::{self, ImageFormat};
 use crate::error::{OpenSlideError, Result};
 use crate::format::{tiff::OpenslideHash, SlideBackend};
@@ -255,33 +259,110 @@ impl SlideBackend for SakuraSlide {
     }
 
     fn compressed_level_info(&self, level: u32) -> Result<CompressedExtractionSupport> {
-        if level as usize >= self.levels.len() {
+        let Some(level_data) = self.levels.get(level as usize) else {
             return Err(OpenSlideError::InvalidArgument(format!(
                 "Invalid level {level}"
             )));
+        };
+        if self.sqlite.is_none() || self.tile_source.is_none() {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "Sakura SQLite schema does not expose a recognized tile BLOB table".into(),
+            });
         }
-        Ok(CompressedExtractionSupport::NotSupported {
-            reason: "Sakura stores RGB tiles as separate per-channel JPEG blobs; use read_region instead"
-                .into(),
-        })
+        let tiles_across = level_data.width.div_ceil(u64::from(level_data.tile_size));
+        let tiles_down = level_data.height.div_ceil(u64::from(level_data.tile_size));
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                level,
+                width: level_data.width,
+                height: level_data.height,
+                tile_width: level_data.tile_size,
+                tile_height: level_data.tile_size,
+                tiles_across,
+                tiles_down,
+                codec: sakura_compressed_codec(),
+                modes: vec![CompressedTileMode::OriginalBytes],
+                constraints: vec![
+                    CompressedExtractionConstraint::RequiresCustomZarrCodec,
+                    CompressedExtractionConstraint::EdgeTilesMayBePartial,
+                ],
+            },
+        ))
     }
 
     fn read_compressed_tile(
         &self,
         level: u32,
-        _col: u64,
-        _row: u64,
-        _preferred_modes: &[CompressedTileMode],
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
     ) -> Result<CompressedTile> {
-        if level as usize >= self.levels.len() {
+        let Some(level_data) = self.levels.get(level as usize) else {
             return Err(OpenSlideError::InvalidArgument(format!(
                 "Invalid level {level}"
             )));
+        };
+        if !mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
+            return Err(OpenSlideError::UnsupportedFormat(
+                "requested compressed tile modes are not available for Sakura".into(),
+            ));
         }
-        Err(OpenSlideError::UnsupportedFormat(
-            "Sakura stores RGB tiles as separate per-channel JPEG blobs; use read_region instead"
-                .into(),
-        ))
+        let tiles_across = level_data.width.div_ceil(u64::from(level_data.tile_size));
+        let tiles_down = level_data.height.div_ceil(u64::from(level_data.tile_size));
+        if col >= tiles_across || row >= tiles_down {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Invalid compressed tile coordinates ({col}, {row}) for level {level}"
+            )));
+        }
+        let db = self.sqlite.as_ref().ok_or_else(|| {
+            OpenSlideError::UnsupportedFormat("Sakura SQLite schema could not be read".into())
+        })?;
+        let source = self.tile_source.as_ref().ok_or_else(|| {
+            OpenSlideError::UnsupportedFormat(
+                "Sakura SQLite schema does not expose a recognized tile BLOB table".into(),
+            )
+        })?;
+        let tile_x = i64::try_from(col)
+            .map_err(|_| OpenSlideError::InvalidArgument("Sakura tile column overflow".into()))?;
+        let tile_y = i64::try_from(row)
+            .map_err(|_| OpenSlideError::InvalidArgument("Sakura tile row overflow".into()))?;
+        let mut planes = Vec::new();
+        for (channel, role) in [
+            (0, ColorChannel::Red),
+            (1, ColorChannel::Green),
+            (2, ColorChannel::Blue),
+        ] {
+            let Some(blob) =
+                self.cached_tile_blob(db, source, level_data, channel, tile_x, tile_y)?
+            else {
+                return Err(OpenSlideError::UnsupportedFormat(format!(
+                    "Sakura compressed tile ({col}, {row}) is missing its {} JPEG plane",
+                    self.channel_name(channel).unwrap_or("unknown")
+                )));
+            };
+            planes.push(CompressedPlane {
+                channel: role,
+                bytes: CompressedPlaneBytes::Owned(blob),
+            });
+        }
+        let width = (level_data.width - col * u64::from(level_data.tile_size))
+            .min(u64::from(level_data.tile_size)) as u32;
+        let height = (level_data.height - row * u64::from(level_data.tile_size))
+            .min(u64::from(level_data.tile_size)) as u32;
+        Ok(CompressedTile {
+            level,
+            col,
+            row,
+            origin_x: col * u64::from(level_data.tile_size),
+            origin_y: row * u64::from(level_data.tile_size),
+            width,
+            height,
+            nominal_tile_width: level_data.tile_size,
+            nominal_tile_height: level_data.tile_size,
+            codec: sakura_compressed_codec(),
+            mode: CompressedTileMode::OriginalBytes,
+            bytes: CompressedBytes::Planes { planes },
+        })
     }
 
     fn read_region(
@@ -870,6 +951,19 @@ fn chosen_focal_plane(focal_planes: u32) -> i64 {
         return 0;
     }
     i64::from((focal_planes / 2) + (focal_planes % 2) - 1)
+}
+
+fn sakura_compressed_codec() -> LossyCodec {
+    LossyCodec::JpegPlanes {
+        planes: [ColorChannel::Red, ColorChannel::Green, ColorChannel::Blue]
+            .into_iter()
+            .map(|channel| JpegPlaneInfo {
+                channel,
+                color_space: JpegColorSpace::Gray,
+                subsampling: None,
+            })
+            .collect(),
+    }
 }
 
 fn build_sakura_tile_id_levels(
@@ -2424,6 +2518,86 @@ mod tests {
 
         assert_eq!(slide.level_tile_dimensions(0), Some((240, 240)));
         assert_eq!(slide.level_tile_dimensions(1), None);
+    }
+
+    #[test]
+    fn exposes_sakura_compressed_tiles_as_jpeg_planes() {
+        let source = TileSource {
+            root_page: 5,
+            blob_col: 1,
+            address: TileAddress::SakuraTileId { id_col: 0 },
+            focal_plane: Some(0),
+            rowid_alias_col: None,
+        };
+        let level = SakuraLevel {
+            width: 17,
+            height: 19,
+            downsample: 1.0,
+            tile_size: 16,
+        };
+        let mut index = TileBlobIndex::default();
+        index.tiles.insert(
+            TileKey {
+                level: Some(1),
+                color: Some(0),
+                x: 0,
+                y: 0,
+            },
+            vec![10],
+        );
+        index.tiles.insert(
+            TileKey {
+                level: Some(1),
+                color: Some(1),
+                x: 0,
+                y: 0,
+            },
+            vec![20],
+        );
+        index.tiles.insert(
+            TileKey {
+                level: Some(1),
+                color: Some(2),
+                x: 0,
+                y: 0,
+            },
+            vec![30],
+        );
+        let slide = SakuraSlide {
+            levels: vec![level],
+            properties: HashMap::new(),
+            sqlite: Some(SqliteDatabase {
+                path: PathBuf::new(),
+                page_size: 4096,
+                reserved_bytes: 0,
+                tables: Vec::new(),
+            }),
+            tile_source: Some(source),
+            tile_index: Mutex::new(Some(index)),
+            associated_images: HashMap::new(),
+        };
+
+        let CompressedExtractionSupport::Supported(info) = slide.compressed_level_info(0).unwrap()
+        else {
+            panic!("expected compressed Sakura level");
+        };
+        assert_eq!(info.tiles_across, 2);
+        assert_eq!(info.tiles_down, 2);
+        assert_eq!(info.codec, sakura_compressed_codec());
+
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+        assert_eq!(tile.width, 16);
+        assert_eq!(tile.height, 16);
+        let CompressedBytes::Planes { planes } = tile.bytes else {
+            panic!("expected compressed planes");
+        };
+        assert_eq!(planes.len(), 3);
+        assert_eq!(planes[0].channel, ColorChannel::Red);
+        assert_eq!(planes[0].bytes, CompressedPlaneBytes::Owned(vec![10]));
+        assert_eq!(planes[1].channel, ColorChannel::Green);
+        assert_eq!(planes[1].bytes, CompressedPlaneBytes::Owned(vec![20]));
+        assert_eq!(planes[2].channel, ColorChannel::Blue);
+        assert_eq!(planes[2].bytes, CompressedPlaneBytes::Owned(vec![30]));
     }
 
     fn one_by_one_bmp(rgb: [u8; 3]) -> Vec<u8> {

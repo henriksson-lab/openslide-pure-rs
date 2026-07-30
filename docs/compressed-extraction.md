@@ -17,8 +17,10 @@ lossy compressed blocks:
 - `NotSupported { reason }` is a normal result for formats, levels, or codecs
   that should be read through `read_region`.
 
-`OpenSlide::read_compressed_tile(level, col, row, preferred_modes)` returns a
-single compressed tile/frame. It never decodes pixels and recompresses them.
+`OpenSlide::read_compressed_tile(level, col, row, preferred_modes)` returns one
+compressed tile/frame. For formats that store a logical RGB tile as separate
+lossy component planes, the returned bytes contain one compressed stream per
+plane. It never decodes pixels and recompresses them.
 
 ## Modes
 
@@ -35,7 +37,8 @@ stream, and for `jpegtran -crop`-style block-aligned MIRAX JPEG crops.
 The initial implementation is conservative and supports whole lossy compressed
 tile/frame passthrough for:
 
-- Generic TIFF tiled JPEG and irreversible JPEG2000.
+- Generic TIFF tiled JPEG, planar-separate tiled JPEG, and irreversible
+  JPEG2000.
 - Generic TIFF tiled JPEG with external `JPEGTables` as derived standalone
   JPEG streams.
 - Aperio tiled JPEG and irreversible JPEG2000, except missing/synthesized
@@ -48,6 +51,7 @@ tile/frame passthrough for:
 - DICOM encapsulated JPEG Baseline and irreversible JPEG2000 frames.
 - MIRAX whole JPEG records when the logical tile is the entire stored record,
   and MCU-compatible JPEG subregions as derived standalone JPEG streams.
+- Sakura RGB tiles as three original per-channel JPEG plane streams.
 - Trestle simple non-overlapping tiled JPEG and irreversible JPEG2000 levels.
   Trestle JPEG tiles with external `JPEGTables` are returned as derived
   standalone JPEG streams.
@@ -59,13 +63,12 @@ tile/frame passthrough for:
   header verifies lossy coding, when default-view subblocks form a simple
   one-block-per-tile grid.
 
-Sakura, Synthetic, and Ventana BIF AOI tilemap levels currently report
-`NotSupported` with backend-specific reasons. They can be expanded when a
-backend can prove that one stored lossy block maps to one requested tile, or
-when `DerivedLosslessJpeg` support exists. Zeiss CZI levels that use lossless
-or unverifiable JPEG XR, Zstd, uncompressed data, separate per-channel blocks,
-mixed codecs, duplicate cells, or irregular subblock placement also report
-`NotSupported`.
+Synthetic and Ventana BIF AOI tilemap levels currently report `NotSupported`
+with backend-specific reasons. They can be expanded when a backend can prove
+that stored lossy blocks map cleanly to requested tiles. Zeiss CZI levels that
+use lossless or unverifiable JPEG XR, Zstd, uncompressed data, separate
+per-channel blocks, mixed codecs, duplicate cells, or irregular subblock
+placement also report `NotSupported`.
 
 ## OME-Zarr Caveat
 

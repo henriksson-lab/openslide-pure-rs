@@ -7,8 +7,9 @@ use flate2::read::{DeflateDecoder, ZlibDecoder};
 
 use crate::cache::{CachedTile, TileCache};
 use crate::compressed::{
-    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
-    CompressedLevelInfo, CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace,
+    mode_allowed, ColorChannel, CompressedBytes, CompressedExtractionConstraint,
+    CompressedExtractionSupport, CompressedLevelInfo, CompressedPlane, CompressedPlaneBytes,
+    CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace, JpegPlaneInfo,
     JpegSubsampling, LossyCodec,
 };
 use crate::decode::compositor::RgbBlit;
@@ -1413,11 +1414,20 @@ impl GenericTiffSlide {
     }
 
     fn compressed_level_modes(&self, level: &TiffLevel) -> Option<Vec<CompressedTileMode>> {
-        if level.planar_config != PLANARCONFIG_CONTIG
-            || level.old_jpeg.is_some()
+        if level.old_jpeg.is_some()
             || level.samples_per_pixel != level.channel_count() as u16
             || level.bits_per_sample_value().ok()? != 8
         {
+            return None;
+        }
+        if level.planar_config == PLANARCONFIG_SEPARATE {
+            return match (level.compression, level.jpeg_tables.is_some()) {
+                (COMPRESSION_JPEG, false) => Some(vec![CompressedTileMode::OriginalBytes]),
+                (COMPRESSION_JPEG, true) => Some(vec![CompressedTileMode::DerivedLosslessJpeg]),
+                _ => None,
+            };
+        }
+        if level.planar_config != PLANARCONFIG_CONTIG {
             return None;
         }
         match (level.compression, level.jpeg_tables.is_some()) {
@@ -1431,9 +1441,6 @@ impl GenericTiffSlide {
     }
 
     fn lossy_level_codec(&self, level: &TiffLevel, tile_no: u64) -> Result<Option<LossyCodec>> {
-        if level.planar_config != PLANARCONFIG_CONTIG {
-            return Ok(None);
-        }
         if level.old_jpeg.is_some() {
             return Ok(None);
         }
@@ -1441,6 +1448,24 @@ impl GenericTiffSlide {
             return Ok(None);
         }
         if level.bits_per_sample_value()? != 8 {
+            return Ok(None);
+        }
+
+        if level.planar_config == PLANARCONFIG_SEPARATE {
+            return match level.compression {
+                COMPRESSION_JPEG => Ok(Some(LossyCodec::JpegPlanes {
+                    planes: (0..level.channel_count())
+                        .map(|sample| JpegPlaneInfo {
+                            channel: tiff_sample_channel(sample),
+                            color_space: JpegColorSpace::Gray,
+                            subsampling: None,
+                        })
+                        .collect(),
+                })),
+                _ => Ok(None),
+            };
+        }
+        if level.planar_config != PLANARCONFIG_CONTIG {
             return Ok(None);
         }
 
@@ -1524,6 +1549,72 @@ impl GenericTiffSlide {
                 compressed_level_unsupported_reason(level),
             ));
         };
+        if level.planar_config == PLANARCONFIG_SEPARATE {
+            let tiles_per_plane = level
+                .tiles_across
+                .checked_mul(level.tiles_down)
+                .ok_or_else(|| OpenSlideError::Format("TIFF planar tile count overflow".into()))?;
+            let mut planes = Vec::new();
+            for sample in 0..level.channel_count() {
+                let index = u64::from(sample)
+                    .checked_mul(tiles_per_plane)
+                    .and_then(|base| base.checked_add(tile_no))
+                    .ok_or_else(|| {
+                        OpenSlideError::InvalidArgument("TIFF planar tile index overflow".into())
+                    })?;
+                let byte_count = *level.tile_byte_counts.get(index as usize).ok_or_else(|| {
+                    OpenSlideError::Format("TIFF tile byte count is missing".into())
+                })?;
+                if byte_count == 0 {
+                    return Err(OpenSlideError::UnsupportedFormat(
+                        "TIFF planar tile is missing and cannot be emitted as lossy compressed bytes"
+                            .into(),
+                    ));
+                }
+                let offset = *level
+                    .tile_offsets
+                    .get(index as usize)
+                    .ok_or_else(|| OpenSlideError::Format("TIFF tile offset is missing".into()))?;
+                let bytes = match mode {
+                    CompressedTileMode::OriginalBytes => CompressedPlaneBytes::FileRange {
+                        path: self.path.clone(),
+                        offset,
+                        length: byte_count,
+                    },
+                    CompressedTileMode::DerivedLosslessJpeg => {
+                        let raw = read_file_range_from_open_file(
+                            &self.tiff_file,
+                            self.tiff_file_len,
+                            offset,
+                            byte_count,
+                        )?;
+                        CompressedPlaneBytes::Owned(merge_jpeg_tables(
+                            &raw,
+                            level.jpeg_tables.as_deref(),
+                        )?)
+                    }
+                };
+                planes.push(CompressedPlane {
+                    channel: tiff_sample_channel(sample),
+                    bytes,
+                });
+            }
+            let (width, height) = tile_visible_size(level, tile_no)?;
+            return Ok(CompressedTile {
+                level: level_index,
+                col,
+                row,
+                origin_x: col * u64::from(level.tile_width),
+                origin_y: row * u64::from(level.tile_height),
+                width,
+                height,
+                nominal_tile_width: level.tile_width,
+                nominal_tile_height: level.tile_height,
+                codec,
+                mode,
+                bytes: CompressedBytes::Planes { planes },
+            });
+        }
         let byte_count = *level
             .tile_byte_counts
             .get(tile_no as usize)
@@ -1621,6 +1712,15 @@ fn jpeg_subsampling_metadata(subsampling: (u16, u16)) -> JpegSubsampling {
             horizontal,
             vertical,
         },
+    }
+}
+
+fn tiff_sample_channel(sample: u32) -> ColorChannel {
+    match sample {
+        0 => ColorChannel::Red,
+        1 => ColorChannel::Green,
+        2 => ColorChannel::Blue,
+        other => ColorChannel::Unknown(other as u16),
     }
 }
 
@@ -4079,6 +4179,98 @@ mod tests {
                 path: path.clone(),
                 offset: 0,
                 length: 4,
+            }
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compressed_extraction_returns_planar_tiff_jpeg_file_ranges() {
+        let path = temp_path("compressed-planar-jpeg.bin");
+        fs::write(&path, [11, 12, 21, 22, 23, 31]).unwrap();
+        let slide = generic_tiff_test_slide(
+            path.clone(),
+            TiffLevel {
+                dir: 0,
+                width: 2,
+                height: 1,
+                downsample: 1.0,
+                tile_width: 2,
+                tile_height: 1,
+                tiles_across: 1,
+                tiles_down: 1,
+                compression: COMPRESSION_JPEG,
+                photometric: PHOTOMETRIC_RGB,
+                samples_per_pixel: 3,
+                planar_config: PLANARCONFIG_SEPARATE,
+                predictor: 1,
+                bits_per_sample: vec![8, 8, 8],
+                ycbcr_subsampling: (1, 1),
+                tile_offsets: vec![0, 2, 5],
+                tile_byte_counts: vec![2, 3, 1],
+                jpeg_tables: None,
+                old_jpeg: None,
+                endian: Endian::Little,
+            },
+        );
+
+        let support = slide.compressed_level_info(0).unwrap();
+        let crate::compressed::CompressedExtractionSupport::Supported(info) = support else {
+            panic!("expected planar TIFF JPEG level to be supported");
+        };
+        assert_eq!(
+            info.codec,
+            crate::compressed::LossyCodec::JpegPlanes {
+                planes: vec![
+                    crate::compressed::JpegPlaneInfo {
+                        channel: crate::compressed::ColorChannel::Red,
+                        color_space: crate::compressed::JpegColorSpace::Gray,
+                        subsampling: None,
+                    },
+                    crate::compressed::JpegPlaneInfo {
+                        channel: crate::compressed::ColorChannel::Green,
+                        color_space: crate::compressed::JpegColorSpace::Gray,
+                        subsampling: None,
+                    },
+                    crate::compressed::JpegPlaneInfo {
+                        channel: crate::compressed::ColorChannel::Blue,
+                        color_space: crate::compressed::JpegColorSpace::Gray,
+                        subsampling: None,
+                    },
+                ],
+            }
+        );
+
+        let tile = slide.read_compressed_tile(0, 0, 0, &[]).unwrap();
+        let crate::compressed::CompressedBytes::Planes { planes } = tile.bytes else {
+            panic!("expected compressed planes");
+        };
+        assert_eq!(planes.len(), 3);
+        assert_eq!(planes[0].channel, crate::compressed::ColorChannel::Red);
+        assert_eq!(
+            planes[0].bytes,
+            crate::compressed::CompressedPlaneBytes::FileRange {
+                path: path.clone(),
+                offset: 0,
+                length: 2,
+            }
+        );
+        assert_eq!(planes[1].channel, crate::compressed::ColorChannel::Green);
+        assert_eq!(
+            planes[1].bytes,
+            crate::compressed::CompressedPlaneBytes::FileRange {
+                path: path.clone(),
+                offset: 2,
+                length: 3,
+            }
+        );
+        assert_eq!(planes[2].channel, crate::compressed::ColorChannel::Blue);
+        assert_eq!(
+            planes[2].bytes,
+            crate::compressed::CompressedPlaneBytes::FileRange {
+                path: path.clone(),
+                offset: 5,
+                length: 1,
             }
         );
         let _ = fs::remove_file(path);
