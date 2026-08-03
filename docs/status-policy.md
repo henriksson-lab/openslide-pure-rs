@@ -113,9 +113,9 @@ must record read time and maximum RSS against the same reference stack used for
 parity. Benchmark jobs publish artifacts on unstable runners and enforce saved
 thresholds on stable runners. Strict enforcement is automatic when the
 benchmark report `runner_profile` matches
-`fixtures/bench-baseline.json.enforcement_policy.strict_runner_profile`; the
-nightly workflow exposes this as a manual `runner_profile` input for stable
-benchmark runners.
+`fixtures/bench-baseline.json.enforcement_policy.strict_runner_profile`. The
+manual `Stable Benchmark` workflow runs on the self-hosted stable-profile
+runner and is the strict benchmark enforcement path.
 
 Strict runner readiness is tracked separately from reader parity in
 `fixtures/runner-status.toml` and surfaced in `docs/maturity-report.md`.

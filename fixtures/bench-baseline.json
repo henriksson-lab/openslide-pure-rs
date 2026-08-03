@@ -13,7 +13,7 @@
   "enforcement_policy": {
     "default_mode": "stable-profile-strict",
     "strict_runner_profile": "openslide-audit-stable-v1",
-    "notes": "Strict read-time/RSS enforcement is automatic for benchmark reports generated on this runner profile. Scheduled github-hosted runs remain audit-only because they use a different runner profile."
+    "notes": "Strict read-time/RSS enforcement is automatic for benchmark reports generated on this runner profile. The manual Stable Benchmark workflow runs on the self-hosted stable-profile runner."
   },
   "rows": [
     {

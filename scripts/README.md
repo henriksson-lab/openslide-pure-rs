@@ -273,11 +273,10 @@ against it:
   Benchmark and level-baseline statuses must also match expected-parity
   statuses.
 * Required CI/parity workflow files must exist and retain the core commands
-  used for Rust quality gates, smoke parity, nightly parity, benchmark reports,
-  level diagnostics, and audit-baseline validation. The parity smoke workflow
-  must trigger on maturity docs and audit files as well as source/fixture
-  changes. CI must run `scripts/maturity-audit.sh` so local and automated
-  maturity gates share the same entry point.
+  used for Rust quality gates, smoke parity, fixture-candidate discovery,
+  stable benchmark reports, and audit-baseline validation. CI must run
+  `scripts/maturity-audit.sh` so local and automated maturity gates share the
+  same entry point.
 * The stable benchmark runner contract must exist as
   `docs/benchmark-runner.md` and `scripts/run-stable-benchmark.sh`, and it must
   use the strict `openslide-audit-stable-v1` runner profile. The manual stable
@@ -312,23 +311,18 @@ python3 scripts/check-audit-baselines.py
 python3 scripts/check-audit-baselines.py \
   --parity-report .tmp/openslide-testdata/parity-smoke.json
 python3 scripts/check-audit-baselines.py \
-  --parity-report .tmp/openslide-testdata/parity-nightly.json \
-  --bench-report .tmp/openslide-testdata/bench-nightly.json
-python3 scripts/check-audit-baselines.py \
-  --level-report .tmp/openslide-testdata/levels-mirax.json
+  --bench-report .tmp/openslide-testdata/bench-stable.json
 python3 scripts/check-audit-baselines.py \
   --fixture-candidates-report .tmp/openslide-testdata/fixture-candidates.json \
   --fail-on-fixture-candidates
 ```
 
-All public smoke and nightly fixtures should have manifest rows. Matched exact
-fixtures must stay exact; matched known-drift fixtures may warn but must still
-be measured. Benchmark reports are checked for structure and parity status by
-default. Saved RSS/read-time thresholds are enforced automatically when a report
-uses the configured strict `runner_profile`; pass `--enforce-bench` to force
-the same checks manually. The `Parity Nightly` workflow exposes
-`runner_profile` for stable-runner dispatches and leaves scheduled
-github-hosted runs non-strict by using the hosted audit profile.
+All checked smoke and stable-runner fixtures should have manifest rows. Matched
+exact fixtures must stay exact; matched known-drift fixtures may warn but must
+still be measured. Benchmark reports are checked for structure and parity
+status by default. Saved RSS/read-time thresholds are enforced automatically
+when a report uses the configured strict `runner_profile`; pass
+`--enforce-bench` to force the same checks manually.
 Fixture candidate reports are checked for the currently missing reader blockers
 from `fixtures/reader-status.toml`; use
 `scripts/find-fixture-candidates.py --missing-from-reader-status

@@ -1445,15 +1445,6 @@ def validate_workflow_contracts() -> list[str]:
             "--fail-on-fixture-candidates",
             "actions/upload-artifact",
         ],
-        ".github/workflows/parity-nightly.yml": [
-            "--profile nonmirax-coverage",
-            "bench-realdata.py",
-            "bench-realdata-levels.py",
-            "--parity-report",
-            "--bench-report",
-            "--level-report",
-            "runner_profile",
-        ],
         ".github/workflows/benchmark-stable.yml": [
             "self-hosted",
             "openslide-audit-stable-v1",
