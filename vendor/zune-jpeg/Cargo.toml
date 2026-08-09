@@ -1,5 +1,5 @@
 [package]
-name = "zune-jpeg"
+name = "openslide-zune-jpeg"
 version = "0.5.15"
 rust-version = "1.77.1"
 authors = ["caleb <etemesicaleb@gmail.com>"]
@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0 OR Zlib"
 keywords = ["jpeg", "jpeg-decoder", "decoder"]
 categories = ["multimedia::images"]
 exclude = ["/benches/images/*", "/tests/*", "/.idea/*", "/.gradle/*", "/test-images/*", "fuzz/*"]
-description = "A fast, correct and safe jpeg decoder"
+description = "OpenSlide patched fork of zune-jpeg with TIFF JPEG assembly and region decode helpers"
 
 [lints.rust]
 # Disable feature checker for fuzzing since it's used and cargo doesn't
@@ -30,7 +30,7 @@ default = ["x86", "neon", "std"]
 
 
 [dependencies]
-zune-core = { path = "../zune-core", version = "0.5.1" }
+zune-core = { package = "openslide-zune-core", path = "../zune-core", version = "0.5.1" }
 
 
 [dev-dependencies]
