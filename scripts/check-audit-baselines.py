@@ -1478,7 +1478,6 @@ def validate_workflow_contracts() -> list[str]:
             "Failure Triage",
             "/big/henriksson/ome_images",
             ".github/workflows/benchmark-stable.yml",
-            "TOAUDIT.md",
         ],
         "docs/status-policy.md": [
             "Promotion Gates",
@@ -1522,9 +1521,6 @@ def validate_workflow_contracts() -> list[str]:
             "mature status requires active strict benchmark runner",
             "YYYY-MM-DDTHH:MM:SSZ",
             "--stable-runner-report",
-            "validate_toaudit_status",
-            "validate_toaudit_benchmark_summary",
-            "translation_audit_format",
             "benchmark_tuple",
             "fixtures/bench-baseline.json",
             "README benchmark snapshot",
@@ -1565,22 +1561,6 @@ def validate_workflow_contracts() -> list[str]:
             "fixtures/reader-status.toml",
             "--reader-status",
             "Mature runner gate smoke OK",
-        ],
-        "TOAUDIT.md": [
-            "Translation Audit Log",
-            "Real Data Reader Benchmarks",
-            "Checked-In Benchmark Baseline Summary",
-            "BEGIN BENCHMARK BASELINE SUMMARY",
-            "| Format | Status | Clean streak | Notes |",
-            "Complete",
-        ],
-        "scripts/toaudit-benchmark-summary.py": [
-            "BEGIN BENCHMARK BASELINE SUMMARY",
-            "END BENCHMARK BASELINE SUMMARY",
-            "generate_summary",
-            "fixtures/bench-baseline.json",
-            "--write",
-            "--check",
         ],
         "docs/codec-policy.md": [
             "JPEG 2000",
@@ -1712,7 +1692,6 @@ def validate_package_contract(cargo_path: Path, readme_path: Path, build_path: P
         "/README.md",
         "/Cargo.toml",
         "/MATURITY_PLAN.md",
-        "/TOAUDIT.md",
         "/scripts/README.md",
     }
     for include in sorted(required_exact_includes):
@@ -1766,72 +1745,6 @@ def validate_maturity_report(
     return errors
 
 
-def translation_audit_format(reader_id: str, reader: dict[str, Any]) -> str:
-    if reader_id.startswith("hamamatsu-"):
-        return "Hamamatsu"
-    if reader_id == "mirax":
-        return "Mirax"
-    if reader_id == "generic-tiff":
-        return "Generic TIFF"
-    return str(reader.get("name", ""))
-
-
-def validate_toaudit_status(toaudit_path: Path, reader_doc: dict[str, Any] | None) -> list[str]:
-    errors: list[str] = []
-    if not reader_doc:
-        return errors
-    if not toaudit_path.exists():
-        return [f"translation audit log is missing: {toaudit_path}"]
-
-    rows = markdown_table_rows(toaudit_path.read_text(), "Format")
-    required_formats = {
-        translation_audit_format(str(reader.get("id", "")), reader)
-        for reader in reader_doc.get("reader", [])
-        if reader.get("id")
-    }
-    for format_name in sorted(required_formats):
-        row = rows.get(format_name)
-        if not row:
-            errors.append(f"TOAUDIT.md status table is missing format {format_name}")
-            continue
-        if len(row) < 4:
-            errors.append(f"TOAUDIT.md status row for {format_name} has too few columns")
-            continue
-        status = row[1]
-        clean_streak_text = row[2]
-        notes = row[3]
-        if status != "Complete":
-            errors.append(f"TOAUDIT.md status row for {format_name} is not Complete")
-        try:
-            clean_streak = int(clean_streak_text)
-        except ValueError:
-            errors.append(f"TOAUDIT.md status row for {format_name} has non-integer clean streak")
-            continue
-        if clean_streak < 2:
-            errors.append(f"TOAUDIT.md status row for {format_name} needs clean streak >= 2")
-        if not notes:
-            errors.append(f"TOAUDIT.md status row for {format_name} is missing notes")
-    return errors
-
-
-def validate_toaudit_benchmark_summary(toaudit_path: Path, bench_baseline_path: Path) -> list[str]:
-    if not toaudit_path.exists():
-        return [f"translation audit log is missing: {toaudit_path}"]
-    namespace = runpy.run_path("scripts/toaudit-benchmark-summary.py")
-    generate_summary = namespace.get("generate_summary")
-    current_block = namespace.get("current_block")
-    if not callable(generate_summary) or not callable(current_block):
-        return ["scripts/toaudit-benchmark-summary.py does not expose generate_summary/current_block"]
-    try:
-        expected = generate_summary(bench_baseline_path)
-        current = current_block(toaudit_path.read_text())
-    except ValueError as exc:
-        return [str(exc)]
-    if current != expected:
-        return [f"{toaudit_path} benchmark baseline summary is stale; run scripts/toaudit-benchmark-summary.py --write"]
-    return []
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", default="fixtures/manifest.toml")
@@ -1843,7 +1756,6 @@ def main() -> int:
     parser.add_argument("--runner-status", default="fixtures/runner-status.toml")
     parser.add_argument("--readme", default="README.md")
     parser.add_argument("--maturity-report", default="docs/maturity-report.md")
-    parser.add_argument("--toaudit", default="TOAUDIT.md")
     parser.add_argument("--parity-report", help="optional parity-check.py JSON report")
     parser.add_argument("--bench-report", help="optional bench-realdata.py JSON report")
     parser.add_argument("--level-report", help="optional bench-realdata-levels.py JSON report")
@@ -1892,9 +1804,6 @@ def main() -> int:
     )
     errors.extend(validate_workflow_contracts())
     errors.extend(validate_package_contract(Path("Cargo.toml"), Path("README.md"), Path("build.rs")))
-    if args.toaudit:
-        errors.extend(validate_toaudit_status(Path(args.toaudit), reader_doc))
-        errors.extend(validate_toaudit_benchmark_summary(Path(args.toaudit), Path(args.bench_baseline)))
     if args.maturity_report:
         errors.extend(
             validate_maturity_report(

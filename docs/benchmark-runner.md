@@ -122,8 +122,6 @@ Only refresh `fixtures/bench-baseline.json` from this runner profile after:
 
 - The generated report is exact or matches an accepted known-drift row.
 - A read-time/RSS change is explained by a code or dependency change.
-- The corresponding `TOAUDIT.md` row records the command, fixture, parity
-  status, Rust/reference timing, and RSS.
 - `README.md` is updated when user-facing speed/RSS numbers change.
 
 ## Baseline Refresh Procedure
@@ -133,9 +131,8 @@ Only refresh `fixtures/bench-baseline.json` from this runner profile after:
    `bench-stable.json`.
 3. If strict validation fails, explain whether the change is caused by code,
    dependency, fixture, or runner drift before editing baselines.
-4. Refresh `fixtures/bench-baseline.json`, `README.md`, and the generated
-   benchmark block in `TOAUDIT.md` together when user-facing speed/RSS numbers
-   change.
+4. Refresh `fixtures/bench-baseline.json` and `README.md` together when
+   user-facing speed/RSS numbers change.
 5. Run `scripts/maturity-audit.sh` before merging the baseline refresh.
 
 ## Failure Triage

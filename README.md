@@ -46,8 +46,8 @@ MIRAX translation, including support for MRXS slides with missing fluorescence
 channels, plus verified, blind, or partially verified translations for the other
 OpenSlide formats listed below.
 
-Real-data verification status is tracked in `TOAUDIT.md`; promotion criteria
-for moving a backend out of experimental status are tracked in
+Real-data verification status is tracked in `docs/maturity-report.md`;
+promotion criteria for moving a backend out of experimental status are tracked in
 `MATURITY_PLAN.md` and `docs/status-policy.md`. A backend is only considered
 mature after repeatable fixture parity, benchmark/RSS baselines, CI coverage,
 and dependency caveats are recorded.

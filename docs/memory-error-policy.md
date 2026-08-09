@@ -33,6 +33,6 @@ for small regions or silently accepts unsupported layouts.
 - Detected-only formats may expose diagnostic metadata, but they remain
   experimental unless pixel reads have fixture-backed parity.
 - Known reference-stack blockers must be recorded in `fixtures/manifest.toml`,
-  `fixtures/expected-parity.toml`, `fixtures/matrix.toml`, and `TOAUDIT.md`.
+  `fixtures/expected-parity.toml`, and `fixtures/matrix.toml`.
 - Promotion beyond `Fixture-verified` is blocked while relevant matrix rows are
   `pending`, `known-drift`, `blocked`, `missing`, or `missing-fixture`.

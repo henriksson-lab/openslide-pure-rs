@@ -296,13 +296,6 @@ against it:
   `scripts/maturity-report.py --output docs/maturity-report.md`; the baseline
   validator regenerates it from reader-status, matrix, manifest, and benchmark
   contracts and rejects stale output.
-* `TOAUDIT.md` must keep a translation-audit status row for every README reader
-  family from `fixtures/reader-status.toml`. Split README reader rows such as
-  Hamamatsu NDPI/VMS/VMU map back to the shared Hamamatsu translation-audit row;
-  each required row must be `Complete` with clean streak `>= 2`.
-  Its checked-in benchmark baseline summary must also match
-  `scripts/toaudit-benchmark-summary.py --write`, which is generated from
-  `fixtures/bench-baseline.json`.
 * `Cargo.toml` packaging, `build.rs` native helper sources, and README native
   dependency wording must stay aligned.
 
@@ -372,15 +365,3 @@ The report is a readable view of `fixtures/reader-status.toml`,
 a reader maturity table, an `Execution Focus` section generated from
 non-covered matrix cases, and a `Runner Status` section for the strict benchmark
 runner. It is not a replacement for `scripts/check-audit-baselines.py`.
-
-### `toaudit-benchmark-summary.py`
-
-Refreshes the checked-in benchmark-baseline block in `TOAUDIT.md`:
-
-```sh
-python3 scripts/toaudit-benchmark-summary.py --write
-python3 scripts/toaudit-benchmark-summary.py --check
-```
-
-The central audit validator runs the same freshness check against
-`fixtures/bench-baseline.json`.

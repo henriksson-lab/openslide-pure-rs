@@ -25,7 +25,6 @@ include = [
     "/vendor/zune-core/**",
     "/vendor/zune-jpeg/**",
     "/README.md",
-    "/TOAUDIT.md",
     "/Cargo.toml",
 ]
 
