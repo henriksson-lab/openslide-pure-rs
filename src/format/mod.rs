@@ -27,6 +27,13 @@ pub(crate) trait SlideBackend: Send + Sync {
     fn vendor(&self) -> &'static str;
     fn channel_count(&self) -> u32;
     fn channel_name(&self, channel: u32) -> Option<&str>;
+
+    /// Channel indices that composite to a true-colour RGB image, in R, G, B, A
+    /// order. Formats whose channel indices already *are* R, G, B need not
+    /// override this.
+    fn natural_rgb_channels(&self) -> [Option<u32>; 4] {
+        [Some(0), Some(1), Some(2), None]
+    }
     fn level_count(&self) -> u32;
     fn level_dimensions(&self, level: u32) -> Option<(u64, u64)>;
     fn level_downsample(&self, level: u32) -> Option<f64>;
@@ -112,6 +119,11 @@ pub(crate) trait SlideBackend: Send + Sync {
     }
     fn set_cache(&mut self, _cache: Arc<TileCache>) {}
     fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize;
+
+    /// Bounding box of a level's tile grid, for diagnostics.
+    fn debug_grid_bounds(&self, _channel: u32, _level: u32) -> Option<(f64, f64, f64, f64)> {
+        None
+    }
 }
 
 /// Try to detect and open a slide file, returning the appropriate backend.

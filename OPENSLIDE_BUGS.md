@@ -186,3 +186,86 @@ Ventana slide.
 | `test3.ndpis` set | **fails** (bug 4; 4.x too) | **reads** as 3-channel slide |
 | `Ventana-1.bif` (`LEFT` tile join) | **fails** (bug 5; 4.x too) | **reads** |
 | `CMU-1/2/3.ndpi` | reads | reads, **exact parity** |
+
+---
+
+## MIRAX: deliberate divergences from the C driver
+
+Unlike the entries above, these are not defects found in C OpenSlide and worked
+around — they are places where this port **deliberately does something the C
+driver does not**, because the vendor software does. The reference for each is
+the MIRAX container specification derived from the 3DHISTECH binaries.
+
+The C driver is not a specification for this format. Where it disagrees with the
+vendor's own reader, it is wrong.
+
+### 1. The hierarchical root table is a cross product, not consecutive blocks
+
+The index's hierarchical root table has `Π HIER_i_COUNT` entries, addressed
+mixed-radix with the first hierarchy varying fastest. C OpenSlide reads the zoom
+levels as the first `HIER_0_COUNT` entries, which is the same thing only because
+the zoom hierarchy is first. Any addressing beyond the zoom axis — which the C
+driver never does, and which this port needs for fluorescence channels — must
+compute the entry. Searching the table for blocks that "look like" tile data
+lands on a neighbouring hierarchy's records: on the SDK's own demo slide, the
+fourth such block is the **Scan info layer**, not a channel.
+
+### 2. Non-hierarchical records are 20 bytes and there can be more than one
+
+A non-hierarchical record is `{x, y, offset, length, fileno}`. C OpenSlide reads
+the first record of the first page only, and requires the `x` and `y` fields to
+be zero — it treats them as padding. That makes every record other than the one
+at the origin unreachable, including the intensity-correction table at `x = 1`
+and the slide-flag records.
+
+### 3. A page chain is a chain
+
+Both drivers walk `{count, next}` pages. C OpenSlide additionally requires the
+first page's `count` to be 0 and treats anything else as a corrupt level. A
+non-zero count on the first page is legal; only `next == 0` ends a chain.
+
+### 4. The index header has fixed offsets
+
+C OpenSlide computes the root-table offsets as
+`strlen("01.02") + strlen(uuid)`, i.e. from the expected slide ID's length. The
+slide-ID field is a fixed 32 bytes. A slide whose `SLIDE_ID` is not exactly 32
+characters shifts both roots and misparses instead of failing cleanly.
+
+### 5. Index version `01.01` is legal
+
+C OpenSlide accepts only `01.02`. `01.01` differs solely in having no
+non-hierarchical root, and its slide ID is not cross-checked.
+
+### 6. Channels index a BGR component slot
+
+`STORING_CHANNEL_NUMBER` indexes the decoder's memory order, which for the
+ordinary MIRAX JPEG tile is BGR — so the RGB plane is `2 - slot`. The C driver
+has no channel concept at all (it composites to RGBA and exposes nothing), so
+this is an extension rather than a divergence, but it is the single easiest
+thing to get wrong: a reader that treats the slot as an RGB plane index names
+every channel after the wrong dye, and returns an all-zero array for channel 0
+of a two-channel filter level.
+
+Note also that `IMAGE_FORMAT` does **not** determine the component order. The
+scanner emits `JPEG_RGB` for tiles encoded exactly like `JPEG` ones, and selects
+the 4:4:4 encoder while still writing `JPEG`. The tile's own bitstream decides.
+
+### 7. The stored pyramid is on the nominal grid
+
+Camera positions place tiles only at the levels where a tile lies inside one
+FOV. Above that the stored pixels are already a downsample of the *nominal*
+mosaic — measured at r = 1.00000 against a nominal reconstruction and r = 0.03
+against a stitched one — so scaling a FOV position there applies a correction
+the pixels do not have. A consequence worth knowing: a MIRAX slide's own pyramid
+is **not** a reduction of its own stitched level 0, and is larger by the overlap
+fraction (about 7 % on the demo slide).
+
+### Not yet implemented
+
+The per-FOV **illumination gain** — one `f32` per camera FOV in the record at
+`x = 1` of the stitching level, applied by the vendor as
+`out = min(255, floor(in * g + 0.5))` — is not applied. The vendor software does
+apply it, so tiles here retain FOV-to-FOV banding of up to about ±2.7 % that the
+slide carries a correction for. Reading the table is straightforward; the work is
+routing it through the cached decode path, which is shared between the grey and
+RGBA renderers.

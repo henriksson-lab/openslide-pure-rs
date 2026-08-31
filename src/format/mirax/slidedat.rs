@@ -35,18 +35,49 @@ pub struct SlideDat {
 pub struct FilterChannel {
     /// Filter name, e.g. "DAPI-5060C-ZHE-ZERO"
     pub name: String,
-    /// Which RGB channel stores this filter's data (0=R, 1=G, 2=B).
+    /// `STORING_CHANNEL_NUMBER`: which **component slot** of the tile holds this
+    /// filter's data.
+    ///
+    /// This is an index into the decoder's memory order, which for the ordinary
+    /// chroma-subsampled JPEG tile is **BGR**: slot 0 is blue, 1 green, 2 red.
+    /// It is *not* an RGB plane index — see `Self::plane` and spec §8.4. Using
+    /// it directly as an RGB plane names every channel after the wrong dye.
     pub storing_channel: i32,
-    /// Which FilterLevel this channel's tiles belong to (e.g. "FilterLevel_0").
+    /// `DATA_IN_THIS_FILTER_LEVEL`: the name of the filter-hierarchy level whose
+    /// tiles carry this channel, e.g. "FilterLevel_0".
     pub filter_level_name: String,
-    /// The hier record offset where this filter level's zoom level 0 tiles start.
-    /// For FilterLevel_0 this is 0 (same as HIER_0), for FilterLevel_1 it's
-    /// the offset of "ExtFocusLevel" in HIER_3 (or wherever the data lives).
-    pub hier_offset: i32,
-    /// Display color.
+    /// Index of that level within the "Slide filter level" hierarchy, resolved
+    /// from `filter_level_name`. This is the level to address in the tile index;
+    /// it is *not* this channel's own position in the hierarchy once there are
+    /// more than three channels.
+    pub filter_level_index: i32,
+    /// Display pseudo-colour. Correlates loosely with the storage slot and must
+    /// never be used as one.
     pub color_r: u8,
     pub color_g: u8,
     pub color_b: u8,
+}
+
+impl FilterChannel {
+    /// The RGB plane index this channel occupies in a decoded tile.
+    ///
+    /// `bgr_tile` says whether the tile decoded into the vendor's BGR order —
+    /// true for the ordinary chroma-subsampled JPEG, which is every tile on
+    /// every slide seen in practice. See spec §7 for how to determine it, and
+    /// note that `IMAGE_FORMAT` does not decide it.
+    pub fn plane(&self, bgr_tile: bool) -> u32 {
+        let slot = self.storing_channel.clamp(0, 2) as u32;
+        if bgr_tile {
+            2 - slot
+        } else {
+            slot
+        }
+    }
+
+    /// The channel's global ordinal: three channels per filter level.
+    pub fn global_index(&self) -> i32 {
+        3 * self.filter_level_index + self.storing_channel
+    }
 }
 
 #[derive(Debug)]
@@ -67,6 +98,9 @@ pub struct HierLayer {
     pub index: i32,
     pub name: String,
     pub section: Option<String>,
+    /// `HIER_i_DEFAULT`: the level to use when a caller does not choose one on
+    /// this axis. Absent in Slidedat.ini means 0.
+    pub default_level: i32,
     pub levels: Vec<HierLevel>,
 }
 
@@ -109,6 +143,10 @@ pub struct HierarchicalSection {
 pub struct NonhierOffsets {
     pub vimslide_position: i32,
     pub stitching_position: i32,
+    /// Whether the stitching level declares `COMPRESSSED_STITCHING_VERSION`
+    /// (the vendor's spelling). When it does, that layer holds the position
+    /// table and takes precedence over `VIMSLIDE_POSITION_BUFFER`.
+    pub stitching_is_compressed: bool,
     pub macro_image: i32,
     pub label_image: i32,
     pub thumbnail_image: i32,
@@ -404,10 +442,16 @@ impl SlideDat {
                 });
             }
 
+            let default_level = ini
+                .get("HIERARCHICAL", &format!("HIER_{}_DEFAULT", i))
+                .and_then(|v| parse_int(&v).ok())
+                .unwrap_or(0);
+
             layers.push(HierLayer {
                 index: i,
                 name,
                 section,
+                default_level,
                 levels,
             });
         }
@@ -443,13 +487,19 @@ impl SlideDat {
         let (vimslide_position, _, _) =
             get_nonhier_name_offset(&ini, nonhier_count, "VIMSLIDE_POSITION_BUFFER")?;
 
-        let stitching_position = if vimslide_position == -1 {
-            let (off, _, _) =
-                get_nonhier_name_offset(&ini, nonhier_count, "StitchingIntensityLayer")?;
-            off
-        } else {
-            -1
-        };
+        // Both may exist. Which one holds the positions is decided by the
+        // presence of COMPRESSSED_STITCHING_VERSION, not by which layer is
+        // present.
+        let (stitching_position, stitching_section) = get_nonhier_val_offset(
+            &ini,
+            nonhier_count,
+            "StitchingIntensityLayer",
+            "StitchingIntensityLevel",
+        )?;
+        let stitching_is_compressed = stitching_section
+            .as_deref()
+            .map(|sec| ini.get(sec, "COMPRESSSED_STITCHING_VERSION").is_some())
+            .unwrap_or(false);
 
         let macro_image = get_associated_image_offset(
             &ini,
@@ -544,8 +594,11 @@ impl SlideDat {
         // the C driver does not read at all. This is the metadata source for the
         // multi-channel fluorescence feature; if `filter_channels` is empty the
         // slide is treated as ordinary brightfield RGB.
-        // hier_offset is set to -1 here; it gets resolved in MiraxSlide::open()
-        // by probing the actual index to find which blocks contain tile data.
+        // Each channel names the filter-hierarchy level whose tiles carry it,
+        // in DATA_IN_THIS_FILTER_LEVEL. That name is looked up in the
+        // hierarchy's own level list; the numeric suffix of the conventional
+        // "FilterLevel_<n>" spelling is the fallback. Nothing is probed or
+        // sniffed — the address is computed (spec §8.3).
         let mut filter_channels = Vec::new();
 
         for layer in &layers {
@@ -578,11 +631,28 @@ impl SlideDat {
                         .and_then(|v| u8::try_from(v).ok())
                         .unwrap_or(255);
 
+                    let ordinal = filter_channels.len() as i32;
+                    let filter_level_index = layer
+                        .levels
+                        .iter()
+                        .position(|l| l.name.eq_ignore_ascii_case(filter_level_name.trim()))
+                        .map(|i| i as i32)
+                        .or_else(|| {
+                            filter_level_name
+                                .trim()
+                                .rsplit('_')
+                                .next()
+                                .and_then(|t| t.parse::<i32>().ok())
+                        })
+                        // No usable DATA_IN_THIS_FILTER_LEVEL: fall back to
+                        // three channels per level in order.
+                        .unwrap_or(ordinal / 3);
+
                     filter_channels.push(FilterChannel {
                         name,
                         storing_channel: storing_ch,
                         filter_level_name,
-                        hier_offset: -1, // resolved later by probing index
+                        filter_level_index,
                         color_r,
                         color_g,
                         color_b,
@@ -613,6 +683,7 @@ impl SlideDat {
                 nonhier_offsets: NonhierOffsets {
                     vimslide_position,
                     stitching_position,
+                    stitching_is_compressed,
                     macro_image,
                     label_image,
                     thumbnail_image,
@@ -629,6 +700,105 @@ impl SlideDat {
     }
 
     /// Look up a value from an arbitrary section in the INI file.
+    /// The hierarchical root-table entry for a level vector (spec §5.3).
+    ///
+    /// The table is the **cross product** of every hierarchy, indexed
+    /// mixed-radix with the first hierarchy varying fastest — not a
+    /// concatenation of per-hierarchy blocks. `levels` must give one level per
+    /// hierarchy, in Slidedat.ini order.
+    pub fn hier_entry(&self, levels: &[i32]) -> Result<i32> {
+        if levels.len() != self.layers.len() {
+            return Err(OpenSlideError::Format(format!(
+                "Level vector has {} entries, slide has {} hierarchies",
+                levels.len(),
+                self.layers.len()
+            )));
+        }
+        let mut entry: i64 = 0;
+        let mut radix: i64 = 1;
+        for (level, layer) in levels.iter().zip(&self.layers) {
+            let count = layer.levels.len() as i64;
+            if *level < 0 || (*level as i64) >= count {
+                return Err(OpenSlideError::Format(format!(
+                    "Level {} out of range for hierarchy '{}' ({} levels)",
+                    level, layer.name, count
+                )));
+            }
+            entry += (*level as i64) * radix;
+            radix *= count;
+        }
+        i32::try_from(entry)
+            .map_err(|_| OpenSlideError::Format("Hierarchical entry overflows i32".into()))
+    }
+
+    /// Number of entries in the hierarchical root table: the product of every
+    /// `HIER_i_COUNT`.
+    pub fn hier_entry_count(&self) -> i64 {
+        self.layers
+            .iter()
+            .map(|l| l.levels.len() as i64)
+            .product::<i64>()
+            .max(0)
+    }
+
+    /// The non-hierarchical root-table entry for a layer and level (spec §5.4):
+    /// a running **sum** of the preceding layers' level counts.
+    pub fn nonhier_entry(&self, layer_index: usize, level: usize) -> Result<i32> {
+        let layer = self.nonhier_layers.get(layer_index).ok_or_else(|| {
+            OpenSlideError::Format(format!("No non-hierarchical layer {}", layer_index))
+        })?;
+        if level >= layer.levels.len() {
+            return Err(OpenSlideError::Format(format!(
+                "No level {} in non-hierarchical layer '{}'",
+                level, layer.name
+            )));
+        }
+        let base: usize = self.nonhier_layers[..layer_index]
+            .iter()
+            .map(|l| l.levels.len())
+            .sum();
+        i32::try_from(base + level)
+            .map_err(|_| OpenSlideError::Format("Non-hierarchical entry overflows i32".into()))
+    }
+
+    /// Locate a hierarchy by name, case-insensitively.
+    pub fn find_hier(&self, name: &str) -> Option<&HierLayer> {
+        self.layers.iter().find(|l| l.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Locate a non-hierarchical layer level by name, returning its indices.
+    pub fn find_nonhier(&self, layer: &str, level: &str) -> Option<(usize, usize)> {
+        let li = self
+            .nonhier_layers
+            .iter()
+            .position(|l| l.name.eq_ignore_ascii_case(layer))?;
+        let vi = self.nonhier_layers[li]
+            .levels
+            .iter()
+            .position(|l| l.name.eq_ignore_ascii_case(level))?;
+        Some((li, vi))
+    }
+
+    /// Build a level vector selecting `zoom` on the zoom axis and `filter` on
+    /// the filter axis, with every other hierarchy at its `HIER_i_DEFAULT`.
+    ///
+    /// This is how a caller addresses tiles without having to know which
+    /// hierarchies a particular slide happens to declare.
+    pub fn level_vector(&self, zoom: i32, filter: i32) -> Vec<i32> {
+        self.layers
+            .iter()
+            .map(|l| {
+                if l.name.eq_ignore_ascii_case("Slide zoom level") {
+                    zoom
+                } else if l.name.eq_ignore_ascii_case("Slide filter level") {
+                    filter
+                } else {
+                    l.default_level
+                }
+            })
+            .collect()
+    }
+
     pub fn get_section_value(&self, section: &str, key: &str) -> Option<String> {
         self.ini.get(section, key)
     }

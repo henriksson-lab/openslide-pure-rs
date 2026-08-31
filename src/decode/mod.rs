@@ -584,3 +584,161 @@ mod tests {
         bmp
     }
 }
+
+/// Whether a decoded MIRAX tile's components are in BGR order.
+///
+/// MIRAX stores a channel's data in a *component slot* of the tile, and the slot
+/// is an index into the decoder's memory order. For the ordinary MIRAX JPEG tile
+/// that order is BGR, so slot 0 is blue and the RGB plane is `2 - slot`.
+///
+/// The order is a property of the **bitstream**, not of the slide's
+/// `IMAGE_FORMAT` key: a 4:4:4 tile can be stored under `JPEG`, and a
+/// chroma-subsampled one under `JPEG_RGB`. So it must be read off the tile.
+///
+/// Returns `None` when the tile cannot be classified, in which case the caller
+/// should fall back to [`format_is_bgr_by_default`].
+pub fn tile_is_bgr(format: ImageFormat, data: &[u8]) -> Option<bool> {
+    match format {
+        ImageFormat::Jpeg => jpeg_is_bgr(data),
+        // BMP is BGR by its own specification.
+        ImageFormat::Bmp => Some(true),
+        // PNG carries RGB by its own specification.
+        ImageFormat::Png => Some(false),
+    }
+}
+
+/// The component order to assume for a format when no tile is available.
+pub fn format_is_bgr_by_default(format: ImageFormat) -> bool {
+    match format {
+        ImageFormat::Jpeg | ImageFormat::Bmp => true,
+        ImageFormat::Png => false,
+    }
+}
+
+/// Classify a three-component JPEG's component order.
+///
+/// Chroma-subsampled (anything other than 4:4:4) is BGR. A 4:4:4 stream is BGR
+/// too, unless it carries a `COM` segment beginning `Intel(R) JPEG Library`,
+/// which marks tiles written by an older encoder that emitted RGB.
+///
+/// This walks marker segments only — no entropy decoding — so it is cheap enough
+/// to run per tile.
+fn jpeg_is_bgr(data: &[u8]) -> Option<bool> {
+    const LEGACY_RGB_COMMENT: &[u8] = b"Intel(R) JPEG Library";
+
+    let mut pos = 2usize; // skip SOI
+    let mut comment_is_legacy = false;
+    let mut subsampled: Option<bool> = None;
+    let mut components = 0u8;
+
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
+    }
+    while pos + 3 < data.len() {
+        if data[pos] != 0xFF {
+            return None;
+        }
+        let marker = data[pos + 1];
+        if marker == 0xD8 || marker == 0xD9 {
+            pos += 2;
+            continue;
+        }
+        let seg_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        if seg_len < 2 || pos + 2 + seg_len > data.len() {
+            return None;
+        }
+        let body = &data[pos + 4..pos + 2 + seg_len];
+
+        match marker {
+            // COM
+            0xFE => comment_is_legacy = body.starts_with(LEGACY_RGB_COMMENT),
+            // SOFn, excluding DHT (0xC4), JPG (0xC8) and DAC (0xCC)
+            0xC0..=0xCF if marker != 0xC4 && marker != 0xC8 && marker != 0xCC => {
+                // precision(1) height(2) width(2) ncomp(1), then ncomp * 3
+                if body.len() < 6 {
+                    return None;
+                }
+                components = body[5];
+                let n = components as usize;
+                if body.len() < 6 + n * 3 {
+                    return None;
+                }
+                // Each component: id(1) sampling(1) quant(1); 0x11 is 1x1.
+                subsampled = Some((0..n).any(|k| body[6 + k * 3 + 1] != 0x11));
+            }
+            // SOS: no header information left to gather.
+            0xDA => break,
+            _ => {}
+        }
+        pos += 2 + seg_len;
+    }
+
+    if components != 3 {
+        // Greyscale or CMYK: the slot model does not apply.
+        return None;
+    }
+    match subsampled {
+        Some(true) => Some(true),
+        Some(false) => Some(!comment_is_legacy),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod component_order_tests {
+    use super::*;
+
+    /// Build a minimal JPEG header: SOI, optional COM, SOF0, SOS.
+    fn jpeg(comment: Option<&[u8]>, sampling: u8) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8];
+        if let Some(c) = comment {
+            let len = (c.len() + 2) as u16;
+            v.extend_from_slice(&[0xFF, 0xFE]);
+            v.extend_from_slice(&len.to_be_bytes());
+            v.extend_from_slice(c);
+        }
+        v.extend_from_slice(&[0xFF, 0xC0]);
+        v.extend_from_slice(&(17u16).to_be_bytes());
+        v.push(8); // precision
+        v.extend_from_slice(&(352u16).to_be_bytes());
+        v.extend_from_slice(&(352u16).to_be_bytes());
+        v.push(3); // components
+        v.extend_from_slice(&[1, sampling, 0, 2, 0x11, 1, 3, 0x11, 1]);
+        v.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        v
+    }
+
+    #[test]
+    fn subsampled_jpeg_is_bgr() {
+        // 0x21 is 2x1 — the 4:2:2 MIRAX tile.
+        assert_eq!(jpeg_is_bgr(&jpeg(None, 0x21)), Some(true));
+    }
+
+    #[test]
+    fn subsampled_jpeg_is_bgr_even_with_the_legacy_comment() {
+        let d = jpeg(Some(b"Intel(R) JPEG Library v1.0"), 0x21);
+        assert_eq!(jpeg_is_bgr(&d), Some(true));
+    }
+
+    #[test]
+    fn plain_444_jpeg_is_bgr() {
+        assert_eq!(jpeg_is_bgr(&jpeg(None, 0x11)), Some(true));
+    }
+
+    #[test]
+    fn legacy_444_jpeg_is_rgb() {
+        let d = jpeg(Some(b"Intel(R) JPEG Library v1.0"), 0x11);
+        assert_eq!(jpeg_is_bgr(&d), Some(false));
+    }
+
+    #[test]
+    fn the_current_encoder_comment_does_not_trigger_the_rgb_branch() {
+        let d = jpeg(Some(b"Intel(R) IPP JPEG encoder [6.1.787]"), 0x11);
+        assert_eq!(jpeg_is_bgr(&d), Some(true));
+    }
+
+    #[test]
+    fn garbage_is_not_classified() {
+        assert_eq!(jpeg_is_bgr(&[0, 1, 2, 3]), None);
+    }
+}

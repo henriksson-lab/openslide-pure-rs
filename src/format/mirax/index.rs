@@ -1,31 +1,63 @@
+//! Index.dat reader.
+//!
+//! Implemented from the MIRAX container specification, §5. The three points
+//! that a reader most easily gets wrong, and that this module is careful about:
+//!
+//! * the header fields are at **fixed** offsets — the slide-ID field is 32
+//!   bytes whatever the ID's own length;
+//! * a record list is a **chain** of `{count, next}` pages, and a `count` of 0
+//!   does not end it — only `next == 0` does;
+//! * hierarchical records are 16 bytes, non-hierarchical records are **20**,
+//!   because the latter carry an explicit `(x, y)`.
+
 use std::path::Path;
 
 use crate::error::{OpenSlideError, Result};
 
-const INDEX_VERSION: &str = "01.02";
+/// Byte offsets and widths of the index header (§5.1).
+const VERSION_LEN: i64 = 5;
+const SLIDE_ID_LEN: i64 = 32;
+const HIER_ROOT_OFFSET: i64 = VERSION_LEN + SLIDE_ID_LEN; // 37
+const NONHIER_ROOT_OFFSET: i64 = HIER_ROOT_OFFSET + 4; // 41
 
-/// A hierarchical image entry from the index.
+const HIER_RECORD_LEN: usize = 16;
+const NONHIER_RECORD_LEN: usize = 20;
+
+/// A hierarchical image entry from the index (§5.6).
 #[derive(Debug, Clone)]
 pub struct HierEntry {
+    /// Packed tile position, `y * IMAGENUMBER_X + x`.
     pub image_index: i32,
     pub offset: i32,
     pub length: i32,
     pub fileno: i32,
 }
 
-/// A non-hierarchical record (associated image, position buffer, etc.)
+/// A non-hierarchical record (associated image, position buffer, ...) (§5.6).
 #[derive(Debug, Clone)]
 pub struct NonhierRecord {
+    pub x: i32,
+    pub y: i32,
     pub offset: i32,
     pub size: i32,
     pub fileno: i32,
 }
 
+/// Index version, from the 5-byte header (§5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexVersion {
+    /// `01.01` — no non-hierarchical root.
+    V0101,
+    /// `01.02`.
+    V0102,
+}
+
 /// Parsed Index.dat file handle.
 pub struct IndexFile {
     reader: crate::util::OpenSlideFile,
-    hier_root: i64,
-    nonhier_root: i64,
+    version: IndexVersion,
+    hier_root: i32,
+    nonhier_root: i32,
 }
 
 impl IndexFile {
@@ -33,43 +65,56 @@ impl IndexFile {
     pub fn open(path: &Path, expected_slide_id: &str) -> Result<Self> {
         let mut reader = crate::util::_openslide_fopen(path)?;
 
-        // Read and verify version
-        let mut version_buf = [0u8; 5];
+        let mut version_buf = [0u8; VERSION_LEN as usize];
         crate::util::_openslide_fread_exact(&mut reader, &mut version_buf)
             .map_err(|e| OpenSlideError::Format(format!("Cannot read index version: {}", e)))?;
-        let version = std::str::from_utf8(&version_buf)
-            .map_err(|_| OpenSlideError::Format("Index version is not valid UTF-8".into()))?;
-        if version != INDEX_VERSION {
-            return Err(OpenSlideError::Format(format!(
-                "Index.dat has unexpected version '{}', expected '{}'",
-                version, INDEX_VERSION
-            )));
-        }
+        let version = match &version_buf {
+            b"01.01" => IndexVersion::V0101,
+            b"01.02" => IndexVersion::V0102,
+            other => {
+                return Err(OpenSlideError::Format(format!(
+                    "Index.dat has unexpected version '{}', expected '01.01' or '01.02'",
+                    String::from_utf8_lossy(other)
+                )))
+            }
+        };
 
-        // Read and verify slide ID
-        let id_len = expected_slide_id.len();
-        let mut id_buf = vec![0u8; id_len];
+        // The slide-ID field is a fixed 32 bytes, right-aligned and left-padded.
+        // Deriving its length from the expected ID would shift every later
+        // offset on a slide whose SLIDE_ID is not exactly 32 characters.
+        let mut id_buf = [0u8; SLIDE_ID_LEN as usize];
         crate::util::_openslide_fread_exact(&mut reader, &mut id_buf).map_err(|e| {
             OpenSlideError::Format(format!("Cannot read slide ID from index: {}", e))
         })?;
         let found_id = std::str::from_utf8(&id_buf)
-            .map_err(|_| OpenSlideError::Format("Index slide ID is not valid UTF-8".into()))?;
-        if found_id != expected_slide_id {
+            .map_err(|_| OpenSlideError::Format("Index slide ID is not valid UTF-8".into()))?
+            .trim();
+        // 01.01 predates the cross-check; only 01.02 is required to match.
+        if version == IndexVersion::V0102 && found_id != expected_slide_id {
             return Err(OpenSlideError::Format(format!(
                 "Index.dat slide ID '{}' doesn't match expected '{}'",
                 found_id, expected_slide_id
             )));
         }
 
-        // Root positions are right after version + slide_id
-        let hier_root = (INDEX_VERSION.len() + id_len) as i64;
-        let nonhier_root = hier_root + 4;
-
-        Ok(Self {
+        let mut file = Self {
             reader,
-            hier_root,
-            nonhier_root,
-        })
+            version,
+            hier_root: 0,
+            nonhier_root: 0,
+        };
+        file.seek_index(HIER_ROOT_OFFSET)?;
+        file.hier_root = file.read_i32()?;
+        if version == IndexVersion::V0102 {
+            file.seek_index(NONHIER_ROOT_OFFSET)?;
+            file.nonhier_root = file.read_i32()?;
+        }
+        Ok(file)
+    }
+
+    /// `01.01` indexes carry no non-hierarchical layers at all.
+    pub fn has_nonhier(&self) -> bool {
+        self.version == IndexVersion::V0102
     }
 
     fn read_i32(&mut self) -> Result<i32> {
@@ -80,269 +125,146 @@ impl IndexFile {
     }
 
     fn seek_index(&mut self, pos: i64) -> Result<()> {
+        if pos < 0 {
+            return Err(OpenSlideError::Format(format!(
+                "Negative index offset {}",
+                pos
+            )));
+        }
         crate::util::_openslide_fseek(&mut self.reader, pos, crate::util::OpenSlideSeekWhence::Set)
             .map_err(|e| OpenSlideError::Format(format!("Cannot seek in index to {}: {}", pos, e)))
     }
 
-    fn read_hier_entry(&mut self) -> Result<HierEntry> {
-        let image_index = self.read_i32()?;
-        let offset = self.read_i32()?;
-        let length = self.read_i32()?;
-        let fileno = self.read_i32()?;
-
-        if image_index < 0 {
-            return Err(OpenSlideError::Format("image_index < 0".into()));
-        }
-        if offset < 0 {
-            return Err(OpenSlideError::Format("offset < 0".into()));
-        }
-        if length < 0 {
-            return Err(OpenSlideError::Format("length < 0".into()));
-        }
-        if fileno < 0 {
-            return Err(OpenSlideError::Format("fileno < 0".into()));
-        }
-
-        Ok(HierEntry {
-            image_index,
-            offset,
-            length,
-            fileno,
-        })
-    }
-
-    /// Read a non-hierarchical record by record number.
-    pub fn read_nonhier_record(&mut self, recordno: i32) -> Result<NonhierRecord> {
-        if recordno < 0 {
+    /// Read one root-table slot. `root` is the table's file offset, `entry` the
+    /// slot index within it. A slot of 0 means "no records for this address".
+    fn root_slot(&mut self, root: i32, entry: i32) -> Result<i32> {
+        if entry < 0 {
             return Err(OpenSlideError::InvalidArgument(
-                "Negative record number".into(),
+                "Negative index table entry".into(),
             ));
         }
-
-        self.seek_index(self.nonhier_root)?;
-        let table_base = self.read_i32()?;
-
-        // seek to record pointer
-        self.seek_index(table_base as i64 + 4 * recordno as i64)?;
-        let list_head = self.read_i32()?;
-
-        // seek to list head
-        self.seek_index(list_head as i64)?;
-
-        // read initial value (0 means data follows, 0x302e3130 means empty)
-        let initial = self.read_i32()?;
-        if initial == 0x302e3130 {
-            // Magic constant = empty section
-            return Err(OpenSlideError::Format("Nonhier record is empty".into()));
-        }
-        if initial != 0 {
-            return Err(OpenSlideError::Format(format!(
-                "Expected 0 at beginning of data page, got {}",
-                initial
-            )));
-        }
-
-        // read pointer to data page
-        let data_page = self.read_i32()?;
-        self.seek_index(data_page as i64)?;
-
-        // read page size (should be 1)
-        let page_size = self.read_i32()?;
-        if page_size < 1 {
-            return Err(OpenSlideError::Format(
-                "Expected at least one data item in nonhier record".into(),
-            ));
-        }
-
-        // read next pointer (sometimes nonzero) and 2 zeros
-        let _next_ptr = self.read_i32()?;
-        let zero1 = self.read_i32()?;
-        let zero2 = self.read_i32()?;
-        if zero1 != 0 || zero2 != 0 {
-            return Err(OpenSlideError::Format(
-                "Expected zero values in nonhier record prologue".into(),
-            ));
-        }
-
-        // read actual data
-        let offset = self.read_i32()?;
-        let size = self.read_i32()?;
-        let fileno = self.read_i32()?;
-
-        if offset < 0 || size < 0 || fileno < 0 {
-            return Err(OpenSlideError::Format(
-                "Negative value in nonhier record".into(),
-            ));
-        }
-
-        Ok(NonhierRecord {
-            offset,
-            size,
-            fileno,
-        })
+        self.seek_index(root as i64 + 4 * entry as i64)?;
+        self.read_i32()
     }
 
-    /// Read all hierarchical entries for all zoom levels.
+    /// Walk a page chain, collecting every record.
     ///
-    /// Returns a Vec (one per zoom level) of Vec<HierEntry>.
-    pub fn read_hier_data_pages(
-        &mut self,
-        zoom_levels: i32,
-        images_across: i32,
-        images_down: i32,
-    ) -> Result<Vec<Vec<HierEntry>>> {
-        self.seek_index(self.hier_root)?;
-        let root_ptr = self.read_i32()?;
-        if root_ptr < 0 {
-            return Err(OpenSlideError::Format(
-                "Can't read initial hier pointer".into(),
-            ));
-        }
-
-        let mut all_entries = Vec::with_capacity(zoom_levels as usize);
-        let mut seek_location = root_ptr as i64;
-
-        for zoom_level in 0..zoom_levels {
-            self.seek_index(seek_location)?;
-            let level_ptr = self.read_i32()?;
-            if level_ptr < 0 {
-                return Err(OpenSlideError::Format(format!(
-                    "Can't read zoom level {} pointer",
-                    zoom_level
-                )));
-            }
-
-            self.seek_index(level_ptr as i64)?;
-
-            // read initial 0
-            let initial = self.read_i32()?;
-            if initial != 0 {
-                return Err(OpenSlideError::Format(format!(
-                    "Expected 0 at beginning of data page for level {}",
-                    zoom_level
-                )));
-            }
-
-            // read pointer to first data page
-            let first_page = self.read_i32()?;
-            if first_page < 0 {
+    /// Each page is `{i32 count, i32 next}` followed by `count` records of
+    /// `record_len` bytes. The first page of a chain is commonly a stub with
+    /// `count == 0` whose `next` points at the real page, but that is a
+    /// convention and not a rule: a non-zero count on the first page is read
+    /// like any other.
+    fn walk_pages(&mut self, first_page: i32, record_len: usize) -> Result<Vec<[i32; 5]>> {
+        let mut out = Vec::new();
+        let mut page = first_page;
+        let mut seen = 0usize;
+        while page != 0 {
+            if page < 0 {
                 return Err(OpenSlideError::Format(
-                    "Can't read initial data page pointer".into(),
+                    "Negative index page pointer".into(),
                 ));
             }
-
-            self.seek_index(first_page as i64)?;
-
-            let mut entries = Vec::new();
-
-            // Read linked list of data pages
-            loop {
-                let page_len = self.read_i32()?;
-                if page_len < 0 {
-                    return Err(OpenSlideError::Format("Can't read page length".into()));
-                }
-
-                let next_ptr = self.read_i32()?;
-                if next_ptr < 0 {
-                    return Err(OpenSlideError::Format("Can't read next pointer".into()));
-                }
-
-                for _ in 0..page_len {
-                    let entry = self.read_hier_entry()?;
-
-                    let y = entry.image_index / images_across;
-                    if y >= images_down {
-                        return Err(OpenSlideError::Format(format!(
-                            "y ({}) outside of bounds for zoom level ({})",
-                            y, zoom_level
-                        )));
-                    }
-
-                    entries.push(entry);
-                }
-
-                if next_ptr == 0 {
-                    break;
-                }
-                self.seek_index(next_ptr as i64)?;
+            // A malformed file can make the chain loop; bound the walk.
+            seen += 1;
+            if seen > 1 << 24 {
+                return Err(OpenSlideError::Format("Index page chain too long".into()));
             }
 
-            all_entries.push(entries);
-            seek_location += 4; // advance to next zoom level
+            self.seek_index(page as i64)?;
+            let count = self.read_i32()?;
+            let next = self.read_i32()?;
+            if count < 0 {
+                return Err(OpenSlideError::Format("Negative index page count".into()));
+            }
+            for _ in 0..count {
+                let mut rec = [0i32; 5];
+                for slot in rec.iter_mut().take(record_len / 4) {
+                    *slot = self.read_i32()?;
+                }
+                out.push(rec);
+            }
+            page = next;
         }
-
-        Ok(all_entries)
+        Ok(out)
     }
 
-    /// Read tile entries from a single hier record at a given offset in the
-    /// pointer table. The offset is the sequential index across all HIER layers
-    /// (e.g. offset 0 = first HIER_0 level, offset 10 = first HIER_1 level, etc.)
+    /// All hierarchical records at a root-table entry (§5.3 gives the entry).
+    pub fn hier_records(&mut self, entry: i32) -> Result<Vec<HierEntry>> {
+        let head = self.root_slot(self.hier_root, entry)?;
+        if head == 0 {
+            return Ok(Vec::new());
+        }
+        let raw = self.walk_pages(head, HIER_RECORD_LEN)?;
+        let mut out = Vec::with_capacity(raw.len());
+        for r in raw {
+            let entry = HierEntry {
+                image_index: r[0],
+                offset: r[1],
+                length: r[2],
+                fileno: r[3],
+            };
+            // A negative image_index is the format's "no position" sentinel;
+            // such a record is skipped rather than treated as corruption.
+            if entry.image_index < 0 {
+                continue;
+            }
+            if entry.offset < 0 || entry.length < 0 || entry.fileno < 0 {
+                return Err(OpenSlideError::Format(format!(
+                    "Corrupt hierarchical record: offset={}, length={}, fileno={}",
+                    entry.offset, entry.length, entry.fileno
+                )));
+            }
+            out.push(entry);
+        }
+        Ok(out)
+    }
+
+    /// All non-hierarchical records at a root-table entry (§5.4 gives the entry).
     ///
-    /// Returns Ok(entries) if the record contains tile data, or Err if it doesn't
-    /// match the expected tile data page structure.
-    pub fn read_hier_record_at_offset(&mut self, record_offset: i32) -> Result<Vec<HierEntry>> {
-        self.seek_index(self.hier_root)?;
-        let root_ptr = self.read_i32()?;
-        if root_ptr < 0 {
-            return Err(OpenSlideError::Format(
-                "Can't read initial hier pointer".into(),
-            ));
+    /// Returns every record of the chain, not just the first: a layer level can
+    /// legitimately hold several, distinguished by `(x, y)`.
+    pub fn nonhier_records(&mut self, entry: i32) -> Result<Vec<NonhierRecord>> {
+        if !self.has_nonhier() {
+            return Ok(Vec::new());
         }
-
-        let seek_location = root_ptr as i64 + record_offset as i64 * 4;
-        self.seek_index(seek_location)?;
-        let level_ptr = self.read_i32()?;
-        if level_ptr < 0 {
-            return Err(OpenSlideError::Format(format!(
-                "Can't read hier record pointer at offset {}",
-                record_offset
-            )));
+        let head = self.root_slot(self.nonhier_root, entry)?;
+        if head == 0 {
+            return Ok(Vec::new());
         }
-
-        self.seek_index(level_ptr as i64)?;
-
-        let initial = self.read_i32()?;
-        if initial != 0 {
-            return Err(OpenSlideError::Format(format!(
-                "Expected 0 at beginning of data page at offset {}, got {}",
-                record_offset, initial
-            )));
-        }
-
-        let first_page = self.read_i32()?;
-        if first_page < 0 {
-            return Err(OpenSlideError::Format(
-                "Can't read initial data page pointer".into(),
-            ));
-        }
-
-        self.seek_index(first_page as i64)?;
-
-        let mut entries = Vec::new();
-        loop {
-            let page_len = self.read_i32()?;
-            if page_len < 0 {
-                return Err(OpenSlideError::Format("Can't read page length".into()));
+        let raw = self.walk_pages(head, NONHIER_RECORD_LEN)?;
+        let mut out = Vec::with_capacity(raw.len());
+        for r in raw {
+            let rec = NonhierRecord {
+                x: r[0],
+                y: r[1],
+                offset: r[2],
+                size: r[3],
+                fileno: r[4],
+            };
+            if rec.x < 0 {
+                continue; // negative sentinel
             }
-
-            let next_ptr = self.read_i32()?;
-
-            for _ in 0..page_len {
-                entries.push(self.read_hier_entry()?);
+            if rec.offset < 0 || rec.size < 0 || rec.fileno < 0 {
+                return Err(OpenSlideError::Format(format!(
+                    "Corrupt non-hierarchical record: offset={}, size={}, fileno={}",
+                    rec.offset, rec.size, rec.fileno
+                )));
             }
-
-            if next_ptr == 0 {
-                break;
-            }
-            if next_ptr < 0 {
-                return Err(OpenSlideError::Format(
-                    "Can't read next page pointer".into(),
-                ));
-            }
-            self.seek_index(next_ptr as i64)?;
+            out.push(rec);
         }
+        Ok(out)
+    }
 
-        Ok(entries)
+    /// The record at `(x, 0)` of a non-hierarchical layer level, if present.
+    ///
+    /// Most layers hold a single record at the origin; the position and
+    /// intensity-correction records of the stitching layer are distinguished by
+    /// `x`.
+    pub fn nonhier_record_at(&mut self, entry: i32, x: i32) -> Result<Option<NonhierRecord>> {
+        Ok(self
+            .nonhier_records(entry)?
+            .into_iter()
+            .find(|r| r.x == x && r.y == 0))
     }
 }
 
@@ -353,220 +275,183 @@ mod tests {
     use byteorder::WriteBytesExt;
     use std::io::Write;
 
-    /// Build a minimal synthetic Index.dat for testing.
-    fn build_test_index(slide_id: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
+    const TEST_ID: &str = "0123456789ABCDEF0123456789ABCDEF";
 
-        // version
-        buf.write_all(b"01.02").unwrap();
-        // slide ID
-        buf.write_all(slide_id.as_bytes()).unwrap();
-
-        let hier_root_pos = buf.len();
-
-        // hier root pointer (will point to zoom level table)
-        // nonhier root pointer (will point to nonhier table)
-        // We'll fill these in after we know the positions.
-        buf.write_i32::<LittleEndian>(0).unwrap(); // hier_root -> placeholder
-        buf.write_i32::<LittleEndian>(0).unwrap(); // nonhier_root -> placeholder
-
-        // === Build a simple hier level with 1 entry ===
-
-        // Zoom level pointer table (pointed to by hier_root ptr)
-        let zoom_table_pos = buf.len();
-        buf.write_i32::<LittleEndian>(0).unwrap(); // pointer for level 0 -> placeholder
-
-        // Level 0 list head
-        let list_head_pos = buf.len();
-        buf.write_i32::<LittleEndian>(0).unwrap(); // initial 0
-        buf.write_i32::<LittleEndian>(0).unwrap(); // pointer to first data page -> placeholder
-
-        // Data page for level 0
-        let data_page_pos = buf.len();
-        buf.write_i32::<LittleEndian>(1).unwrap(); // page_len = 1 entry
-        buf.write_i32::<LittleEndian>(0).unwrap(); // next_ptr = 0 (no more pages)
-
-        // One entry: image_index=0, offset=1000, length=2000, fileno=0
-        buf.write_i32::<LittleEndian>(0).unwrap(); // image_index
-        buf.write_i32::<LittleEndian>(1000).unwrap(); // offset
-        buf.write_i32::<LittleEndian>(2000).unwrap(); // length
-        buf.write_i32::<LittleEndian>(0).unwrap(); // fileno
-
-        // === Build a simple nonhier section ===
-        // nonhier table
-        let nonhier_table_pos = buf.len();
-        buf.write_i32::<LittleEndian>(0).unwrap(); // record 0 pointer -> placeholder
-
-        // record 0 list head
-        let nonhier_list_head_pos = buf.len();
-        buf.write_i32::<LittleEndian>(0).unwrap(); // initial 0
-        buf.write_i32::<LittleEndian>(0).unwrap(); // pointer to data page -> placeholder
-
-        // nonhier data page
-        let nonhier_data_page_pos = buf.len();
-        buf.write_i32::<LittleEndian>(1).unwrap(); // page_size = 1
-        buf.write_i32::<LittleEndian>(0).unwrap(); // next (sometimes nonzero)
-        buf.write_i32::<LittleEndian>(0).unwrap(); // zero
-        buf.write_i32::<LittleEndian>(0).unwrap(); // zero
-        buf.write_i32::<LittleEndian>(5000).unwrap(); // offset
-        buf.write_i32::<LittleEndian>(3000).unwrap(); // size
-        buf.write_i32::<LittleEndian>(0).unwrap(); // fileno
-
-        // Now patch all the pointers
-
-        // hier_root -> zoom_table_pos
-        let hier_ptr_pos = hier_root_pos;
-        buf[hier_ptr_pos..hier_ptr_pos + 4].copy_from_slice(&(zoom_table_pos as i32).to_le_bytes());
-
-        // zoom_table[0] -> list_head_pos
-        buf[zoom_table_pos..zoom_table_pos + 4]
-            .copy_from_slice(&(list_head_pos as i32).to_le_bytes());
-
-        // list_head: pointer to data_page_pos
-        let list_head_ptr_offset = list_head_pos + 4;
-        buf[list_head_ptr_offset..list_head_ptr_offset + 4]
-            .copy_from_slice(&(data_page_pos as i32).to_le_bytes());
-
-        // nonhier_root -> nonhier_table_pos
-        let nonhier_ptr_pos = hier_root_pos + 4;
-        buf[nonhier_ptr_pos..nonhier_ptr_pos + 4]
-            .copy_from_slice(&(nonhier_table_pos as i32).to_le_bytes());
-
-        // nonhier_table[0] -> nonhier_list_head_pos
-        buf[nonhier_table_pos..nonhier_table_pos + 4]
-            .copy_from_slice(&(nonhier_list_head_pos as i32).to_le_bytes());
-
-        // nonhier list head: pointer to nonhier_data_page_pos
-        let nonhier_list_head_ptr = nonhier_list_head_pos + 4;
-        buf[nonhier_list_head_ptr..nonhier_list_head_ptr + 4]
-            .copy_from_slice(&(nonhier_data_page_pos as i32).to_le_bytes());
-
-        buf
+    struct IndexBuilder {
+        buf: Vec<u8>,
     }
 
-    fn first_hier_entry_offset(slide_id: &str) -> usize {
-        b"01.02".len()
-            + slide_id.len()
-            + 8 // root pointers
-            + 4 // zoom-level pointer table
-            + 8 // list head
-            + 8 // data page header
-    }
+    impl IndexBuilder {
+        fn new(version: &[u8; 5], slide_id: &str) -> Self {
+            let mut buf = Vec::new();
+            buf.write_all(version).unwrap();
+            let mut id = slide_id.as_bytes().to_vec();
+            id.resize(SLIDE_ID_LEN as usize, b' ');
+            buf.write_all(&id).unwrap();
+            buf.write_i32::<LittleEndian>(0).unwrap(); // hier root
+            buf.write_i32::<LittleEndian>(0).unwrap(); // nonhier root
+            Self { buf }
+        }
 
-    fn patch_first_hier_entry_i32(data: &mut [u8], slide_id: &str, field_index: usize, value: i32) {
-        let offset = first_hier_entry_offset(slide_id) + field_index * 4;
-        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    }
+        fn here(&self) -> i32 {
+            self.buf.len() as i32
+        }
 
-    #[test]
-    fn test_index_open_and_read_hier() {
-        let slide_id = "test-slide-123";
-        let data = build_test_index(slide_id);
+        fn put_i32(&mut self, v: i32) {
+            self.buf.write_i32::<LittleEndian>(v).unwrap();
+        }
 
-        let dir = std::env::temp_dir().join("openslide_test_index");
-        let _ = std::fs::create_dir_all(&dir);
-        let index_path = dir.join("Index.dat");
-        std::fs::write(&index_path, &data).unwrap();
+        fn patch(&mut self, at: usize, v: i32) {
+            self.buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
 
-        let mut idx = IndexFile::open(&index_path, slide_id).unwrap();
+        /// A chain: a stub page with count 0, then a page holding `records`.
+        fn page_chain(&mut self, records: &[&[i32]]) -> i32 {
+            let stub = self.here();
+            self.put_i32(0); // count
+            let next_slot = self.buf.len();
+            self.put_i32(0); // next, patched below
+            let real = self.here();
+            self.patch(next_slot, real);
+            self.put_i32(records.len() as i32);
+            self.put_i32(0); // last page
+            for r in records {
+                for v in r.iter() {
+                    self.put_i32(*v);
+                }
+            }
+            stub
+        }
 
-        // Read 1 zoom level, 1 image across, 1 image down
-        let entries = idx.read_hier_data_pages(1, 1, 1).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].len(), 1);
-        assert_eq!(entries[0][0].image_index, 0);
-        assert_eq!(entries[0][0].offset, 1000);
-        assert_eq!(entries[0][0].length, 2000);
-        assert_eq!(entries[0][0].fileno, 0);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_index_read_nonhier() {
-        let slide_id = "test-slide-123";
-        let data = build_test_index(slide_id);
-
-        let dir = std::env::temp_dir().join("openslide_test_index_nh");
-        let _ = std::fs::create_dir_all(&dir);
-        let index_path = dir.join("Index.dat");
-        std::fs::write(&index_path, &data).unwrap();
-
-        let mut idx = IndexFile::open(&index_path, slide_id).unwrap();
-        let record = idx.read_nonhier_record(0).unwrap();
-        assert_eq!(record.offset, 5000);
-        assert_eq!(record.size, 3000);
-        assert_eq!(record.fileno, 0);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn mirax_hier_entry_negative_fields_report_upstream_errors() {
-        let slide_id = "test-slide-123";
-        let cases = [
-            (0, "image_index < 0"),
-            (1, "offset < 0"),
-            (2, "length < 0"),
-            (3, "fileno < 0"),
-        ];
-
-        for (field_index, expected) in cases {
-            let mut data = build_test_index(slide_id);
-            patch_first_hier_entry_i32(&mut data, slide_id, field_index, -1);
-
-            let dir = std::env::temp_dir().join(format!(
-                "openslide_test_index_negative_field_{}_{}",
-                field_index,
-                std::process::id()
-            ));
-            let _ = std::fs::create_dir_all(&dir);
-            let index_path = dir.join("Index.dat");
-            std::fs::write(&index_path, &data).unwrap();
-
-            let mut idx = IndexFile::open(&index_path, slide_id).unwrap();
-            let err = idx.read_hier_data_pages(1, 1, 1).unwrap_err();
-            assert!(format!("{err}").contains(expected));
-
-            let mut idx = IndexFile::open(&index_path, slide_id).unwrap();
-            let err = idx.read_hier_record_at_offset(0).unwrap_err();
-            assert!(format!("{err}").contains(expected));
-
-            let _ = std::fs::remove_dir_all(&dir);
+        fn finish(mut self, hier: &[i32], nonhier: &[i32]) -> Vec<u8> {
+            let hier_root = self.here();
+            for v in hier {
+                self.put_i32(*v);
+            }
+            let nonhier_root = self.here();
+            for v in nonhier {
+                self.put_i32(*v);
+            }
+            self.patch(HIER_ROOT_OFFSET as usize, hier_root);
+            self.patch(NONHIER_ROOT_OFFSET as usize, nonhier_root);
+            self.buf
         }
     }
 
-    #[test]
-    fn test_index_wrong_version() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"02.00");
-        data.extend_from_slice(b"id");
-
-        let dir = std::env::temp_dir().join("openslide_test_index_badver");
+    fn write_temp(name: &str, data: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("openslide_mirax_index_{}", name));
         let _ = std::fs::create_dir_all(&dir);
-        let index_path = dir.join("Index.dat");
-        std::fs::write(&index_path, &data).unwrap();
-
-        let result = IndexFile::open(&index_path, "id");
-        assert!(result.is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("Index.dat");
+        std::fs::write(&path, data).unwrap();
+        path
     }
 
     #[test]
-    fn test_index_wrong_slide_id() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"01.02");
-        data.extend_from_slice(b"wrong-id");
+    fn reads_hier_records_across_a_page_chain() {
+        let mut b = IndexBuilder::new(b"01.02", TEST_ID);
+        let head = b.page_chain(&[&[7, 1000, 2000, 0], &[8, 3000, 400, 1]]);
+        let data = b.finish(&[0, head], &[]);
+        let path = write_temp("hier", &data);
 
-        let dir = std::env::temp_dir().join("openslide_test_index_badid");
-        let _ = std::fs::create_dir_all(&dir);
-        let index_path = dir.join("Index.dat");
-        std::fs::write(&index_path, &data).unwrap();
+        let mut idx = IndexFile::open(&path, TEST_ID).unwrap();
+        assert!(idx.hier_records(0).unwrap().is_empty(), "slot 0 is empty");
+        let recs = idx.hier_records(1).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].image_index, 7);
+        assert_eq!(recs[0].offset, 1000);
+        assert_eq!(recs[1].fileno, 1);
+    }
 
-        let result = IndexFile::open(&index_path, "expected-id");
-        assert!(result.is_err());
+    /// The bug this replaces: only the first record of the first page was
+    /// reachable, and any record not at (0, 0) was rejected outright.
+    #[test]
+    fn reads_every_nonhier_record_including_non_origin() {
+        let mut b = IndexBuilder::new(b"01.02", TEST_ID);
+        let head = b.page_chain(&[&[0, 0, 296, 100, 3], &[1, 0, 396, 200, 3]]);
+        let data = b.finish(&[], &[head]);
+        let path = write_temp("nonhier", &data);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let mut idx = IndexFile::open(&path, TEST_ID).unwrap();
+        let recs = idx.nonhier_records(0).unwrap();
+        assert_eq!(recs.len(), 2, "both records must be reachable");
+        assert_eq!(recs[1].x, 1);
+        assert_eq!(recs[1].offset, 396);
+
+        let second = idx.nonhier_record_at(0, 1).unwrap().unwrap();
+        assert_eq!(second.size, 200);
+        assert!(idx.nonhier_record_at(0, 9).unwrap().is_none());
+    }
+
+    /// A first page carrying records directly is legal; only `next == 0` ends
+    /// the chain.
+    #[test]
+    fn first_page_may_carry_records() {
+        let mut b = IndexBuilder::new(b"01.02", TEST_ID);
+        let head = b.here();
+        b.put_i32(1); // count on the *first* page
+        b.put_i32(0); // no next
+        for v in [5, 100, 50, 0] {
+            b.put_i32(v);
+        }
+        let data = b.finish(&[head], &[]);
+        let path = write_temp("firstpage", &data);
+
+        let mut idx = IndexFile::open(&path, TEST_ID).unwrap();
+        let recs = idx.hier_records(0).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].image_index, 5);
+    }
+
+    #[test]
+    fn accepts_version_0101_without_a_nonhier_root() {
+        let mut b = IndexBuilder::new(b"01.01", TEST_ID);
+        let head = b.page_chain(&[&[3, 8, 9, 0]]);
+        let data = b.finish(&[head], &[]);
+        let path = write_temp("v0101", &data);
+
+        let mut idx = IndexFile::open(&path, "a-different-id").unwrap();
+        assert!(!idx.has_nonhier());
+        assert_eq!(idx.hier_records(0).unwrap().len(), 1);
+        assert!(idx.nonhier_records(0).unwrap().is_empty());
+    }
+
+    /// Header offsets are fixed: a short SLIDE_ID must not shift them.
+    #[test]
+    fn header_offsets_do_not_depend_on_the_slide_id_length() {
+        let short = "SHORT-ID";
+        let mut b = IndexBuilder::new(b"01.02", short);
+        let head = b.page_chain(&[&[11, 12, 13, 0]]);
+        let data = b.finish(&[head], &[]);
+        let path = write_temp("shortid", &data);
+
+        let mut idx = IndexFile::open(&path, short).unwrap();
+        assert_eq!(idx.hier_records(0).unwrap()[0].image_index, 11);
+    }
+
+    #[test]
+    fn negative_position_sentinel_is_skipped_not_fatal() {
+        let mut b = IndexBuilder::new(b"01.02", TEST_ID);
+        let head = b.page_chain(&[&[-1, 0, 0, 0], &[4, 10, 20, 0]]);
+        let data = b.finish(&[head], &[]);
+        let path = write_temp("sentinel", &data);
+
+        let mut idx = IndexFile::open(&path, TEST_ID).unwrap();
+        let recs = idx.hier_records(0).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].image_index, 4);
+    }
+
+    #[test]
+    fn rejects_an_unknown_version() {
+        let data = IndexBuilder::new(b"02.00", TEST_ID).finish(&[], &[]);
+        let path = write_temp("badver", &data);
+        assert!(IndexFile::open(&path, TEST_ID).is_err());
+    }
+
+    #[test]
+    fn rejects_a_mismatched_slide_id_on_0102() {
+        let data = IndexBuilder::new(b"01.02", TEST_ID).finish(&[], &[]);
+        let path = write_temp("badid", &data);
+        assert!(IndexFile::open(&path, "0000000000000000000000000000FFFF").is_err());
     }
 }

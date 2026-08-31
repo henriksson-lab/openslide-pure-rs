@@ -309,73 +309,31 @@ impl MiraxSlide {
             &zoom_params,
         )?;
 
-        // Probe the index to find tile data blocks.
-        //
-        // The index contains blocks of zoom_level_count consecutive records.
-        // Some blocks are tile data (large entry counts), others are mask/metadata
-        // (small entries). We identify tile data blocks by checking if the first
-        // record has an entry count close to the expected number of tiles at
-        // zoom level 0.
-        //
-        // Then assign: first tile block = FilterLevel_0, second = FilterLevel_1, etc.
-        // Identify tile data blocks by checking average entry data length.
-        // Real tile data (JPEG/PNG) has entries with length > 500 bytes.
-        // Mask/metadata blocks have tiny entries (~100-140 bytes).
-        let mut tile_block_offsets: Vec<i32> = Vec::new();
-        let mut block_idx = 0i32;
-        loop {
-            let offset = block_idx * zoom_level_count;
-            match index.read_hier_record_at_offset(offset) {
-                Ok(entries) if !entries.is_empty() => {
-                    let avg_len: f64 =
-                        entries.iter().map(|e| e.length as f64).sum::<f64>() / entries.len() as f64;
-                    if avg_len > 500.0 {
-                        tile_block_offsets.push(offset);
-                    }
-                    block_idx += 1;
-                }
-                _ => break,
-            }
-        }
-
         // --- EXTENSION (not in C OpenSlide): filter-level discovery ---
-        // The C driver reads only the primary "Slide zoom level" hierarchy.
-        // Here we additionally enumerate the Mirax "Slide filter level"
-        // hierarchies so each fluorescence filter's tile blocks can be located.
-        // `filter_level_hier_offsets` always starts with 0 (the primary level),
-        // so a brightfield slide ends up with exactly one entry and the loops
-        // below collapse to the C behaviour.
-        // Collect unique FilterLevel names in order, map to block offsets
-        let mut filter_level_names: Vec<String> = Vec::new();
-        for fc in &sd.filter_channels {
-            let fl = fc.filter_level_name.clone();
-            if !filter_level_names.contains(&fl) {
-                filter_level_names.push(fl);
-            }
-        }
+        //
+        // The C driver reads only the "Slide zoom level" hierarchy. Here we
+        // additionally address the filter levels so each fluorescence channel's
+        // tiles can be found.
+        //
+        // The address of a tile block is *computed*, not searched for: the
+        // hierarchical root table is the cross product of every hierarchy
+        // (SlideDat::hier_entry), and a channel names its own container level in
+        // DATA_IN_THIS_FILTER_LEVEL. Earlier revisions probed the table for
+        // blocks whose entries "looked like" tile data; that happened to work on
+        // the common layout and silently read a neighbouring hierarchy's records
+        // on others.
+        let filter_channels = sd.filter_channels.clone();
 
-        // Resolve hier_offset for each filter channel
-        let mut filter_level_to_offset: std::collections::HashMap<String, i32> =
-            std::collections::HashMap::new();
-        for (i, name) in filter_level_names.iter().enumerate() {
-            let offset = tile_block_offsets.get(i).copied().unwrap_or(0);
-            filter_level_to_offset.insert(name.clone(), offset);
-        }
-
-        // Update filter_channels with resolved offsets
-        let mut filter_channels = sd.filter_channels.clone();
-        for fc in &mut filter_channels {
-            fc.hier_offset = filter_level_to_offset
-                .get(&fc.filter_level_name)
-                .copied()
-                .unwrap_or(0);
-        }
-
-        let mut filter_level_hier_offsets: Vec<i32> = vec![0];
-        for fc in &filter_channels {
-            if fc.hier_offset >= 0 && !filter_level_hier_offsets.contains(&fc.hier_offset) {
-                filter_level_hier_offsets.push(fc.hier_offset);
-            }
+        // The distinct container levels, in ascending order. A brightfield slide
+        // yields exactly [0], so the loops below collapse to the C behaviour.
+        let mut filter_levels: Vec<i32> = filter_channels
+            .iter()
+            .map(|fc| fc.filter_level_index)
+            .collect();
+        filter_levels.sort_unstable();
+        filter_levels.dedup();
+        if filter_levels.is_empty() {
+            filter_levels.push(0);
         }
         // --- end EXTENSION ---
 
@@ -386,7 +344,7 @@ impl MiraxSlide {
         // placement inside the loop mirrors the C driver.
         let mut filter_level_grids: Vec<Vec<MiraxLevelData>> = Vec::new();
 
-        for &hier_base_offset in &filter_level_hier_offsets {
+        for (filter_slot, &filter_level) in filter_levels.iter().enumerate() {
             // Build empty levels
             let mut levels = Vec::with_capacity(zoom_level_count as usize);
             for i in 0..zoom_level_count as usize {
@@ -418,14 +376,16 @@ impl MiraxSlide {
                 std::collections::HashSet::new();
 
             for zoom_level in 0..zoom_level_count as usize {
-                let record_offset = hier_base_offset + zoom_level as i32;
-                let is_primary = hier_base_offset == 0;
+                // Cross-product address, not a running offset (spec §5.3).
+                let entry =
+                    sd.hier_entry(&sd.level_vector(zoom_level as i32, filter_level))?;
+                let is_primary = filter_slot == 0;
                 let entries = match mirax_hier_entries_or_extension_end(
-                    index.read_hier_record_at_offset(record_offset),
+                    index.hier_records(entry),
                     is_primary,
                 )? {
                     Some(entries) => entries,
-                    None => break, // no more zoom levels at this extension filter level
+                    None => continue, // this filter level has no tiles here
                 };
 
                 let lp = &zoom_params[zoom_level];
@@ -486,6 +446,10 @@ impl MiraxSlide {
                             let yp = yy / image_divisions;
                             let cp = yp * (images_x / image_divisions) + xp;
 
+                            // A tile whose level step is no larger than the FOV
+                            // division count lies wholly inside one camera FOV.
+                            let inside_one_fov = lp.image_concat <= image_divisions;
+
                             // For the primary filter level, use the position
                             // buffer and active_positions filtering.
                             // For secondary filter levels, place tiles directly
@@ -520,25 +484,46 @@ impl MiraxSlide {
                                 }
                             }
 
-                            let (pos_x, pos_y) =
-                                if is_primary && (cp * 2 + 1) < slide_positions.len() as i32 {
-                                    let image0_w = levels[0].level.image_width;
-                                    let image0_h = levels[0].level.image_height;
-                                    let pos0_x = slide_positions[(cp * 2) as usize]
-                                        + image0_w * (xx - xp * image_divisions);
-                                    let pos0_y = slide_positions[(cp * 2 + 1) as usize]
-                                        + image0_h * (yy - yp * image_divisions);
-                                    (
-                                        pos0_x as f64 / lp.image_concat as f64,
-                                        pos0_y as f64 / lp.image_concat as f64,
-                                    )
-                                } else {
-                                    // Simple grid placement: tile position from
-                                    // image coordinates × tile advance
-                                    let tile_col = (x / lp.tile_count_divisor + xi) as f64;
-                                    let tile_row = (y / lp.tile_count_divisor + yi) as f64;
-                                    (tile_col * lp.tile_advance_x, tile_row * lp.tile_advance_y)
-                                };
+                            // Where a tile goes depends on the level.
+                            // (`inside_one_fov` is computed above.)
+                            //
+                            // A tile whose level step is no larger than the FOV
+                            // division count lies wholly inside one camera FOV,
+                            // and is placed from that FOV's measured position.
+                            //
+                            // Above that a tile spans whole FOVs, and the stored
+                            // pixels are *already* a downsample of the nominal
+                            // grid — the reduced pyramid is built from the
+                            // seam-duplicated mosaic, not from the stitched
+                            // image. Scaling a FOV position there applies a
+                            // correction the pixels do not have, and stretches
+                            // the level relative to level 0.
+                            let have_position = (cp * 2 + 1) < slide_positions.len() as i32;
+
+                            let (pos_x, pos_y) = if inside_one_fov && have_position {
+                                let image0_w = levels[0].level.image_width;
+                                let image0_h = levels[0].level.image_height;
+                                let pos0_x = slide_positions[(cp * 2) as usize]
+                                    + image0_w * (xx - xp * image_divisions);
+                                let pos0_y = slide_positions[(cp * 2 + 1) as usize]
+                                    + image0_h * (yy - yp * image_divisions);
+                                (
+                                    pos0_x as f64 / lp.image_concat as f64,
+                                    pos0_y as f64 / lp.image_concat as f64,
+                                )
+                            } else if inside_one_fov {
+                                // No position for this cell: fall back to the
+                                // advance grid, which honours the overlap.
+                                let tile_col = (x / lp.tile_count_divisor + xi) as f64;
+                                let tile_row = (y / lp.tile_count_divisor + yi) as f64;
+                                (tile_col * lp.tile_advance_x, tile_row * lp.tile_advance_y)
+                            } else {
+                                // Nominal grid: tile index × tile size, with no
+                                // overlap subtracted.
+                                let tile_col = (x / lp.tile_count_divisor + xi) as f64;
+                                let tile_row = (y / lp.tile_count_divisor + yi) as f64;
+                                (tile_col * tile_w, tile_row * tile_h)
+                            };
 
                             let tile_col = (x / lp.tile_count_divisor + xi) as i64;
                             let tile_row = (y / lp.tile_count_divisor + yi) as i64;
@@ -568,96 +553,61 @@ impl MiraxSlide {
         // logical-channel table. The C driver has no equivalent — it always
         // composites tiles to RGBA. Do not delete this to match the C source.
         //
-        // Build channel mappings from filter_channels metadata.
-        // The RGB channel for CY5 after YCbCr→RGB decoding is B (channel 2),
-        // because a single-channel luminance JPEG maps to the blue component.
-        // For FilterLevel_0 channels, storing_channel directly maps to R/G/B.
-        // For non-primary filter levels, auto-detect which RGB channel
-        // carries the signal by decoding a sample tile and checking sums.
-        let mut detected_rgb_channel: HashMap<i32, u32> = HashMap::new();
-        for &offset in &filter_level_hier_offsets {
-            if offset == 0 {
-                continue; // primary filter level uses storing_channel directly
-            }
-            if let Ok(entries) = index.read_hier_record_at_offset(offset) {
-                // Pick the entry with the largest data (likely most signal)
-                if let Some(entry) = entries.iter().max_by_key(|e| e.length) {
-                    if let Ok(path) = sd
-                        .datafile_paths
-                        .get(entry.fileno as usize)
-                        .ok_or_else(|| OpenSlideError::Format("bad fileno".into()))
-                    {
-                        if let Ok(data) =
-                            read_record_data(path, entry.offset as i64, entry.length as i64)
-                        {
-                            let format = sd.zoom_levels[0].image_format;
-                            if let Ok((rgb, _, _)) = decode::decode_rgb(format, &data) {
-                                // Sum each channel
-                                let mut sums = [0u64; 3];
-                                for pixel in rgb.chunks_exact(3) {
-                                    sums[0] += pixel[0] as u64;
-                                    sums[1] += pixel[1] as u64;
-                                    sums[2] += pixel[2] as u64;
-                                }
-                                let best = if sums[0] == 0 && sums[1] == 0 && sums[2] == 0 {
-                                    2 // All zeros: default to B (YCbCr luminance mapping)
-                                } else if sums[0] >= sums[1] && sums[0] >= sums[2] {
-                                    0
-                                } else if sums[1] >= sums[2] {
-                                    1
-                                } else {
-                                    2
-                                };
-                                detected_rgb_channel.insert(offset, best);
-                            }
-                        }
-                    }
-                }
-            }
+        // A channel occupies one component slot of the tiles of its container
+        // filter level. The slot is STORING_CHANNEL_NUMBER, and it indexes the
+        // decoder's memory order — which for the ordinary chroma-subsampled
+        // JPEG tile is BGR, so the RGB plane is `2 - slot`. Neither the slot nor
+        // the container is guessed; both come from the slide's own keys.
+        //
+        // IMAGE_FORMAT does not decide the component order: the scanner can emit
+        // a 4:4:4 tile under `JPEG` and a subsampled one under `JPEG_RGB`. The
+        // tile's own bitstream decides, so we test one tile per filter level.
+        let mut level_is_bgr: HashMap<i32, bool> = HashMap::new();
+        for &filter_level in &filter_levels {
+            let bgr = (|| -> Option<bool> {
+                let entry = sd
+                    .hier_entry(&sd.level_vector(0, filter_level))
+                    .ok()?;
+                let entries = index.hier_records(entry).ok()?;
+                let probe = entries.iter().find(|e| e.length > 0)?;
+                let path = sd.datafile_paths.get(probe.fileno as usize)?;
+                let data =
+                    read_record_data(path, probe.offset as i64, probe.length as i64).ok()?;
+                decode::tile_is_bgr(sd.zoom_levels[0].image_format, &data)
+            })();
+            // With no tile to inspect, fall back to the format's usual order.
+            level_is_bgr.insert(
+                filter_level,
+                bgr.unwrap_or_else(|| decode::format_is_bgr_by_default(sd.zoom_levels[0].image_format)),
+            );
         }
 
         let channels: Vec<ChannelMapping> = if filter_channels.is_empty() {
-            // Non-fluorescence slide: 3 channels = R, G, B
-            vec![
-                ChannelMapping {
-                    name: "Red".into(),
-                    rgb_channel: 0,
-                    filter_level_idx: 0,
-                },
-                ChannelMapping {
-                    name: "Green".into(),
-                    rgb_channel: 1,
-                    filter_level_idx: 0,
-                },
-                ChannelMapping {
-                    name: "Blue".into(),
-                    rgb_channel: 2,
-                    filter_level_idx: 0,
-                },
-            ]
+            // No filter hierarchy: three channels in slots 0, 1, 2 of every
+            // tile. Name them after the colour the slot resolves to.
+            let bgr = *level_is_bgr.get(&0).unwrap_or(&true);
+            (0..3u32)
+                .map(|slot| {
+                    let plane = if bgr { 2 - slot } else { slot };
+                    ChannelMapping {
+                        name: ["Red", "Green", "Blue"][plane as usize].into(),
+                        rgb_channel: plane,
+                        filter_level_idx: 0,
+                    }
+                })
+                .collect()
         } else {
             filter_channels
                 .iter()
                 .map(|fc| {
-                    let filter_level_idx = filter_level_hier_offsets
+                    let bgr = *level_is_bgr.get(&fc.filter_level_index).unwrap_or(&true);
+                    let filter_level_idx = filter_levels
                         .iter()
-                        .position(|&o| o == fc.hier_offset)
+                        .position(|&l| l == fc.filter_level_index)
                         .unwrap_or(0);
-
-                    let rgb_channel = if fc.hier_offset == 0 {
-                        // Primary filter level: storing_channel maps to RGB directly
-                        fc.storing_channel as u32
-                    } else {
-                        // Non-primary: use auto-detected channel
-                        detected_rgb_channel
-                            .get(&fc.hier_offset)
-                            .copied()
-                            .unwrap_or(2)
-                    };
-
                     ChannelMapping {
                         name: fc.name.clone(),
-                        rgb_channel,
+                        rgb_channel: fc.plane(bgr),
                         filter_level_idx,
                     }
                 })
@@ -713,9 +663,16 @@ impl MiraxSlide {
             ("thumbnail", offsets.thumbnail_image),
         ] {
             if recordno >= 0 {
-                let record = index.read_nonhier_record(recordno).map_err(|err| {
-                    OpenSlideError::Format(format!("Cannot read {name} associated image: {err}"))
-                })?;
+                let record = index
+                    .nonhier_record_at(recordno, 0)
+                    .map_err(|err| {
+                        OpenSlideError::Format(format!(
+                            "Cannot read {name} associated image: {err}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        OpenSlideError::Format(format!("No {name} associated image record"))
+                    })?;
                 let fileno = validate_datafile_index(
                     record.fileno,
                     sd.datafile_paths.len(),
@@ -775,14 +732,24 @@ impl MiraxSlide {
         let slide_position_buffer_size = 9 * npositions;
         let offsets = &sd.hierarchical.nonhier_offsets;
 
-        let record_no = if offsets.vimslide_position != -1 {
+        // The compressed stitching layer wins when it declares a version; the
+        // uncompressed VIMSLIDE_POSITION_BUFFER is the fallback. A slide can
+        // carry both.
+        let use_stitching = offsets.stitching_position != -1 && offsets.stitching_is_compressed;
+        let record_no = if use_stitching {
+            offsets.stitching_position
+        } else if offsets.vimslide_position != -1 {
             offsets.vimslide_position
         } else {
             offsets.stitching_position
         };
 
         if record_no != -1 {
-            let record = index.read_nonhier_record(record_no)?;
+            // The position table is the record at x = 0; x >= 1 are the
+            // per-focus-layer intensity-correction tables.
+            let record = index
+                .nonhier_record_at(record_no, 0)?
+                .ok_or_else(|| OpenSlideError::Format("No position record".into()))?;
 
             if record.fileno < 0 || record.fileno as usize >= sd.datafile_paths.len() {
                 return Err(OpenSlideError::Format(
@@ -796,9 +763,7 @@ impl MiraxSlide {
                 record.size as i64,
             )?;
 
-            let data = if offsets.stitching_position != -1
-                && record_no == offsets.stitching_position
-            {
+            let data = if record_no == offsets.stitching_position {
                 // Decompress zlib
                 use flate2::read::ZlibDecoder;
                 let mut decoder = ZlibDecoder::new(&raw_data[..]);
@@ -1183,6 +1148,10 @@ impl SlideBackend for MiraxSlide {
         self.channels.get(channel as usize).map(|c| c.name.as_str())
     }
 
+    fn natural_rgb_channels(&self) -> [Option<u32>; 4] {
+        self.natural_rgb_channels_impl()
+    }
+
     fn level_count(&self) -> u32 {
         // Use the first filter level's grid count (all filter levels share the same zoom structure)
         self.filter_level_grids
@@ -1467,9 +1436,34 @@ impl SlideBackend for MiraxSlide {
             .get(level as usize)
             .map_or(0, |l| l.grid.tile_count())
     }
+
+    fn debug_grid_bounds(&self, channel: u32, level: u32) -> Option<(f64, f64, f64, f64)> {
+        let mapping = self.channels.get(channel as usize)?;
+        let levels = self.filter_level_grids.get(mapping.filter_level_idx)?;
+        levels.get(level as usize)?.grid.bounds()
+    }
 }
 
 impl MiraxSlide {
+    /// The channel indices that composite to a true-colour RGB image.
+    ///
+    /// A channel's index is its position in the filter hierarchy, and its
+    /// `rgb_channel` is the plane it occupies. On the ordinary BGR tile those
+    /// are reversed, so for a brightfield slide channel 0 is *blue*, not red,
+    /// and `[0, 1, 2]` composites to BGR. This returns the channels ordered by
+    /// the plane they occupy, so index 0 of the result is the red channel.
+    pub(crate) fn natural_rgb_channels_impl(&self) -> [Option<u32>; 4] {
+        let mut by_plane: [Option<u32>; 4] = [None; 4];
+        for (idx, mapping) in self.channels.iter().enumerate() {
+            if let Some(slot) = by_plane.get_mut(mapping.rgb_channel as usize) {
+                if slot.is_none() {
+                    *slot = Some(idx as u32);
+                }
+            }
+        }
+        by_plane
+    }
+
     fn same_filter_level_cairo_channels(
         &self,
         channels: [Option<u32>; 4],
@@ -1882,7 +1876,7 @@ mod tests {
                 image,
                 src_x: 0.0,
                 src_y: 0.0,
-            },
+                },
         );
         let cache = Arc::new(TileCache::new());
         let slide = MiraxSlide {
@@ -1967,7 +1961,7 @@ mod tests {
                 image,
                 src_x: 0.0,
                 src_y: 0.0,
-            },
+                },
         );
         let cache = Arc::new(TileCache::new());
         let slide = MiraxSlide {
@@ -2063,7 +2057,7 @@ mod tests {
             }),
             src_x: 0.0,
             src_y: 0.0,
-        };
+                };
 
         let decoded = slide
             .decode_tile_rgb(&tile, 0, 0, ImageFormat::Png, 1, 1)

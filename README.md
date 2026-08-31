@@ -6,6 +6,7 @@ Includes full **Mirax (.mrxs)** support from 3DHISTECH scanners; format reverse 
 trying to [address long-standing problems with this format](https://www.openmicroscopy.org/2016/01/06/format-support.html).
 Fix yet to be contributed upstream (more testing needed)
 
+* 2026-08-31: Fixes to Mirax reader
 * 2026-06-30: More formats expose raw byte access
 * 2026-07-29: Pure rust; vendoring modified zune-jpeg until upstream accepts patches
 * 2026-07-13: Support to get raw compressed tile data out. Now tracking openslide 4.0.1

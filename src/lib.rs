@@ -838,8 +838,24 @@ impl OpenSlide {
     /// Read up to 4 channels and composite them into an RGBA image.
     ///
     /// `channels`: which logical channels map to R, G, B, A (use None to skip).
-    /// For a 3-channel brightfield slide: `[Some(0), Some(1), Some(2), None]`
-    /// For fluorescence: e.g. `[Some(0), Some(1), Some(2), Some(3)]` for DAPI→R, FITC→G, TRITC→B, CY5→A.
+    ///
+    /// Note that a channel index is **not** a colour. In MIRAX a channel's index
+    /// is its position in the filter hierarchy and it occupies a component slot
+    /// of the tile; on the ordinary BGR tile those run in opposite directions,
+    /// so on a brightfield slide channel 0 is *blue*. Passing
+    /// `[Some(0), Some(1), Some(2), None]` therefore composites to BGR, not RGB.
+    /// Use [`Self::natural_rgb_channels`] for a true-colour view.
+    ///
+    /// For fluorescence, pass whichever channels you want in whichever slots —
+    /// e.g. `[Some(0), Some(1), Some(2), Some(3)]` for DAPI→R, FITC→G, TRITC→B,
+    /// CY5→A — and use [`Self::channel_name`] to label them.
+    /// Channel indices that composite to a true-colour RGB image, in R, G, B, A
+    /// order — see [`Self::read_region_rgba`] for why this is not always
+    /// `[0, 1, 2]`.
+    pub fn natural_rgb_channels(&self) -> [Option<u32>; 4] {
+        self.backend.natural_rgb_channels()
+    }
+
     pub fn read_region_rgba(
         &self,
         channels: [Option<u32>; 4],
@@ -997,6 +1013,10 @@ impl OpenSlide {
     }
 
     /// Debug: get the number of tiles in the grid for a given channel and level.
+    pub fn debug_grid_bounds(&self, channel: u32, level: u32) -> Option<(f64, f64, f64, f64)> {
+        self.backend.debug_grid_bounds(channel, level)
+    }
+
     pub fn debug_grid_tile_count(&self, channel: u32, level: u32) -> usize {
         self.backend.debug_grid_tile_count(channel, level)
     }

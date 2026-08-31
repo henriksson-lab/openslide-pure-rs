@@ -16,7 +16,8 @@ fn print_usage() {
     eprintln!("Read options:");
     eprintln!("  --level N        Zoom level (default: 0)");
     eprintln!("  --channel N      Single channel to read (default: 0)");
-    eprintln!("  --rgb R,G,B      Map channels to RGB (e.g. --rgb 0,1,2)");
+    eprintln!("  --rgb R,G,B      Map channels to RGB (e.g. --rgb 0,1,2)
+  --rgb natural    Composite the channels that give true colour");
     eprintln!("  --all            Concatenate all channels horizontally");
     eprintln!("  --out FILE       Output filename (default: out.png)");
 }
@@ -360,10 +361,17 @@ fn cmd_read(path: &str, args: &[String]) {
             "--rgb" => {
                 i += 1;
                 if let Some(val) = args.get(i) {
-                    let parts: Vec<u32> = val.split(',').filter_map(|s| s.parse().ok()).collect();
-                    if parts.len() == 3 {
-                        rgb_channels = Some([parts[0], parts[1], parts[2]]);
+                    if val.eq_ignore_ascii_case("natural") {
+                        // Resolved once the slide is open; see below.
+                        rgb_channels = None;
                         mode = "rgb";
+                    } else {
+                        let parts: Vec<u32> =
+                            val.split(',').filter_map(|s| s.parse().ok()).collect();
+                        if parts.len() == 3 {
+                            rgb_channels = Some([parts[0], parts[1], parts[2]]);
+                            mode = "rgb";
+                        }
                     }
                 }
             }
@@ -434,9 +442,15 @@ fn cmd_read(path: &str, args: &[String]) {
             out
         );
     } else if mode == "rgb" {
-        let chs = rgb_channels.unwrap();
+        // A channel index is not a colour: on a MIRAX brightfield slide channel
+        // 0 is blue, so `--rgb 0,1,2` gives BGR. `--rgb natural` asks the slide
+        // which channels compose to true colour.
+        let selection = match rgb_channels {
+            Some(chs) => [Some(chs[0]), Some(chs[1]), Some(chs[2]), None],
+            None => slide.natural_rgb_channels(),
+        };
         let rgba = match slide.read_region_rgba(
-            [Some(chs[0]), Some(chs[1]), Some(chs[2]), None],
+            selection,
             x,
             y,
             level,
