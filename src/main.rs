@@ -16,8 +16,10 @@ fn print_usage() {
     eprintln!("Read options:");
     eprintln!("  --level N        Zoom level (default: 0)");
     eprintln!("  --channel N      Single channel to read (default: 0)");
-    eprintln!("  --rgb R,G,B      Map channels to RGB (e.g. --rgb 0,1,2)
-  --rgb natural    Composite the channels that give true colour");
+    eprintln!(
+        "  --rgb R,G,B      Map channels to RGB (e.g. --rgb 0,1,2)
+  --rgb natural    Composite the channels that give true colour"
+    );
     eprintln!("  --all            Concatenate all channels horizontally");
     eprintln!("  --out FILE       Output filename (default: out.png)");
 }
@@ -449,14 +451,7 @@ fn cmd_read(path: &str, args: &[String]) {
             Some(chs) => [Some(chs[0]), Some(chs[1]), Some(chs[2]), None],
             None => slide.natural_rgb_channels(),
         };
-        let rgba = match slide.read_region_rgba(
-            selection,
-            x,
-            y,
-            level,
-            w,
-            h,
-        ) {
+        let rgba = match slide.read_region_rgba(selection, x, y, level, w, h) {
             Ok(img) => img,
             Err(e) => {
                 eprintln!("Error reading region: {}", e);

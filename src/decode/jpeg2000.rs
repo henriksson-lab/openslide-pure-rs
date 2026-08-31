@@ -550,7 +550,7 @@ fn decode_openjp2_rgba(
         2 => {
             let decoded = decode_openjp2_packed(request, openjp2_interleaved_output(2)?)?;
             let mut rgba = Vec::with_capacity(decoded.pixels.len() / 2 * 4);
-            for pixel in decoded.pixels.chunks_exact(2) {
+            for pixel in decoded.pixels.as_chunks::<2>().0.iter() {
                 rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
             }
             rgba
@@ -609,7 +609,9 @@ fn decode_openjp2_gray(
         );
         decoded
             .pixels
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|pixel| pixel[channel])
             .collect()
     } else {
@@ -667,7 +669,7 @@ fn openjp2_interleaved_output(channels: usize) -> Result<openjp2::OutputFormat> 
 
 fn rgb_to_rgba(rgb: Vec<u8>) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-    for pixel in rgb.chunks_exact(3) {
+    for pixel in rgb.as_chunks::<3>().0.iter() {
         rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xff]);
     }
     rgba
@@ -714,7 +716,7 @@ fn jpeg2000_native_pixels_to_u8(bitmap: &dicom_toolkit_jpeg2000::RawBitmap) -> R
             }
             let max_value = ((1u32 << bitmap.bit_depth) - 1).max(1);
             let mut out = Vec::with_capacity(expected_samples);
-            for bytes in bitmap.data.chunks_exact(2) {
+            for bytes in bitmap.data.as_chunks::<2>().0.iter() {
                 let sample = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
                 out.push(((sample * 255 + (max_value / 2)) / max_value) as u8);
             }
@@ -774,14 +776,14 @@ fn jpeg2000_pixels_to_rgba(
         }
         2 => {
             let mut rgba = Vec::with_capacity(pixels.len() / 2 * 4);
-            for pixel in pixels.chunks_exact(2) {
+            for pixel in pixels.as_chunks::<2>().0.iter() {
                 rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
             }
             Ok(rgba)
         }
         3 => {
             let mut rgba = Vec::with_capacity(pixels.len() / 3 * 4);
-            for pixel in pixels.chunks_exact(3) {
+            for pixel in pixels.as_chunks::<3>().0.iter() {
                 let (r, g, b) = match color_space {
                     Jpeg2000ComponentColorSpace::Rgb => (pixel[0], pixel[1], pixel[2]),
                     Jpeg2000ComponentColorSpace::YCbCr => {

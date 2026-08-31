@@ -2549,7 +2549,7 @@ fn decode_planar_jpeg_plane(
         )));
     }
     let mut plane = Vec::with_capacity(expected_samples);
-    for pixel in rgb.chunks_exact(3).take(expected_samples) {
+    for pixel in rgb.as_chunks::<3>().0.iter().take(expected_samples) {
         plane.push(pixel[0]);
     }
     Ok(plane)
@@ -2617,7 +2617,7 @@ fn decode_planar_old_jpeg_plane(
         )));
     }
     let mut plane = Vec::with_capacity(expected_samples);
-    for pixel in rgb.chunks_exact(3).take(expected_samples) {
+    for pixel in rgb.as_chunks::<3>().0.iter().take(expected_samples) {
         plane.push(pixel[0]);
     }
     Ok(plane)

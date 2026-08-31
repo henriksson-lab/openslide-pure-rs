@@ -788,7 +788,7 @@ fn normalize_pure_data(
         }
         JpegXrPixelFormat::Bgra32 if pure_format.channel_order() == ChannelOrder::Bgr => {
             if !pure_format.has_alpha() {
-                for pixel in data.chunks_exact_mut(4) {
+                for pixel in data.as_chunks_mut::<4>().0.iter_mut() {
                     pixel[3] = 0xff;
                 }
             } else if pure_format.premultiplied_alpha() {
@@ -797,7 +797,7 @@ fn normalize_pure_data(
             Ok(data)
         }
         JpegXrPixelFormat::Bgra32 if pure_format.channel_order() == ChannelOrder::Rgb => {
-            for pixel in data.chunks_exact_mut(4) {
+            for pixel in data.as_chunks_mut::<4>().0.iter_mut() {
                 pixel.swap(0, 2);
                 if !pure_format.has_alpha() {
                     pixel[3] = 0xff;
@@ -827,7 +827,7 @@ fn swap_rgb_channels(data: &mut [u8], bytes_per_pixel: usize) {
 
 #[cfg(feature = "jpegxr")]
 fn unpremultiply_bgra(data: &mut [u8]) {
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0.iter_mut() {
         let alpha = u32::from(pixel[3]);
         if alpha == 0 {
             pixel[0] = 0;

@@ -503,7 +503,7 @@ impl SlideBackend for VentanaSlide {
         let size = w as usize * h as usize;
         let mut rgba = vec![0u8; size * 4];
         if channels[3].is_none() {
-            for pixel in rgba.chunks_exact_mut(4) {
+            for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
                 pixel[3] = 255;
             }
         }
@@ -1701,7 +1701,7 @@ impl BifTilemapLevel {
             )));
         }
         let mut plane = Vec::with_capacity(expected_samples);
-        for pixel in rgb.chunks_exact(3).take(expected_samples) {
+        for pixel in rgb.as_chunks::<3>().0.iter().take(expected_samples) {
             plane.push(pixel[0]);
         }
         Ok(plane)
@@ -1723,7 +1723,7 @@ impl BifTilemapLevel {
             )));
         }
         let mut plane = Vec::with_capacity(expected_samples);
-        for pixel in rgb.chunks_exact(3).take(expected_samples) {
+        for pixel in rgb.as_chunks::<3>().0.iter().take(expected_samples) {
             plane.push(pixel[0]);
         }
         Ok(plane)
@@ -2587,7 +2587,7 @@ fn try_cairo_blit_single_tile_batch(
 }
 
 fn unpremultiply_rgba(image: &mut RgbaImage) {
-    for pixel in image.data.chunks_exact_mut(4) {
+    for pixel in image.data.as_chunks_mut::<4>().0.iter_mut() {
         let alpha = pixel[3];
         if alpha == 0 {
             pixel[0] = 0;
@@ -2893,7 +2893,7 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
                     "Decoded Ventana associated TIFF image is truncated".into(),
                 ));
             }
-            for pixel in data.chunks_exact(2).take(pixel_count) {
+            for pixel in data.as_chunks::<2>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
             }
         }
@@ -2903,7 +2903,7 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
                     "Decoded Ventana associated TIFF image is truncated".into(),
                 ));
             }
-            for pixel in data.chunks_exact(2).take(pixel_count) {
+            for pixel in data.as_chunks::<2>().0.iter().take(pixel_count) {
                 let gray = downscale_u16_to_u8(pixel[0]);
                 let alpha = downscale_u16_to_u8(pixel[1]);
                 rgba.extend_from_slice(&[gray, gray, gray, alpha]);
@@ -2918,7 +2918,7 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
                     "Decoded Ventana associated TIFF image is truncated".into(),
                 ));
             }
-            for pixel in data.chunks_exact(3).take(pixel_count) {
+            for pixel in data.as_chunks::<3>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xff]);
             }
         }
@@ -2928,7 +2928,7 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
                     "Decoded Ventana associated TIFF image is truncated".into(),
                 ));
             }
-            for pixel in data.chunks_exact(3).take(pixel_count) {
+            for pixel in data.as_chunks::<3>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[
                     downscale_u16_to_u8(pixel[0]),
                     downscale_u16_to_u8(pixel[1]),
@@ -2951,7 +2951,7 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
                     "Decoded Ventana associated TIFF image is truncated".into(),
                 ));
             }
-            for pixel in data.chunks_exact(4).take(pixel_count) {
+            for pixel in data.as_chunks::<4>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[
                     downscale_u16_to_u8(pixel[0]),
                     downscale_u16_to_u8(pixel[1]),
@@ -5690,12 +5690,12 @@ mod tests {
                     );
                 }
                 if let Some(tiles) = spec.tiles {
-                    let tile_chunks = tiles.chunks_exact(12).collect::<Vec<_>>();
+                    let tile_chunks = tiles.as_chunks::<12>().0.iter().collect::<Vec<_>>();
                     assert_eq!(tile_chunks.len() * 12, tiles.len());
                     let bits_offset = add_extra(&mut extra, base, &[8, 0, 8, 0, 8, 0]);
                     let tile_offsets = tile_chunks
                         .iter()
-                        .map(|tile| add_extra(&mut extra, base, tile))
+                        .map(|tile| add_extra(&mut extra, base, tile.as_slice()))
                         .collect::<Vec<_>>();
                     let tile_offsets_bytes = tile_offsets
                         .iter()

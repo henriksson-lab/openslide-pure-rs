@@ -121,11 +121,16 @@ fn main() {
                 .data
                 .iter()
                 .fold(checksum, |acc, &byte| acc.wrapping_add(u64::from(byte)));
-            rgb_checksum = image.data.chunks_exact(4).fold(rgb_checksum, |acc, pixel| {
-                pixel[..3]
-                    .iter()
-                    .fold(acc, |acc, &byte| acc.wrapping_add(u64::from(byte)))
-            });
+            rgb_checksum = image
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .fold(rgb_checksum, |acc, pixel| {
+                    pixel[..3]
+                        .iter()
+                        .fold(acc, |acc, &byte| acc.wrapping_add(u64::from(byte)))
+                });
             regions += 1;
             pixels += u64::from(image.width) * u64::from(image.height);
         }

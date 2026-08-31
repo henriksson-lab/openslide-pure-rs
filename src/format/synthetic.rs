@@ -278,7 +278,7 @@ impl SlideBackend for SyntheticSlide {
         let size = w as usize * h as usize;
         let mut rgba = vec![0u8; size * 4];
         if channels[3].is_none() {
-            for pixel in rgba.chunks_exact_mut(4) {
+            for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
                 pixel[3] = 255;
             }
         }
@@ -588,7 +588,7 @@ fn synthetic_read_le_u32(data: &[u8], offset: usize, context: &str) -> Result<u3
 fn decode_jpeg_image(data: &[u8]) -> Result<RgbaImage> {
     let (rgb, width, height) = decode::jpeg::decode_jpeg_rgb_libjpeg(data)?;
     let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-    for pixel in rgb.chunks_exact(3) {
+    for pixel in rgb.as_chunks::<3>().0.iter() {
         rgba.extend_from_slice(pixel);
         rgba.push(0xff);
     }
@@ -607,7 +607,7 @@ fn decode_jpeg2000_image(data: &[u8]) -> Result<RgbaImage> {
         ),
     )?;
     let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-    for pixel in rgb.chunks_exact(3) {
+    for pixel in rgb.as_chunks::<3>().0.iter() {
         rgba.extend_from_slice(pixel);
         rgba.push(0xff);
     }
@@ -641,7 +641,7 @@ fn decode_zstd_image(data: &[u8]) -> Result<RgbaImage> {
     }
 
     let mut rgba = Vec::with_capacity(expected);
-    for pixel in argb.chunks_exact(4) {
+    for pixel in argb.as_chunks::<4>().0.iter() {
         rgba.push(pixel[1]);
         rgba.push(pixel[2]);
         rgba.push(pixel[3]);
@@ -957,7 +957,7 @@ fn decode_synthetic_tiff_jpeg(data: &[u8], info: &SyntheticTiffInfo) -> Result<R
         color_space,
     )?;
     let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-    for pixel in rgb.chunks_exact(3) {
+    for pixel in rgb.as_chunks::<3>().0.iter() {
         rgba.extend_from_slice(pixel);
         rgba.push(0xff);
     }

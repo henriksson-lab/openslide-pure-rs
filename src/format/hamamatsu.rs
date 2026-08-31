@@ -241,7 +241,11 @@ impl SlideBackend for NdpiSetSlide {
         // its channels as the dye intensity so the colour choice is irrelevant.
         let rgba = member.read_region_rgba([Some(0), Some(1), Some(2), None], x, y, level, w, h)?;
         let mut gray = GrayImage::new(w, h);
-        for (dst, px) in gray.data.iter_mut().zip(rgba.data.chunks_exact(4)) {
+        for (dst, px) in gray
+            .data
+            .iter_mut()
+            .zip(rgba.data.as_chunks::<4>().0.iter())
+        {
             *dst = px[0].max(px[1]).max(px[2]);
         }
         Ok(gray)
@@ -745,7 +749,7 @@ impl SlideBackend for HamamatsuSlide {
             let size = w as usize * h as usize;
             let mut rgba = vec![0u8; size * 4];
             if channels[3].is_none() {
-                for pixel in rgba.chunks_exact_mut(4) {
+                for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
                     pixel[3] = 255;
                 }
             }
@@ -806,7 +810,7 @@ impl SlideBackend for HamamatsuSlide {
             _ => {
                 let size = w as usize * h as usize;
                 let mut rgba = vec![0u8; size * 4];
-                for pixel in rgba.chunks_exact_mut(4) {
+                for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
                     pixel[3] = 255;
                 }
                 for (out_idx, channel) in [0, 1, 2].into_iter().enumerate() {
@@ -3048,7 +3052,7 @@ fn read_vms_region_rgba(
     if w == 0 || h == 0 {
         return Ok(output);
     }
-    for pixel in output.data.chunks_exact_mut(4) {
+    for pixel in output.data.as_chunks_mut::<4>().0.iter_mut() {
         pixel[3] = 255;
     }
 
@@ -3452,7 +3456,7 @@ fn read_ndpi_region_rgba(
     if w == 0 || h == 0 {
         return Ok(output);
     }
-    for pixel in output.data.chunks_exact_mut(4) {
+    for pixel in output.data.as_chunks_mut::<4>().0.iter_mut() {
         pixel[3] = 255;
     }
 
@@ -3516,7 +3520,7 @@ fn read_scaled_ndpi_region_rgba(
     if w == 0 || h == 0 {
         return Ok(output);
     }
-    for pixel in output.data.chunks_exact_mut(4) {
+    for pixel in output.data.as_chunks_mut::<4>().0.iter_mut() {
         pixel[3] = 255;
     }
 
@@ -3718,7 +3722,12 @@ fn decode_ndpi_jpegxr_bgr_to_rgba(data: &[u8], width: u32, height: u32) -> Resul
             context: "Hamamatsu NDPI JPEG XR macro",
         })?;
     let mut rgba = vec![0u8; image.width as usize * image.height as usize * 4];
-    for (dst, src) in rgba.chunks_exact_mut(4).zip(image.data.chunks_exact(3)) {
+    for (dst, src) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(image.data.as_chunks::<3>().0.iter())
+    {
         dst[0] = src[2];
         dst[1] = src[1];
         dst[2] = src[0];
@@ -3775,7 +3784,7 @@ fn rgb_channel_to_gray(rgb: &[u8], width: u32, height: u32, channel: u32) -> Res
         ));
     }
     let mut image = GrayImage::new(width, height);
-    for (dst, pixel) in image.data.iter_mut().zip(rgb.chunks_exact(3)) {
+    for (dst, pixel) in image.data.iter_mut().zip(rgb.as_chunks::<3>().0.iter()) {
         *dst = pixel[channel];
     }
     Ok(image)
@@ -4685,7 +4694,7 @@ fn read_planar_ndpi_plane(
                 )));
             }
             let mut plane_data = Vec::with_capacity(expected_samples);
-            for pixel in rgb.chunks_exact(3).take(expected_samples) {
+            for pixel in rgb.as_chunks::<3>().0.iter().take(expected_samples) {
                 plane_data.push(pixel[0]);
             }
             decoded_bytes_per_sample = 1;
@@ -5374,7 +5383,7 @@ impl TiffValue {
             10 => chunks_to_rationals(&self.data, self.endian, true),
             11 => {
                 let mut out = Vec::new();
-                for chunk in self.data.chunks_exact(4) {
+                for chunk in self.data.as_chunks::<4>().0.iter() {
                     let bits = read_u32_from_chunk(chunk, self.endian);
                     out.push(f32::from_bits(bits) as f64);
                 }
@@ -5382,7 +5391,7 @@ impl TiffValue {
             }
             12 => {
                 let mut out = Vec::new();
-                for chunk in self.data.chunks_exact(8) {
+                for chunk in self.data.as_chunks::<8>().0.iter() {
                     let bits = read_u64_from_chunk(chunk, self.endian);
                     out.push(f64::from_bits(bits));
                 }
@@ -5639,7 +5648,7 @@ fn chunks_to_rationals(data: &[u8], endian: Endian, signed: bool) -> Option<Vec<
         return None;
     }
     let mut out = Vec::new();
-    for chunk in data.chunks_exact(8) {
+    for chunk in data.as_chunks::<8>().0.iter() {
         let num = read_u32_from_chunk(&chunk[0..4], endian);
         let den = read_u32_from_chunk(&chunk[4..8], endian);
         if den == 0 {

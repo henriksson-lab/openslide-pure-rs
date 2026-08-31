@@ -1769,7 +1769,7 @@ impl SlideBackend for TrestleSlide {
             && trestle_level_needs_cairo_composition(level_data);
         if channels[3].is_none() {
             if !use_cairo_rgb {
-                for pixel in output.data.chunks_exact_mut(4) {
+                for pixel in output.data.as_chunks_mut::<4>().0.iter_mut() {
                     pixel[3] = 255;
                 }
             }
@@ -1969,7 +1969,9 @@ fn parse_trestle_image_description(
                 .map(|value| crate::util::_openslide_parse_uint64(value, 10).unwrap_or(0) as i32)
                 .collect::<Vec<_>>();
             values
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| (pair[0], pair[1]))
                 .collect()
         })
@@ -2668,7 +2670,7 @@ fn decode_planar_old_jpeg_plane(
         )));
     }
     let mut plane = Vec::with_capacity(expected_samples);
-    for pixel in rgb.chunks_exact(3).take(expected_samples) {
+    for pixel in rgb.as_chunks::<3>().0.iter().take(expected_samples) {
         plane.push(pixel[0]);
     }
     Ok(plane)
@@ -2791,7 +2793,7 @@ fn decode_planar_jpeg_plane(
         )));
     }
     let mut plane = Vec::with_capacity(expected_samples);
-    for pixel in rgb.chunks_exact(3).take(expected_samples) {
+    for pixel in rgb.as_chunks::<3>().0.iter().take(expected_samples) {
         plane.push(pixel[0]);
     }
     Ok(plane)
@@ -3178,7 +3180,7 @@ fn trestle_level_needs_cairo_composition(level: &TrestleLevel) -> bool {
 }
 
 fn unpremultiply_rgba(image: &mut RgbaImage) {
-    for pixel in image.data.chunks_exact_mut(4) {
+    for pixel in image.data.as_chunks_mut::<4>().0.iter_mut() {
         let alpha = u32::from(pixel[3]);
         if alpha == 0 || alpha == 255 {
             continue;
@@ -4324,7 +4326,9 @@ mod tests {
         assert!(
             image
                 .data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel[3] != 0 && pixel[3] != 255),
             "fractional Cairo composition should preserve partially covered alpha"
         );

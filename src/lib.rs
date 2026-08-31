@@ -1273,7 +1273,9 @@ fn blit_rgba(src: &RgbaImage, dst: &mut RgbaImage, dst_x: u32, dst_y: u32) {
 }
 
 fn rgba_to_premultiplied_argb(rgba: &[u8]) -> Vec<u32> {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| {
             let alpha = u32::from(pixel[3]);
             let premul = |sample: u8| (u32::from(sample) * alpha + 127) / 255;

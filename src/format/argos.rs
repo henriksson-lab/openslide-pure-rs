@@ -541,13 +541,13 @@ fn decoded_tiff_image_to_rgba(
         }
         (::tiff::decoder::DecodingResult::U8(data), ::tiff::ColorType::GrayA(8)) => {
             require_len(data.len(), pixel_count.saturating_mul(2), vendor)?;
-            for pixel in data.chunks_exact(2).take(pixel_count) {
+            for pixel in data.as_chunks::<2>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
             }
         }
         (::tiff::decoder::DecodingResult::U16(data), ::tiff::ColorType::GrayA(16)) => {
             require_len(data.len(), pixel_count.saturating_mul(2), vendor)?;
-            for pixel in data.chunks_exact(2).take(pixel_count) {
+            for pixel in data.as_chunks::<2>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[
                     downscale_u16_to_u8(pixel[0]),
                     downscale_u16_to_u8(pixel[0]),
@@ -561,13 +561,13 @@ fn decoded_tiff_image_to_rgba(
             ::tiff::ColorType::RGB(8) | ::tiff::ColorType::YCbCr(8),
         ) => {
             require_len(data.len(), pixel_count.saturating_mul(3), vendor)?;
-            for pixel in data.chunks_exact(3).take(pixel_count) {
+            for pixel in data.as_chunks::<3>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xff]);
             }
         }
         (::tiff::decoder::DecodingResult::U16(data), ::tiff::ColorType::RGB(16)) => {
             require_len(data.len(), pixel_count.saturating_mul(3), vendor)?;
-            for pixel in data.chunks_exact(3).take(pixel_count) {
+            for pixel in data.as_chunks::<3>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[
                     downscale_u16_to_u8(pixel[0]),
                     downscale_u16_to_u8(pixel[1]),
@@ -582,7 +582,7 @@ fn decoded_tiff_image_to_rgba(
         }
         (::tiff::decoder::DecodingResult::U16(data), ::tiff::ColorType::RGBA(16)) => {
             require_len(data.len(), pixel_count.saturating_mul(4), vendor)?;
-            for pixel in data.chunks_exact(4).take(pixel_count) {
+            for pixel in data.as_chunks::<4>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[
                     downscale_u16_to_u8(pixel[0]),
                     downscale_u16_to_u8(pixel[1]),

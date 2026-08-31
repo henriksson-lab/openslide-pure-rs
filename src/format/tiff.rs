@@ -1919,7 +1919,7 @@ impl SlideBackend for GenericTiffSlide {
             }
             unpremultiply_rgba(&mut output);
             if channels[3].is_none() {
-                for pixel in output.data.chunks_exact_mut(4) {
+                for pixel in output.data.as_chunks_mut::<4>().0.iter_mut() {
                     if pixel[3] != 0 {
                         pixel[3] = 255;
                     }
@@ -2317,7 +2317,7 @@ impl Sha256 {
             0xc67178f2,
         ];
         let mut w = [0u32; 64];
-        for (i, chunk) in block.chunks_exact(4).take(16).enumerate() {
+        for (i, chunk) in block.as_chunks::<4>().0.iter().take(16).enumerate() {
             w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
         for i in 16..64 {
@@ -3324,7 +3324,7 @@ fn decode_planar_jpeg_plane(
         )));
     }
     let mut plane = Vec::with_capacity(expected_samples);
-    for pixel in rgb.chunks_exact(3).take(expected_samples) {
+    for pixel in rgb.as_chunks::<3>().0.iter().take(expected_samples) {
         plane.push(pixel[0]);
     }
     Ok(plane)
@@ -3888,7 +3888,7 @@ fn tiff_level_needs_cairo_composition(level: &TiffLevel) -> bool {
 }
 
 fn unpremultiply_rgba(image: &mut RgbaImage) {
-    for pixel in image.data.chunks_exact_mut(4) {
+    for pixel in image.data.as_chunks_mut::<4>().0.iter_mut() {
         let alpha = u32::from(pixel[3]);
         if alpha == 0 || alpha == 255 {
             continue;

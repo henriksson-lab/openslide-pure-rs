@@ -1702,7 +1702,7 @@ impl SlideBackend for DicomSlide {
         }
         let rgb = self.read_region_rgb(x, y, level, w, h)?;
         let mut output = GrayImage::new(w, h);
-        for (index, pixel) in rgb.chunks_exact(3).enumerate() {
+        for (index, pixel) in rgb.as_chunks::<3>().0.iter().enumerate() {
             output.data[index] = pixel[channel as usize];
         }
 
@@ -1731,7 +1731,7 @@ impl SlideBackend for DicomSlide {
         let size = w as usize * h as usize;
         let mut rgba = vec![0u8; size * 4];
         if channels[3].is_none() {
-            for pixel in rgba.chunks_exact_mut(4) {
+            for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
                 pixel[3] = 255;
             }
         }
@@ -3639,70 +3639,86 @@ fn element_values_as_strings(element: &DicomElement) -> Vec<String> {
             .collect(),
         Some(b"FD") => element
             .value
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|chunk| {
                 let value = match element.endian {
-                    Endian::Little => f64::from_le_bytes(chunk.try_into().unwrap()),
-                    Endian::Big => f64::from_be_bytes(chunk.try_into().unwrap()),
+                    Endian::Little => f64::from_le_bytes(*chunk),
+                    Endian::Big => f64::from_be_bytes(*chunk),
                 };
                 format_float(value)
             })
             .collect(),
         Some(b"FL") => element
             .value
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| {
                 let value = match element.endian {
-                    Endian::Little => f32::from_le_bytes(chunk.try_into().unwrap()),
-                    Endian::Big => f32::from_be_bytes(chunk.try_into().unwrap()),
+                    Endian::Little => f32::from_le_bytes(*chunk),
+                    Endian::Big => f32::from_be_bytes(*chunk),
                 };
                 format_float(f64::from(value))
             })
             .collect(),
         Some(b"SL") => element
             .value
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| {
                 let value = match element.endian {
-                    Endian::Little => i32::from_le_bytes(chunk.try_into().unwrap()),
-                    Endian::Big => i32::from_be_bytes(chunk.try_into().unwrap()),
+                    Endian::Little => i32::from_le_bytes(*chunk),
+                    Endian::Big => i32::from_be_bytes(*chunk),
                 };
                 value.to_string()
             })
             .collect(),
         Some(b"SS") => element
             .value
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| {
                 let value = match element.endian {
-                    Endian::Little => i16::from_le_bytes(chunk.try_into().unwrap()),
-                    Endian::Big => i16::from_be_bytes(chunk.try_into().unwrap()),
+                    Endian::Little => i16::from_le_bytes(*chunk),
+                    Endian::Big => i16::from_be_bytes(*chunk),
                 };
                 value.to_string()
             })
             .collect(),
         Some(b"UL") => element
             .value
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| read_u32(chunk, element.endian).to_string())
             .collect(),
         Some(b"US") => element
             .value
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| read_u16(chunk, element.endian).to_string())
             .collect(),
         Some(b"UV") => element
             .value
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|chunk| read_u64(chunk, element.endian).to_string())
             .collect(),
         Some(b"SV") => element
             .value
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|chunk| {
                 let value = match element.endian {
-                    Endian::Little => i64::from_le_bytes(chunk.try_into().unwrap()),
-                    Endian::Big => i64::from_be_bytes(chunk.try_into().unwrap()),
+                    Endian::Little => i64::from_le_bytes(*chunk),
+                    Endian::Big => i64::from_be_bytes(*chunk),
                 };
                 value.to_string()
             })
@@ -4319,7 +4335,9 @@ fn parse_basic_offset_table(data: &[u8]) -> Result<Vec<u32>> {
         ));
     }
     Ok(data
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect())
 }
@@ -4340,10 +4358,12 @@ fn parse_extended_offset_table(elements: &[DicomElement], tag: Tag) -> Result<Op
     Ok(Some(
         element
             .value
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|chunk| match element.endian {
-                Endian::Little => u64::from_le_bytes(chunk.try_into().unwrap()),
-                Endian::Big => u64::from_be_bytes(chunk.try_into().unwrap()),
+                Endian::Little => u64::from_le_bytes(*chunk),
+                Endian::Big => u64::from_be_bytes(*chunk),
             })
             .collect(),
     ))
@@ -4662,7 +4682,9 @@ fn parse_palette_data(
             }
             Ok(element
                 .value
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .take(entries)
                 .map(|chunk| (read_u16(chunk, element.endian) >> 8) as u8)
                 .collect())
@@ -4798,7 +4820,7 @@ fn native_frame_to_rgb(
             }
             let mut rgb = Vec::with_capacity(samples.len());
             if planar_configuration == 0 {
-                for pixel in samples.chunks_exact(3) {
+                for pixel in samples.as_chunks::<3>().0.iter() {
                     rgb.extend_from_slice(&ycbcr_to_rgb(
                         scale_sample_to_u8(pixel[0], bits_stored, pixel_representation, intensity),
                         scale_sample_to_u8(pixel[1], bits_stored, pixel_representation, intensity),
@@ -4853,7 +4875,7 @@ fn native_frame_to_rgb(
                     )));
                 }
                 for row in samples.chunks_exact(packed_samples_per_row) {
-                    for (pair_index, pair) in row.chunks_exact(4).enumerate() {
+                    for (pair_index, pair) in row.as_chunks::<4>().0.iter().enumerate() {
                         let y0 = scale_sample_to_u8(
                             pair[0],
                             bits_stored,
@@ -4985,7 +5007,9 @@ fn native_samples_to_i32(
                 )));
             }
             Ok(data
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| {
                     stored_sample_to_i32(
                         read_u16(chunk, endian),
@@ -5157,7 +5181,7 @@ fn blit_rgb(
 
 fn rgb_to_rgba(width: u32, height: u32, rgb: &[u8]) -> RgbaImage {
     let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-    for pixel in rgb.chunks_exact(3) {
+    for pixel in rgb.as_chunks::<3>().0.iter() {
         rgba.extend_from_slice(pixel);
         rgba.push(255);
     }

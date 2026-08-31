@@ -119,11 +119,17 @@ fn main() {
                 .data
                 .iter()
                 .fold(0u64, |acc, &byte| acc.wrapping_add(u64::from(byte)));
-            let sample_rgb_checksum = image.data.chunks_exact(4).fold(0u64, |acc, pixel| {
-                pixel[..3]
+            let sample_rgb_checksum =
+                image
+                    .data
+                    .as_chunks::<4>()
+                    .0
                     .iter()
-                    .fold(acc, |acc, &byte| acc.wrapping_add(u64::from(byte)))
-            });
+                    .fold(0u64, |acc, pixel| {
+                        pixel[..3]
+                            .iter()
+                            .fold(acc, |acc, &byte| acc.wrapping_add(u64::from(byte)))
+                    });
             checksum = checksum.wrapping_add(sample_checksum);
             rgb_checksum = rgb_checksum.wrapping_add(sample_rgb_checksum);
             samples.push(format!(

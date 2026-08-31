@@ -160,9 +160,7 @@ impl IndexFile {
         let mut seen = 0usize;
         while page != 0 {
             if page < 0 {
-                return Err(OpenSlideError::Format(
-                    "Negative index page pointer".into(),
-                ));
+                return Err(OpenSlideError::Format("Negative index page pointer".into()));
             }
             // A malformed file can make the chain loop; bound the walk.
             seen += 1;

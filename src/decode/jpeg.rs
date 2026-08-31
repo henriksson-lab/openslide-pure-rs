@@ -275,7 +275,7 @@ fn floor_to_i64(value: f64) -> i64 {
 
 fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(bgra.len() / 4 * 3);
-    for pixel in bgra.chunks_exact(4) {
+    for pixel in bgra.as_chunks::<4>().0.iter() {
         rgb.push(pixel[2]);
         rgb.push(pixel[1]);
         rgb.push(pixel[0]);
@@ -285,7 +285,7 @@ fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
 
 fn rgb_region_to_gray(rgb: Vec<u8>, width: u32, height: u32, channel: u32) -> GrayImage {
     let mut data = Vec::with_capacity(width as usize * height as usize);
-    for pixel in rgb.chunks_exact(3) {
+    for pixel in rgb.as_chunks::<3>().0.iter() {
         data.push(pixel[channel as usize]);
     }
     GrayImage {
@@ -472,7 +472,7 @@ pub fn decode_jpeg_channel(data: &[u8], channel: u32) -> Result<crate::pixel::Gr
     let (rgb, width, height) = decode_jpeg_rgb(data)?;
     let pixel_count = width as usize * height as usize;
     let mut gray = Vec::with_capacity(pixel_count);
-    for pixel in rgb.chunks_exact(3) {
+    for pixel in rgb.as_chunks::<3>().0.iter() {
         gray.push(pixel[channel as usize]);
     }
     Ok(crate::pixel::GrayImage {
@@ -774,7 +774,7 @@ fn jpeg_crop_error_message(err: &[i8]) -> String {
 pub fn rgb_to_rgba(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
     let pixel_count = width as usize * height as usize;
     let mut rgba = Vec::with_capacity(pixel_count * 4);
-    for pixel in rgb.chunks_exact(3) {
+    for pixel in rgb.as_chunks::<3>().0.iter() {
         rgba.push(pixel[0]); // R
         rgba.push(pixel[1]); // G
         rgba.push(pixel[2]); // B
@@ -1363,7 +1363,7 @@ mod tests {
                     values
                 } else {
                     let mut values = Vec::with_capacity(64);
-                    for chunk in segment[cursor..cursor + 128].chunks_exact(2) {
+                    for chunk in segment[cursor..cursor + 128].as_chunks::<2>().0.iter() {
                         values.push(u16::from_be_bytes([chunk[0], chunk[1]]));
                     }
                     cursor += 128;

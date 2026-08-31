@@ -1280,7 +1280,7 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
                     "Decoded Philips associated TIFF image is truncated".into(),
                 ));
             }
-            for pixel in data.chunks_exact(2).take(pixel_count) {
+            for pixel in data.as_chunks::<2>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
             }
         }
@@ -1290,7 +1290,7 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
                     "Decoded Philips associated TIFF image is truncated".into(),
                 ));
             }
-            for pixel in data.chunks_exact(2).take(pixel_count) {
+            for pixel in data.as_chunks::<2>().0.iter().take(pixel_count) {
                 let gray = downscale_u16_to_u8(pixel[0]);
                 let alpha = downscale_u16_to_u8(pixel[1]);
                 rgba.extend_from_slice(&[gray, gray, gray, alpha]);
@@ -1305,7 +1305,7 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
                     "Decoded Philips associated TIFF image is truncated".into(),
                 ));
             }
-            for pixel in data.chunks_exact(3).take(pixel_count) {
+            for pixel in data.as_chunks::<3>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xff]);
             }
         }
@@ -1315,7 +1315,7 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
                     "Decoded Philips associated TIFF image is truncated".into(),
                 ));
             }
-            for pixel in data.chunks_exact(3).take(pixel_count) {
+            for pixel in data.as_chunks::<3>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[
                     downscale_u16_to_u8(pixel[0]),
                     downscale_u16_to_u8(pixel[1]),
@@ -1338,7 +1338,7 @@ fn read_associated_with_tiff_crate(path: &Path, dir_index: usize) -> Result<Rgba
                     "Decoded Philips associated TIFF image is truncated".into(),
                 ));
             }
-            for pixel in data.chunks_exact(4).take(pixel_count) {
+            for pixel in data.as_chunks::<4>().0.iter().take(pixel_count) {
                 rgba.extend_from_slice(&[
                     downscale_u16_to_u8(pixel[0]),
                     downscale_u16_to_u8(pixel[1]),

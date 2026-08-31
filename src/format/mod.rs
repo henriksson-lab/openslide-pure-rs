@@ -77,7 +77,7 @@ pub(crate) trait SlideBackend: Send + Sync {
         let size = w as usize * h as usize;
         let mut rgba = vec![0u8; size * 4];
         if channels[3].is_none() {
-            for pixel in rgba.chunks_exact_mut(4) {
+            for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
                 pixel[3] = 255;
             }
         }

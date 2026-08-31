@@ -21,7 +21,7 @@ pub fn decode_png_rgba(data: &[u8]) -> Result<RgbaImage> {
         png::ColorType::Rgb => {
             let pixels = &buf[..info.buffer_size()];
             let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-            for chunk in pixels.chunks_exact(3) {
+            for chunk in pixels.as_chunks::<3>().0.iter() {
                 rgba.push(chunk[0]);
                 rgba.push(chunk[1]);
                 rgba.push(chunk[2]);

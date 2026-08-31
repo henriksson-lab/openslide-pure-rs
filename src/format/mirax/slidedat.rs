@@ -763,7 +763,9 @@ impl SlideDat {
 
     /// Locate a hierarchy by name, case-insensitively.
     pub fn find_hier(&self, name: &str) -> Option<&HierLayer> {
-        self.layers.iter().find(|l| l.name.eq_ignore_ascii_case(name))
+        self.layers
+            .iter()
+            .find(|l| l.name.eq_ignore_ascii_case(name))
     }
 
     /// Locate a non-hierarchical layer level by name, returning its indices.

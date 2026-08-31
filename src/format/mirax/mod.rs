@@ -377,8 +377,7 @@ impl MiraxSlide {
 
             for zoom_level in 0..zoom_level_count as usize {
                 // Cross-product address, not a running offset (spec §5.3).
-                let entry =
-                    sd.hier_entry(&sd.level_vector(zoom_level as i32, filter_level))?;
+                let entry = sd.hier_entry(&sd.level_vector(zoom_level as i32, filter_level))?;
                 let is_primary = filter_slot == 0;
                 let entries = match mirax_hier_entries_or_extension_end(
                     index.hier_records(entry),
@@ -565,20 +564,19 @@ impl MiraxSlide {
         let mut level_is_bgr: HashMap<i32, bool> = HashMap::new();
         for &filter_level in &filter_levels {
             let bgr = (|| -> Option<bool> {
-                let entry = sd
-                    .hier_entry(&sd.level_vector(0, filter_level))
-                    .ok()?;
+                let entry = sd.hier_entry(&sd.level_vector(0, filter_level)).ok()?;
                 let entries = index.hier_records(entry).ok()?;
                 let probe = entries.iter().find(|e| e.length > 0)?;
                 let path = sd.datafile_paths.get(probe.fileno as usize)?;
-                let data =
-                    read_record_data(path, probe.offset as i64, probe.length as i64).ok()?;
+                let data = read_record_data(path, probe.offset as i64, probe.length as i64).ok()?;
                 decode::tile_is_bgr(sd.zoom_levels[0].image_format, &data)
             })();
             // With no tile to inspect, fall back to the format's usual order.
             level_is_bgr.insert(
                 filter_level,
-                bgr.unwrap_or_else(|| decode::format_is_bgr_by_default(sd.zoom_levels[0].image_format)),
+                bgr.unwrap_or_else(|| {
+                    decode::format_is_bgr_by_default(sd.zoom_levels[0].image_format)
+                }),
             );
         }
 
@@ -835,7 +833,7 @@ impl MiraxSlide {
         let pixel_count = rgb_tile.width as usize * rgb_tile.height as usize;
         let ch = channel.min(2) as usize;
         let mut gray = Vec::with_capacity(pixel_count);
-        for pixel in rgb_tile.rgb.chunks_exact(3) {
+        for pixel in rgb_tile.rgb.as_chunks::<3>().0.iter() {
             gray.push(pixel[ch]);
         }
         Ok(GrayImage {
@@ -1631,7 +1629,7 @@ fn cairo_blit_rgb_rgba(
 }
 
 fn unpremultiply_rgba(image: &mut RgbaImage) {
-    for pixel in image.data.chunks_exact_mut(4) {
+    for pixel in image.data.as_chunks_mut::<4>().0.iter_mut() {
         let alpha = u32::from(pixel[3]);
         if alpha == 0 || alpha == 255 {
             continue;
@@ -1876,7 +1874,7 @@ mod tests {
                 image,
                 src_x: 0.0,
                 src_y: 0.0,
-                },
+            },
         );
         let cache = Arc::new(TileCache::new());
         let slide = MiraxSlide {
@@ -1961,7 +1959,7 @@ mod tests {
                 image,
                 src_x: 0.0,
                 src_y: 0.0,
-                },
+            },
         );
         let cache = Arc::new(TileCache::new());
         let slide = MiraxSlide {
@@ -2057,7 +2055,7 @@ mod tests {
             }),
             src_x: 0.0,
             src_y: 0.0,
-                };
+        };
 
         let decoded = slide
             .decode_tile_rgb(&tile, 0, 0, ImageFormat::Png, 1, 1)

@@ -131,7 +131,7 @@ pub fn decode_rgb(format: ImageFormat, data: &[u8]) -> Result<(Vec<u8>, u32, u32
             // Fallback: decode to RGBA, then strip alpha
             let rgba = decode_to_rgba(format, data)?;
             let mut rgb = Vec::with_capacity(rgba.width as usize * rgba.height as usize * 3);
-            for pixel in rgba.data.chunks_exact(4) {
+            for pixel in rgba.data.as_chunks::<4>().0.iter() {
                 rgb.push(pixel[0]);
                 rgb.push(pixel[1]);
                 rgb.push(pixel[2]);
@@ -293,7 +293,7 @@ pub fn decode_channel(format: ImageFormat, data: &[u8], channel: u32) -> Result<
             let rgba = decode_to_rgba(format, data)?;
             let pixel_count = rgba.width as usize * rgba.height as usize;
             let mut gray = Vec::with_capacity(pixel_count);
-            for pixel in rgba.data.chunks_exact(4) {
+            for pixel in rgba.data.as_chunks::<4>().0.iter() {
                 gray.push(pixel[channel.min(3) as usize]);
             }
             Ok(GrayImage {
